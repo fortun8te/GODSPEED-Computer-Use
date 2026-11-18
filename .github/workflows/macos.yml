@@ -26,6 +26,8 @@ jobs:
           node-version: '24'
       - name: Verify the JavaScript API
         run: node --test scripts/node-repl/open-computer-use-repl.test.mjs
+      - name: Reject stale packages after a failed build
+        run: ./scripts/tests/godspeed-package-guard.sh
       - name: Package a development build
         if: github.event_name == 'workflow_dispatch'
         run: ./scripts/package-godspeed.sh
