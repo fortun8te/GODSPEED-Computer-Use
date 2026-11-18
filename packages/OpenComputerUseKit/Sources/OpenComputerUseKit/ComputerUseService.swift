@@ -778,21 +778,33 @@ public final class ComputerUseService {
         treeLimits: AccessibilityTreeLimits = .defaults,
         windowPlacement: WindowPlacement = .keep,
         observation: SnapshotObservationOptions = .defaults,
-        settleMs: Int? = nil
+        settleMs: Int? = nil,
+        compact: Bool = false
     ) throws -> ToolCallResult {
         if windowPlacement == .agentDisplay { try VirtualDisplayConfig.current.requireEnabled() }
         try observation.validate()
+        func render(_ snapshot: AppSnapshot) -> ToolCallResult {
+            let result = snapshotResult(for: snapshot, style: .fullState)
+            guard compact else { return result }
+            let kept = snapshot.elements.values.compactMap { record -> String? in
+                let isFocused = record.element.map { element in
+                    snapshot.focusedElement.map { CFEqual(element, $0) } == true
+                } ?? false
+                return !record.rawActions.isEmpty || isFocused ? String(record.index) : nil
+            }
+            return LeanOutput.condensed(result, mode: .compact, preserving: Set(kept))
+        }
         if let settleMs {
             let note = try waitForWindowToSettle(app: query, timeoutMs: settleMs)
             let result = try getAppState(app: query, textLimit: textLimit, treeLimits: treeLimits,
-                                         windowPlacement: windowPlacement, observation: observation)
+                                         windowPlacement: windowPlacement, observation: observation, compact: compact)
             // After the state text and before the screenshot, so primaryText stays the state.
             var content = result.content
             content.insert(.text(note), at: content.firstIndex { $0.dictionary["type"] as? String == "image" } ?? content.endIndex)
             return ToolCallResult(content: content, isError: result.isError)
         }
         guard windowPlacement != .keep else {
-            return snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, observation: observation), style: .fullState)
+            return render(try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, observation: observation))
         }
 
         // Explicit placements never activate or raise; they only move the frame.
@@ -823,7 +835,7 @@ public final class ComputerUseService {
             break
         }
 
-        return snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, recoveryPolicy: .readOnly, observation: observation), style: .fullState)
+        return render(try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, recoveryPolicy: .readOnly, observation: observation))
     }
 
     /// Waits while the app's window shows a busy sign, for at most `timeoutMs` (capped at 5 s).

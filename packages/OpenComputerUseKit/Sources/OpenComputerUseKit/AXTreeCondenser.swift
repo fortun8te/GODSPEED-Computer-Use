@@ -56,6 +56,50 @@ enum AXTreeCondenser {
         condenseLines(text, options: options).text
     }
 
+    /// Compact native observation retains labelled context and all visible control evidence.
+    /// Only bare structural wrappers and decoration are omitted. Repeated rows, offscreen
+    /// controls and state lines survive regardless of their position or the output length.
+    static func compactObservation(_ text: String, preserving indexes: Set<String> = []) -> String {
+        let parts = text.components(separatedBy: "\n")
+        guard let firstTree = parts.firstIndex(where: { parseLine($0).isTree }) else { return text }
+
+        let header = parts[..<firstTree]
+        let packedIndentation = header.contains("[tab=4 w=settable]")
+        let lines = parts[firstTree...].map(parseLine)
+        var output = Array(header)
+        var removedDepths: [Int] = []
+        for (position, original) in lines.enumerated() {
+            guard original.isTree else {
+                output.append(original.raw)
+                continue
+            }
+
+            let depth = packedIndentation ? original.width : original.indent.count
+            while let last = removedDepths.last, last >= depth {
+                removedDepths.removeLast()
+            }
+
+            let isBare = original.rest == original.role && !indexes.contains(original.index)
+            let isLeaf = position + 1 == lines.count || !lines[position + 1].isTree
+                || lines[position + 1].width <= original.width
+            if isBare && wrapperRoles.contains(original.role) {
+                removedDepths.append(depth)
+                continue
+            }
+            if isBare && isLeaf && decorationRoles.contains(original.role) {
+                continue
+            }
+
+            var line = original
+            let adjustedDepth = depth - removedDepths.count
+            line.indent = packedIndentation
+                ? String(repeating: "\t", count: adjustedDepth / 4) + String(repeating: " ", count: adjustedDepth % 4)
+                : String(original.indent.prefix(adjustedDepth))
+            output.append(line.render())
+        }
+        return output.joined(separator: "\n")
+    }
+
     /// Same output as `condense`, plus line counts before and after (header included).
     static func condenseWithStats(_ text: String, options: Options = .default) -> (text: String, before: Int, after: Int) {
         condenseLines(text, options: options)

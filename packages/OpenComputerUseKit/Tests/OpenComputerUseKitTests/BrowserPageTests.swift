@@ -6,6 +6,26 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testRememberedBrowserControlsRequireTheOriginalHelperAndLoaders() throws {
+        let memory = BrowserPageMemory()
+        let first = BrowserBridge(sessionID: "test-first")
+        let second = BrowserBridge(sessionID: "test-second")
+        let observation = try XCTUnwrap(BrowserDocumentIdentity(tree: [
+            "frame": ["id": "root", "loaderId": "one"],
+            "childFrames": [["frame": ["id": "child", "loaderId": "one"]]],
+        ]))
+        let replacedFrame = try XCTUnwrap(BrowserDocumentIdentity(tree: [
+            "frame": ["id": "root", "loaderId": "one"],
+            "childFrames": [["frame": ["id": "child", "loaderId": "two"]]],
+        ]))
+        memory.store([], bridge: first, tab: 9, document: observation, generation: first.referenceGeneration)
+        XCTAssertNotNil(memory.observation(bridge: first, tab: 9, document: observation))
+        XCTAssertNil(memory.observation(bridge: second, tab: 9, document: observation))
+        XCTAssertNil(memory.observation(bridge: first, tab: 9, document: replacedFrame))
+        memory.forgetTab(bridge: first, tab: 9)
+        XCTAssertNil(memory.observation(bridge: first, tab: 9, document: observation))
+    }
+
     func testPointerDragReleasesOnceWhenMovementFails() throws {
         let start = CGPoint(x: 10, y: 20)
         let end = CGPoint(x: 60, y: 50)

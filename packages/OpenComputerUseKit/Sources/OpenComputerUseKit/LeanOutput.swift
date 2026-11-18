@@ -7,6 +7,11 @@ import Foundation
 /// - a batch's final read can be replaced by `AXStateDiff` (only what changed since the previous read
 ///   of that app) when the change is small. `OPEN_COMPUTER_USE_BATCH_DIFF=0` turns it off.
 enum LeanOutput {
+    enum ObservationMode {
+        case standard
+        case compact
+    }
+
     static let condenses: Bool = flag("OPEN_COMPUTER_USE_CONDENSE")
     static let diffsBatchReads: Bool = flag("OPEN_COMPUTER_USE_BATCH_DIFF")
 
@@ -20,15 +25,20 @@ enum LeanOutput {
     }
 
     /// The result with each state text condensed; other items (notes, images) unchanged.
-    static func condensed(_ result: ToolCallResult) -> ToolCallResult {
-        guard condenses else { return result }
+    static func condensed(
+        _ result: ToolCallResult, mode: ObservationMode = .standard, preserving indexes: Set<String> = []
+    ) -> ToolCallResult {
+        guard condenses || mode == .compact else { return result }
         var changed = false
         let content = result.content.map { item -> ToolResultContentItem in
             guard item.dictionary["type"] as? String == "text",
                   let text = item.dictionary["text"] as? String, isStateText(text)
             else { return item }
             changed = true
-            return .text(AXTreeCondenser.condense(text))
+            switch mode {
+            case .standard: return .text(AXTreeCondenser.condense(text))
+            case .compact: return .text(AXTreeCondenser.compactObservation(text, preserving: indexes))
+            }
         }
         return changed ? ToolCallResult(content: content, isError: result.isError) : result
     }

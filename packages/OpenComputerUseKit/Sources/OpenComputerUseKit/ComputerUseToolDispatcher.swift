@@ -139,7 +139,8 @@ public final class ComputerUseToolDispatcher {
            let hint = BatchRecipes.shared.hint(app: app) {
             log.tail(hint)
         }
-        let condensed = name == BatchTool.name ? result : LeanOutput.condensed(result)
+        let compact = name == "get_app_state" && (arguments["compact"] as? Bool) == true
+        let condensed = name == BatchTool.name || compact ? result : LeanOutput.condensed(result)
         return notesInResult ? log.apply(to: condensed) : condensed
     }
 
@@ -354,7 +355,8 @@ public final class ComputerUseToolDispatcher {
                         "include_screenshot", in: arguments, default: LeanDefaults.includeScreenshot
                     )
                 ),
-                settleMs: try optionalSettleMs(in: arguments)
+                settleMs: try optionalSettleMs(in: arguments),
+                compact: try strictObservationBool("compact", in: arguments, default: false)
             )
         case "click":
             let elementIndex: String?

@@ -25,6 +25,64 @@ final class AXTreeCondenserTests: XCTestCase {
         (["Window: Synthetic"] + lines).joined(separator: "\n")
     }
 
+    func testCompactObservationKeepsControlsAndContextWithTheirOriginalNumbers() {
+        let header = ["App=Synthetic", "Window=Library", "[w=settable]"]
+        let body = [
+            "0 window Library",
+            "\t1 group",
+            "\t\t2 scroll area (offscreen)",
+            "\t\t\t3 group Selected playlist",
+            "\t\t\t\t4 text Side A",
+            "\t\t\t\t5 link Details",
+            "\t\t\t\t6 group Secondary Actions: Press",
+            "\t\t\t\t7 image",
+            "\t\t\t\t8 image (focused)",
+            "\t\t\t\t9 text field (w:str) Search = Miles",
+            "\t10 button Next",
+        ]
+        let result = AXTreeCondenser.compactObservation((header + body + [""]).joined(separator: "\n"))
+        XCTAssertEqual(result.components(separatedBy: "\n"), header + [
+            "0 window Library",
+            "\t2 scroll area (offscreen)",
+            "\t\t3 group Selected playlist",
+            "\t\t\t4 text Side A",
+            "\t\t\t5 link Details",
+            "\t\t\t6 group Secondary Actions: Press",
+            "\t\t\t8 image (focused)",
+            "\t\t\t9 text field (w:str) Search = Miles",
+            "\t10 button Next",
+            "",
+        ])
+    }
+
+    func testCompactObservationKeepsAllRepeatedRowsAndFocusPastStandardBudget() {
+        let links = (1...500).map { "\t\($0) link Item \($0) with a long descriptive title" }
+        let lines = ["App=Synthetic", "0 window Library"] + links + ["\t501 text field (focused) Search"]
+        let state = ToolCallResult(content: [.text(lines.joined(separator: "\n")), .text("Separate note")], isError: false)
+        let result = LeanOutput.condensed(state, mode: .compact)
+        XCTAssertEqual(result.content.map { $0.dictionary["text"] as? String }, [
+            lines.joined(separator: "\n"), "Separate note",
+        ])
+    }
+
+    func testCompactObservationPreservesActionIndexesWithoutRenderedTraits() {
+        let lines = ["App=Synthetic", "0 window Library", "\t1 group", "\t\t2 image", "\t\t3 image"]
+        let result = AXTreeCondenser.compactObservation(lines.joined(separator: "\n"), preserving: ["1", "3"])
+        XCTAssertEqual(result.components(separatedBy: "\n"), Array(lines.prefix(3)) + [lines[4]])
+    }
+
+    func testCompactObservationKeepsPackedIndentationAcrossTabBoundary() {
+        let input = [
+            "App=Synthetic", "[tab=4 w=settable]", "0 window Library",
+            " 1 group Named", "  2 group Named", "   3 group", "\t4 button Save", "  5 button Other",
+        ]
+        XCTAssertEqual(
+            AXTreeCondenser.compactObservation(input.joined(separator: "\n")).components(separatedBy: "\n"),
+            ["App=Synthetic", "[tab=4 w=settable]", "0 window Library",
+             " 1 group Named", "  2 group Named", "   4 button Save", "  5 button Other"]
+        )
+    }
+
     // MARK: - Header
 
     func testHeaderLinesAreUntouched() {

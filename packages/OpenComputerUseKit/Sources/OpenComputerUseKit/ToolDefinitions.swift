@@ -158,6 +158,8 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "compact": ["type": "boolean", "default": false,
+                                "description": "Keep actionable controls and focus, omit extra layout text"],
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "include_ax": ["type": "boolean", "default": true, "description": "False skips the element list and invalidates earlier element numbers."],
                     "include_screenshot": ["type": "boolean", "default": LeanDefaults.includeScreenshot, "description": "Also return a screenshot, e.g. for pixel clicks."],

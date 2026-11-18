@@ -33,7 +33,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 |---|---|
 | `batch` | Up to 20 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
-| `get_app_state` | The app's numbered element tree (`App=` text). Screenshot only when asked. |
+| `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
 | `click`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
 | `drag` | Two points on an app screenshot. Both must be in the observed window. Optional `modifiers` such as `["shift"]`. |
 | `press_menu` | Chooses a menu item in one call, e.g. `path: "File > Save"`, through accessibility. |

@@ -86,11 +86,18 @@ struct BrowserLocation: Sendable {
     let readyState: String
 }
 
-struct BrowserPage {
+final class BrowserPage {
     let bridge: BrowserBridge
     let tab: [String: Any]
     /// Keep the numbered list for later index clicks. Off for throwaway reads (peek lanes).
-    var remember = true
+    let remember: Bool
+    private var indexedGeneration: Int?
+
+    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true) {
+        self.bridge = bridge
+        self.tab = tab
+        self.remember = remember
+    }
 
     /// Roles a model can act on.
     static let interactiveRoles: Set<String> = [
@@ -106,7 +113,16 @@ struct BrowserPage {
     static let controlBudget = 7_000
     static let textBudget = 2_500
 
-    private var tabKey: Int { (tab["tab_id"] as? Int) ?? -1 }
+    private var tabID: Int? { tab["tab_id"] as? Int }
+
+    private static let staleIndex = ComputerUseError.invalidArguments(
+        "browser: the tab or document changed; browser read again before using an element number"
+    )
+
+    private func documentIdentity() throws -> BrowserDocumentIdentity? {
+        guard let frames = try cdp("Page.getFrameTree")["frameTree"] as? [String: Any] else { return nil }
+        return BrowserDocumentIdentity(tree: frames)
+    }
 
     // MARK: Read
 
@@ -114,6 +130,8 @@ struct BrowserPage {
     /// times the usual budget, for pages whose controls did not all fit.
     func read(find: String? = nil, full: Bool = false) throws -> String {
         guardForeignFrames()
+        let identity = remember && tabID != nil ? try? documentIdentity() : nil
+        let generation = bridge.referenceGeneration
         let raw = try fullTree()
         let query = find?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A find looks through the whole page, however long (only its matches are printed); a full read lists
@@ -126,16 +144,20 @@ struct BrowserPage {
             : Self.parseAX(raw, controlBudget: .max, textBudget: .max, maxControls: .max)
         var parse = parsed
         let place = try? location()
-        if remember {
-            // Numbers new since this agent's last read of the same page get a "*".
-            let previous = BrowserPageMemory.shared.lastRead(tab: tabKey)
-            let sameAddress = previous != nil && previous?.href == place?.href
-            parse.controls = BrowserRules.markNew(parse.controls, previousKeys: sameAddress ? previous?.keys : nil)
-            parse.newControls = parse.controls.filter(\.isNew).count
-            BrowserPageMemory.shared.storeRead(keys: BrowserRules.controlKeys(parse.controls), href: place?.href ?? "", tab: tabKey)
-            BrowserPageMemory.shared.store(parse.controls, tab: tabKey)
-        }
         parse.texts = visibleTexts(parse.texts)
+        var indicesAvailable = false
+        if remember, let tabID {
+            let memory = BrowserPageMemory.shared
+            if let identity, (try? documentIdentity()) == identity, generation == bridge.referenceGeneration {
+                let previous = memory.observation(bridge: bridge, tab: tabID, document: identity)
+                parse.controls = BrowserRules.markNew(parse.controls, previousKeys: previous?.keys)
+                parse.newControls = parse.controls.filter(\.isNew).count
+                memory.store(parse.controls, bridge: bridge, tab: tabID, document: identity, generation: generation)
+                indicesAvailable = true
+            } else {
+                memory.forgetTab(bridge: bridge, tab: tabID)
+            }
+        }
         var shown = query.isEmpty ? parse : Self.filtered(parse, find: query)
         if !query.isEmpty, shown.controls.count > 150 || shown.texts.count > 80 {
             shown.droppedControls = Swift.max(0, shown.controls.count - 150)
@@ -345,31 +367,30 @@ struct BrowserPage {
     func resolve(label: String?, index: Int?) throws -> BrowserNode {
         guardForeignFrames()
         if let index {
-            guard let nodes = BrowserPageMemory.shared.nodes(tab: tabKey) else {
-                throw ComputerUseError.invalidArguments("browser: read the page first (browser read), then use an index, or give a label")
+            guard let tabID, let document = try documentIdentity(),
+                  let observation = BrowserPageMemory.shared.observation(bridge: bridge, tab: tabID, document: document) else {
+                throw Self.staleIndex
             }
-            guard let node = nodes.first(where: { $0.index == index }) else {
+            guard let node = observation.nodes.first(where: { $0.index == index }) else {
                 throw ComputerUseError.invalidArguments("browser: no element \(index) in the last read; browser read again")
             }
-            return try verified(node, index: index)
+            indexedGeneration = observation.generation
+            let verified = try verified(node, index: index)
+            guard try documentIdentity() == document else {
+                BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID)
+                throw Self.staleIndex
+            }
+            return verified
         }
         guard let label, !label.isEmpty else {
             throw ComputerUseError.invalidArguments("browser: give a label (visible text) or an index from browser read")
         }
         let wanted = Self.normalize(label)
-        // The last read already lists the page's controls: a label found there is checked with one quick call
-        // instead of a tree search (each Chrome call costs seconds when the Mac is busy).
-        if let remembered = BrowserPageMemory.shared.nodes(tab: tabKey),
-           let hit = Self.pickNamed(remembered, wanted: wanted),
-           let checked = try? verified(hit, index: hit.index) {
-            return checked
-        }
         if let named = try? queryNamed(label), let hit = Self.pickNamed(named, wanted: wanted) {
             return hit
         }
         let raw = try fullTree()
         let nodes = Self.parseAX(raw, controlBudget: Int.max, textBudget: 0, maxControls: .max).controls
-        BrowserPageMemory.shared.store(nodes, tab: tabKey)
         if let hit = try Self.pickFuzzy(nodes, label: label) { return hit }
         let names = nodes.prefix(12).map { "\($0.role) \"\($0.name.prefix(40))\"" }.joined(separator: ", ")
         throw ComputerUseError.invalidArguments(
@@ -379,10 +400,8 @@ struct BrowserPage {
 
     /// A page that re-rendered can reuse an element for other content, so a number from an earlier read is
     /// checked against a fingerprint (name, value, and the text that sat before it) before it is used.
-    /// Changed: found again by its old name, else the model reads again. Whether something now covers it is
-    /// checked at click time (`clickPoint`).
+    /// Renamed or repurposed controls require a fresh read. Coverage is checked at click time.
     private func verified(_ node: BrowserNode, index: Int) throws -> BrowserNode {
-        guard !node.name.isEmpty else { return node }
         // Chrome no longer has the node (the page was rebuilt or navigated): it must not be used at its old place.
         guard let live = try? cdp("Accessibility.getPartialAXTree", ["backendNodeId": node.backendNodeID, "fetchRelatives": false]),
               let first = Self.nodes(of: live).first(where: { ($0["ignored"] as? Bool) != true })
@@ -397,7 +416,6 @@ struct BrowserPage {
         case .same:
             break
         case .renamed(let now):
-            if let again = try? resolve(label: node.name, index: nil) { return again }
             throw ComputerUseError.invalidArguments(
                 "browser: element \(index) changed since the last read (it was \"\(node.name.prefix(40))\", now \"\(now.prefix(40))\"); browser read again"
             )
@@ -1137,7 +1155,7 @@ struct BrowserPage {
     }
 
     private func domainKey(_ method: String) -> String {
-        "\(bridge.sessionID)|\(tabKey)|\(method)"
+        "\(bridge.referenceScope)|\(tabID ?? -1)|\(bridge.referenceGeneration)|\(method)"
     }
 
     private func forgetDomain(_ method: String) {
@@ -1146,12 +1164,20 @@ struct BrowserPage {
 
     @discardableResult
     private func cdp(_ method: String, _ params: [String: Any] = [:]) throws -> [String: Any] {
+        if let indexedGeneration, indexedGeneration != bridge.referenceGeneration {
+            throw Self.staleIndex
+        }
         do {
             return try cdpOnce(method, params)
         } catch let error as BrowserLinkDropped {
             // The new link starts without what was set up on the old one (focus emulation, accessibility,
             // the frame guard): forget that it was done, so it is done again.
-            BrowserPageMemory.shared.forgetTab(session: bridge.sessionID, tab: tabKey, clearNodes: false)
+            if let tabID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID) }
+            if indexedGeneration != nil {
+                // Do not send any more commands using the old resolution, even if a caller catches this error.
+                indexedGeneration = -1
+                throw ComputerUseError.message("browser: the tab connection changed; browser read to check what happened before continuing")
+            }
             // Chrome dropped the link to the tab, usually because another extension put a frame into the page
             // (the guard above removes it). A command that is harmless twice is sent again once the link is
             // back; a click, key or typed text is not, in case it did arrive.
@@ -1258,7 +1284,7 @@ struct BrowserPage {
             guard remaining > 0.3 else {
                 throw ComputerUseError.message("browser: Chrome is answering slowly, so this step stopped after \(Int(BrowserCallBudget.limit)) s. browser read to see where it got to, then continue")
             }
-            reply = try bridge.callTool("cdp", arguments: arguments, timeout: min(base, remaining))
+            reply = try bridge.callTool("cdp", arguments: arguments, timeout: min(base, remaining), referenceGeneration: indexedGeneration)
         } catch {
             if answeredDialog(after: method, failure: String(describing: error)) { throw Self.dialogAnswered }
             throw error
@@ -1720,35 +1746,65 @@ enum BrowserReply {
     }
 }
 
-/// The last numbered element list per tab, so `click` with an index matches what the model read. Also remembers
-/// which CDP domains were enabled per tab, so each call does not enable them again.
+/// The document identity Chrome exposes for each frame in the tab's frame tree.
+struct BrowserDocumentIdentity: Equatable {
+    private let loadersByFrame: [String: String]
+
+    init?(tree: [String: Any]) {
+        var loaders: [String: String] = [:]
+
+        func collect(_ tree: [String: Any]) -> Bool {
+            guard let frame = tree["frame"] as? [String: Any],
+                  let id = frame["id"] as? String, !id.isEmpty,
+                  let loader = frame["loaderId"] as? String, !loader.isEmpty,
+                  loaders[id] == nil else { return false }
+            loaders[id] = loader
+            guard let children = tree["childFrames"] else { return true }
+            guard let frames = children as? [[String: Any]] else { return false }
+            return frames.allSatisfy(collect)
+        }
+
+        guard collect(tree) else { return nil }
+        loadersByFrame = loaders
+    }
+}
+
+/// The numbered controls shown to this client, bound to one helper, tab and document.
 final class BrowserPageMemory: @unchecked Sendable {
-    /// Per agent (see `ClientScope`): two agents' numbered lists never mix.
     static var shared: BrowserPageMemory { scoped.current }
     private static let scoped = ScopedStore<BrowserPageMemory>(make: { _ in BrowserPageMemory() })
 
+    struct Observation {
+        let nodes: [BrowserNode]
+        let document: BrowserDocumentIdentity
+        let generation: Int
+        var keys: Set<String> { BrowserRules.controlKeys(nodes) }
+    }
+
+    private struct Tab: Hashable {
+        let scope: UUID
+        let id: Int
+    }
+
     private let lock = NSLock()
-    private var byTab: [Int: [BrowserNode]] = [:]
+    private var observations: [Tab: Observation] = [:]
     private var enabled: Set<String> = []
-    private var reads: [Int: (keys: Set<String>, href: String)] = [:]
 
-    /// What the agent saw in its last `read` of the tab (controls by role and name), to mark what is new.
-    func storeRead(keys: Set<String>, href: String, tab: Int) {
-        lock.lock(); reads[tab] = (keys, href); lock.unlock()
+    func store(_ nodes: [BrowserNode], bridge: BrowserBridge, tab: Int, document: BrowserDocumentIdentity, generation: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        observations[Tab(scope: bridge.referenceScope, id: tab)] = Observation(
+            nodes: nodes, document: document, generation: generation
+        )
     }
 
-    func lastRead(tab: Int) -> (keys: Set<String>, href: String)? {
-        lock.lock(); defer { lock.unlock() }
-        return reads[tab]
-    }
-
-    func store(_ nodes: [BrowserNode], tab: Int) {
-        lock.lock(); byTab[tab] = nodes; lock.unlock()
-    }
-
-    func nodes(tab: Int) -> [BrowserNode]? {
-        lock.lock(); defer { lock.unlock() }
-        return byTab[tab]
+    func observation(bridge: BrowserBridge, tab: Int, document: BrowserDocumentIdentity) -> Observation? {
+        let generation = bridge.referenceGeneration
+        lock.lock()
+        defer { lock.unlock() }
+        guard let observation = observations[Tab(scope: bridge.referenceScope, id: tab)],
+              observation.document == document, observation.generation == generation else { return nil }
+        return observation
     }
 
     func isEnabled(_ key: String) -> Bool {
@@ -1764,14 +1820,12 @@ final class BrowserPageMemory: @unchecked Sendable {
         lock.lock(); enabled.remove(key); lock.unlock()
     }
 
-    /// Drops everything remembered for a tab: its numbered list and its enabled domains. Used when a tab is
-    /// opened, switched to or recreated, so nothing stale is trusted.
-    func forgetTab(session: String, tab: Int, clearNodes: Bool = true) {
-        let prefix = "\(session)|\(tab)|"
+    func forgetTab(bridge: BrowserBridge, tab: Int) {
+        let prefix = "\(bridge.referenceScope)|\(tab)|"
         lock.lock()
-        if clearNodes { byTab[tab] = nil; reads[tab] = nil }
+        defer { lock.unlock() }
+        observations[Tab(scope: bridge.referenceScope, id: tab)] = nil
         enabled = enabled.filter { !$0.hasPrefix(prefix) }
-        lock.unlock()
     }
 }
 

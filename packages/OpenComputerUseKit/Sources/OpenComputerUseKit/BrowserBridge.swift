@@ -151,6 +151,7 @@ final class BrowserBridge: @unchecked Sendable {
     }
 
     let sessionID: String
+    let referenceScope = UUID()
     private let launchEnvironment: [String: String]
 
     init(sessionID: String, launchEnvironment: [String: String] = GodspeedSettings.environment) {
@@ -224,6 +225,13 @@ final class BrowserBridge: @unchecked Sendable {
     private var process: Process?
     private var input: FileHandle?
     private var nextID = 1
+    private var helperGeneration = 0
+
+    var referenceGeneration: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return helperGeneration
+    }
     /// Responses of the current child only; a new child gets a new buffer, so a late end-of-file
     /// from a child that already exited can never close the buffer the restarted child uses.
     private var responses = BrowserBridgeResponses()
@@ -261,7 +269,9 @@ final class BrowserBridge: @unchecked Sendable {
     }
 
     /// Calls one OBU tool and returns its text and error flag. One request at a time.
-    func callTool(_ name: String, arguments: [String: Any], timeout: TimeInterval) throws -> (text: String, isError: Bool) {
+    func callTool(
+        _ name: String, arguments: [String: Any], timeout: TimeInterval, referenceGeneration: Int? = nil
+    ) throws -> (text: String, isError: Bool) {
         lock.lock()
         defer {
             let stamp = Date()
@@ -269,6 +279,9 @@ final class BrowserBridge: @unchecked Sendable {
             detached = false
             lock.unlock()
             scheduleIdleWork(stamp: stamp)
+        }
+        if let referenceGeneration, process?.isRunning != true || referenceGeneration != helperGeneration {
+            throw ComputerUseError.invalidArguments("browser: the tab connection changed; browser read again before using an element number")
         }
         try startIfNeeded()
         let result = try request(method: "tools/call", params: ["name": name, "arguments": arguments], timeout: timeout)
@@ -343,6 +356,7 @@ final class BrowserBridge: @unchecked Sendable {
         try BrowserRequestContext.validateCurrent()
         try child.run()
         process = child
+        helperGeneration += 1
         input = toChild.fileHandleForWriting
         nextID = 1
 
@@ -492,20 +506,18 @@ extension ComputerUseToolDispatcher {
         let explicit = Self.browserTabID(arguments["tab_id"])
         if let explicit {
             tab["tab_id"] = explicit
-        } else if !tabless.contains(action), let current = bridge.currentTab {
-            tab["tab_id"] = current
-        }
-        let implicit = explicit == nil && tab["tab_id"] != nil
-        do {
-            return try browserAction(action, arguments: arguments, bridge: bridge, tab: tab)
-        } catch {
-            // The tab we picked for the model is gone: forget it, so the next call falls back to Open Browser Use's own choice.
-            let message = (error as? LocalizedError)?.errorDescription ?? ""
-            if implicit, message.hasPrefix("browser: lost the link") || message.hasPrefix("browser: that tab is closed") {
-                bridge.currentTab = nil
+        } else if !tabless.contains(action) {
+            if let current = bridge.currentTab {
+                tab["tab_id"] = current
+            } else {
+                guard let ids = bridge.sessionTabIDs(), ids.count == 1, let only = ids.first else {
+                    throw ComputerUseError.message("browser: choose a tab with browser tabs and use_tab, or open a page")
+                }
+                bridge.currentTab = only
+                tab["tab_id"] = only
             }
-            throw error
         }
+        return try browserAction(action, arguments: arguments, bridge: bridge, tab: tab)
     }
 
     private func browserAction(
@@ -641,14 +653,15 @@ extension ComputerUseToolDispatcher {
             guard !opened.isError else { return finish([opened]) }
             let newID = BrowserReply.openedTabID(in: opened.text)
             if let newID { bridge.currentTab = newID }
-            BrowserPageMemory.shared.forgetTab(session: bridge.sessionID, tab: -1)
+            if let newID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: newID) }
             guard let url else {
                 return .text("opened a blank tab" + (newID.map { " (id \($0))" } ?? ""))
             }
             if let error = BrowserReply.navigationError(in: opened.text) {
                 throw ComputerUseError.message("browser: could not load \(url): \(error). Check the address")
             }
-            let fresh = BrowserPage(bridge: bridge, tab: newID.map { ["tab_id": $0] } ?? [:])
+            guard let newID else { return .text("opened a tab; use browser tabs to select it") }
+            let fresh = BrowserPage(bridge: bridge, tab: ["tab_id": newID])
             fresh.waitLoad(changedFrom: nil, expect: url, timeout: 20)
             fresh.settle()
             fresh.prime()
@@ -695,7 +708,7 @@ extension ComputerUseToolDispatcher {
             let claimed = try call("claim_tab")
             guard !claimed.isError else { return finish([claimed]) }
             bridge.currentTab = id
-            BrowserPageMemory.shared.forgetTab(session: bridge.sessionID, tab: id)
+            BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: id)
             return .text("now working in tab \(id) (\(page.title(try? page.location())))")
 
         case "wait", "wait_load":
@@ -743,10 +756,10 @@ extension ComputerUseToolDispatcher {
            let opened = try? bridge.callTool("open_tab", arguments: ["url": url], timeout: 20), !opened.isError {
             let newID = BrowserReply.openedTabID(in: opened.text)
             if let newID { bridge.currentTab = newID }
-            BrowserPageMemory.shared.forgetTab(session: bridge.sessionID, tab: newID ?? -1)
-            BrowserPage(bridge: bridge, tab: newID.map { ["tab_id": $0] } ?? [:]).waitLoad(changedFrom: nil, expect: url, timeout: 20)
-            return "opened \"\(node.name)\" in a new background tab" + (newID.map { " (id \($0))" } ?? "")
-                + "; browser now works in that tab"
+            if let newID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: newID) }
+            guard let newID else { return "opened a new background tab; use browser tabs to select it" }
+            BrowserPage(bridge: bridge, tab: ["tab_id": newID]).waitLoad(changedFrom: nil, expect: url, timeout: 20)
+            return "opened \"\(node.name)\" in a new background tab" + " (id \(newID)); browser now works in that tab"
         }
         let mayOpenTab = ["link", "button", "menuitem"].contains(node.role)
         let tabsBefore = mayOpenTab ? bridge.sessionTabIDs() : nil
@@ -775,7 +788,7 @@ extension ComputerUseToolDispatcher {
         }
         if let tabsBefore, let after = bridge.sessionTabIDs(), let fresh = after.first(where: { !tabsBefore.contains($0) }) {
             bridge.currentTab = fresh
-            BrowserPageMemory.shared.forgetTab(session: bridge.sessionID, tab: fresh)
+            BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: fresh)
             message += "; it opened a new tab (id \(fresh)), and browser now works in that tab"
         }
         return message

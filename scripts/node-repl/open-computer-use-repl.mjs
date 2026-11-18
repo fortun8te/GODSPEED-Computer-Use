@@ -282,7 +282,7 @@ function optionsToSnapshotArgs(options = {}) {
     args.window_placement = options.windowPlacement;
   }
   if (options.settleMs !== undefined) args.settle_ms = options.settleMs;
-  for (const [option, argument] of [["includeAX", "include_ax"], ["includeScreenshot", "include_screenshot"]]) {
+  for (const [option, argument] of [["includeAX", "include_ax"], ["includeScreenshot", "include_screenshot"], ["compact", "compact"]]) {
     if (options[option] !== undefined) {
       if (typeof options[option] !== "boolean") throw new Error(`${option} must be a boolean`);
       args[argument] = options[option];
@@ -438,7 +438,7 @@ export function createCuaApi(native, activeOutput) {
       if (!isPlainObject(options) || (options.initialState !== undefined && typeof options.initialState !== "boolean")) throw new Error("initialState must be true or false");
       await emitDocs();
       if (options.initialState !== false) {
-        const result = await call("get_app_state", { app, text_limit: "max" });
+        const result = await call("get_app_state", { app, text_limit: "max", ...optionsToSnapshotArgs(options), include_screenshot: false });
         await emitText(toolResultText(result));
       }
       return appBinding(app);

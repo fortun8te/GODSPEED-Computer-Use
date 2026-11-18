@@ -20,12 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Verify Godspeed behavior
-        run: swift test --filter 'BackgroundDragTests|AppAgentAdmissionTests|AppAgentProxyTests|TrajectoryLogTests|BatchEffectsTests|DoneCheckTests|CursorTimingTests/testClickRipple|CursorTimingTests/testCursorLens|CursorTimingTests/testInteractionIndicator|GodspeedLeanTests|BrowserPageTests|ClientScopeTests|ClientScopeSafetyTests|testInitializeResponseContainsComputerUseInstructions'
+        run: swift test --filter 'AXTreeCondenserTests/testCompactObservation|BackgroundDragTests|AppAgentAdmissionTests|AppAgentProxyTests|TrajectoryLogTests|BatchEffectsTests|DoneCheckTests|CursorTimingTests/testClickRipple|CursorTimingTests/testCursorLens|CursorTimingTests/testInteractionIndicator|GodspeedLeanTests|BrowserPageTests|ClientScopeTests|ClientScopeSafetyTests|testInitializeResponseContainsComputerUseInstructions'
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '24'
       - name: Verify the JavaScript API
         run: node --test scripts/node-repl/open-computer-use-repl.test.mjs
+      - name: Verify matched benchmark scoring
+        run: python3 scripts/tests/test_godspeed_benchmark_compare.py
       - name: Reject stale packages after a failed build
         run: ./scripts/tests/godspeed-package-guard.sh
       - name: Package a development build
