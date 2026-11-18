@@ -733,9 +733,9 @@ final class OpenComputerUseKitTests: XCTestCase {
         let instructions = try XCTUnwrap(result["instructions"] as? String)
 
         XCTAssertEqual(instructions, computerUseServerInstructions)
-        XCTAssertTrue(instructions.contains("Where the state lives"))
-        XCTAssertTrue(instructions.contains("After two failed tries"))
-        XCTAssertTrue(instructions.contains("Plan from one read"))
+        XCTAssertTrue(instructions.contains("get_app_state, then batch"))
+        XCTAssertTrue(instructions.contains("After a partial failure, read fresh state"))
+        XCTAssertTrue(instructions.contains("observable done_when"))
     }
 
     func testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep() {

@@ -6,6 +6,13 @@ import XCTest
 /// backlog, one persistent cursor across calls.
 @MainActor
 final class CursorTimingTests: XCTestCase {
+    func testCursorLensRequiresAnExplicitOptIn() {
+        let key = "OPEN_COMPUTER_USE_CURSOR_LENS"
+        XCTAssertFalse(VisualCursorSettings(environment: [:]).lensEnabled)
+        XCTAssertFalse(VisualCursorSettings(environment: [key: "false"]).lensEnabled)
+        XCTAssertTrue(VisualCursorSettings(environment: [key: "true"]).lensEnabled)
+    }
+
     func testClickRippleExpandsAndFadesAndReducedMotionKeepsItsRadius() {
         let start = CursorClickRipple(progress: 0, strength: 1, reducesMotion: false)
         let middle = CursorClickRipple(progress: 0.5, strength: 1, reducesMotion: false)

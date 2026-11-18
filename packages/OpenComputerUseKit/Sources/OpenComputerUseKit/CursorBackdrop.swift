@@ -4,14 +4,9 @@ import ScreenCaptureKit
 
 /// Keeps a recent picture of the screen under the cursor window, so the glass cursor can show what is beneath it
 /// slightly enlarged, as a lens does. Entirely optional: with no screen recording permission, on any failure, or
-/// with `OPEN_COMPUTER_USE_CURSOR_LENS=0`, nothing is captured and the cursor is simply see-through.
+/// when the lens is disabled, no image is captured and the cursor is see-through.
 final class CursorBackdrop: @unchecked Sendable {
     static let shared = CursorBackdrop()
-
-    static let enabled: Bool = {
-        let raw = (GodspeedSettings.environment["OPEN_COMPUTER_USE_CURSOR_LENS"] ?? "").lowercased()
-        return !["0", "false", "off", "no"].contains(raw)
-    }()
 
     /// A picture older than this is not drawn (the screen may have changed under the cursor).
     static let maxAge: TimeInterval = 0.9
@@ -40,7 +35,6 @@ final class CursorBackdrop: @unchecked Sendable {
     /// Takes a new picture when the current one is old or the cursor has left it. `onUpdate` runs (on any
     /// thread) once a new picture is in place.
     func refreshIfNeeded(windowFrame: CGRect, windowNumber: Int, onUpdate: @escaping @Sendable () -> Void) {
-        guard Self.enabled else { return }
         let now = Date()
         lock.lock()
         let covered = image != nil && rect.contains(windowFrame.insetBy(dx: windowFrame.width * 0.3, dy: windowFrame.height * 0.3))

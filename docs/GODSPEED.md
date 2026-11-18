@@ -71,6 +71,7 @@ Two places, one rule: **an environment variable that is set always wins**. Other
 | Key | Sets | Default if absent |
 |---|---|---|
 | `cursor_visible` | `OPEN_COMPUTER_USE_VISUAL_CURSOR` | `true` |
+| `cursor_lens` | `OPEN_COMPUTER_USE_CURSOR_LENS` | `false`. Optional local capture under the cursor window. |
 | `cursor_color` | `OPEN_COMPUTER_USE_CURSOR_COLOR` (`#RRGGBB`; `"default"` = original grey) | default grey |
 | `cursor_speed` | `OPEN_COMPUTER_USE_CURSOR_SPEED`: `calm` (2), `normal` (4), `fast` (8), `instant`, or a number | `normal` (4) |
 | `screenshots_by_default` | `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT` | `false` |

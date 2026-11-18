@@ -29,22 +29,15 @@ final class BrowserBridge: @unchecked Sendable {
     /// At most this many pages are loaded at once by parallel actions.
     static let maxLanes = 3
 
-    private static let laneLock = NSLock()
-    /// Lanes per agent (see `ClientScope`): two agents' parallel loads must not share a session or close each other's tabs.
-    nonisolated(unsafe) private static var lanesByScope: [String: [BrowserBridge]] = [:]
+    private static let lanes = ScopedStore<[BrowserBridge]>(
+        make: { scope in
+            (1...maxLanes).map { BrowserBridge(sessionID: sessionID(for: scope, lane: $0)) }
+        },
+        drop: { bridges in bridges.forEach { $0.shutdown() } }
+    )
 
-    /// Lane `index` (0-based) of the agent this thread works for, created on first use and kept.
-    static func lane(_ index: Int) -> BrowserBridge {
-        let scope = ClientScope.current
-        laneLock.lock()
-        defer { laneLock.unlock() }
-        var lanes = lanesByScope[scope] ?? []
-        while lanes.count <= index {
-            lanes.append(BrowserBridge(sessionID: sessionID(for: scope, lane: lanes.count + 1)))
-        }
-        lanesByScope[scope] = lanes
-        return lanes[index]
-    }
+    /// These bridges start their helpers lazily and expire with the client's scope.
+    static func lane(_ index: Int) -> BrowserBridge { lanes.current[index] }
 
     private static func sessionID(for scope: String, lane: Int? = nil) -> String {
         if let lane { return "\(baseSessionID)-lane\(lane)-\(scope)" }

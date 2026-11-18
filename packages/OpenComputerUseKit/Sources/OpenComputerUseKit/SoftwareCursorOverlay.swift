@@ -166,6 +166,7 @@ struct VisualCursorSettings: Equatable, Sendable {
     /// `.infinity` is instant. See `visualCursorSpeed(environment:)` for the setting's scale.
     var speed: CGFloat
     var floats: Bool
+    var lensEnabled: Bool
     var idleHideDelay: TimeInterval
     var observationFilePath: String?
     var traceFilePath: String?
@@ -177,6 +178,9 @@ struct VisualCursorSettings: Equatable, Sendable {
         enabled = visualCursorEnabled(environment: environment)
         speed = visualCursorSpeed(environment: environment)
         floats = visualCursorFloats(environment: environment)
+        lensEnabled = ["1", "true", "on", "yes"].contains(
+            environment["OPEN_COMPUTER_USE_CURSOR_LENS"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
         idleHideDelay = visualCursorPostInteractionIdleTimeout(environment: environment)
         observationFilePath = visualCursorObservationFileURL(environment: environment)?.path
         let trace = environment["OPEN_COMPUTER_USE_CURSOR_TRACE_FILE"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -405,6 +409,7 @@ enum SoftwareCursorOverlay {
     private static func adoptRequestSettings() {
         activeSettings = VisualCursorSupport.settings
         SoftwareCursorGlyphRenderer.tint = activeSettings.color
+        cursorView?.lensEnabled = activeSettings.lensEnabled
     }
     private static let claimNotification: Notification.Name = {
         // Isolation is useful for smoke fixtures; normal sessions share one name.
@@ -1346,6 +1351,7 @@ enum SoftwareCursorOverlay {
         cursorView.fogScale = renderState.fogScale
         cursorView.clickProgress = clickProgress
         cursorView.ripple = ripple
+        cursorView.lensEnabled = activeSettings.lensEnabled
         cursorView.needsDisplay = true
         displayedTipPosition = renderState.tipPosition
         writeObservationSnapshot(
@@ -1484,6 +1490,7 @@ private final class SoftwareCursorView: NSView {
     var fogScale: CGFloat = 1
     var clickProgress: CGFloat = 0
     var ripple: CursorClickRipple?
+    var lensEnabled = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1511,7 +1518,7 @@ private final class SoftwareCursorView: NSView {
 
         // The lens: a recent picture of the screen under this window, refreshed while the cursor is shown.
         SoftwareCursorGlyphRenderer.backdrop = nil
-        if let window, window.isVisible, CursorBackdrop.enabled {
+        if let window, window.isVisible, lensEnabled {
             SoftwareCursorGlyphRenderer.backdrop = CursorBackdrop.shared.current(for: window.frame)
             CursorBackdrop.shared.refreshIfNeeded(windowFrame: window.frame, windowNumber: window.windowNumber) { [weak self] in
                 DispatchQueue.main.async { self?.needsDisplay = true }

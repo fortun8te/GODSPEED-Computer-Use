@@ -97,7 +97,6 @@ public final class ComputerUseToolDispatcher {
             }
             return try callTool(name: BatchTool.name, arguments: ["steps": webSteps, "goal": arguments["goal"] ?? "web steps"], log: log, notesInResult: notesInResult)
         }
-        // A pending "⌘A, then type replaces everything" ends at any other action.
         let result: ToolCallResult
         do {
             result = try autoreleasepool { try runWithSmartSteps(name: name, arguments: arguments, log: log) }
