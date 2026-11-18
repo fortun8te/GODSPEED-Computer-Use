@@ -64,9 +64,11 @@ enum HandoffTool {
             throw ComputerUseError.invalidArguments("values is a map like {\"Name\": \"Ann\"}")
         }
         func number(_ key: String) -> Double? {
-            (arguments[key] as? NSNumber).map(\.doubleValue) ?? (arguments[key] as? String).flatMap(Double.init)
+            let parsed = (arguments[key] as? NSNumber).map(\.doubleValue) ?? (arguments[key] as? String).flatMap(Double.init)
+            guard let parsed, parsed.isFinite else { return nil }
+            return parsed
         }
-        let steps = min(maxStepsCap, max(1, Int(number("max_steps") ?? Double(defaultMaxSteps))))
+        let steps = Int(min(Double(maxStepsCap), max(1, number("max_steps") ?? Double(defaultMaxSteps))))
         let budget = min(timeBudgetCap, max(5, number("time_budget_s") ?? defaultTimeBudget))
         return Request(app: app, goal: goal, doneWhen: doneWhen, values: values, maxSteps: steps, timeBudget: budget)
     }
@@ -309,11 +311,9 @@ enum HandoffTool {
         }
     }
 
-    /// True when the batch's own report (its first text block, never the app's screen text) says done_when held.
+    /// Verify from the driver's receipt. Display text can include app-controlled content.
     static func batchReportsVerifiedDone(_ result: ToolCallResult) -> Bool {
-        guard let first = result.content.first(where: { $0.dictionary["type"] as? String == "text" }),
-              let text = first.dictionary["text"] as? String else { return false }
-        return text.split(separator: "\n").contains { $0.hasPrefix("Done: verified") }
+        !result.isError && result.batchReceipt?.doneCheck == .verified
     }
 
     static func percent(_ value: Double) -> String { "\(Int((value * 100).rounded()))%" }
@@ -323,6 +323,8 @@ enum HandoffTool {
     struct ActResult {
         let ok: Bool
         let message: String
+        var delivery: BatchEffects.Receipt? = nil
+        var observedState: String? = nil
     }
 
     struct Outcome {
@@ -379,11 +381,12 @@ enum HandoffTool {
         var check: (_ state: String) -> DoneCheck.Result
         /// A saved recipe's replay: nil when there is none, else whether it reached the goal.
         var replay: () -> Bool?
-        var now: () -> Date
+        var now: () -> TimeInterval
     }
 
-    static func run(_ request: Request, _ deps: Dependencies) -> Outcome {
-        let started = deps.now()
+    static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
+        let deadline = deadline ?? deps.now() + request.timeBudget
+        func hasTime() -> Bool { deps.now() < deadline }
         var steps: [String] = []
         var tried = Set<String>()
         var typedAny = false
@@ -410,6 +413,9 @@ enum HandoffTool {
                            screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet)
         }
 
+        guard hasTime() else {
+            return finish(.budget, "the time budget elapsed before any action was sent", initial: nil, latest: nil)
+        }
         guard var state = deps.readState() else {
             return finish(.failed, "could not read \(request.app)", initial: nil, latest: nil)
         }
@@ -419,22 +425,29 @@ enum HandoffTool {
             return Outcome(kind: .done, reason: "already true (\(met.joined(separator: "; ")))", steps: [], changes: nil, options: [])
         }
 
+        guard hasTime() else {
+            return finish(.budget, "the time budget elapsed before any action was sent", initial: initial, latest: state)
+        }
         if let replayed = deps.replay() {
             steps.append("replayed the saved recipe")
             if replayed { return Outcome(kind: .done, reason: doneSummary.isEmpty ? "the saved recipe reached the goal" : "\(doneSummary) (saved recipe)", steps: steps, changes: nil, options: []) }
+            guard hasTime() else {
+                return finish(.budget, "the recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: nil)
+            }
             steps[steps.count - 1] = "the saved recipe did not finish; continued by hand"
             // The replay moved the screen; plan from what is there now.
-            if let fresh = deps.readState() {
-                state = fresh
-                initial = fresh
-                if case .verified(let met) = verdict(state) {
-                    return finish(.done, met.joined(separator: "; "), initial: initial, latest: state)
-                }
+            guard let fresh = deps.readState() else {
+                return finish(.failed, "the saved recipe may have partially run; the app could not be read afterward", initial: initial, latest: nil)
+            }
+            state = fresh
+            initial = fresh
+            if case .verified(let met) = verdict(state) {
+                return finish(.done, met.joined(separator: "; "), initial: initial, latest: state)
             }
         }
 
         for number in 1...request.maxSteps {
-            if deps.now().timeIntervalSince(started) > request.timeBudget {
+            if !hasTime() {
                 return finish(.budget, "\(Int(request.timeBudget)) seconds used", initial: initial, latest: state)
             }
             let options = candidates(
@@ -443,33 +456,47 @@ enum HandoffTool {
             )
             let history = steps.suffix(4).enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
             let screen = RefereeSummary.screen(from: state)
-            var probabilities = options.isEmpty ? nil : deps.choose(
+            let probabilities = options.isEmpty ? nil : deps.choose(
                 request.goal, doneSummary, history, screen, options.map { ($0.id, $0.text) }
             )
-            if probabilities == nil, !options.isEmpty, deps.now().timeIntervalSince(started) <= request.timeBudget {
-                probabilities = deps.choose(request.goal, doneSummary, history, screen, options.map { ($0.id, $0.text) })
-            }
             switch decide(candidates: options, probabilities: probabilities) {
             case .escalate(let reason):
                 let ranked = options.map { ($0.text, probabilities?[$0.id] ?? 0) }.sorted { $0.1 > $1.1 }
                 return finish(.escalate, reason, initial: initial, latest: state, options: ranked)
             case .act(let choice, _):
+                guard hasTime() else {
+                    return finish(.budget, "the time budget elapsed before the next action was sent", initial: initial, latest: state)
+                }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
                 if choice.kind == .setValue { typedAny = true }
                 if choice.kind == .scroll { scrolls += 1 }
+                if !hasTime(), result.observedState == nil {
+                    steps.append(result.ok ? choice.text : "\(choice.text) failed")
+                    return finish(.budget, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: nil)
+                }
                 guard result.ok else {
                     steps.append("\(choice.text) failed")
+                    if result.delivery == .outcomeUnknown {
+                        let fresh = deps.readState()
+                        if let fresh, case .verified(let met) = verdict(fresh) {
+                            return finish(.done, met.joined(separator: "; "), initial: initial, latest: fresh)
+                        }
+                        return finish(.escalate, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: fresh)
+                    }
                     failures += 1
                     if failures >= 2 {
                         return finish(.stuck, "two actions failed in a row (last: \(choice.text): \(result.message))", initial: initial, latest: state)
                     }
-                    if let fresh = deps.readState() { state = fresh }
+                    guard let fresh = deps.readState() else {
+                        return finish(.failed, "could not refresh the app after the failed action", initial: initial, latest: nil)
+                    }
+                    state = fresh
                     continue
                 }
                 failures = 0
                 steps.append(choice.text)
-                guard let next = deps.readState() else {
+                guard let next = result.observedState ?? deps.readState() else {
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
                 let unchanged = AXStateDiff.diff(previous: state, current: next) == AXStateDiff.noChangesMessage
@@ -481,10 +508,14 @@ enum HandoffTool {
                 if noChange >= 2 {
                     return finish(.stuck, "the last two actions changed nothing on screen", initial: initial, latest: state)
                 }
-                if number >= 2 {
+                // A changed screen already gives the next step new evidence. Ask the checker
+                // only on a stall that the two-action rule has not yet handled.
+                if unchanged, number >= 2, number < request.maxSteps,
+                   hasTime() {
                     let summary = RefereeSummary.build(
                         goal: request.goal, steps: steps.map { ($0, "ok") }, repeatedFailures: failures,
-                        screenChanged: !unchanged, dialogOpen: RefereeSummary.dialogOpen(in: state), changes: nil, screen: screen
+                        screenChanged: false, dialogOpen: RefereeSummary.dialogOpen(in: state),
+                        changes: nil, screen: RefereeSummary.screen(from: state), maxCharacters: Referee.maxViewCharacters
                     )
                     if deps.looksStuck(request.goal, choice.text, summary) {
                         return finish(.stuck, "the checker model says no progress is being made", initial: initial, latest: state)
@@ -503,9 +534,14 @@ extension ComputerUseToolDispatcher {
     /// only while a dialog is open, then given back.
     func runHandoff(arguments: [String: Any]) throws -> ToolCallResult {
         let request = try HandoffTool.parse(arguments)
+        guard request.app.lowercased() != "browser" else {
+            throw ComputerUseError.invalidArguments("Handoff ranks native Mac actions. For websites, use browser read and a batch with an observable done_when.")
+        }
         let focus = FocusBorrowSession()
         defer { focus.close() }
         let app = request.app
+        let clock = ProcessInfo.processInfo
+        let deadline = clock.systemUptime + request.timeBudget
 
         let deps = HandoffTool.Dependencies(
             readState: { [self] in
@@ -522,21 +558,37 @@ extension ComputerUseToolDispatcher {
                 }
                 var args = candidate.arguments
                 args["app"] = app
-                let result = callStepAsResult(name: candidate.tool, arguments: args, log: SmartLog(), notesInResult: false)
-                return HandoffTool.ActResult(ok: !result.isError, message: BatchTool.firstLine(result.textContent))
+                let result = BrowserCallBudget.withDeadline(deadline) {
+                    callStepAsResult(name: candidate.tool, arguments: args, log: SmartLog(), notesInResult: false)
+                }
+                let state = !result.isError && candidate.kind != .pressReturn ? LeanOutput.stateText(of: result) : nil
+                return HandoffTool.ActResult(
+                    ok: !result.isError, message: BatchTool.firstLine(result.textContent),
+                    delivery: result.isError ? BatchEffects.failureReceipt(result.textContent) : nil,
+                    observedState: state.flatMap { text in
+                        text.contains(SnapshotObservationOptions.accessibilityOmittedNote) ? nil : text
+                    }
+                )
             },
             choose: { goal, doneWhen, history, screen, options in
-                Referee.choose(goal: goal, doneWhen: doneWhen, history: history, screen: screen, options: options)
+                Referee.choose(goal: goal, doneWhen: doneWhen, history: history, screen: screen,
+                               options: options, remaining: deadline - clock.systemUptime)
             },
             looksStuck: { goal, lastStep, summary in
-                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary) else { return false }
+                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary,
+                                                   remaining: deadline - clock.systemUptime) else { return false }
                 return verdict.label == "stuck" && verdict.confidence >= Referee.minimumConfidence
             },
             check: { [self] state in
                 let isBrowser = app.lowercased() == "browser"
                 return DoneCheck.check(request.doneWhen, evidence: DoneCheck.Evidence(
                     screenText: state,
-                    pageURL: { isBrowser ? self.callToolAsResult(name: "browser", arguments: ["action": "info"]).textContent : nil }
+                    pageURL: {
+                        guard isBrowser, clock.systemUptime < deadline else { return nil }
+                        return BrowserCallBudget.withDeadline(deadline) {
+                            try? self.runBrowser(arguments: ["action": "location"]).browserObservationURL
+                        }
+                    }
                 ))
             },
             replay: { [self] in
@@ -550,12 +602,12 @@ extension ComputerUseToolDispatcher {
                 var batchArguments: [String: Any] = ["app": app, "goal": request.goal]
                 if !recipeValues.isEmpty { batchArguments["values"] = recipeValues }
                 if let doneWhen = arguments["done_when"] { batchArguments["done_when"] = doneWhen }
-                guard let result = try? runBatch(arguments: batchArguments), !result.isError else { return false }
+                guard let result = try? runBatch(arguments: batchArguments, inheritedDeadline: deadline), !result.isError else { return false }
                 return HandoffTool.batchReportsVerifiedDone(result)
             },
-            now: { Date() }
+            now: { clock.systemUptime }
         )
-        let outcome = HandoffTool.run(request, deps)
+        let outcome = HandoffTool.run(request, deps, deadline: deadline)
         focus.close()
         return .text(outcome.reply(), isError: outcome.kind == .failed)
     }

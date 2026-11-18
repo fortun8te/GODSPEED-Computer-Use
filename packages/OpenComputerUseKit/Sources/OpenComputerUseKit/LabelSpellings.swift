@@ -19,10 +19,10 @@ enum LabelSpellings {
     static let menuBarTitles: Set<String> = ["file", "edit", "view", "format", "window", "help", "insert", "go", "history",
                                               "bookmarks", "tools", "image", "arrange", "share", "table", "mailbox", "message"]
 
-    /// A keypad (a calculator, a dialer): at least five of its buttons are named by digit words.
+    /// A keypad (a calculator, a dialer): at least five of its buttons are named by digits or digit words.
     static func isKeypad(buttonNames: [String]) -> Bool {
         let names = Set(buttonNames)
-        return digits.values.filter { names.contains($0) }.count >= 5
+        return digits.filter { names.contains($0.key) || names.contains($0.value) }.count >= 5
     }
 
     /// Other spellings of `label`, in both directions: "add" finds a "+" button and "+" finds an "Add" one,

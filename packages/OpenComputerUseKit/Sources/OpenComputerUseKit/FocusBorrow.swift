@@ -31,6 +31,7 @@ enum FocusBorrow {
     }
 
     static func isEnabled(environment: [String: String]) -> Bool {
+        guard !backgroundOnlyMode(environment: environment) else { return false }
         let raw = environment["OPEN_COMPUTER_USE_FOCUS_BORROW"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(raw)

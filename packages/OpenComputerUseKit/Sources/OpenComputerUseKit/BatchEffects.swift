@@ -13,6 +13,19 @@ enum BatchEffects {
     /// Most effect lines one step adds.
     static let maxEffectLines = 5
 
+    /// Optional reads stop once they consume the budget. Failed reads count
+    /// at full cost because there is no evidence that they settled a window.
+    struct ReadBudget {
+        private(set) var elapsed: TimeInterval = 0
+        private(set) var exhausted = false
+
+        mutating func record(seconds: TimeInterval, settleMs: Int, observed: Bool) {
+            elapsed += seconds
+            let settleCredit = observed ? Double(settleMs) / 1000 : 0
+            exhausted = exhausted || elapsed >= 8 || seconds - settleCredit > 2.5
+        }
+    }
+
     // MARK: - Step receipts
 
     /// How a step line ends when it was not plainly ok.
@@ -27,7 +40,7 @@ enum BatchEffects {
 
     /// Phrases of errors that prove nothing was sent.
     private static let notSentPhrases = [
-        "nothing sent", "nothing was sent", "missing required argument", "invalidarguments",
+        "nothing sent", "nothing was sent", "no text was sent", "missing required argument", "invalidarguments",
         "unknown element_index", "no element labelled", "matches several controls", "is disabled",
         "appnotfound", "unsupportedtool", "stale:", "no longer has the identity", "permissiondenied",
     ]
@@ -35,6 +48,10 @@ enum BatchEffects {
     private static let unknownPhrases = [
         "may have acted", "may have run", "did not answer", "did not respond", "timed out", "timeout",
         "not responding", "outcome unknown", "a repeat could act twice",
+        "may have taken effect", "may have created a tab", "background link may have opened",
+        "navigation was sent", "navigation was not confirmed", "requested page did not become ready", "destination did not become ready",
+        "could not confirm tab", "was claimed, but", "click ran and multiple tabs appeared",
+        "drag was interrupted after starting", "helper returned an unreadable reply",
     ]
 
     /// The receipt for a failed step's message, or nil when it is a plain failure. Unknown wins over not sent:
@@ -69,10 +86,12 @@ enum BatchEffects {
 
     /// The closing advice after a failed step.
     static func advice(for receipt: Receipt?, stepNumber: Int) -> String {
-        if receipt == .outcomeUnknown {
-            return "Step \(stepNumber) may have run, so it was not retried. Check the state below before sending it again; the earlier steps already ran."
+        switch receipt {
+        case .notSent:
+            return "Step \(stepNumber) was not sent. Fix it using the state below and continue from that step."
+        case .outcomeUnknown, .noEffectSeen, nil:
+            return "Check whether step \(stepNumber) took effect before retrying. Resume at the first unfinished step."
         }
-        return "Fix the failed step using the state below, then send only the failed step and the ones after it; the earlier steps already ran."
     }
 
     // MARK: - Effect lines
@@ -255,10 +274,9 @@ enum BatchEffects {
         let kind: Kind
         let timeoutMs: Int
 
-        /// Seconds this wait may poll: its own timeout, never past what is left of the batch's time budget
-        /// (at least a short last look, so a nearly spent budget still reads once).
+        /// Seconds this wait may poll, limited by its own timeout and the batch's remaining time.
         func pollSeconds(elapsedInBatch: TimeInterval, budget: TimeInterval) -> TimeInterval {
-            min(Double(timeoutMs) / 1000, max(budget - elapsedInBatch, 0.3))
+            min(Double(timeoutMs) / 1000, max(budget - elapsedInBatch, 0))
         }
 
         private var lastHash: Int?
@@ -320,7 +338,7 @@ enum BatchEffects {
             case .text(let wanted):
                 return state.localizedCaseInsensitiveContains(wanted)
             case .gone(let wanted):
-                return !state.localizedCaseInsensitiveContains(wanted)
+                return DoneCheck.supportsAbsenceCheck(state) && !state.localizedCaseInsensitiveContains(wanted)
             case .settle:
                 let hash = BatchTool.stateText(ofText: state).hashValue
                 if hash != lastHash {

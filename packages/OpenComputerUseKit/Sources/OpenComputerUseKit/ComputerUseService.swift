@@ -714,6 +714,9 @@ func shouldPreferContainingWebRowAXClickCandidate(
 }
 
 public final class ComputerUseService {
+    @TaskLocal static var requiredWindowID: CGWindowID?
+    @TaskLocal static var awaitsModalTextFocus = false
+
     private var snapshotsByApp: [String: AppSnapshot] = [:]
     private var invalidatedSnapshotAliases: Set<String> = []
     // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
@@ -741,7 +744,7 @@ public final class ComputerUseService {
     /// With a target window, returns as soon as the window stops changing (WindowSettle),
     /// capped at `interval`; without one, sleeps the fixed interval as before.
     private func pauseBeforeReadBack(_ interval: TimeInterval, windowID: CGWindowID? = nil) {
-        guard actionReadBack else {
+        guard Self.requiredWindowID == nil, actionReadBack else {
             return
         }
 
@@ -757,7 +760,7 @@ public final class ComputerUseService {
     /// The result an action returns: the after-action snapshot, or a short status
     /// when read-back is off.
     private func actionResult(for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ToolCallResult {
-        guard actionReadBack else {
+        guard Self.requiredWindowID == nil, actionReadBack else {
             return .text("ok")
         }
 
@@ -779,7 +782,8 @@ public final class ComputerUseService {
         windowPlacement: WindowPlacement = .keep,
         observation: SnapshotObservationOptions = .defaults,
         settleMs: Int? = nil,
-        compact: Bool = false
+        compact: Bool = false,
+        windowID: CGWindowID? = nil
     ) throws -> ToolCallResult {
         if windowPlacement == .agentDisplay { try VirtualDisplayConfig.current.requireEnabled() }
         try observation.validate()
@@ -793,6 +797,19 @@ public final class ComputerUseService {
                 return !record.rawActions.isEmpty || isFocused ? String(record.index) : nil
             }
             return LeanOutput.condensed(result, mode: .compact, preserving: Set(kept))
+        }
+        if let windowID {
+            guard windowPlacement == .keep else {
+                throw ComputerUseError.invalidArguments("A window-bound read cannot move the window.")
+            }
+            let app = try AppDiscovery.resolveRunning(query)
+            let snapshot = try SnapshotBuilder.build(
+                for: app, textLimit: textLimit, treeLimits: treeLimits,
+                recoveryPolicy: .readOnly, observation: observation, windowID: windowID
+            )
+            guard snapshot.observedWindowID == windowID else { throw windowBindingError(windowID) }
+            rememberSnapshot(snapshot, for: query)
+            return render(snapshot)
         }
         if let settleMs {
             let note = try waitForWindowToSettle(app: query, timeoutMs: settleMs)
@@ -862,8 +879,21 @@ public final class ComputerUseService {
         y: Double?,
         clickCount: Int,
         mouseButton: String,
-        clickMethod: ClickMethod = .auto
+        clickMethod requestedMethod: ClickMethod = .auto
     ) throws -> ToolCallResult {
+        let clickMethod: ClickMethod
+        if Self.requiredWindowID != nil {
+            switch requestedMethod {
+            case .auto:
+                clickMethod = elementIndex == nil ? .skyClick : .accessibility
+            case .accessibility, .skyClick:
+                clickMethod = requestedMethod
+            case .global, .appPost:
+                throw ComputerUseError.invalidArguments("A bound click requires accessibility or sky_click delivery.")
+            }
+        } else {
+            clickMethod = requestedMethod
+        }
         try validateClickMethod(
             clickMethod,
             hasElementIndex: elementIndex != nil,
@@ -934,8 +964,8 @@ public final class ComputerUseService {
                         snapshot: snapshot,
                         button: button,
                         clickCount: clickCount,
-                        includeNearbyHitTesting: true,
-                        allowActivationFallback: true
+                        includeNearbyHitTesting: Self.requiredWindowID == nil,
+                        allowActivationFallback: Self.requiredWindowID == nil
                     )) {
                         try performNonAXClickFallback(
                             at: targetPoint,
@@ -951,8 +981,8 @@ public final class ComputerUseService {
                         snapshot: snapshot,
                         button: button,
                         clickCount: clickCount,
-                        includeNearbyHitTesting: true,
-                        allowActivationFallback: true
+                        includeNearbyHitTesting: Self.requiredWindowID == nil,
+                        allowActivationFallback: Self.requiredWindowID == nil
                     ) else {
                         throw ComputerUseError.message(
                             "click_method 'accessibility' could not click element_index=\(elementIndex)"
@@ -1065,6 +1095,9 @@ public final class ComputerUseService {
         try refuseDisabledControl(record, elementIndex: elementIndex)
 
         if rawAction.caseInsensitiveCompare(kAXRaiseAction as String) == .orderedSame {
+            guard Self.requiredWindowID == nil else {
+                throw ComputerUseError.invalidArguments("Raise is unavailable in a bound action.")
+            }
             if backgroundOnlyMode() {
                 throw ComputerUseError.message(backgroundOnlyRaiseRefusedMessage)
             }
@@ -1150,6 +1183,9 @@ public final class ComputerUseService {
             }
 
             if !scrolledByAccessibility {
+                guard Self.requiredWindowID == nil else {
+                    throw ComputerUseError.stateUnavailable("This element cannot scroll by whole pages through accessibility in the bound window.")
+                }
                 // Refused before the first page, or not a page-scrolling element: a scroll-wheel event over its frame.
                 guard let point = try globalPoint(for: record, snapshot: snapshot) else {
                     throw ComputerUseError.stateUnavailable("element \(elementIndex) has no scrollable frame")
@@ -1176,7 +1212,9 @@ public final class ComputerUseService {
             throw ComputerUseError.invalidArguments("drag needs distinct start and end points")
         }
         let flags = try dragModifierFlags(modifiers)
-        let deliveryPath = dragDeliveryPath(environment: ProcessInfo.processInfo.environment)
+        let deliveryPath: DragDeliveryPath = Self.requiredWindowID == nil
+            ? dragDeliveryPath(environment: ProcessInfo.processInfo.environment)
+            : .appPost
         let recoveryPolicy = dragActionSnapshotRecoveryPolicy(for: deliveryPath)
         let snapshot = try currentSnapshot(for: query, recoveryPolicy: recoveryPolicy)
         guard snapshot.observation.includeScreenshot else {
@@ -1189,6 +1227,18 @@ public final class ComputerUseService {
             try FixtureBridge.post(FixtureCommand(kind: "drag", identifier: "fixture-drag-pad", x: fromX, y: fromY, toX: toX, toY: toY))
             Thread.sleep(forTimeInterval: 0.15)
             return try actionResult(for: query)
+        }
+
+        if deliveryPath == .appPost {
+            guard let size = screenshotPixelSize(snapshot: snapshot) else {
+                throw ComputerUseError.stateUnavailable("Background drag requires a delivered screenshot of the target window.")
+            }
+            let width = Double(size.width)
+            let height = Double(size.height)
+            guard [fromX, toX].allSatisfy({ $0 >= 0 && $0 < width }),
+                  [fromY, toY].allSatisfy({ $0 >= 0 && $0 < height }) else {
+                throw ComputerUseError.invalidArguments("Background drag requires both points inside the target window screenshot.")
+            }
         }
 
         let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
@@ -1232,21 +1282,49 @@ public final class ComputerUseService {
     }
 
     private func deliverText(app query: String, text: String, keyMethod: KeyMethod, snapshot: AppSnapshot) throws -> ToolCallResult {
+        if let windowID = Self.requiredWindowID {
+            let focused = try requireBoundInputFocus(in: snapshot)
+            if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
+                return .text("ok")
+            }
+            guard canTypeTextUsingKeyboardFallback(on: focused) else {
+                throw ComputerUseError.stateUnavailable("Focus an editable field in the observed window before typing.")
+            }
+            try requireCurrentTextFocus(focused, pid: snapshot.app.pid)
+            try InputSimulation.typeTextWithSkyLight(text, windowID: windowID, pid: snapshot.app.pid)
+            return .text("ok")
+        }
 
-        if keyMethod == .skyKey {
+        if keyMethod == .skyKey, !Self.awaitsModalTextFocus {
             let target = try skyKeyTarget(for: snapshot)
             if let focused = Self.focusedElement(pid: target.pid) {
                 try selectWholeNameForKeys(text: text, focused: focused, pid: target.pid, windowID: target.windowID)
             }
             try InputSimulation.typeTextWithSkyLight(text, windowID: target.windowID, pid: target.pid)
-            return snapshotResult(
-                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
-                style: .actionResult
-            )
+            return try actionResult(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod))
         }
 
-        // A keystroke can open a modal after the cached snapshot was taken.
-        guard let focused = Self.currentInputFocus(pid: snapshot.app.pid) else {
+        // A dialog shortcut can return before the sheet exposes its editor.
+        let focused: AXUIElement?
+        if Self.awaitsModalTextFocus {
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.8
+            var editor: AXUIElement?
+            repeat {
+                if let candidate = Self.currentInputFocus(pid: snapshot.app.pid, requireModal: true),
+                   canTypeTextUsingKeyboardFallback(on: candidate) {
+                    editor = candidate
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            } while ProcessInfo.processInfo.systemUptime < deadline
+            guard let editor else {
+                throw ComputerUseError.stateUnavailable("The Go to Folder dialog did not expose a focused text field. Read the dialog before retrying.")
+            }
+            focused = editor
+        } else {
+            focused = Self.currentInputFocus(pid: snapshot.app.pid)
+        }
+        guard let focused else {
             // A background calculator has no focused element at all; its keypad still takes keys.
             if try typeOnKeypad(text, snapshot: snapshot, focused: nil) {
                 pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
@@ -1254,7 +1332,7 @@ public final class ComputerUseService {
             }
             throw ComputerUseError.stateUnavailable(focusedElementUnreadableMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
         }
-        if try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
+        if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
             pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
             return try actionResult(for: query)
         }
@@ -1280,7 +1358,7 @@ public final class ComputerUseService {
         try requireCurrentTextFocus(focused, pid: snapshot.app.pid)
         let isSecure = isSecureTextField(subrole: stringValue(of: focused, attribute: kAXSubroleAttribute))
         let before = isSecure ? nil : stringValue(of: focused, attribute: kAXValueAttribute)
-        if useSkyLightKeyRoute(snapshot: snapshot, focused: focused, opensDialogFromMenu: false, hasLiveTextFocus: true) {
+        if keyMethod == .skyKey || useSkyLightKeyRoute(snapshot: snapshot, focused: focused, opensDialogFromMenu: false, hasLiveTextFocus: true) {
             // Keys posted to a background process reach only a window that is key; the key-window route makes it key.
             // This is the default whenever the app is not in front (not only in background-only mode); a borrowed
             // app, a save/open sheet and Finder's rename editor take the normal route below, which is also what a
@@ -1358,23 +1436,20 @@ public final class ComputerUseService {
     /// and a following Return renames it. False when this is not such a case or the keys could not be sent.
     private func typeOnKeypad(_ text: String, snapshot: AppSnapshot, focused: AXUIElement?) throws -> Bool {
         guard !text.isEmpty, text.allSatisfy({ "0123456789+-*/=.,%()^ ".contains($0) }) else { return false }
-        let buttonNames = snapshot.elements.values.flatMap { record in
-            [record.title, record.identifier, record.identity?.name].compactMap { $0?.lowercased().filter { !$0.isWhitespace } }
+        let buttonNames = snapshot.elements.values.flatMap { record -> [String] in
+            guard SmartSteps.roleKey(record.role) == "button" else { return [] }
+            return [record.title, record.identifier, record.identity?.name].compactMap { $0?.lowercased().filter { !$0.isWhitespace } }
         }
         guard LabelSpellings.isKeypad(buttonNames: buttonNames) else { return false }
         if let focused, Self.isInsideWebArea(focused) { return false }
         guard let windowID = focused.flatMap({ SkyLightSPI.shared.windowID(for: $0) }) ?? snapshot.targetWindowID,
               SkyLightSPI.shared.capability.isAvailable else { return false }
-        do {
-            // One key at a time: a keypad takes only the first character of a longer string.
-            for character in text where character != " " {
-                try InputSimulation.typeTextWithSkyLight(String(character), windowID: windowID, pid: snapshot.app.pid)
-                Thread.sleep(forTimeInterval: 0.04)
-            }
-            return true
-        } catch {
-            return false
-        }
+        let keys = text.filter { $0 != " " }
+        guard !keys.isEmpty else { return false }
+        try SkyKeyboardDispatcher.typeKeypad(
+            target: SkyKeyboardTarget(windowID: windowID, pid: snapshot.app.pid), keys: keys
+        )
+        return true
     }
 
     /// Whether the element sits in web content (a browser page, an Electron app's view).
@@ -1409,11 +1484,11 @@ public final class ComputerUseService {
         return (value as! AXUIElement)
     }
 
-    private static func currentInputFocus(pid: pid_t) -> AXUIElement? {
+    private static func currentInputFocus(pid: pid_t, requireModal: Bool = false) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.2)
         let appFocus = elementAttribute(app, kAXFocusedUIElementAttribute)
-        guard let window = elementAttribute(app, kAXFocusedWindowAttribute) else { return appFocus }
+        guard let window = elementAttribute(app, kAXFocusedWindowAttribute) else { return requireModal ? nil : appFocus }
 
         // A sheet can own the editor while the app reports focus beneath it. Only use
         // focus exposed by the AX hierarchy, and require membership in the active sheet.
@@ -1446,7 +1521,7 @@ public final class ComputerUseService {
                 return false
             }
         }
-        return appFocus
+        return requireModal ? nil : appFocus
     }
 
     /// "Command+Shift+N", "META+SHIFT+N", "⌘⇧N" → "cmd+shift+n": modifiers by one name, in a fixed order.
@@ -1473,7 +1548,8 @@ public final class ComputerUseService {
     /// the document already has a file. Nil when neither applies (the key then goes the normal way).
     private func pressKeyDirectly(_ key: String, snapshot: AppSnapshot, query: String) throws -> ToolCallResult? {
         let normalized = Self.canonicalKey(key)
-        if NSRunningApplication(processIdentifier: snapshot.app.pid)?.bundleIdentifier == "com.apple.finder",
+        if PrivateClipboard.Action(key: key) == nil,
+           NSRunningApplication(processIdentifier: snapshot.app.pid)?.bundleIdentifier == "com.apple.finder",
            let message = FinderClipboard.handle(key: normalized) {
             return insertingNote(message, into: try actionResult(for: query))
         }
@@ -1508,8 +1584,88 @@ public final class ComputerUseService {
         return nil
     }
 
+    private func nativeClipboard(
+        _ action: PrivateClipboard.Action, snapshot: AppSnapshot, query: String, keyMethod: KeyMethod
+    ) throws -> ToolCallResult {
+        if Self.requiredWindowID != nil { try requireBoundFocusedWindow(in: snapshot) }
+        let clipboard = PrivateClipboard.current
+        if snapshot.app.bundleIdentifier == "com.apple.finder", Self.requiredWindowID == nil {
+            let key: String?
+            switch (action, clipboard.payload) {
+            case (.copy, _): key = "cmd+c"
+            case (.cut, _): key = "cmd+x"
+            case (.paste, .files): key = "cmd+v"
+            case (.moveFiles, .files): key = "alt+cmd+v"
+            default: key = nil
+            }
+            if let key {
+                guard let message = FinderClipboard.handle(key: key) else {
+                    throw ComputerUseError.stateUnavailable("Finder could not complete the private clipboard action. Check the selection or destination before retrying.")
+                }
+                return .text(message)
+            }
+        }
+        switch action {
+        case .moveFiles:
+            throw ComputerUseError.invalidArguments("Move-paste requires files on the private clipboard and a Finder destination.")
+        case .paste:
+            let text = try clipboard.textForPaste()
+            if text.isEmpty { return .text("Private clipboard text is empty.") }
+            return try typeText(app: query, text: text, keyMethod: keyMethod)
+        case .copy, .cut:
+            let focus = Self.requiredWindowID != nil
+                ? try requireBoundInputFocus(in: snapshot) : Self.currentInputFocus(pid: snapshot.app.pid)
+            guard let focus,
+                  !isSecureTextField(subrole: stringValue(of: focus, attribute: kAXSubroleAttribute)),
+                  let selected = stringValue(of: focus, attribute: kAXSelectedTextAttribute), !selected.isEmpty else {
+                throw ComputerUseError.invalidArguments("No accessible text is selected. Select ordinary text first.")
+            }
+            if action == .copy {
+                try clipboard.writeText(selected)
+                return .text("Copied selected text to the private clipboard.")
+            }
+            guard keyMethod == .auto,
+                  isSettable(element: focus, attribute: kAXSelectedTextAttribute),
+                  let original = stringValue(of: focus, attribute: kAXValueAttribute),
+                  let range = selectedRange(of: focus),
+                  let change = typedTextReplacement(value: original, selection: range, text: ""),
+                  let selectionRange = Range(NSRange(location: range.location, length: range.length), in: original),
+                  original[selectionRange].utf16.elementsEqual(selected.utf16) else {
+                throw ComputerUseError.invalidArguments("This selection cannot be cut through accessibility. Copy it to the private clipboard instead.")
+            }
+            try requireCurrentTextFocus(focus, pid: snapshot.app.pid)
+            guard stringValue(of: focus, attribute: kAXValueAttribute)?.utf16.elementsEqual(original.utf16) == true,
+                  let current = selectedRange(of: focus), current.location == range.location, current.length == range.length else {
+                throw ComputerUseError.stateUnavailable("The selected text changed before cut. Nothing was sent.")
+            }
+            try clipboard.writeText(selected)
+            guard AXUIElementSetAttributeValue(focus, kAXSelectedTextAttribute as CFString, "" as CFString) == .success,
+                  stringValue(of: focus, attribute: kAXValueAttribute)?.utf16.elementsEqual(change.value.utf16) == true else {
+                throw ComputerUseError.stateUnavailable("The private clipboard has the text, but deletion may have taken effect. Check the field before retrying.")
+            }
+            return .text("Cut selected text to the private clipboard.")
+        }
+    }
+
     public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
-        let snapshot = try currentSnapshot(for: query)
+        let recoveryPolicy = backgroundOnlyMode() ? .readOnly : keyActionSnapshotRecoveryPolicy(for: keyMethod)
+        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: recoveryPolicy)
+        if let action = PrivateClipboard.Action(key: key) {
+            return try nativeClipboard(action, snapshot: snapshot, query: query, keyMethod: keyMethod)
+        }
+        if let windowID = Self.requiredWindowID {
+            try requireBoundFocusedWindow(in: snapshot)
+            if keyMethod == .auto, NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.app.pid {
+                try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+            } else {
+                try SkyKeyboardDispatcher.pressKey(
+                    target: SkyKeyboardTarget(windowID: windowID, pid: snapshot.app.pid),
+                    key: key,
+                    allowMenuEquivalent: false
+                )
+            }
+            return .text("ok")
+        }
         if snapshot.mode != .fixture, let direct = try pressKeyDirectly(key, snapshot: snapshot, query: query) {
             return direct
         }
@@ -1523,10 +1679,7 @@ public final class ComputerUseService {
         if keyMethod == .skyKey {
             let target = try skyKeyTarget(for: snapshot)
             let reportedDisabled = try InputSimulation.pressKeyWithSkyLight(key, windowID: target.windowID, pid: target.pid)
-            let result = snapshotResult(
-                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
-                style: .actionResult
-            )
+            let result = try actionResult(for: query, recoveryPolicy: recoveryPolicy)
             return reportedDisabled ? insertingNote(disabledMenuKeyNote, into: result) : result
         }
 
@@ -1551,10 +1704,7 @@ public final class ComputerUseService {
             }
             let windowID = try backgroundKeyboardWindow(for: snapshot, action: "press_key '\(key)'")
             try InputSimulation.pressKeyWithSkyLight(key, windowID: windowID, pid: snapshot.app.pid)
-            return snapshotResult(
-                for: try refreshSnapshot(for: query, recoveryPolicy: .readOnly),
-                style: .actionResult
-            )
+            return try actionResult(for: query, recoveryPolicy: .readOnly)
         }
 
         try InputSimulation.pressKey(key, pid: snapshot.app.pid)
@@ -1576,6 +1726,12 @@ public final class ComputerUseService {
     /// The reply is one line, so a batch can show it without the whole app state.
     public func pressMenu(app query: String, titles: [String]) throws -> ToolCallResult {
         let titles = try menuPathTitles(titles)
+        if let item = titles.last?.lowercased(), let key = [
+            "copy": "cmd+c", "cut": "cmd+x", "paste": "cmd+v", "paste and match style": "cmd+shift+v",
+            "paste and match formatting": "cmd+shift+v"
+        ][item] {
+            return try pressKey(app: query, key: key)
+        }
         try requireUsableComputerUseSession()
         let app = try AppDiscovery.resolveRunning(query)
         // Finder's selection commands are disabled in a background Finder's menus; its scripting does them.
@@ -1813,8 +1969,15 @@ public final class ComputerUseService {
             try requireUsableComputerUseSession()
             let app = try AppDiscovery.resolveRunning(query)
             let target = try targetedElements.resolve(index, app: TargetedAppIdentity(app: app))
+            if let windowID = Self.requiredWindowID, target.context.windowID != windowID {
+                throw windowBindingError(windowID)
+            }
             do {
                 let (context, record) = try SnapshotBuilder.currentGeometry(of: target.record, in: target.context, criteria: target.criteria)
+                if let windowID = Self.requiredWindowID,
+                   !SnapshotBuilder.isUsableWindowElement(context.windowElement) {
+                    throw windowBindingError(windowID)
+                }
                 return liteSnapshot(context: context, elements: [index: record])
             } catch {
                 targetedElements.remove(index)
@@ -1849,7 +2012,52 @@ public final class ComputerUseService {
         return dict
     }
 
+    private func windowBindingError(_ id: CGWindowID) -> ComputerUseError {
+        .stateUnavailable("Observed window \(id) changed or is unavailable. Read its state or query it again before acting.")
+    }
+
+    private func requireBoundFocusedWindow(in snapshot: AppSnapshot) throws {
+        guard let windowID = Self.requiredWindowID else { return }
+        let appElement = AXUIElementCreateApplication(snapshot.app.pid)
+        AXUIElementSetMessagingTimeout(appElement, 0.2)
+        guard let window = snapshot.windowElement,
+              let focused = Self.elementAttribute(appElement, kAXFocusedWindowAttribute),
+              CFEqual(focused, window),
+              SkyLightSPI.shared.windowID(for: focused) == windowID else {
+            throw windowBindingError(windowID)
+        }
+    }
+
+    private func requireBoundInputFocus(in snapshot: AppSnapshot) throws -> AXUIElement {
+        try requireBoundFocusedWindow(in: snapshot)
+        guard let window = snapshot.windowElement,
+              let focused = Self.currentInputFocus(pid: snapshot.app.pid),
+              SnapshotBuilder.belongsToWindow(focused, window: window) else {
+            throw ComputerUseError.stateUnavailable("There is no confirmed input focus in the observed window.")
+        }
+        return focused
+    }
+
     func currentSnapshot(for query: String, needScreenshot: Bool = true, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
+        if let windowID = Self.requiredWindowID {
+            try requireUsableComputerUseSession()
+            let app = try AppDiscovery.resolveRunning(query)
+            guard let snapshot = snapshotsByApp[query.lowercased()],
+                  snapshot.app.pid == app.pid,
+                  snapshot.app.runningApplication.launchDate == app.runningApplication.launchDate,
+                  !snapshot.app.runningApplication.isTerminated,
+                  snapshot.observedWindowID == windowID,
+                  let observedWindow = snapshot.windowElement else {
+                throw windowBindingError(windowID)
+            }
+            let live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID)
+            guard CFEqual(observedWindow, live.windowElement),
+                  SnapshotBuilder.isUsableWindowElement(live.windowElement),
+                  live.windowBounds == snapshot.windowBounds else {
+                throw windowBindingError(windowID)
+            }
+            return snapshot
+        }
         if let snapshot = snapshotsByApp[query.lowercased()] {
             if snapshot.mode != .fixture {
                 do {
@@ -1887,6 +2095,7 @@ public final class ComputerUseService {
         }
         let clickable: Set<String> = ["button", "menuitem", "menubutton", "menubaritem", "checkbox", "radiobutton", "popupbutton",
                                       "tab", "switch", "link", "cell", "row", "disclosuretriangle", "toggle", "segment"]
+        let wrapperRoles: Set<String> = ["row", "cell"]
         let given = labels.map { norm($0) }.filter { !$0.isEmpty }
         guard !given.isEmpty else { throw ComputerUseError.invalidArguments("label is empty") }
         // Each label plus the spellings apps use for it: Calculator's keys are "one", "add", "multiply".
@@ -1904,8 +2113,30 @@ public final class ComputerUseService {
             var distinct: [ElementRecord] = []
             for hit in hits {
                 let nested = distinct.contains { kept in
-                    guard let a = kept.localFrame, let b = hit.localFrame else { return true }
-                    return a.insetBy(dx: -1, dy: -1).contains(b) || b.insetBy(dx: -1, dy: -1).contains(a)
+                    guard let a = kept.element, let b = hit.element else { return false }
+                    if CFEqual(a, b) { return true }
+                    // Overlapping or missing rectangles don't prove two controls are the same.
+                    // Only collapse a row or cell with a matching descendant on its actual AX path.
+                    guard let keptFrame = kept.localFrame, let hitFrame = hit.localFrame,
+                          keptFrame.insetBy(dx: -1, dy: -1).contains(hitFrame)
+                            || hitFrame.insetBy(dx: -1, dy: -1).contains(keptFrame) else { return false }
+                    let outer: AXUIElement
+                    var child: AXUIElement?
+                    if wrapperRoles.contains(roleKey(kept.role)) {
+                        outer = a
+                        child = b
+                    } else if wrapperRoles.contains(roleKey(hit.role)) {
+                        outer = b
+                        child = a
+                    } else {
+                        return false
+                    }
+                    for _ in 0..<6 {
+                        child = child.flatMap { copyParent(of: $0) }
+                        guard let child else { return false }
+                        if CFEqual(child, outer) { return true }
+                    }
+                    return false
                 }
                 if !nested { distinct.append(hit) }
             }
@@ -1975,8 +2206,13 @@ public final class ComputerUseService {
         }
 
         // A cached state may list controls that are gone, so an ambiguity there is checked against a fresh read.
-        if let hit = try? find(in: try currentSnapshot(for: query, needScreenshot: false)) { return hit }
-        let fresh = try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false))
+        let fresh: AppSnapshot
+        if Self.requiredWindowID != nil {
+            fresh = try currentSnapshot(for: query, needScreenshot: false)
+        } else {
+            if let hit = try? find(in: try currentSnapshot(for: query, needScreenshot: false)) { return hit }
+            fresh = try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false))
+        }
         if let hit = try find(in: fresh) { return hit }
         // A text field or document named by what it contains ("The quick blue fox."): the one field holding it.
         if let w = given.first, w.count >= 4 {
@@ -2073,6 +2309,12 @@ public final class ComputerUseService {
             throw ComputerUseError.invalidArguments("unknown element_index '\(index)'")
         }
 
+        if let windowID = Self.requiredWindowID {
+            guard let element = record.element, let window = snapshot.windowElement,
+                  SnapshotBuilder.belongsToWindow(element, window: window) else {
+                throw windowBindingError(windowID)
+            }
+        }
         return try keptRecord(record, index: index, snapshot: snapshot)
     }
 
@@ -3063,9 +3305,13 @@ public final class ComputerUseService {
         if snapshot.screenshotData == nil, let note = snapshot.screenshotNote {
             throw ComputerUseError.stateUnavailable(note + "; coordinate input requires a delivered screenshot")
         }
+        let pixelSize = screenshotPixelSize(snapshot: snapshot)
+        if Self.requiredWindowID != nil, pixelSize == nil {
+            throw ComputerUseError.stateUnavailable("Bound coordinate input requires a delivered screenshot.")
+        }
         return screenshotPixelToWindowPoint(
             point,
-            screenshotPixelSize: screenshotPixelSize(snapshot: snapshot),
+            screenshotPixelSize: pixelSize,
             windowBounds: snapshot.windowBounds
         )
     }

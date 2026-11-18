@@ -237,19 +237,42 @@ enum SkyKeyboardDispatcher {
         }
     }
 
+    /// A keypad needs separate key events, but can reuse one target focus for a short group.
+    static func typeKeypad(target: SkyKeyboardTarget, keys: String) throws {
+        try deliverKeypadGroups(keys) { group, precededByKey in
+            if precededByKey { Thread.sleep(forTimeInterval: 0.04) }
+            try deliver(to: target, spi: .shared) {
+                for (offset, key) in group.enumerated() {
+                    if offset > 0 { Thread.sleep(forTimeInterval: 0.04) }
+                    try InputSimulation.typeText(String(key), pid: target.pid, authenticated: true)
+                }
+            }
+        }
+    }
+
+    static func deliverKeypadGroups(_ keys: String, send: (Substring, Bool) throws -> Void) rethrows {
+        var start = keys.startIndex
+        while start < keys.endIndex {
+            let end = keys.index(start, offsetBy: 4, limitedBy: keys.endIndex) ?? keys.endIndex
+            try send(keys[start..<end], start != keys.startIndex)
+            start = end
+        }
+    }
+
     /// Delivers `key` to the target window. Returns true when a menu item was pressed that the
     /// closed menu listed as disabled: the press may have done nothing, so the caller says so.
     @discardableResult
     static func pressKey(
         target: SkyKeyboardTarget,
         key: String,
-        spi: SkyLightSPI = .shared
+        spi: SkyLightSPI = .shared,
+        allowMenuEquivalent: Bool = true
     ) throws -> Bool {
         // Reject bad key specs before touching the target's focus state.
         let parsed = try KeyPressParser.parse(key)
         var reportedDisabled = false
         try deliver(to: target, spi: spi) {
-            if let equivalent = skyMenuKeyEquivalent(for: parsed),
+            if allowMenuEquivalent, let equivalent = skyMenuKeyEquivalent(for: parsed),
                let found = menuItem(matching: equivalent, pid: target.pid) {
                 reportedDisabled = found.reportedDisabled
                 try pressMenuItem(found, key: key)

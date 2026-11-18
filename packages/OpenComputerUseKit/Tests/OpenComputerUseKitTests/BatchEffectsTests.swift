@@ -154,3 +154,27 @@ final class ElementNumberingTests: XCTestCase {
         XCTAssertEqual(numbering.highWater, back + 1)
     }
 }
+
+extension BatchEffectsTests {
+    func testRepeatedFailedReadsExhaustTheObservationBudget() {
+        var budget = BatchEffects.ReadBudget()
+        var attempts = 0
+        for _ in 0..<20 where !budget.exhausted {
+            attempts += 1
+            budget.record(seconds: 1, settleMs: 600, observed: false)
+        }
+        XCTAssertEqual(attempts, 8)
+        XCTAssertEqual(budget.elapsed, 8)
+    }
+
+    func testSettleCreditOnlyAppliesToSuccessfulReads() {
+        var failed = BatchEffects.ReadBudget()
+        failed.record(seconds: 2.7, settleMs: 600, observed: false)
+        XCTAssertTrue(failed.exhausted)
+
+        var successful = BatchEffects.ReadBudget()
+        successful.record(seconds: 2.7, settleMs: 600, observed: true)
+        XCTAssertFalse(successful.exhausted)
+        XCTAssertEqual(successful.elapsed, 2.7)
+    }
+}

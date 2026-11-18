@@ -36,9 +36,9 @@ final class BatchReceiptsTests: XCTestCase {
 
     func testAdviceForUnknownDoesNotSayResend() {
         let unknown = BatchEffects.advice(for: .outcomeUnknown, stepNumber: 3)
-        XCTAssertTrue(unknown.contains("Step 3 may have run"))
-        XCTAssertTrue(unknown.contains("not retried"))
-        XCTAssertTrue(BatchEffects.advice(for: .notSent, stepNumber: 3).hasPrefix("Fix the failed step"))
+        XCTAssertTrue(unknown.contains("whether step 3 took effect before retrying"))
+        XCTAssertTrue(unknown.contains("Resume at the first unfinished step"))
+        XCTAssertTrue(BatchEffects.advice(for: .notSent, stepNumber: 3).contains("Step 3 was not sent"))
     }
 
     func testHealsToTheSingleRedrawnTwin() {

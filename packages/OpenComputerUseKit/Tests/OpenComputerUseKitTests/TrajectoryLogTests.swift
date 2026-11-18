@@ -16,6 +16,13 @@ final class TrajectoryLogTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    func testWorkersInSameBenchmarkRunHaveSeparateStreams() {
+        let first = makeLog()
+        let second = makeLog()
+        XCTAssertEqual(first.runID, second.runID)
+        XCTAssertNotEqual(first.sessionID, second.sessionID)
+    }
+
     private func makeLog(runID: String? = "bench-7", maxBytes: UInt64 = TrajectoryLog.defaultMaxBytes) -> TrajectoryLog {
         var environment = [TrajectoryLog.enabledVariable: "1", TrajectoryLog.contentVariable: "1"]
         if let runID { environment[TrajectoryLog.runIDVariable] = runID }
@@ -130,7 +137,7 @@ final class TrajectoryLogTests: XCTestCase {
         ]
         let result = try ComputerUseToolDispatcher().runBatch(arguments: arguments)
         XCTAssertTrue(result.isError)
-        XCTAssertEqual(Set(result.asDictionary.keys), ["content", "isError"])
+        XCTAssertEqual(Set(result.asDictionary.keys), ["content", "isError", "_meta"])
 
         let log = TrajectoryLog(environment: [:], directory: directory)
         log.recordToolCall(name: "batch", arguments: arguments, result: result, startedAt: started())
@@ -160,7 +167,7 @@ final class TrajectoryLogTests: XCTestCase {
         let call = lines[0]
         XCTAssertEqual(call["event"] as? String, "tool_call")
         XCTAssertEqual(call["tool"] as? String, "type_text")
-        XCTAssertEqual(call["session_id"] as? String, "bench-7")
+        XCTAssertEqual(call["session_id"] as? String, log.sessionID)
         XCTAssertEqual(call["run_id"] as? String, "bench-7")
         XCTAssertEqual(call["is_error"] as? Bool, false)
         XCTAssertEqual(call["result_text"] as? String, "Typed 8 characters.")
@@ -209,7 +216,7 @@ final class TrajectoryLogTests: XCTestCase {
         let line = try XCTUnwrap(records(log).first)
         XCTAssertEqual(line["screenshot_returned"] as? Bool, true)
         XCTAssertEqual(line["result_text"] as? String, "Notes window: 3 elements")
-        let raw = try String(contentsOf: directory.appendingPathComponent("bench-7.jsonl"), encoding: .utf8)
+        let raw = try String(contentsOf: directory.appendingPathComponent(log.sessionID + ".jsonl"), encoding: .utf8)
         XCTAssertFalse(raw.contains(Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3]).base64EncodedString()))
     }
 
@@ -244,7 +251,7 @@ final class TrajectoryLogTests: XCTestCase {
         XCTAssertEqual((lines[0]["arguments"] as? [String: Any])?["label"] as? String, "Password", "the target name stays")
         XCTAssertEqual((lines[1]["arguments"] as? [String: Any])?["text"] as? String, TrajectoryLog.redactedValue)
 
-        let raw = try String(contentsOf: directory.appendingPathComponent("bench-7.jsonl"), encoding: .utf8)
+        let raw = try String(contentsOf: directory.appendingPathComponent(log.sessionID + ".jsonl"), encoding: .utf8)
         XCTAssertFalse(raw.contains("hunter2"))
         XCTAssertFalse(raw.contains("correct horse"))
     }
@@ -303,7 +310,7 @@ final class TrajectoryLogTests: XCTestCase {
         XCTAssertGreaterThan(calls.count, 0)
         XCTAssertLessThan(calls.count, 10)
 
-        let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent("bench-7.jsonl").path)[.size] as? NSNumber)
+        let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent(log.sessionID + ".jsonl").path)[.size] as? NSNumber)
         XCTAssertLessThanOrEqual(size.uint64Value, 900 + 300, "the file stays near the cap")
     }
 
@@ -341,7 +348,7 @@ final class TrajectoryLogTests: XCTestCase {
         log.recordToolCall(name: "click", arguments: [:], result: .text("ok"), startedAt: started())
         log.flush()
         XCTAssertFalse(FileManager.default.fileExists(atPath: old.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("new-run.jsonl").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(log.sessionID + ".jsonl").path))
     }
 
     // MARK: - Files and folders
@@ -354,7 +361,7 @@ final class TrajectoryLogTests: XCTestCase {
         let folder = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: directory.path)[.posixPermissions] as? NSNumber)
         XCTAssertEqual(folder.intValue & 0o777, 0o700)
         let file = try XCTUnwrap(
-            FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent("bench-7.jsonl").path)[.posixPermissions] as? NSNumber
+            FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent(log.sessionID + ".jsonl").path)[.posixPermissions] as? NSNumber
         )
         XCTAssertEqual(file.intValue & 0o777, 0o600)
     }

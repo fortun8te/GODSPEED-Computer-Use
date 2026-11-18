@@ -22,7 +22,14 @@ public enum VisualCursorSupport {
             return snapshot
         }
         // PURE's Settings > GODSPEED fill in whatever the environment does not set.
-        var settings = VisualCursorSettings(environment: GodspeedSettings.merged(ProcessInfo.processInfo.environment))
+        let environment = GodspeedSettings.merged(ProcessInfo.processInfo.environment)
+        var settings = VisualCursorSettings(environment: environment)
+        let client = ClientScope.current
+        if environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]?.lowercased() == "auto", client != "main" {
+            let palette = ["#5C9CFA", "#C77BF2", "#35BA9A", "#F19A5B", "#E876A4", "#8CA965"]
+            let index = client.utf8.reduce(0) { ($0 * 31 + Int($1)) % palette.count }
+            settings.color = CursorColor(hex: palette[index])
+        }
         if shortLivedProcess {
             settings.enabled = false
         }
@@ -41,7 +48,7 @@ public enum VisualCursorSupport {
     /// What a queued cursor animation is. Moves can be skipped when a later move is queued; see the drain loop.
     enum AnimationKind { case move, other }
 
-    @MainActor private static var pendingAnimations: [(kind: AnimationKind, body: @MainActor () -> Void)] = []
+    @MainActor private static var pendingAnimations: [(kind: AnimationKind, client: String, body: @MainActor () -> Void)] = []
     @MainActor private static var isDrainingAnimations = false
     /// A reset asked for by another process or a finished turn while animations play. Resetting then aborted
     /// the glide and the cursor vanished mid-batch, so it waits until the queue is empty.
@@ -60,6 +67,7 @@ public enum VisualCursorSupport {
         // main queue can run after those overrides are restored, so capture the
         // request's cursor setting before dispatching any work.
         let captured = settings
+        let client = ClientScope.current
         let perform: @MainActor () -> Void = {
             let dictionary = Thread.current.threadDictionary
             let previous = dictionary[settingsSnapshotKey]
@@ -77,7 +85,7 @@ public enum VisualCursorSupport {
         backlogLock.lock(); backlog += 1; backlogLock.unlock()
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
-                pendingAnimations.append((kind, perform))
+                pendingAnimations.append((kind, client, perform))
                 // The animation pumps the main run loop. A nested queue callback
                 // must enqueue its work, not interrupt the animation in progress.
                 guard !isDrainingAnimations else { return }
@@ -88,7 +96,8 @@ public enum VisualCursorSupport {
                     backlogLock.lock(); backlog -= 1; backlogLock.unlock()
                     // Coalesce consecutive moves. A pulse or settle is a boundary: dropping a
                     // move across one would make that click jump to its target instead of gliding.
-                    if next.kind == .move, pendingAnimations.first?.kind == .move { continue }
+                    if next.kind == .move, pendingAnimations.first?.kind == .move,
+                       pendingAnimations.first?.client == next.client { continue }
                     next.body()
                 }
                 if deferredReset {
@@ -245,6 +254,24 @@ func visualCursorFreshStartPoint(target: CGPoint, forward: CGVector, distance: C
     CGPoint(x: target.x - forward.dx * distance, y: target.y - forward.dy * distance)
 }
 
+/// The same step, kept on the target's display. Near the bottom or right edge the plain step lies
+/// off the display: clamped back, the cursor slid in along the edge with its body out of view, or
+/// started on the neighbouring display. Mirrored, it glides in from inside the display instead.
+func visualCursorFreshStartPoint(
+    target: CGPoint, forward: CGVector, distance: CGFloat = 96, keptInside frame: CGRect
+) -> CGPoint {
+    let plain = visualCursorFreshStartPoint(target: target, forward: forward, distance: distance)
+    guard frame.contains(target) else { return plain }
+    return CGPoint(
+        x: plain.x < frame.minX || plain.x > frame.maxX ? target.x + (target.x - plain.x) : plain.x,
+        y: plain.y < frame.minY || plain.y > frame.maxY ? target.y + (target.y - plain.y) : plain.y
+    )
+}
+
+func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
+    !frame.insetBy(dx: 36, dy: 36).contains(point)
+}
+
 func visualCursorFloats(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
     let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.lowercased() ?? "0"
     return ["1", "true", "yes", "on"].contains(raw)
@@ -397,6 +424,8 @@ enum SoftwareCursorOverlay {
     private static var watchTimer: Timer?
     private static var fadeTimer: Timer?
     private static var feedbackTimer: Timer?
+    /// Eases the arrow upright under a typing, scroll or drag mark; see `drawFeedback`.
+    private static var poseTimer: Timer?
     private static var interactionIndicator: CursorInteractionIndicator?
     /// Internal (not private) so CursorHideTimerTests can assert scheduling order.
     static var swayStopTimer: Timer?
@@ -510,8 +539,11 @@ enum SoftwareCursorOverlay {
         let isFreshStart = displayedTipPosition == nil
         // A cursor that is already on screen continues from where the last action left it. One
         // that is not appears a short step from the target, never in a screen corner.
-        let startPoint = displayedTipPosition
-            ?? clampTipPosition(visualCursorFreshStartPoint(target: constrainedTarget, forward: restingForwardVector()))
+        let startPoint = displayedTipPosition ?? clampTipPosition(visualCursorFreshStartPoint(
+            target: constrainedTarget,
+            forward: restingForwardVector(),
+            keptInside: (screen(containing: constrainedTarget) ?? nearestScreen(to: constrainedTarget))?.frame ?? .null
+        ))
         let now = CACurrentMediaTime()
         let travel = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : visualCursorTravelDuration(
             distance: distanceBetween(startPoint, constrainedTarget),
@@ -667,7 +699,51 @@ enum SoftwareCursorOverlay {
 
     private static func drawFeedback(at point: CGPoint) {
         restingTipPosition = point
-        visualDynamicsState = CursorVisualDynamicsAnimator.state(at: point, time: CGFloat(CACurrentMediaTime()))
+        poseTimer?.invalidate()
+        poseTimer = nil
+        let now = CACurrentMediaTime()
+        // A mark usually starts the moment a glide lands, while the arrow still leans into its
+        // travel. Resetting the pose here turned it upright in one frame, so the lean (and any last
+        // fraction of travel) eases out under the mark instead. Reduce Motion, a hidden cursor and
+        // one that is not at the point yet are still placed directly.
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, panel?.isVisible == true,
+           let shown = displayedTipPosition, let shownRotation = cursorView?.rotation, var state = visualDynamicsState,
+           distanceBetween(shown, point) <= 24,
+           abs(shownRotation) > 0.01 || distanceBetween(shown, point) > 0.25 {
+            // Idle sway is added at render time, so the last visible angle is the
+            // starting pose even when the internal spring was already upright.
+            state.angle = shownRotation
+            state.time = CGFloat(now)
+            visualDynamicsState = state
+            placeCursor(using: advanceVisualDynamics(toward: point, at: now), clickProgress: 0)
+            let generation = interactionGeneration
+            let deadline = now + 0.4
+            let timer = Timer(timeInterval: 1 / 60, repeats: true) { _ in
+                MainActor.assumeIsolated {
+                    // A newer action, a hide or a reset owns the cursor now.
+                    guard generation == interactionGeneration, let target = restingTipPosition else {
+                        poseTimer?.invalidate()
+                        poseTimer = nil
+                        return
+                    }
+                    let time = CACurrentMediaTime()
+                    let render = advanceVisualDynamics(toward: target, at: time)
+                    let settled = distanceBetween(render.tipPosition, target) < 0.25 && abs(render.rotation) < 0.01
+                    guard settled || time >= deadline else {
+                        placeCursor(using: render, clickProgress: 0)
+                        return
+                    }
+                    poseTimer?.invalidate()
+                    poseTimer = nil
+                    visualDynamicsState = CursorVisualDynamicsAnimator.state(at: target, time: CGFloat(time))
+                    placeCursor(using: initialRenderState(at: target), clickProgress: 0)
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            poseTimer = timer
+            return
+        }
+        visualDynamicsState = CursorVisualDynamicsAnimator.state(at: point, time: CGFloat(now))
         placeCursor(using: initialRenderState(at: point), clickProgress: 0)
     }
 
@@ -873,8 +949,11 @@ enum SoftwareCursorOverlay {
             return
         }
 
-        let effectiveTargetWindow = targetWindow.flatMap { targetWindow in
-            isWindowPresent(targetWindow.windowID) ? targetWindow : nil
+        let effectiveTargetWindow = targetWindow.flatMap { target -> CursorTargetWindow? in
+            guard let info = windowInfo(target.windowID),
+                  info[kCGWindowIsOnscreen as String] as? Bool == true,
+                  let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue else { return nil }
+            return CursorTargetWindow(windowID: target.windowID, layer: layer)
         }
 
         // OPEN_COMPUTER_USE_CURSOR_FLOAT=1: draw above every window, so the cursor is visible even when
@@ -926,8 +1005,12 @@ enum SoftwareCursorOverlay {
         var endShift = CGPoint.zero
         var nextRetarget: TimeInterval = 0
         let dragging = interactionIndicator == CursorInteractionIndicator(feedback: .drag)
+        let edgeTravel = screen(containing: end).map { screen in
+            screen.frame.contains(start) && (visualCursorNearDisplayEdge(start, in: screen.frame)
+                || visualCursorNearDisplayEdge(end, in: screen.frame))
+        } ?? false
         // The generated mouse drag travels directly between the two event points.
-        let path = dragging ? CursorMotionPath(start: start, end: end, curveScale: 0)
+        let path = dragging || edgeTravel ? CursorMotionPath(start: start, end: end, curveScale: 0)
             : bestMotionCandidate(from: start, to: end, relativeTo: targetWindow).path
         // The path point follows the recovered official progress spring, compressed into the first
         // part of the move; the rest of the time lets the drawn tip land on the target, so the
@@ -937,6 +1020,9 @@ enum SoftwareCursorOverlay {
         let springTargetDuration = OfficialCursorMotionModel.closeEnoughTime
         let generation = interactionGeneration
         let startTime = CACurrentMediaTime()
+        // Edge travel draws the tip directly. The lean left by the move or sway before it eases
+        // out over the first half instead of snapping upright on the first frame.
+        let edgeStartRotation = visualDynamicsState?.angle ?? 0
         var progress: CGFloat = 0
         var springState = CursorMotionSpringState()
         // Ordering is three window-server round trips; doing it every frame made the
@@ -977,10 +1063,27 @@ enum SoftwareCursorOverlay {
             // The path was planned to the original end; shift it by how far the window moved,
             // more as the glide progresses, so it lands on the window's current position.
             let pathPoint = CGPoint(x: sample.point.x + endShift.x * progress, y: sample.point.y + endShift.y * progress)
-            let renderState = advanceVisualDynamics(
-                toward: pathDone ? end : pathPoint,
-                at: CACurrentMediaTime()
-            )
+            let target = pathDone ? end : pathPoint
+            let renderState: CursorVisualRenderState
+            if edgeTravel {
+                // A spring rebounding off a clipped display edge makes the tip appear to reverse.
+                // The path already has eased progress, so draw its tip directly on edge travel.
+                let tip = clampTipPosition(target)
+                let upright = (normalizedElapsed * 2).clamped(to: 0...1)
+                let rotation = edgeStartRotation * (1 - upright) * (1 - upright)
+                visualDynamicsState = CursorVisualDynamicsState(time: CGFloat(now), tipPosition: tip, angle: rotation)
+                let resting = initialRenderState(at: tip)
+                renderState = CursorVisualRenderState(
+                    tipPosition: tip,
+                    rotation: rotation,
+                    cursorBodyOffset: resting.cursorBodyOffset,
+                    fogOffset: resting.fogOffset,
+                    fogOpacity: resting.fogOpacity,
+                    fogScale: resting.fogScale
+                )
+            } else {
+                renderState = advanceVisualDynamics(toward: target, at: now)
+            }
             placeCursor(using: renderState, clickProgress: 0)
             if fadeIn {
                 panel?.alphaValue = min(1, normalizedElapsed * 2.5)
@@ -1128,14 +1231,12 @@ enum SoftwareCursorOverlay {
         return CGWindowID(windowNumber)
     }
 
-    private static func isWindowPresent(_ windowID: CGWindowID) -> Bool {
+    private static func windowInfo(_ windowID: CGWindowID) -> [String: Any]? {
         guard windowID != 0,
-              let windowInfo = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]]
-        else {
-            return false
+              let windows = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]] else {
+            return nil
         }
-
-        return !windowInfo.isEmpty
+        return windows.first { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }
     }
 
     private static func refreshActiveOrderingIfNeeded() {
@@ -1156,13 +1257,7 @@ enum SoftwareCursorOverlay {
     }
 
     private static func isWindowOnScreen(_ windowID: CGWindowID) -> Bool {
-        guard windowID != 0,
-              let windowInfo = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]],
-              let info = windowInfo.first
-        else {
-            return false
-        }
-        return info[kCGWindowIsOnscreen as String] as? Bool ?? false
+        windowInfo(windowID)?[kCGWindowIsOnscreen as String] as? Bool == true
     }
 
     /// Starts the window check that runs between moves (no idle sway or click ring is running).
@@ -1199,28 +1294,53 @@ enum SoftwareCursorOverlay {
         )
         trace("pulse at=(\(Int(point.x)),\(Int(point.y))) count=\(clickCount) ms=\(Int(duration * 1000))")
 
-        // Keep visual feedback bounded even if a caller requests a long multi-click.
-        let visibleClicks = min(clickCount, 2)
-        for pulse in 0..<visibleClicks where duration > 0 {
+        guard duration > 0 else { return }
+
+        // Show a stationary highlight in Reduce Motion. It still clears through the normal
+        // interaction lifecycle, and it does not run the per-frame pulse loop.
+        if reducesMotion {
+            placeCursor(
+                using: initialRenderState(at: restingTipPosition ?? point),
+                clickProgress: 0,
+                ripple: CursorClickRipple(
+                    progress: 0.5,
+                    strength: pulseBias,
+                    reducesMotion: true,
+                    isSecondary: mouseButton == .right
+                )
+            )
+            pause(for: duration)
+            guard generation == interactionGeneration else { return }
+            placeCursor(using: initialRenderState(at: restingTipPosition ?? point), clickProgress: 0)
+            return
+        }
+
+        // Keep multi-click feedback readable without letting it hold up later actions.
+        let requestedBeats = min(max(clickCount, 1), 3)
+        let visibleClicks = duration / sqrt(Double(requestedBeats)) < 0.04 ? 1 : requestedBeats
+        let beatDuration = duration / sqrt(Double(visibleClicks))
+        for pulse in 0..<visibleClicks {
             let startTime = CACurrentMediaTime()
 
             while true {
                 guard generation == interactionGeneration else { return }
                 _ = reanchorIfWindowMoved()
                 let elapsed = CACurrentMediaTime() - startTime
-                let rawProgress = min(max(elapsed / duration, 0), 1)
-                let clickProgress = sin(rawProgress * .pi) * pulseBias
+                let rawProgress = min(max(elapsed / beatDuration, 0), 1)
+                let attack = min(rawProgress / 0.24, 1)
+                let release = max((1 - rawProgress) / 0.76, 0)
+                let clickProgress = min(attack, release) * pulseBias
 
                 placeCursor(
                     using: advanceVisualDynamics(
                         toward: restingTipPosition ?? point,
                         at: CACurrentMediaTime()
                     ),
-                    clickProgress: reducesMotion ? 0 : clickProgress,
+                    clickProgress: clickProgress,
                     ripple: CursorClickRipple(
                         progress: rawProgress,
                         strength: pulseBias,
-                        reducesMotion: reducesMotion,
+                        reducesMotion: false,
                         isSecondary: mouseButton == .right
                     )
                 )
@@ -1233,7 +1353,7 @@ enum SoftwareCursorOverlay {
             }
 
             if pulse < visibleClicks - 1 {
-                pause(for: duration * 0.3)
+                pause(for: beatDuration * 0.15)
             }
         }
 
@@ -1306,6 +1426,9 @@ enum SoftwareCursorOverlay {
     private static func stopIdleAnimation() {
         idleTimer?.invalidate()
         idleTimer = nil
+        // Whatever stops the sway (a move, a pulse, the sway itself, a hide) takes the pose over.
+        poseTimer?.invalidate()
+        poseTimer = nil
         watchTimer?.invalidate()
         watchTimer = nil
     }

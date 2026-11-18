@@ -41,7 +41,8 @@ public enum AXStateDiff {
     /// sees which number is gone. Without it, indexes are ignored (they may be renumbered on every read).
     public static func diff(previous: String, current: String, maxChangedFraction: Double = 0.5,
                             matchIndexes: Bool = false) -> String? {
-        guard !previous.isEmpty else { return nil }
+        guard !previous.isEmpty, maxChangedFraction.isFinite else { return nil }
+        if previous == current { return noChangesMessage }
 
         let oldLines = previous.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let newLines = current.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -49,6 +50,7 @@ public enum AXStateDiff {
 
         // Intern each line's matching key so the diff compares Ints, not strings.
         var keyIDs: [String: Int] = [:]
+        keyIDs.reserveCapacity(total)
         func key(_ line: String) -> Int {
             let text = matchIndexes ? indentationStripped(line) : strippedContent(of: line)
             if let existing = keyIDs[text] { return existing }
@@ -58,10 +60,12 @@ public enum AXStateDiff {
         }
         let oldKeys = oldLines.map(key)
         let newKeys = newLines.map(key)
+        if oldKeys == newKeys { return noChangesMessage }
 
         let fraction = min(max(maxChangedFraction, 0), 1)
         let limit = Int((Double(total) * fraction).rounded(.down))
-        guard let steps = editScript(old: oldKeys, new: newKeys, maxEdits: limit) else { return nil }
+        guard let steps = replacementScript(old: oldKeys, new: newKeys, maxEdits: limit)
+            ?? editScript(old: oldKeys, new: newKeys, maxEdits: limit) else { return nil }
 
         var changed = 0
         var unchanged = 0
@@ -134,6 +138,29 @@ public enum AXStateDiff {
     private static func isEqual(_ step: Step) -> Bool {
         if case .equal = step { return true }
         return false
+    }
+
+    /// A pure repaint can align by position. If an edited key appears on both sides, it might
+    /// have moved or been duplicated. Leave those cases to the full edit search.
+    private static func replacementScript(old: [Int], new: [Int], maxEdits: Int) -> [Step]? {
+        guard old.count == new.count else { return nil }
+        let changed = old.indices.filter { old[$0] != new[$0] }
+        guard changed.count <= maxEdits / 2 else { return nil }
+        let oldKeys = Set(old)
+        let newKeys = Set(new)
+        guard changed.allSatisfy({ !oldKeys.contains(new[$0]) && !newKeys.contains(old[$0]) }) else { return nil }
+
+        var steps: [Step] = []
+        steps.reserveCapacity(old.count + changed.count)
+        for index in old.indices {
+            if old[index] == new[index] {
+                steps.append(.equal)
+            } else {
+                steps.append(.delete(index))
+                steps.append(.insert(index))
+            }
+        }
+        return steps
     }
 
     /// Myers' O(ND) shortest edit script over interned line keys, with common prefix and suffix

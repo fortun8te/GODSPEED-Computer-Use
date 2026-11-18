@@ -54,9 +54,6 @@ enum FinderRename {
 /// a Finder window that is not key and do nothing. ⌘C / ⌘X remember the selected items; ⌘V (or ⌥⌘V) copies or
 /// moves them into the folder the front Finder window shows.
 enum FinderClipboard {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var held: (paths: [String], move: Bool)?
-
     static func handle(key normalized: String) -> String? {
         switch normalized {
         case "cmd+c", "cmd+x":
@@ -73,7 +70,7 @@ enum FinderClipboard {
             let paths = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
             guard !paths.isEmpty else { return "Nothing is selected in Finder; click the item first." }
             let move = normalized == "cmd+x"
-            lock.withLock { held = (paths, move) }
+            PrivateClipboard.current.write(.files(paths: paths, move: move))
             let names = paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
             return (move ? "Cut " : "Copied ") + names + ". Open the destination folder, then press cmd+v to " + (move ? "move" : "copy") + " it there."
         case "cmd+o", "cmd+down":
@@ -97,9 +94,9 @@ enum FinderClipboard {
             return AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue
                 .map { "Made a new folder \"\($0)\" (selected). Now type_text its name; no Return needed." }
         case "cmd+v", "alt+cmd+v":
-            guard let pending = lock.withLock({ held }) else { return nil }
-            let move = pending.move || normalized != "cmd+v"
-            let list = pending.paths.map { "(POSIX file " + FinderRename.quoted($0) + " as alias)" }.joined(separator: ", ")
+            guard let pending = PrivateClipboard.current.payload, case .files(let paths, let cut) = pending else { return nil }
+            let move = cut || normalized != "cmd+v"
+            let list = paths.map { "(POSIX file " + FinderRename.quoted($0) + " as alias)" }.joined(separator: ", ")
             let verb = move ? "move" : "duplicate"
             // Into the one selected folder when a folder is selected (what the model means by "click the
             // destination, then paste"), else into the folder the window shows.
@@ -116,8 +113,8 @@ enum FinderClipboard {
             end tell
             """
             guard let dest = AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue else { return nil }
-            if move { lock.withLock { held = nil } }
-            let names = pending.paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+            if move { PrivateClipboard.current.clear(matching: pending) }
+            let names = paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
             return (move ? "Moved " : "Copied ") + names + " into " + dest + "."
         default:
             return nil

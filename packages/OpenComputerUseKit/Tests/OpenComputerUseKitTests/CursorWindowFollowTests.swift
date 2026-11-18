@@ -4,6 +4,72 @@ import XCTest
 
 final class CursorWindowFollowTests: XCTestCase {
     @MainActor
+    func testTypingFeedbackKeepsTheCursorPoseThenSettlesAndStopsOnReset() throws {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            throw XCTSkip("This test measures the animated path with Reduce Motion off")
+        }
+        try withOverlay { file, frame in
+            let target = point(frame)
+            func observation() throws -> VisualCursorObservationSnapshot {
+                try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
+            }
+            SoftwareCursorOverlay.settle(at: target, in: nil)
+            let deadline = Date().addingTimeInterval(1.5)
+            while abs(try observation().rotation ?? 0) < 0.03, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            }
+            let before = try XCTUnwrap(observation().rotation)
+            XCTAssertGreaterThan(abs(before), 0.025)
+
+            SoftwareCursorOverlay.beginFeedback(.typing)
+            let first = try observation()
+            XCTAssertEqual(first.phase, "typing")
+            XCTAssertGreaterThan(abs(try XCTUnwrap(first.rotation)), 0.01)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.47))
+            let settled = try observation()
+            XCTAssertEqual(try XCTUnwrap(settled.rotation), 0, accuracy: 0.01)
+            XCTAssertEqual(try XCTUnwrap(settled.tipPosition).x, target.x, accuracy: 0.5)
+            XCTAssertEqual(try XCTUnwrap(settled.tipPosition).y, target.y, accuracy: 0.5)
+
+            SoftwareCursorOverlay.reset()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+            XCTAssertEqual(try observation().phase, "hidden")
+        }
+    }
+
+    @MainActor
+    func testCursorGlidesToBottomLeftWithoutLeavingTheDisplay() throws {
+        try withOverlay { file, _ in
+            let frame = try XCTUnwrap(NSScreen.screens.first).frame
+            let target = CGPoint(x: frame.minX + 2, y: frame.minY + 2)
+            let start = CGPoint(x: target.x + 280, y: target.y + 22)
+            SoftwareCursorOverlay.settle(at: start, in: nil)
+            var samples: [CGPoint] = []
+            let timer = Timer(timeInterval: 0.012, repeats: true) { _ in
+                MainActor.assumeIsolated {
+                    if let data = try? Data(contentsOf: file),
+                       let sample = try? JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: data),
+                       let point = sample.tipPosition {
+                        samples.append(CGPoint(x: point.x, y: point.y))
+                    }
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            defer { timer.invalidate() }
+            SoftwareCursorOverlay.moveCursor(to: target, in: nil)
+            let final = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
+            let actual = try XCTUnwrap(final.tipPosition)
+            XCTAssertEqual(actual.x, target.x, accuracy: 0.5)
+            XCTAssertEqual(actual.y, target.y, accuracy: 0.5)
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                XCTAssertGreaterThan(samples.count, 5)
+                XCTAssertTrue(samples.allSatisfy { frame.contains($0) && $0.y >= target.y - 0.5 && $0.y <= start.y + 0.5 })
+                XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy { $1.x <= $0.x + 0.5 })
+            }
+        }
+    }
+
+    @MainActor
     func testReschedulingHidePreservesSwayStopAndLongHide() throws {
         // A hide delay longer than the sway timeout (the default is shorter): the sway
         // stops at six seconds and the hide still fires afterwards.

@@ -869,7 +869,11 @@ final class SmartLog {
         let after = trailing.map { ToolResultContentItem.text($0) }
         return ToolCallResult(
             content: before + result.content + after, isError: result.isError,
-            batchReceipt: result.batchReceipt, failureCode: result.failureCode
+            batchReceipt: result.batchReceipt, failureCode: result.failureCode,
+            browserObservationURL: result.browserObservationURL,
+            browserContinuationTabID: result.browserContinuationTabID,
+            browserPreviewPages: result.browserPreviewPages,
+            browserFullObservationText: result.browserFullObservationText
         )
     }
 }

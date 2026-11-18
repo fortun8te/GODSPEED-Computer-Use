@@ -124,6 +124,33 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(parse.framedControls, 1)
     }
 
+    func testCompactBrowserSnapshotCarriesObservedControlStates() {
+        func property(_ name: String, _ value: Any) -> [String: Any] {
+            ["name": name, "value": ["value": value]]
+        }
+        var checkbox = ax("checkbox", "Include files", backend: 12)
+        checkbox["properties"] = [property("focused", true), property("checked", "mixed"), property("disabled", false)]
+        var button = ax("button", "More", backend: 13)
+        button["properties"] = [property("expanded", false), property("disabled", true)]
+        let lines = BrowserPage.parseAX([checkbox, button], textBudget: 0).controls.map(\.line)
+        XCTAssertEqual(lines, ["1 checkbox Include files [focused, mixed]", "2 button More [collapsed, disabled]"])
+        var field = ax("textbox", "Name", backend: 14, value: "Ada")
+        field["properties"] = [property("focused", true)]
+        let line = BrowserPage.parseAX([field], textBudget: 0).controls.first?.line ?? ""
+        XCTAssertTrue(DoneCheck.fieldEquals(line, label: "Name", value: "Ada"))
+    }
+
+    func testClippedBrowserFieldCannotVerifyItsPrefix() throws {
+        let prefix = String(repeating: "a", count: 80)
+        func line(_ value: String) throws -> String {
+            try XCTUnwrap(BrowserPage.parseAX([
+                ax("textbox", "Name", backend: 14, value: value),
+            ]).controls.first).line
+        }
+        XCTAssertTrue(DoneCheck.fieldEquals(try line(prefix), label: "Name", value: prefix))
+        XCTAssertFalse(DoneCheck.fieldEquals(try line(prefix + "b"), label: "Name", value: prefix))
+    }
+
     func testRenderPutsControlsBeforeTextAndAddsAddress() {
         let text = BrowserPage.renderRead(
             BrowserPage.parseAX(page()), href: "https://demo.test/", title: "Demo", readyState: "complete"
@@ -374,6 +401,10 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertTrue(BrowserRules.sameAddress("https://x.com/", "https://X.com"))
         XCTAssertTrue(BrowserRules.sameAddress("https://x.com/a", "https://x.com"))
         XCTAssertFalse(BrowserRules.sameAddress("https://y.com", "https://x.com"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com.example.test", "https://x.com"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com/cartoon", "https://x.com/cart"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com/Cart", "https://x.com/cart"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com?q=Wrong", "https://x.com?q=Right"))
     }
 
     func testURLNormalisationKeepsPathsAndTrimsSpaces() {
@@ -495,6 +526,40 @@ final class BrowserPageTests: XCTestCase {
         }
         XCTAssertEqual(BrowserBridge.browserApp, originalApp)
         XCTAssertNil(BrowserRequestContext.current)
+    }
+
+    func testCloseVerifiesAnUncertainReplyWithoutResending() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        let script = #"""
+        #!/bin/sh
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"result\":{\"tab\":{\"id\":12}}}"}]}}'
+        IFS= read -r request
+        case "$request" in *Page.close*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":"close acknowledgement lost"}]}}'
+        IFS= read -r request
+        case "$request" in *'"name":"tabs"'*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"result\":[{\"id\":12}]}"}]}}'
+        IFS= read -r request
+        case "$request" in *'"name":"tabs"'*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"result\":[]}"}]}}'
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "close-ack-test", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        let opened = try bridge.callTool("open_tab", arguments: [:], timeout: 3)
+        XCTAssertFalse(opened.isError)
+        bridge.currentTab = 12
+        try bridge.closeOpenedTab(12)
+        XCTAssertNil(bridge.currentTab)
     }
 
     func testPeekWorkersApplyRequestValidationBeforeLaunchingTheirHelpers() throws {
@@ -656,5 +721,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertTrue(BrowserPage.settleJS(cap: 800).contains("quiet:"))
         XCTAssertFalse(BrowserPage.settleJS(cap: 800).contains("Promise"))
         XCTAssertTrue(BrowserPage.pageStateJS.contains("beforeunload"))
+    }
+}
+
+extension BrowserPageTests {
+    func testUploadVerificationRejectsWrongFilesWithSameCount() {
+        let expected = [BrowserPage.UploadFile(name: "fixture.txt", size: 4)]
+        XCTAssertTrue(BrowserPage.matchesUploadSelection([["fixture.txt", 4]], expected: expected))
+        XCTAssertFalse(BrowserPage.matchesUploadSelection([["wrong.txt", 4]], expected: expected))
+        XCTAssertFalse(BrowserPage.matchesUploadSelection([["fixture.txt", 5]], expected: expected))
+        XCTAssertFalse(BrowserPage.matchesUploadSelection(nil, expected: expected))
     }
 }
