@@ -349,6 +349,19 @@ public enum ToolDefinitions {
             )
         ),
         ToolDefinition(
+            name: "hover",
+            description: "Move the agent cursor over an observed Mac control to reveal a tooltip or hover state. Deliver to its window without moving the user's pointer. Check the returned state. For Chrome use browser hover.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "label": labelProperty(),
+                    "element_index": stringProperty(description: "Element number"),
+                ],
+                required: ["app"]
+            )
+        ),
+        ToolDefinition(
             name: "drag",
             description: "Use to drag between two pixel points only when no other tool does it (not for scrolling or selecting text). Both points must be inside the app's window. Delivery does not verify the UI result; window moves or Finder drag-and-drop are not guaranteed. Global pointer use is off unless the user has enabled it.",
             annotations: defaultAnnotations(),

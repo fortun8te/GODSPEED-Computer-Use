@@ -60,6 +60,20 @@ final class BackgroundDragTests: XCTestCase {
         }
     }
 
+    func testHoverPostsOneMoveWithoutFocusOrButtonEvents() throws {
+        let probe = Probe()
+        try BackgroundDragDispatcher.hover(target: target, io: probe.io, validateSession: {})
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved])
+        XCTAssertEqual(probe.events.first?.getIntegerValueField(CGEventField(rawValue: 51)!), 42)
+        XCTAssertEqual(probe.locations, [CGPoint(x: 20, y: 40)])
+        XCTAssertFalse(probe.lifecycle.contains("activate"))
+
+        let stale = Probe()
+        stale.failValidation = 2
+        XCTAssertThrowsError(try BackgroundDragDispatcher.hover(target: target, io: stale.io, validateSession: {}))
+        XCTAssertTrue(stale.events.isEmpty)
+    }
+
     func testOneWindowAddressedGestureWithoutPrimerOrDuplicatePosts() throws {
         let probe = Probe()
         try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {})

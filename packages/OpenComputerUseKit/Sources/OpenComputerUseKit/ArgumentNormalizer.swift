@@ -10,12 +10,12 @@ enum ArgumentNormalizer {
 
     /// Tools that act on one app window; they take `app`.
     static let appTools: Set<String> = [
-        "get_app_state", "query", "click", "perform_secondary_action", "scroll", "drag",
+        "get_app_state", "query", "click", "hover", "perform_secondary_action", "scroll", "drag",
         "type_text", "press_key", "press_menu", "set_value", "select_text",
     ]
 
     /// Tools that act on one accessibility element, by `element_index` or `label`.
-    static let elementTools: Set<String> = ["click", "perform_secondary_action", "scroll", "set_value", "select_text"]
+    static let elementTools: Set<String> = ["click", "hover", "perform_secondary_action", "scroll", "set_value", "select_text"]
 
     /// Spellings for `app` on every app tool and on batch.
     private static let appAliases = [
@@ -146,6 +146,7 @@ enum ArgumentNormalizer {
             Need(keys: ["direction"], text: "\"direction\" (up, down, left or right)"),
             elementNeed,
         ],
+        "hover": [appNeed, elementNeed],
         "select_text": [appNeed, Need(keys: ["text"], text: "\"text\", exactly as shown"), elementNeed],
         "perform_secondary_action": [
             appNeed,

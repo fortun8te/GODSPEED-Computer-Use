@@ -140,7 +140,7 @@ enum BatchTool {
             // (select, check, hover, go, ...) always mean the browser; shared ones (click, type, read) only with web.
             let browserOnly: Set<String> = ["select", "check", "uncheck", "hover", "go", "goto", "navigate", "back",
                                             "forward", "reload", "wait_for", "tabs", "use_tab", "upload", "peek"]
-            let browserShared: Set<String> = ["click", "type", "key", "read", "scroll", "wait", "open", "screenshot"]
+            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "scroll", "wait", "open", "screenshot"]
             let isWeb = (arguments["web"] as? Bool) == true || (arguments["web"] as? String)?.lowercased() == "true"
             // With "web": true, the native names a model reaches for mean the browser action of the same job. Without
             // this, {"tool": "type_text", "web": true} would type into the app named, which may be the user's own Chrome.

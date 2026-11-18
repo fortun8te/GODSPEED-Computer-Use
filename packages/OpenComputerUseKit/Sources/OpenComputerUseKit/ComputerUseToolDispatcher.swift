@@ -392,6 +392,11 @@ public final class ComputerUseToolDispatcher {
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log),
                 action: requireString("action", in: arguments)
             )
+        case "hover":
+            return try service.hover(
+                app: requireString("app", in: arguments),
+                elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
+            )
         case "scroll":
             return try service.scroll(
                 app: requireString("app", in: arguments),

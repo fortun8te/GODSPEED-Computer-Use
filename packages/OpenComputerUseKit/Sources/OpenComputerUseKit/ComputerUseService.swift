@@ -1084,6 +1084,27 @@ public final class ComputerUseService {
         return try actionResult(for: query)
     }
 
+    public func hover(app query: String, elementIndex: String) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        guard snapshot.mode != .fixture, let windowID = snapshot.targetWindowID,
+              let bounds = snapshot.windowBounds,
+              let point = try globalPoint(for: record, snapshot: snapshot) else {
+            throw ComputerUseError.stateUnavailable("Hover requires an element with a frame inside the observed Mac window.")
+        }
+        let location = inputEventPoint(fromScreenStatePoint: point)
+        try BackgroundDragDispatcher.hover(target: BackgroundDragTarget(
+            start: location, end: location, windowBounds: bounds, windowID: windowID, pid: snapshot.app.pid
+        ))
+        let visualTarget = visualCursorTarget(for: record, snapshot: snapshot)
+        moveVisualCursor(to: visualTarget)
+        settleVisualCursor(at: visualTarget)
+        pauseBeforeReadBack(0.1, windowID: windowID)
+        let state = try actionResult(for: query)
+        return ToolCallResult(content: [.text("Hover event delivered. Check the app state for the expected effect.")] + state.content,
+                              isError: state.isError)
+    }
+
     public func scroll(app query: String, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
         let normalized = direction.lowercased()
         guard ["up", "down", "left", "right"].contains(normalized) else {

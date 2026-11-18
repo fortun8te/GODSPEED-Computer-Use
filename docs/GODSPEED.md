@@ -34,7 +34,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 | `batch` | Up to 20 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
 | `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
-| `click`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
+| `click`, `hover`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
 | `drag` | Two points on an app screenshot. Both must be in the observed window. Optional `modifiers` such as `["shift"]`. |
 | `press_menu` | Chooses a menu item in one call, e.g. `path: "File > Save"`, through accessibility. |
 | `query` | Finds elements by text or role. |
@@ -173,7 +173,7 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 ## Known limits
 
 - macOS only. The app is built for the native arch. `obu` is built for arm64.
-- The Mac app agent processes one tool request at a time across clients. A browser `peek` loads up to three pages in parallel within one request.
+- Native app input and browser writes are serialized. Eligible browser reads can overlap across clients. A browser `peek` loads up to three pages in parallel within one request.
 - Background delivery depends on the app. Dialogs, sheets and some key chords need focus borrowing.
 - A batch is at most 20 steps. `peek` takes at most 6 URLs with a shared 40-second browser budget. It reports pages it could not load or read.
 - The referee and vision are hints and fallbacks, off by default. Vision has been checked on one synthetic image, not on real apps.
@@ -183,3 +183,5 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 - Apps with no usable accessibility tree can be clicked only by vision. That needs `find_on_screen` on and the helper service running.
 
 See [training fixtures](training-fixtures.md) for reviewed vision annotations and verified decision labels.
+
+See the [macOS capability audit](macos-capabilities.md) for the boundary between Godspeed tools, app workflows, and other macOS interfaces.

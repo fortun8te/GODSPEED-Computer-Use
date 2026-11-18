@@ -105,6 +105,36 @@ enum BackgroundDragDispatcher {
     private static let windowNumberField = CGEventField(rawValue: 51)!
     private static let eventDelay: TimeInterval = 0.03
 
+    /// Deliver a move addressed to one observed window, without raising it or moving the user's pointer.
+    static func hover(
+        target: BackgroundDragTarget,
+        io: BackgroundDragIO = .system(),
+        validateSession: () throws -> Void = { try requireUsableComputerUseSession() }
+    ) throws {
+        try validateSession()
+        try target.validateGeometry()
+        guard io.windowLocationCapability.isAvailable else {
+            throw ComputerUseError.stateUnavailable("Hover cannot address this window on this Mac.")
+        }
+        dispatchLock.lock()
+        defer { dispatchLock.unlock() }
+        try io.validateWindow(target)
+
+        guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                  mouseCursorPosition: target.start, mouseButton: .left) else {
+            throw ComputerUseError.stateUnavailable("Could not prepare a window-targeted hover.")
+        }
+        event.flags = []
+        event.setIntegerValueField(.mouseEventClickState, value: 0)
+        event.setIntegerValueField(windowNumberField, value: Int64(target.windowID))
+        let local = CGPoint(x: target.start.x - target.windowBounds.minX, y: target.start.y - target.windowBounds.minY)
+        try io.setWindowLocation(event, local)
+        try validateSession()
+        try io.validateWindow(target)
+        event.timestamp = DispatchTime.now().uptimeNanoseconds
+        io.post(event, target.pid)
+    }
+
     static func drag(
         target: BackgroundDragTarget,
         flags: CGEventFlags = [],
