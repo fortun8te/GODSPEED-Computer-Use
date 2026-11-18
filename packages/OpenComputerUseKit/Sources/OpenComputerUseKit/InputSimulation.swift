@@ -167,18 +167,19 @@ enum InputSimulation {
         Thread.sleep(forTimeInterval: 0.03)
     }
 
-    static func dragTargeted(from start: CGPoint, to end: CGPoint, windowBounds: CGRect, windowID: CGWindowID, pid: pid_t) throws {
+    static func dragTargeted(from start: CGPoint, to end: CGPoint, windowBounds: CGRect, windowID: CGWindowID, pid: pid_t, flags: CGEventFlags = []) throws {
         try BackgroundDragDispatcher.drag(target: BackgroundDragTarget(
             start: start, end: end, windowBounds: windowBounds, windowID: windowID, pid: pid
-        ))
+        ), flags: flags)
     }
 
-    static func dragGlobally(from start: CGPoint, to end: CGPoint) throws {
+    static func dragGlobally(from start: CGPoint, to end: CGPoint, flags: CGEventFlags = []) throws {
         let gesture = dragGestureEventNumber()
         let release = try mouseRelease(source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
-        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1)
+        release.flags = flags
+        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1, flags: flags)
         try withPressedMouseButton(press: {
-            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
+            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, flags: flags)
         }, release: { postPreparedRelease(release) }) {
             Thread.sleep(forTimeInterval: 0.05)
             var previous = start
@@ -187,7 +188,7 @@ enum InputSimulation {
                 let progress = CGFloat(step) / CGFloat(steps)
                 let point = CGPoint(x: start.x + ((end.x - start.x) * progress), y: start.y + ((end.y - start.y) * progress))
                 let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
-                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture)
+                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture, flags: flags)
                 previous = point
                 release.location = point
             }
@@ -319,7 +320,7 @@ enum InputSimulation {
         }
     }
 
-    private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil) throws {
+    private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, flags: CGEventFlags? = nil) throws {
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
             throw ComputerUseError.message("Failed to create mouse event \(type.rawValue).")
@@ -327,6 +328,7 @@ enum InputSimulation {
 
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         applyDragMotionFields(to: event, delta: delta, eventNumber: eventNumber)
+        if let flags { event.flags = flags }
         // A press or move through the global stream lands wherever the user is working: only when they are
         // hands-off. A release always goes out, so no button stays held.
         if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown || type == .mouseMoved {
@@ -340,7 +342,7 @@ enum InputSimulation {
     /// per-step movement delta: macOS reads kCGMouseEventDeltaX/Y (both the integer
     /// and double fields), not the absolute position, to decide the pointer moved.
     /// Applied only to drag events (delta != nil); clicks are unchanged.
-    private static func applyDragMotionFields(to event: CGEvent, delta: CGSize?, eventNumber: Int64? = nil) {
+    static func applyDragMotionFields(to event: CGEvent, delta: CGSize?, eventNumber: Int64? = nil) {
         if eventNumber != nil || delta != nil {
             event.flags = []
         }
@@ -362,7 +364,7 @@ enum InputSimulation {
 
     /// A gesture identity shared by the down/dragged/up sequence, seeded above the
     /// system's last event number so recent macOS treats the sequence as one drag.
-    private static func dragGestureEventNumber() -> Int64? {
+    static func dragGestureEventNumber() -> Int64? {
         guard needsDragEventNumber(majorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion) else { return nil }
         let hid = CGEventSourceStateID.hidSystemState
         let base = Int64(CGEventSource.counterForEventType(hid, eventType: .leftMouseDown))

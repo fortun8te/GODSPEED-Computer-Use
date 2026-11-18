@@ -33,9 +33,22 @@ public enum ToolDefinitions {
         configured(virtualDisplayEnabled: VirtualDisplayConfig.current.enabled)
     }
 
-    static func configured(virtualDisplayEnabled: Bool) -> [ToolDefinition] {
+    public static func isKnown(_ name: String) -> Bool {
+        definitions.contains { $0.name == name }
+    }
+
+    static func available(environment: [String: String]) -> [ToolDefinition] {
+        configured(
+            virtualDisplayEnabled: VirtualDisplayConfig.load(environment: environment).enabled,
+            browserAvailable: BrowserBridge.executablePath(environment: GodspeedSettings.merged(environment)) != nil
+        )
+    }
+
+    static func configured(
+        virtualDisplayEnabled: Bool, browserAvailable: Bool = BrowserBridge.isAvailable
+    ) -> [ToolDefinition] {
         // `browser` is listed only when Open Browser Use is installed.
-        let definitions = definitions.filter { $0.name != "browser" || BrowserBridge.isAvailable }
+        let definitions = definitions.filter { $0.name != "browser" || browserAvailable }
         guard !virtualDisplayEnabled else { return definitions }
         return definitions.map { tool in
             guard tool.name == "get_app_state" else { return tool }
@@ -100,18 +113,20 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "browser",
-            description: "Use for web pages, in your own background Chrome tab; the user's tab is never touched. Not for native Mac apps (use batch or app tools), and never app tools in Google Chrome. Actions: open, go, read (numbered links, buttons, fields, headings; find: \"words\" lists only matching lines, full: true lists more), screenshot (the visible page as an image, for maps, canvases and editors), click, type, key, select, check, uncheck, hover, scroll, back, forward, reload, wait_for, peek (up to 6 URLs), tabs, use_tab, wait, info, upload. A whole form is ONE call: batch {\"steps\": [{\"tool\": \"fill\", \"web\": true, \"fields\": {\"Name\": \"Ada\", \"Plan\": \"Team\"}, \"submit\": \"Send\"}]} (text boxes, dropdowns and checkboxes). Replies already show what changed; read again only when unsure.",
+            description: "Use for web pages, in your own background Chrome tab; the user's tab is never touched. Not for native Mac apps (use batch or app tools), and never app tools in Google Chrome. Actions: open, go, read (numbered links, buttons, fields, headings; find: \"words\" lists only matching lines, full: true lists more), screenshot (visible page), click, drag (between visible controls in one tab), type, key, select, check, uncheck, hover, scroll, back, forward, reload, wait_for, peek (up to 6 URLs), tabs, use_tab, wait, info, upload. A whole form is ONE call: batch {\"steps\": [{\"tool\": \"fill\", \"web\": true, \"fields\": {\"Name\": \"Ada\", \"Plan\": \"Team\"}, \"submit\": \"Send\"}]} (text boxes, dropdowns and checkboxes). Replies already show what changed; read again only when unsure.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "action": stringProperty(
                         description: "What to do",
-                        enumValues: ["open", "go", "read", "screenshot", "click", "type", "key", "hover", "select", "check", "uncheck", "scroll", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "wait", "info", "upload", "peek"]
+                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "key", "hover", "select", "check", "uncheck", "scroll", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "wait", "info", "upload", "peek"]
                     ),
                     "label": stringProperty(description: "Visible text of the target, e.g. \"Sign in\""),
                     "find": stringProperty(description: "read: only controls and text that mention these words"),
                     "full": ["type": "boolean", "default": false, "description": "read: list about four times as much"],
                     "index": integerProperty(description: "Element number from read"),
+                    "to_label": stringProperty(description: "drag: destination label in the same tab"),
+                    "to_index": integerProperty(description: "drag: destination element number from read"),
                     "text": stringProperty(description: "type: text to enter. wait_for: text to wait for"),
                     "replace": ["type": "boolean", "default": false, "description": "type: true replaces the field's value"],
                     "option": stringProperty(description: "select: option text or value, e.g. Canada"),
@@ -342,6 +357,8 @@ public enum ToolDefinitions {
                     "from_y": numberProperty(description: "Start Y coordinate"),
                     "to_x": numberProperty(description: "End X coordinate"),
                     "to_y": numberProperty(description: "End Y coordinate"),
+                    "modifiers": ["type": "array", "items": ["type": "string"],
+                                  "description": "Optional shift, option, command, or control during the drag"],
                 ],
                 required: ["app", "from_x", "from_y", "to_x", "to_y"]
             )

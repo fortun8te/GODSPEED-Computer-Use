@@ -63,18 +63,72 @@ final class TrajectoryLogTests: XCTestCase {
 
     func testDefaultLogOmitsPrivateContentButRecordsFailedBatch() throws {
         let log = TrajectoryLog(environment: [:], directory: directory)
+        let receipt = TrajectoryLog.BatchReceipt(
+            totalSteps: 3,
+            steps: [.init(observation: .outcomeUnknown), .init(failureCode: .staleState, observation: .notSent)],
+            stop: .stepFailure,
+            observation: .failed,
+            doneCheck: .skipped
+        )
         log.recordToolCall(
             name: "batch",
             arguments: ["goal": "PRIVATE_INPUT"],
-            result: .text("1. type PRIVATE_INPUT: FAILED: PRIVATE_RESULT"),
+            result: ToolCallResult(
+                content: [.text("2. type PRIVATE_INPUT: FAILED: PRIVATE_RESULT")], isError: true, batchReceipt: receipt
+            ),
             startedAt: started()
         )
         let record = try XCTUnwrap(records(log).first)
         XCTAssertEqual(record["capture_mode"] as? String, "metadata")
         XCTAssertEqual(record["batch_failed"] as? Bool, true)
+        XCTAssertEqual(record["schema_version"] as? Int, 3)
+        XCTAssertEqual(record["failure_code"] as? String, "stale_state")
+        XCTAssertEqual(record["batch_stop_code"] as? String, "step_failure")
+        XCTAssertEqual(record["batch_not_run"] as? Int, 1)
+        XCTAssertEqual(record["batch_observation"] as? String, "failed")
+        XCTAssertEqual(record["batch_done_check"] as? String, "skipped")
+        let steps = try XCTUnwrap(record["batch_step_receipts"] as? [[String: Any]])
+        XCTAssertEqual(steps[0]["status"] as? String, "ok")
+        XCTAssertEqual(steps[0]["observation"] as? String, "outcome_unknown")
+        XCTAssertEqual(steps[1]["n"] as? Int, 2)
+        XCTAssertEqual(steps[1]["status"] as? String, "failed")
+        XCTAssertEqual(steps[1]["failure_code"] as? String, "stale_state")
         XCTAssertNil(record["steps"])
         XCTAssertNil(record["arguments"])
         XCTAssertNil(record["result_text"])
+        let contents = try String(contentsOf: directory.appendingPathComponent(log.sessionID + ".jsonl"), encoding: .utf8)
+        XCTAssertFalse(contents.contains("PRIVATE_"))
+    }
+
+    func testTypedFailureCodeOmitsTheOriginalErrorMessage() throws {
+        let log = TrajectoryLog(environment: [:], directory: directory)
+        log.recordFailedToolCall(
+            name: "get_app_state", arguments: ["app": "PRIVATE_APP"],
+            error: ComputerUseError.permissionDenied("PRIVATE_MESSAGE"), startedAt: started()
+        )
+        let record = try XCTUnwrap(records(log).first)
+        XCTAssertEqual(record["failure_code"] as? String, "permission_denied")
+        XCTAssertFalse(String(describing: record).contains("PRIVATE_"))
+    }
+
+    func testDispatcherProducesReceiptWhenBatchStopsBeforeSendingInput() throws {
+        let arguments: [String: Any] = [
+            "steps": [["tool": "wait", "text": "PRIVATE_LABEL"], ["tool": "click", "label": "PRIVATE_BUTTON"]],
+        ]
+        let result = try ComputerUseToolDispatcher().runBatch(arguments: arguments)
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(Set(result.asDictionary.keys), ["content", "isError"])
+
+        let log = TrajectoryLog(environment: [:], directory: directory)
+        log.recordToolCall(name: "batch", arguments: arguments, result: result, startedAt: started())
+        let record = try XCTUnwrap(records(log).first)
+        XCTAssertEqual(record["failure_code"] as? String, "invalid_arguments")
+        XCTAssertEqual(record["batch_not_run"] as? Int, 1)
+        XCTAssertEqual(record["batch_observation"] as? String, "unavailable")
+        let steps = try XCTUnwrap(record["batch_step_receipts"] as? [[String: Any]])
+        XCTAssertEqual(steps.count, 1)
+        XCTAssertEqual(steps.first?["observation"] as? String, "not_sent")
+        XCTAssertFalse(String(describing: record).contains("PRIVATE_"))
     }
 
     func testRecordHasTheAgreedFieldsAndSessionEndMarker() throws {

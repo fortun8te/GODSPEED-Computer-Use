@@ -281,7 +281,7 @@ if [[ "${configuration}" != "release" || "${app_variant_override}" == "dev" ]]; 
   bundle_identifier="com.michael.godspeed"
   app_variant="dev"
   app_bundle_name="${development_app_bundle_name}"
-  # GODSPEED has its own icon (the blue ribbed gradient).
+  # GODSPEED uses its red glass cursor icon.
   if [[ -f "${repo_root}/assets/app-icons/godspeed-1024.png" ]]; then
     icon_master_png="${repo_root}/assets/app-icons/godspeed-1024.png"
   fi

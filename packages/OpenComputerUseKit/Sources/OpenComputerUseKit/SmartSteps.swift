@@ -867,6 +867,9 @@ final class SmartLog {
         guard !leading.isEmpty || !trailing.isEmpty else { return result }
         let before = leading.map { ToolResultContentItem.text($0) }
         let after = trailing.map { ToolResultContentItem.text($0) }
-        return ToolCallResult(content: before + result.content + after, isError: result.isError)
+        return ToolCallResult(
+            content: before + result.content + after, isError: result.isError,
+            batchReceipt: result.batchReceipt, failureCode: result.failureCode
+        )
     }
 }

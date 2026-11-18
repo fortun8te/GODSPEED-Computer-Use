@@ -78,13 +78,15 @@ final class TrajectoryLog: @unchecked Sendable {
     func recordToolCall(name: String, arguments: [String: Any], result: ToolCallResult, startedAt: Date) {
         guard isEnabled else { return }
         let screenshotReturned = result.content.contains { $0.dictionary["type"] as? String == "image" }
-        let output = result.textContent
-        let redacted = capturesContent ? Self.redactSecureLines(output) : ""
+        let primary = result.primaryText ?? ""
+        let output = capturesContent ? result.textContent : ""
+        let redacted = Self.redactSecureLines(output)
         let (text, truncated) = Self.limit(redacted)
         // Unlabelled typing can target a secure field. Keep the full payload out of its trace.
         let safeArguments = capturesContent && Self.focusesSecureField(output)
             ? Self.redactTypedValues(arguments) : arguments
-        let receipts = name == BatchTool.name ? Self.parseReceipts(capturesContent ? redacted : output) : nil
+        let receipts = capturesContent && name == BatchTool.name
+            ? result.primaryText.flatMap { Self.parseReceipts(Self.redactSecureLines($0)) } : nil
         submitCall(
             name: name,
             arguments: safeArguments,
@@ -94,7 +96,10 @@ final class TrajectoryLog: @unchecked Sendable {
             screenshotReturned: screenshotReturned,
             startedAt: startedAt,
             receipts: receipts,
-            visionUsed: output.hasPrefix("No accessibility element is labelled ") && output.contains("found it on screen and clicked at")
+            batchReceipt: result.batchReceipt,
+            failureCode: result.isError
+                ? result.batchReceipt?.failureCode ?? result.failureCode ?? Self.failureCode(message: primary) : nil,
+            visionUsed: primary.hasPrefix("No accessibility element is labelled ") && primary.contains("found it on screen and clicked at")
         )
     }
 
@@ -113,7 +118,8 @@ final class TrajectoryLog: @unchecked Sendable {
             resultText: text,
             resultTruncated: truncated,
             screenshotReturned: false,
-            startedAt: startedAt
+            startedAt: startedAt,
+            failureCode: Self.failureCode(error: error, message: message)
         )
     }
 
@@ -148,12 +154,14 @@ final class TrajectoryLog: @unchecked Sendable {
         screenshotReturned: Bool,
         startedAt: Date,
         receipts: Receipts? = nil,
+        batchReceipt: BatchReceipt? = nil,
+        failureCode: FailureCode? = nil,
         visionUsed: Bool = false
     ) {
         let duration = (Date().timeIntervalSince(startedAt) * 1000 * 10).rounded() / 10
         var object: [String: Any] = [
             "event": "tool_call",
-            "schema_version": 2,
+            "schema_version": 3,
             "capture_mode": capturesContent ? "content" : "metadata",
             "session_id": sessionID,
             "run_id": runIDValue,
@@ -163,10 +171,18 @@ final class TrajectoryLog: @unchecked Sendable {
             "screenshot_returned": screenshotReturned,
             "duration_ms": duration,
         ]
-        if let receipts {
-            object["batch_steps"] = receipts.steps.count
-            object["batch_failed"] = receipts.steps.contains { ($0["result"] as? String)?.hasPrefix("FAILED:") == true }
-            object["decision_hint"] = receipts.check != nil
+        object["failure_code"] = failureCode?.rawValue
+        if let batchReceipt {
+            object["batch_steps"] = batchReceipt.steps.count
+            object["batch_failed"] = isError
+            object["decision_hint"] = batchReceipt.decisionHint
+            object["batch_step_receipts"] = batchReceipt.steps.enumerated().map { offset, step in
+                step.metadata(number: offset + 1)
+            }
+            object["batch_stop_code"] = batchReceipt.stop?.rawValue
+            object["batch_not_run"] = batchReceipt.totalSteps - batchReceipt.steps.count
+            object["batch_observation"] = batchReceipt.observation.rawValue
+            object["batch_done_check"] = batchReceipt.doneCheck.rawValue
         }
         if capturesContent {
             object["arguments"] = Self.sanitize(arguments)
@@ -350,6 +366,89 @@ final class TrajectoryLog: @unchecked Sendable {
     }
 
     // MARK: - Receipts
+
+    enum FailureCode: String {
+        case unsupportedTool = "unsupported_tool"
+        case invalidArguments = "invalid_arguments"
+        case appNotFound = "app_not_found"
+        case permissionDenied = "permission_denied"
+        case stateUnavailable = "state_unavailable"
+        case staleState = "stale_state"
+        case timeout
+        case cancelled
+        case recipeVerification = "recipe_verification"
+        case toolError = "tool_error"
+        case internalError = "internal_error"
+    }
+
+    static func failureCode(error: Error, message: String) -> FailureCode {
+        guard let error = error as? ComputerUseError else {
+            return error is CancellationError ? .cancelled : .internalError
+        }
+        switch error {
+        case .unsupportedTool: return .unsupportedTool
+        case .invalidArguments: return .invalidArguments
+        case .appNotFound: return .appNotFound
+        case .permissionDenied: return .permissionDenied
+        case .stateUnavailable: return .stateUnavailable
+        case .message: return failureCode(message: message)
+        }
+    }
+
+    static func failureCode(message: String) -> FailureCode {
+        let firstLine = (message.split(separator: "\n", maxSplits: 1).first ?? "").lowercased()
+        if firstLine.hasPrefix("invalidarguments(") || firstLine.hasPrefix("missing required argument:") { return .invalidArguments }
+        if firstLine.hasPrefix("appnotfound(") { return .appNotFound }
+        if firstLine.hasPrefix("unsupportedtool(") { return .unsupportedTool }
+        if firstLine.hasPrefix("stale:") { return .staleState }
+        if firstLine.hasPrefix("timed out") { return .timeout }
+        return .toolError
+    }
+
+    struct BatchReceipt {
+        enum Stop: String {
+            case stepFailure = "step_failure"
+            case timeBudget = "time_budget"
+            case windowChanged = "window_changed"
+            case recipeVerification = "recipe_verification"
+        }
+
+        enum Observation: String {
+            case returned
+            case failed
+            case unavailable
+        }
+
+        enum DoneCheck: String {
+            case notRequested = "not_requested"
+            case skipped
+            case verified
+            case unmet
+        }
+
+        struct Step {
+            var failureCode: FailureCode?
+            var observation: BatchEffects.Receipt?
+
+            func metadata(number: Int) -> [String: Any] {
+                var fields: [String: Any] = ["n": number, "status": failureCode == nil ? "ok" : "failed"]
+                fields["failure_code"] = failureCode?.rawValue
+                fields["observation"] = observation?.rawValue.replacingOccurrences(of: " ", with: "_")
+                return fields
+            }
+        }
+
+        let totalSteps: Int
+        var steps: [Step] = []
+        var stop: Stop?
+        var observation: Observation = .unavailable
+        var decisionHint = false
+        var doneCheck: DoneCheck = .notRequested
+
+        var failureCode: FailureCode? {
+            stop == .recipeVerification ? .recipeVerification : steps.last?.failureCode
+        }
+    }
 
     struct Receipts {
         /// Each step: `n`, `step`, `result`, and `effects` (the indented effect lines under it, if any).

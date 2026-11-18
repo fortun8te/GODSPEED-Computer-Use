@@ -46,7 +46,7 @@ public final class StdioMCPServer {
         }
     }
 
-    public func handle(line: String) -> String? {
+    public func handle(line: String, toolListingEnvironment: [String: String]? = nil) -> String? {
         do {
             guard let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
                 return try encodeJSONRPCError(id: nil, code: -32700, message: "Invalid JSON-RPC payload")
@@ -82,10 +82,11 @@ public final class StdioMCPServer {
             case "ping":
                 return try encodeJSONRPCResult(id: id, result: [:])
             case "tools/list":
+                let definitions = toolListingEnvironment.map(ToolDefinitions.available(environment:)) ?? ToolDefinitions.all
                 return try encodeJSONRPCResult(
                     id: id,
                     result: [
-                        "tools": ToolDefinitions.all.map(\.asDictionary),
+                        "tools": definitions.map(\.asDictionary),
                     ]
                 )
             case "tools/call":
@@ -148,7 +149,7 @@ public final class StdioMCPServer {
     public func endSession() {
         trajectory.sessionEnded()
         service.clearQueryIndexes()
-        BrowserBridge.shared.turnEnded()
+        BrowserBridge.endClientTurn()
         // The cursor is deliberately left alone here. One `ocu call` is one session, so
         // resetting it made every step of a batch start a new cursor from scratch. The
         // idle timer hides it shortly after the last action, and `turn-ended` clears it at once.

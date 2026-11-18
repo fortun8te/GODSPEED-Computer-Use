@@ -441,7 +441,12 @@ extension ComputerUseToolDispatcher {
                     let state = callToolAsResult(name: "get_app_state", arguments: ["app": app])
                     return ToolCallResult(
                         content: [.text("No steps and no saved recipe for \"\(goal)\", so this is the app's current state.")] + state.content,
-                        isError: state.isError
+                        isError: state.isError,
+                        batchReceipt: .init(
+                            totalSteps: 0, observation: state.isError ? .failed : .returned,
+                            doneCheck: doneConditions.isEmpty ? .notRequested : .skipped
+                        ),
+                        failureCode: state.failureCode
                     )
                 }
                 throw ComputerUseError.invalidArguments(
@@ -454,6 +459,12 @@ extension ComputerUseToolDispatcher {
         }
         let replayApp = replayed.flatMap { $0.app == "browser" ? nil : $0.app }
         let steps = try BatchTool.parseSteps(rawSteps, defaultApp: defaultApp ?? replayApp)
+        var receipt = TrajectoryLog.BatchReceipt(
+            totalSteps: steps.count, doneCheck: doneConditions.isEmpty ? .notRequested : .skipped
+        )
+        func markStepObservation(_ observation: BatchEffects.Receipt) {
+            receipt.steps[receipt.steps.count - 1].observation = observation
+        }
         var failed = false
         var lastApp = defaultApp ?? replayApp
         var changedSomething = false
@@ -530,6 +541,7 @@ extension ComputerUseToolDispatcher {
             if offset > 0, Date().timeIntervalSince(startedAt) > BatchTool.timeBudget {
                 lines.append("Stopped after \(Int(BatchTool.timeBudget)) seconds, before step \(number). Steps \(number)-\(steps.count) were not run; send them in a new batch.")
                 stoppedForTime = true
+                receipt.stop = .timeBudget
                 break
             }
             if step.tool == "browser" {
@@ -549,6 +561,8 @@ extension ComputerUseToolDispatcher {
                     lastResultText = "failed: wait needs an app"
                     failed = true
                     failedNumber = number
+                    receipt.steps.append(.init(failureCode: .invalidArguments, observation: .notSent))
+                    receipt.stop = .stepFailure
                     break
                 }
                 let waitStart = Date()
@@ -578,12 +592,14 @@ extension ComputerUseToolDispatcher {
                     lines.append("\(number). \(lastStepText): ok (waited \(waited) ms; the screen was still changing)")
                     lastResultText = "ok"
                     stepResults.append((lastStepText, "ok"))
+                    receipt.steps.append(.init())
                     continue
                 }
                 if met {
                     lines.append("\(number). \(lastStepText): ok (\(waited) ms)")
                     lastResultText = "ok"
                     stepResults.append((lastStepText, "ok"))
+                    receipt.steps.append(.init())
                     continue
                 }
                 let reason = "timed out after \(waited) ms: \(wait.timeoutReason)" + (budgetCut ? " (the batch's \(Int(BatchTool.timeBudget)) s time budget was nearly used up)" : "")
@@ -593,6 +609,8 @@ extension ComputerUseToolDispatcher {
                 stepResults.append((lastStepText, "FAILED: \(reason)"))
                 failed = true
                 failedNumber = number
+                receipt.steps.append(.init(failureCode: .timeout))
+                receipt.stop = .stepFailure
                 break
             }
 
@@ -603,6 +621,7 @@ extension ComputerUseToolDispatcher {
             if let title = movedTo, normalizedElementIndexArgument(step.arguments["element_index"]) != nil {
                 lines.append("window changed after \(offset) steps (now \"\(title)\"). Steps \(number)-\(steps.count) were not run; read the app with get_app_state and send them again.")
                 stoppedForTime = true
+                receipt.stop = .windowChanged
                 break
             }
             if effectsOn, !effectsDisabled, isMutating, let app = stepApp, watchApp != app || watchState == nil {
@@ -640,6 +659,11 @@ extension ComputerUseToolDispatcher {
                 stepResults.append((BatchTool.describe(step), "FAILED: \(BatchTool.firstLine(result.textContent))"))
                 // Never retried here: a failure that may have reached the app says "outcome unknown".
                 failureReceipt = BatchEffects.failureReceipt(result.textContent)
+                receipt.steps.append(.init(
+                    failureCode: result.failureCode ?? TrajectoryLog.failureCode(message: result.textContent),
+                    observation: failureReceipt
+                ))
+                receipt.stop = .stepFailure
                 failedNumber = number
                 lines.append(BatchEffects.line(
                     "\(number). \(BatchTool.describe(step)): FAILED: \(BatchTool.firstLine(result.textContent))",
@@ -654,6 +678,7 @@ extension ComputerUseToolDispatcher {
             }
 
             lastResultText = "ok"
+            receipt.steps.append(.init())
             stepResults.append((BatchTool.describe(step), "ok"))
             let browserAction = ((step.arguments["action"] as? String) ?? "").lowercased()
             let readsOnly = BatchTool.readOnlyTools.contains(step.tool)
@@ -681,7 +706,10 @@ extension ComputerUseToolDispatcher {
                     pendingLastEffect = (app, before, lines.count, stepLineIndex, step.tool)
                 } else if let read = readWatch(app, settleMs: 600) {
                     let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool)
-                    if effect.noEffect { lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen) }
+                    if effect.noEffect {
+                        lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen)
+                        markStepObservation(.noEffectSeen)
+                    }
                     lines += effect.lines
                     watchState = read.text
                     if read.seconds > 2.5 || effectSeconds > effectBudgetSeconds {
@@ -691,6 +719,7 @@ extension ComputerUseToolDispatcher {
                 } else {
                     // The step ran, but the check read failed or timed out, so its result is not known.
                     lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .outcomeUnknown)
+                    markStepObservation(.outcomeUnknown)
                 }
             } else if step.tool == "get_app_state", effectsOn, let app = stepApp, let text = LeanOutput.stateText(of: result) {
                 // An explicit read: the model now knows this window, so it is the one to stay in.
@@ -702,7 +731,12 @@ extension ComputerUseToolDispatcher {
 
             // A batch that ends with a read reuses it as its final state.
             trailingObservation = step.tool == "get_app_state" || isPageRead ? result : nil
-            if let stop = recipeRun.verify(number: number, total: steps.count, lines: lines) { lines.append(stop); failed = true; break }
+            if let stop = recipeRun.verify(number: number, total: steps.count, lines: lines) {
+                lines.append(stop)
+                failed = true
+                receipt.stop = .recipeVerification
+                break
+            }
         }
 
         // A menu command or shortcut often opens a sheet or dialog that takes a moment to appear; give it
@@ -740,10 +774,12 @@ extension ComputerUseToolDispatcher {
                 let effect = effectLines(before: pending.before, after: text, sig: sig, tool: pending.tool)
                 if effect.noEffect, pending.line < lines.count {
                     lines[pending.line] = BatchEffects.line(lines[pending.line], receipt: .noEffectSeen)
+                    markStepObservation(.noEffectSeen)
                 }
                 lines.insert(contentsOf: effect.lines, at: min(pending.position, lines.count))
             } else if pending.line < lines.count {
                 lines[pending.line] = BatchEffects.line(lines[pending.line], receipt: .outcomeUnknown)
+                markStepObservation(.outcomeUnknown)
             }
         }
 
@@ -793,6 +829,7 @@ extension ComputerUseToolDispatcher {
             )
             let doneResult = DoneCheck.check(doneConditions, evidence: evidence)
             if case .verified = doneResult { verifiedDone = true }
+            receipt.doneCheck = verifiedDone ? .verified : .unmet
             lines.append(DoneCheck.line(for: doneResult))
         }
 
@@ -814,7 +851,10 @@ extension ComputerUseToolDispatcher {
             let result = unchanged ? lastResultText + "; app unchanged since the previous batch" : lastResultText
             if let verdict = Referee.decide(goal: goal, lastStep: lastStepText, result: result, summary: summary) {
                 refereeSaysDone = verdict.label == "done" && verdict.confidence >= BatchRecipes.saveConfidence
-                if let hint = Referee.hint(for: verdict) { lines.append(hint) }
+                if let hint = Referee.hint(for: verdict) {
+                    lines.append(hint)
+                    receipt.decisionHint = true
+                }
             }
         }
 
@@ -827,6 +867,7 @@ extension ComputerUseToolDispatcher {
 
         var content: [ToolResultContentItem] = [.text(lines.joined(separator: "\n"))]
         if let observation {
+            receipt.observation = observation.isError ? .failed : .returned
             var shown = observation
             if let memoryKey, let current = LeanOutput.stateText(of: observation) {
                 // Compare with what the model last saw for this app (a get_app_state or the previous batch),
@@ -837,6 +878,6 @@ extension ComputerUseToolDispatcher {
             }
             content.append(contentsOf: shown.content)
         }
-        return ToolCallResult(content: content, isError: failed)
+        return ToolCallResult(content: content, isError: failed, batchReceipt: receipt)
     }
 }

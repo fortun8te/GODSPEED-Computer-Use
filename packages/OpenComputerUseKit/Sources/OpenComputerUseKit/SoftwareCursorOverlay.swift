@@ -396,6 +396,8 @@ enum SoftwareCursorOverlay {
     /// rests is noticed within a tenth of a second instead of at the fallback hide.
     private static var watchTimer: Timer?
     private static var fadeTimer: Timer?
+    private static var feedbackTimer: Timer?
+    private static var interactionIndicator: CursorInteractionIndicator?
     /// Internal (not private) so CursorHideTimerTests can assert scheduling order.
     static var swayStopTimer: Timer?
     static var hideTimer: Timer?
@@ -482,6 +484,9 @@ enum SoftwareCursorOverlay {
         }
 
         adoptRequestSettings()
+        if interactionIndicator != CursorInteractionIndicator(feedback: .drag) {
+            clearFeedback()
+        }
         // A reset that was waiting for the queue to empty belongs to the turn before this action.
         VisualCursorSupport.deferredReset = false
         // Claim only when another process holds the cursor (or none is shown). Re-claiming on every
@@ -565,6 +570,7 @@ enum SoftwareCursorOverlay {
 
         guard continueOwnedCursor() else { return }
         adoptRequestSettings()
+        clearFeedback()
         placeOnTargetIfNeeded(targetPoint, anchor: anchor)
         configureOrdering(relativeTo: targetWindow)
         takeOverFromFade()
@@ -581,7 +587,100 @@ enum SoftwareCursorOverlay {
         observationPhase = "pulse"
         animateClickPulse(at: constrainedTarget, clickCount: max(clickCount, 1), mouseButton: mouseButton)
         guard pulseGeneration == interactionGeneration else { return }
+        resumeIdleFeedback()
+    }
+
+    static func beginFeedback(
+        _ feedback: CursorInteractionFeedback,
+        at targetPoint: CGPoint? = nil,
+        in targetWindow: CursorTargetWindow? = nil,
+        anchor: CursorRestingAnchor? = nil
+    ) {
+        guard VisualCursorSupport.isEnabled, canPresentOverlay,
+              let point = targetPoint ?? displayedTipPosition, continueOwnedCursor() else { return }
+
+        adoptRequestSettings()
+        clearFeedback()
+        takeOverFromFade()
+        stopIdleAnimation()
+        cancelPendingHide()
+        if targetPoint != nil {
+            adoptAnchor(anchor)
+            prepareWindowIfNeeded()
+        }
+        interactionIndicator = CursorInteractionIndicator(feedback: feedback)
+        drawFeedback(at: clampTipPosition(liveTargetPoint(point, anchor: anchor)))
+        if targetPoint != nil {
+            configureOrdering(relativeTo: targetWindow)
+        }
+        startWindowWatch()
+        // Recover if an interrupted operation never queues its completion.
+        scheduleHide(after: max(activeSettings.idleHideDelay, 12))
+    }
+
+    static func endFeedback(
+        _ feedback: CursorInteractionFeedback,
+        at targetPoint: CGPoint? = nil,
+        in targetWindow: CursorTargetWindow? = nil,
+        anchor: CursorRestingAnchor? = nil
+    ) {
+        guard VisualCursorSupport.isEnabled,
+              interactionIndicator == CursorInteractionIndicator(feedback: feedback),
+              continueOwnedCursor(), let point = targetPoint ?? displayedTipPosition else { return }
+
+        cancelPendingHide()
+        if targetPoint != nil {
+            adoptAnchor(anchor)
+        }
+        interactionIndicator?.isCompleted = true
+        drawFeedback(at: clampTipPosition(liveTargetPoint(point, anchor: anchor)))
+        if targetPoint != nil {
+            configureOrdering(relativeTo: targetWindow)
+        }
+        startWindowWatch()
+
+        let timer = Timer(timeInterval: feedback.completionDuration, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                clearFeedback()
+                observationPhase = "settling"
+                if let restingTipPosition {
+                    drawFeedback(at: restingTipPosition)
+                }
+                resumeIdleFeedback()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        feedbackTimer = timer
+    }
+
+    static func cancelFeedback(_ feedback: CursorInteractionFeedback) {
+        guard VisualCursorSupport.isEnabled,
+              interactionIndicator == CursorInteractionIndicator(feedback: feedback),
+              continueOwnedCursor() else { return }
+        clearFeedback()
+        observationPhase = "settling"
+        if let displayedTipPosition {
+            drawFeedback(at: displayedTipPosition)
+        }
+        resumeIdleFeedback()
+    }
+
+    private static func drawFeedback(at point: CGPoint) {
+        restingTipPosition = point
+        visualDynamicsState = CursorVisualDynamicsAnimator.state(at: point, time: CGFloat(CACurrentMediaTime()))
+        placeCursor(using: initialRenderState(at: point), clickProgress: 0)
+    }
+
+    private static func clearFeedback() {
+        feedbackTimer?.invalidate()
+        feedbackTimer = nil
+        interactionIndicator = nil
+        cursorView?.indicator = nil
+    }
+
+    private static func resumeIdleFeedback() {
         startIdleAnimation()
+        if idleTimer == nil { startWindowWatch() }
         scheduleHide(after: activeSettings.idleHideDelay)
         scheduleSwayStop()
     }
@@ -600,7 +699,6 @@ enum SoftwareCursorOverlay {
         placeOnTargetIfNeeded(targetPoint, anchor: anchor)
         configureOrdering(relativeTo: targetWindow)
         takeOverFromFade()
-        cancelPendingHide()
         adoptAnchor(anchor)
         _ = reanchorIfWindowMoved()
         let constrainedTarget = clampTipPosition(liveTargetPoint(targetPoint, anchor: anchor))
@@ -613,9 +711,10 @@ enum SoftwareCursorOverlay {
             ),
             clickProgress: 0
         )
-        startIdleAnimation()
-        scheduleHide(after: activeSettings.idleHideDelay)
-        scheduleSwayStop()
+        if interactionIndicator == nil {
+            cancelPendingHide()
+            resumeIdleFeedback()
+        }
     }
 
     /// A pulse or settle whose cursor is hidden (idle hide, reset) or still far from the target (its move
@@ -648,6 +747,7 @@ enum SoftwareCursorOverlay {
         if panel?.isVisible == true { trace("reset") }
         takeOverFromFade()
         stopIdleAnimation()
+        clearFeedback()
         swayStopTimer?.invalidate()
         swayStopTimer = nil
         cancelPendingHide()
@@ -825,8 +925,10 @@ enum SoftwareCursorOverlay {
         var end = initialEnd
         var endShift = CGPoint.zero
         var nextRetarget: TimeInterval = 0
-        let candidate = bestMotionCandidate(from: start, to: end, relativeTo: targetWindow)
-        let path = candidate.path
+        let dragging = interactionIndicator == CursorInteractionIndicator(feedback: .drag)
+        // The generated mouse drag travels directly between the two event points.
+        let path = dragging ? CursorMotionPath(start: start, end: end, curveScale: 0)
+            : bestMotionCandidate(from: start, to: end, relativeTo: targetWindow).path
         // The path point follows the recovered official progress spring, compressed into the first
         // part of the move; the rest of the time lets the drawn tip land on the target, so the
         // whole move takes `duration` and the click pulse starts on a cursor that has arrived.
@@ -852,11 +954,13 @@ enum SoftwareCursorOverlay {
                 guard generation == interactionGeneration else { return }
             }
 
-            if now >= nextRetarget, let moved = movedAnchorTarget() {
-                endShift = CGPoint(x: endShift.x + moved.x - end.x, y: endShift.y + moved.y - end.y)
-                end = moved
+            if now >= nextRetarget {
                 nextRetarget = now + 0.1
-                observationPhase = "retargeted"
+                if let moved = movedAnchorTarget() {
+                    endShift = CGPoint(x: endShift.x + moved.x - end.x, y: endShift.y + moved.y - end.y)
+                    end = moved
+                    observationPhase = "retargeted"
+                }
             }
 
             let elapsed = CGFloat(CACurrentMediaTime() - startTime)
@@ -1075,6 +1179,9 @@ enum SoftwareCursorOverlay {
                     return
                 }
                 refreshActiveOrderingIfNeeded()
+                if fadeTimer == nil, panel?.isVisible == true {
+                    _ = reanchorIfWindowMoved()
+                }
             }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -1110,7 +1217,12 @@ enum SoftwareCursorOverlay {
                         at: CACurrentMediaTime()
                     ),
                     clickProgress: reducesMotion ? 0 : clickProgress,
-                    ripple: CursorClickRipple(progress: rawProgress, strength: pulseBias, reducesMotion: reducesMotion)
+                    ripple: CursorClickRipple(
+                        progress: rawProgress,
+                        strength: pulseBias,
+                        reducesMotion: reducesMotion,
+                        isSecondary: mouseButton == .right
+                    )
                 )
 
                 if rawProgress >= 1 {
@@ -1239,6 +1351,7 @@ enum SoftwareCursorOverlay {
 
         stopIdleAnimation()
         cancelPendingHide()
+        clearFeedback()
         // A fade already running owns the hide. A second fade would fight it frame by frame, and the
         // window check calls this every 50 ms while its window is gone.
         guard fadeTimer == nil else { return }
@@ -1247,6 +1360,10 @@ enum SoftwareCursorOverlay {
         interactionGeneration += 1
         let generationAtHide = interactionGeneration
         trace("hide")
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            finishHide(panel)
+            return
+        }
 
         // Manual fade (12 eased 10 ms steps) driven by a timer, not a sleep: the
         // Animator API leaves no cancel handle, and sleeping here would stall the
@@ -1351,6 +1468,7 @@ enum SoftwareCursorOverlay {
         cursorView.fogScale = renderState.fogScale
         cursorView.clickProgress = clickProgress
         cursorView.ripple = ripple
+        cursorView.indicator = interactionIndicator
         cursorView.lensEnabled = activeSettings.lensEnabled
         cursorView.needsDisplay = true
         displayedTipPosition = renderState.tipPosition
@@ -1368,7 +1486,7 @@ enum SoftwareCursorOverlay {
         let url = URL(fileURLWithPath: path)
 
         let snapshot = VisualCursorObservationSnapshot(
-            phase: observationPhase,
+            phase: interactionIndicator?.phase ?? observationPhase,
             tipPosition: tipPosition,
             restingTipPosition: restingTipPosition,
             rotation: rotation,
@@ -1490,6 +1608,7 @@ private final class SoftwareCursorView: NSView {
     var fogScale: CGFloat = 1
     var clickProgress: CGFloat = 0
     var ripple: CursorClickRipple?
+    var indicator: CursorInteractionIndicator?
     var lensEnabled = false
 
     override init(frame frameRect: NSRect) {
@@ -1540,7 +1659,8 @@ private final class SoftwareCursorView: NSView {
                 fogScale: fogScale,
                 clickProgress: clickProgress
             ),
-            ripple: ripple
+            ripple: ripple,
+            indicator: indicator
         )
     }
 }

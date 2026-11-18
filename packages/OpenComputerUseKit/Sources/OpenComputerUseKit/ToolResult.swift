@@ -33,10 +33,21 @@ public struct ToolResultContentItem: @unchecked Sendable {
 public struct ToolCallResult: @unchecked Sendable {
     public let content: [ToolResultContentItem]
     public let isError: Bool
+    let batchReceipt: TrajectoryLog.BatchReceipt?
+    let failureCode: TrajectoryLog.FailureCode?
 
     public init(content: [ToolResultContentItem], isError: Bool = false) {
+        self.init(content: content, isError: isError, batchReceipt: nil)
+    }
+
+    init(
+        content: [ToolResultContentItem], isError: Bool,
+        batchReceipt: TrajectoryLog.BatchReceipt? = nil, failureCode: TrajectoryLog.FailureCode? = nil
+    ) {
         self.content = content
         self.isError = isError
+        self.batchReceipt = batchReceipt
+        self.failureCode = failureCode
     }
 
     public var primaryText: String? {

@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import OpenComputerUseKit
 import QuartzCore
+import UniformTypeIdentifiers
 
 @MainActor
 enum PermissionOnboardingApp {
@@ -161,31 +162,31 @@ protocol PermissionContentControllerDelegate: AnyObject {
 }
 
 private enum PermissionOnboardingLayout {
-    static let windowWidth: CGFloat = 880
-    static let windowHeight: CGFloat = 648
-    static let outerHorizontalInset: CGFloat = 48
-    static let outerTopInset: CGFloat = 40
+    static let windowWidth: CGFloat = 596
+    static let windowHeight: CGFloat = 440
+    static let outerHorizontalInset: CGFloat = 32
+    static let outerTopInset: CGFloat = 24
     static let outerBottomInset: CGFloat = 32
-    static let headerIconSize: CGFloat = 96
-    static let cardWidth: CGFloat = 744
-    static let cardHeight: CGFloat = 106
-    static let cardCornerRadius: CGFloat = 24
+    static let headerIconSize: CGFloat = 72
+    static let cardWidth: CGFloat = windowWidth - 2 * outerHorizontalInset
+    static let cardHeight: CGFloat = 76
+    static let cardCornerRadius: CGFloat = 16
     static let cardHorizontalInset: CGFloat = 20
-    static let cardVerticalInset: CGFloat = 18
-    static let cardIconSize: CGFloat = 54
-    static let actionButtonWidth: CGFloat = 104
-    static let actionButtonHeight: CGFloat = 44
+    static let cardVerticalInset: CGFloat = 12
+    static let cardIconSize: CGFloat = 38
+    static let actionButtonWidth: CGFloat = 112
+    static let actionButtonHeight: CGFloat = 36
 }
 
 @MainActor
 final class PermissionContentController: NSViewController {
     weak var delegate: PermissionContentControllerDelegate?
 
-    private let backgroundView = GradientBackgroundView()
+    private let backgroundView = PermissionBackgroundView()
     private let stackView = NSStackView()
     private let iconView = AppGlyphView()
-    private let titleLabel = NSTextField(labelWithString: "Enable \(PermissionSupport.currentBundleDisplayName())")
-    private let subtitleLabel = NSTextField(wrappingLabelWithString: "\(PermissionSupport.currentBundleDisplayName()) needs these permissions to use apps on your Mac.\nThese permissions are only used when you ask it to perform tasks.")
+    private let titleLabel = NSTextField(labelWithString: "Set up \(PermissionSupport.currentBundleDisplayName())")
+    private let subtitleLabel = NSTextField(wrappingLabelWithString: "Allow macOS permissions so \(PermissionSupport.currentBundleDisplayName()) can work in your apps when you ask.")
     private let cardsContainer = NSStackView()
     private let completionLabel = NSTextField(labelWithString: "All required permissions are enabled.")
     private let refreshTimerInterval: TimeInterval = 0.25
@@ -196,6 +197,11 @@ final class PermissionContentController: NSViewController {
     private var diagnostics = PermissionDiagnostics.current()
     private var hasReportedCompletion = false
     private var requestedPermissions: [SystemPermissionKind: Date] = [:]
+    private var renderedState: [CardState] = []
+
+    private enum CardState {
+        case granted, guidance, restart, pending
+    }
 
     override func loadView() {
         view = NSView()
@@ -261,17 +267,17 @@ final class PermissionContentController: NSViewController {
         view.addSubview(stackView)
 
         iconView.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = NSFont.systemFont(ofSize: 38, weight: .bold)
-        titleLabel.textColor = NSColor(calibratedWhite: 0.18, alpha: 1)
+        titleLabel.font = NSFont.systemFont(ofSize: 30, weight: .bold)
+        titleLabel.textColor = NSColor.labelColor
         titleLabel.maximumNumberOfLines = 1
         subtitleLabel.font = NSFont.systemFont(ofSize: 15, weight: .regular)
-        subtitleLabel.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
+        subtitleLabel.textColor = NSColor.secondaryLabelColor
         subtitleLabel.alignment = .center
         subtitleLabel.maximumNumberOfLines = 2
 
         cardsContainer.orientation = .vertical
         cardsContainer.alignment = .centerX
-        cardsContainer.spacing = 14
+        cardsContainer.spacing = 8
         cardsContainer.translatesAutoresizingMaskIntoConstraints = false
 
         completionLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
@@ -283,9 +289,9 @@ final class PermissionContentController: NSViewController {
         stackView.addArrangedSubview(subtitleLabel)
         stackView.addArrangedSubview(cardsContainer)
         stackView.addArrangedSubview(completionLabel)
-        stackView.setCustomSpacing(16, after: iconView)
+        stackView.setCustomSpacing(10, after: iconView)
         stackView.setCustomSpacing(8, after: titleLabel)
-        stackView.setCustomSpacing(24, after: subtitleLabel)
+        stackView.setCustomSpacing(20, after: subtitleLabel)
         stackView.setCustomSpacing(14, after: cardsContainer)
 
         NSLayoutConstraint.activate([
@@ -306,22 +312,30 @@ final class PermissionContentController: NSViewController {
     }
 
     private func refreshUI() {
+        let orderedPermissions = SystemPermissionKind.allCases
+        let states: [CardState] = orderedPermissions.map { permission in
+            if diagnostics.isGranted(permission) { return .granted }
+            if restartRequired(for: permission) { return .restart }
+            if activeGuidance == permission { return .guidance }
+            return .pending
+        }
+        guard states != renderedState else { return }
+        renderedState = states
+
         cardsContainer.arrangedSubviews.forEach { subview in
             cardsContainer.removeArrangedSubview(subview)
             subview.removeFromSuperview()
         }
 
-        let orderedPermissions = SystemPermissionKind.allCases
-        for permission in orderedPermissions {
-            let restartRequired = restartRequired(for: permission)
-            if activeGuidance == permission, !diagnostics.isGranted(permission), !restartRequired {
+        for (permission, state) in zip(orderedPermissions, states) {
+            if state == .guidance {
                 let placeholder = GuidancePlaceholderView()
                 cardsContainer.addArrangedSubview(placeholder)
                 placeholder.widthAnchor.constraint(equalToConstant: PermissionOnboardingLayout.cardWidth).isActive = true
                 continue
             }
 
-            let card = PermissionCardView(permission: permission, diagnostics: diagnostics, restartRequired: restartRequired)
+            let card = PermissionCardView(permission: permission, diagnostics: diagnostics, restartRequired: state == .restart)
             card.onAllow = { [weak self] requestedPermission, sourceFrameInScreen in
                 guard let self else {
                     return
@@ -381,11 +395,9 @@ final class PermissionCardView: NSView {
     private func configure() {
         wantsLayer = true
         layer?.cornerRadius = PermissionOnboardingLayout.cardCornerRadius
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.99, alpha: 0.92).cgColor
-        layer?.shadowColor = NSColor.black.withAlphaComponent(0.1).cgColor
-        layer?.shadowOpacity = 1
-        layer?.shadowRadius = 16
-        layer?.shadowOffset = CGSize(width: 0, height: -2)
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.24).cgColor
 
         let content = NSStackView()
         content.orientation = .horizontal
@@ -396,20 +408,14 @@ final class PermissionCardView: NSView {
         let iconBackground = NSView()
         iconBackground.translatesAutoresizingMaskIntoConstraints = false
         iconBackground.wantsLayer = true
-        iconBackground.layer?.cornerRadius = PermissionOnboardingLayout.cardIconSize / 2
-        iconBackground.layer?.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.92).cgColor
-        iconBackground.layer?.borderWidth = 2
-        iconBackground.layer?.borderColor = (
-            permission == .accessibility
-            ? NSColor.systemBlue.withAlphaComponent(0.28)
-            : NSColor(calibratedWhite: 0.82, alpha: 1)
-        ).cgColor
+        iconBackground.layer?.cornerRadius = 10
+        iconBackground.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
 
         let icon = NSImageView()
         icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.contentTintColor = permission == .accessibility ? NSColor.systemBlue : NSColor.systemGray
+        icon.contentTintColor = .secondaryLabelColor
         icon.image = NSImage(systemSymbolName: permission.symbolName, accessibilityDescription: permission.title)
-        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 24, weight: .semibold)
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
         iconBackground.addSubview(icon)
 
         let labels = NSStackView()
@@ -417,13 +423,16 @@ final class PermissionCardView: NSView {
         labels.alignment = .leading
         labels.spacing = 2
 
-        let title = NSTextField(labelWithString: permission.title)
-        title.font = NSFont.systemFont(ofSize: 20, weight: .bold)
-        title.textColor = NSColor(calibratedWhite: 0.18, alpha: 1)
+        let title = NSTextField(labelWithString: permission == .accessibility ? "Accessibility" : "Screen Recording")
+        title.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        title.textColor = NSColor.labelColor
 
-        let subtitle = NSTextField(labelWithString: restartRequired ? "Restart to finish enabling this permission" : permission.subtitle)
+        let purpose = permission == .accessibility
+            ? "Click and type in macOS apps."
+            : "See what’s on screen through screenshots."
+        let subtitle = NSTextField(labelWithString: restartRequired ? "If permission is on, restart to finish." : purpose)
         subtitle.font = NSFont.systemFont(ofSize: 14, weight: .regular)
-        subtitle.textColor = NSColor(calibratedWhite: 0.42, alpha: 1)
+        subtitle.textColor = NSColor.secondaryLabelColor
 
         labels.addArrangedSubview(title)
         labels.addArrangedSubview(subtitle)
@@ -439,7 +448,7 @@ final class PermissionCardView: NSView {
             let done = StatusChipView(text: "Done", foreground: NSColor(calibratedRed: 0.16, green: 0.50, blue: 0.23, alpha: 1), background: NSColor(calibratedRed: 0.93, green: 0.98, blue: 0.94, alpha: 1))
             content.addArrangedSubview(done)
         } else {
-            let button = PrimaryActionButton(title: restartRequired ? "Restart" : "Allow", target: self, action: #selector(handleAllow))
+            let button = PrimaryActionButton(title: restartRequired ? "Restart" : "Open Settings", target: self, action: #selector(handleAllow))
             actionButton = button
             content.addArrangedSubview(button)
             button.widthAnchor.constraint(equalToConstant: PermissionOnboardingLayout.actionButtonWidth).isActive = true
@@ -487,14 +496,14 @@ final class GuidancePlaceholderView: NSView {
         layer?.cornerRadius = PermissionOnboardingLayout.cardCornerRadius
         layer?.backgroundColor = NSColor(calibratedWhite: 0.98, alpha: 0.6).cgColor
 
-        let label = NSTextField(labelWithString: "COMPLETE IN SYSTEM SETTINGS")
+        let label = NSTextField(labelWithString: "Finish in System Settings")
         label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        label.textColor = NSColor(calibratedWhite: 0.55, alpha: 1)
+        label.textColor = NSColor.secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 82),
+            heightAnchor.constraint(equalToConstant: PermissionOnboardingLayout.cardHeight),
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -979,6 +988,7 @@ final class PermissionAccessoryPanelController {
 final class PermissionAccessoryPanelView: NSView {
     private let onBack: () -> Void
     private let instructionLabel = NSTextField(labelWithString: "")
+    private let manualLabel = NSTextField(labelWithString: "Or use + in System Settings to select the app.")
     private let dragTileView = DraggableAppTileView()
 
     init(onBack: @escaping () -> Void) {
@@ -1001,40 +1011,33 @@ final class PermissionAccessoryPanelView: NSView {
         materialView.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
         addSubview(materialView)
 
-        let tintView = NSView()
-        tintView.translatesAutoresizingMaskIntoConstraints = false
-        tintView.wantsLayer = true
-        tintView.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.8).cgColor
-        materialView.addSubview(tintView)
-
-        let backChrome = NSView()
-        backChrome.translatesAutoresizingMaskIntoConstraints = false
-        backChrome.wantsLayer = true
-        backChrome.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.95).cgColor
-        backChrome.layer?.cornerRadius = 16
-        materialView.addSubview(backChrome)
-
         let backButton = AccessoryBackButton(target: self, action: #selector(handleBack))
-        backChrome.addSubview(backButton)
+        materialView.addSubview(backButton)
 
         let arrow = NSImageView()
         arrow.translatesAutoresizingMaskIntoConstraints = false
-        arrow.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: "Drag upward")
-        arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 26, weight: .bold)
-        arrow.contentTintColor = NSColor.systemBlue
+        arrow.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: nil)
+        arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        arrow.contentTintColor = .secondaryLabelColor
+        arrow.setAccessibilityElement(false)
 
-        instructionLabel.font = NSFont.systemFont(ofSize: 14, weight: .medium)
-        instructionLabel.textColor = NSColor(calibratedWhite: 0.4, alpha: 1)
+        instructionLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        instructionLabel.textColor = .labelColor
         instructionLabel.translatesAutoresizingMaskIntoConstraints = false
         instructionLabel.lineBreakMode = .byTruncatingTail
-        instructionLabel.maximumNumberOfLines = 1
         instructionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        dragTileView.translatesAutoresizingMaskIntoConstraints = false
+        manualLabel.font = NSFont.systemFont(ofSize: 11)
+        manualLabel.textColor = .secondaryLabelColor
+        manualLabel.translatesAutoresizingMaskIntoConstraints = false
+        manualLabel.lineBreakMode = .byTruncatingTail
+        manualLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        dragTileView.translatesAutoresizingMaskIntoConstraints = false
         materialView.addSubview(arrow)
         materialView.addSubview(instructionLabel)
         materialView.addSubview(dragTileView)
+        materialView.addSubview(manualLabel)
 
         NSLayoutConstraint.activate([
             materialView.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -1042,34 +1045,28 @@ final class PermissionAccessoryPanelView: NSView {
             materialView.topAnchor.constraint(equalTo: topAnchor),
             materialView.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            tintView.leadingAnchor.constraint(equalTo: materialView.leadingAnchor),
-            tintView.trailingAnchor.constraint(equalTo: materialView.trailingAnchor),
-            tintView.topAnchor.constraint(equalTo: materialView.topAnchor),
-            tintView.bottomAnchor.constraint(equalTo: materialView.bottomAnchor),
+            backButton.leadingAnchor.constraint(equalTo: materialView.leadingAnchor, constant: 12),
+            backButton.centerYAnchor.constraint(equalTo: dragTileView.centerYAnchor),
+            backButton.widthAnchor.constraint(equalToConstant: 30),
+            backButton.heightAnchor.constraint(equalToConstant: 30),
 
-            backChrome.leadingAnchor.constraint(equalTo: materialView.leadingAnchor, constant: 18),
-            backChrome.topAnchor.constraint(equalTo: materialView.topAnchor, constant: 52),
-            backChrome.widthAnchor.constraint(equalToConstant: 32),
-            backChrome.heightAnchor.constraint(equalToConstant: 32),
+            arrow.leadingAnchor.constraint(equalTo: dragTileView.leadingAnchor),
+            arrow.centerYAnchor.constraint(equalTo: instructionLabel.centerYAnchor),
+            arrow.widthAnchor.constraint(equalToConstant: 15),
+            arrow.heightAnchor.constraint(equalToConstant: 15),
 
-            backButton.centerXAnchor.constraint(equalTo: backChrome.centerXAnchor),
-            backButton.centerYAnchor.constraint(equalTo: backChrome.centerYAnchor),
-            backButton.widthAnchor.constraint(equalToConstant: 14),
-            backButton.heightAnchor.constraint(equalToConstant: 14),
+            instructionLabel.leadingAnchor.constraint(equalTo: arrow.trailingAnchor, constant: 7),
+            instructionLabel.topAnchor.constraint(equalTo: materialView.topAnchor, constant: 13),
+            instructionLabel.trailingAnchor.constraint(equalTo: materialView.trailingAnchor, constant: -14),
 
-            arrow.leadingAnchor.constraint(equalTo: materialView.leadingAnchor, constant: 35),
-            arrow.topAnchor.constraint(equalTo: materialView.topAnchor, constant: 10),
-            arrow.widthAnchor.constraint(equalToConstant: 28),
-            arrow.heightAnchor.constraint(equalToConstant: 28),
+            dragTileView.leadingAnchor.constraint(equalTo: backButton.trailingAnchor, constant: 6),
+            dragTileView.trailingAnchor.constraint(equalTo: materialView.trailingAnchor, constant: -14),
+            dragTileView.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 7),
+            dragTileView.heightAnchor.constraint(equalToConstant: 42),
 
-            instructionLabel.leadingAnchor.constraint(equalTo: arrow.trailingAnchor, constant: 10),
-            instructionLabel.centerYAnchor.constraint(equalTo: arrow.centerYAnchor),
-            instructionLabel.trailingAnchor.constraint(equalTo: materialView.trailingAnchor, constant: -22),
-
-            dragTileView.leadingAnchor.constraint(equalTo: materialView.leadingAnchor, constant: 64),
-            dragTileView.trailingAnchor.constraint(equalTo: materialView.trailingAnchor, constant: -21),
-            dragTileView.topAnchor.constraint(equalTo: materialView.topAnchor, constant: 47),
-            dragTileView.heightAnchor.constraint(equalToConstant: 43)
+            manualLabel.leadingAnchor.constraint(equalTo: dragTileView.leadingAnchor),
+            manualLabel.trailingAnchor.constraint(equalTo: dragTileView.trailingAnchor),
+            manualLabel.topAnchor.constraint(equalTo: dragTileView.bottomAnchor, constant: 6),
         ])
     }
 
@@ -1079,7 +1076,8 @@ final class PermissionAccessoryPanelView: NSView {
     }
 
     func configure(permission: SystemPermissionKind) {
-        instructionLabel.stringValue = permission.dragInstruction
+        let pane = permission == .accessibility ? "Accessibility" : "Screen & System Audio Recording"
+        instructionLabel.stringValue = "Drag the app into \(pane)"
     }
 
     @objc
@@ -1090,13 +1088,18 @@ final class PermissionAccessoryPanelView: NSView {
 
 @MainActor
 final class DraggableAppTileView: NSView, NSDraggingSource {
+    private let title = PermissionSupport.currentBundleDisplayName()
+    private let icon = Branding.makeAppIconImage(size: 96)
+    private var pointerInside = false
+    private var hoverTrackingArea: NSTrackingArea?
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.backgroundColor = NSColor.white.cgColor
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor(calibratedWhite: 0.86, alpha: 1).cgColor
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel(title)
+        setAccessibilityHelp("Drag this app to the list in System Settings, or use the plus button there.")
+        toolTip = "Drag \(title) into System Settings"
     }
 
     @available(*, unavailable)
@@ -1104,19 +1107,64 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
         nil
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .cursorUpdate],
+            owner: self
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        pointerInside = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        pointerInside = false
+        needsDisplay = true
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.openHand.set()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
+        let tile = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10)
+        (pointerInside ? NSColor.selectedControlColor : NSColor.controlBackgroundColor).setFill()
+        tile.fill()
+        NSColor.separatorColor.setStroke()
+        tile.stroke()
 
-        let iconRect = CGRect(x: 12, y: 8, width: 28, height: 28)
-        let icon = currentIcon()
-        icon.draw(in: iconRect)
+        icon.draw(in: CGRect(x: 8, y: 5, width: 32, height: 32))
 
-        let title = currentTitle()
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
-            .foregroundColor: NSColor(calibratedWhite: 0.26, alpha: 1),
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+            .foregroundColor: pointerInside ? NSColor.selectedControlTextColor : NSColor.labelColor,
+            .paragraphStyle: style,
         ]
-        title.draw(at: CGPoint(x: 52, y: 12), withAttributes: attributes)
+        title.draw(in: CGRect(x: 46, y: 11, width: max(0, bounds.width - 82), height: 20), withAttributes: attributes)
+
+        let grip = NSBezierPath()
+        for x in [bounds.width - 24, bounds.width - 19] {
+            for y in [15.0, 20.0, 25.0] {
+                grip.appendOval(in: CGRect(x: x, y: y, width: 2.5, height: 2.5))
+            }
+        }
+        (pointerInside ? NSColor.selectedControlTextColor : NSColor.secondaryLabelColor).setFill()
+        grip.fill()
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1126,45 +1174,19 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
         }
 
         let draggingItem = NSDraggingItem(pasteboardWriter: bundleURL as NSURL)
-        draggingItem.setDraggingFrame(bounds, contents: snapshotImage())
+        draggingItem.setDraggingFrame(bounds, contents: snapshotImage() ?? icon)
         let session = beginDraggingSession(with: [draggingItem], event: event, source: self)
         session.animatesToStartingPositionsOnCancelOrFail = true
+        pointerInside = false
+        needsDisplay = true
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         .copy
     }
 
-    private func currentIcon() -> NSImage {
-        if let bundleURL = PermissionSupport.currentAppBundleURL() {
-            if let bundle = Bundle(url: bundleURL),
-               PermissionSupport.isOpenComputerUseBundleIdentifier(bundle.bundleIdentifier)
-            {
-                return Branding.makeAppIconImage(size: 128)
-            }
-
-            return NSWorkspace.shared.icon(forFile: bundleURL.path)
-        }
-
-        return Branding.makeAppIconImage(size: 128)
-    }
-
-    private func currentTitle() -> String {
-        if let bundleURL = PermissionSupport.currentAppBundleURL() {
-            if let bundle = Bundle(url: bundleURL) {
-                let displayName = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
-                let bundleName = bundle.object(forInfoDictionaryKey: kCFBundleNameKey as String) as? String
-                return displayName ?? bundleName ?? PermissionSupport.bundleDisplayName
-            }
-
-            return PermissionSupport.bundleDisplayName
-        }
-
-        return PermissionSupport.bundleDisplayName
-    }
-
-    private func snapshotImage() -> NSImage {
-        let bitmap = bitmapImageRepForCachingDisplay(in: bounds) ?? NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(bounds.width), pixelsHigh: Int(bounds.height), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    private func snapshotImage() -> NSImage? {
+        guard let bitmap = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
         cacheDisplay(in: bounds, to: bitmap)
         let image = NSImage(size: bounds.size)
         image.addRepresentation(bitmap)
@@ -1175,84 +1197,36 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
 @MainActor
 enum Branding {
     static func makeAppIconImage(size: CGFloat) -> NSImage {
-        let image = NSImage(size: NSSize(width: size, height: size))
-        image.lockFocus()
-
-        let canvasInset = size * (92.0 / 1024.0)
-        let rect = CGRect(origin: .zero, size: image.size).insetBy(dx: canvasInset, dy: canvasInset)
-        let tile = NSBezierPath(roundedRect: rect, xRadius: rect.width * 0.22, yRadius: rect.height * 0.22)
-
-        let gradient = NSGradient(colors: [
-            NSColor(calibratedRed: 0.12, green: 0.67, blue: 0.99, alpha: 1),
-            NSColor(calibratedRed: 0.94, green: 0.74, blue: 0.93, alpha: 1),
-        ])!
-        gradient.draw(in: tile, angle: 20)
-
-        func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-            CGPoint(x: rect.minX + rect.width * x / 256, y: rect.minY + rect.height * (1 - y / 256))
+        let dimensions = NSSize(width: size, height: size)
+        guard let bundleURL = PermissionSupport.currentAppBundleURL() else {
+            let image = NSWorkspace.shared.icon(for: .applicationBundle)
+            image.size = dimensions
+            return image
         }
 
-        func scale(_ value: CGFloat) -> CGFloat {
-            rect.width * value / 256
+        // Use the same artwork as the selected app bundle, including the GODSPEED variant.
+        let image: NSImage
+        if let bundle = Bundle(url: bundleURL),
+           let iconFile = bundle.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
+           let resourceURL = bundle.resourceURL {
+            let filename = iconFile.hasSuffix(".icns") ? iconFile : iconFile + ".icns"
+            image = NSImage(contentsOf: resourceURL.appendingPathComponent(filename))
+                ?? NSWorkspace.shared.icon(forFile: bundleURL.path)
+        } else {
+            image = NSWorkspace.shared.icon(forFile: bundleURL.path)
         }
-
-        let arc = NSBezierPath()
-        arc.move(to: point(74, 156))
-        arc.curve(
-            to: point(182, 88),
-            controlPoint1: point(78, 112),
-            controlPoint2: point(136, 72)
-        )
-        arc.lineWidth = scale(12)
-        arc.lineCapStyle = .round
-        NSColor.white.withAlphaComponent(0.72).setStroke()
-        arc.stroke()
-
-        let pointerShadow = NSBezierPath()
-        pointerShadow.move(to: point(129, 102))
-        pointerShadow.line(to: point(129, 181))
-        pointerShadow.line(to: point(149, 162))
-        pointerShadow.line(to: point(161, 193))
-        pointerShadow.line(to: point(176, 186))
-        pointerShadow.line(to: point(164, 157))
-        pointerShadow.line(to: point(192, 152))
-        pointerShadow.close()
-        NSColor.white.withAlphaComponent(0.14).setFill()
-        pointerShadow.fill()
-
-        let pointer = NSBezierPath()
-        pointer.move(to: point(126, 98))
-        pointer.line(to: point(126, 177))
-        pointer.line(to: point(146, 158))
-        pointer.line(to: point(158, 189))
-        pointer.line(to: point(173, 182))
-        pointer.line(to: point(161, 153))
-        pointer.line(to: point(189, 148))
-        pointer.close()
-        pointer.lineWidth = scale(6)
-        pointer.lineJoinStyle = .round
-        pointer.lineCapStyle = .round
-        NSColor.white.withAlphaComponent(0.94).setFill()
-        pointer.fill()
-        NSColor.white.setStroke()
-        pointer.stroke()
-
-        image.unlockFocus()
+        image.size = dimensions
         return image
     }
 }
 
 @MainActor
-final class GradientBackgroundView: NSView {
+final class PermissionBackgroundView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        let gradient = NSGradient(colors: [
-            NSColor(calibratedWhite: 0.985, alpha: 1),
-            NSColor(calibratedRed: 0.95, green: 0.97, blue: 1, alpha: 1),
-            NSColor(calibratedRed: 0.98, green: 0.94, blue: 1, alpha: 1),
-        ])!
-        gradient.draw(in: bounds, angle: 15)
+        NSColor.windowBackgroundColor.setFill()
+        NSBezierPath(rect: dirtyRect).fill()
     }
 }
 
@@ -1323,7 +1297,7 @@ final class PrimaryActionButton: NSButton {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         isBordered = false
-        focusRingType = .none
+        focusRingType = .default
         setButtonType(.momentaryPushIn)
         updateAttributedTitle()
         updateAppearance()
@@ -1336,7 +1310,7 @@ final class PrimaryActionButton: NSButton {
 
     override func layout() {
         super.layout()
-        layer?.cornerRadius = bounds.height / 2
+        layer?.cornerRadius = 9
     }
 
     private func updateAttributedTitle() {
@@ -1345,7 +1319,7 @@ final class PrimaryActionButton: NSButton {
         attributedTitle = NSAttributedString(
             string: title,
             attributes: [
-                .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
                 .foregroundColor: NSColor.white,
                 .paragraphStyle: paragraphStyle,
             ]
@@ -1376,8 +1350,10 @@ final class AccessoryBackButton: NSButton {
         self.action = action
         translatesAutoresizingMaskIntoConstraints = false
         isBordered = false
-        focusRingType = .none
+        focusRingType = .default
         image = NSImage(systemSymbolName: "chevron.left", accessibilityDescription: "Back")
+        setAccessibilityLabel("Back to permissions")
+        toolTip = "Back to permissions"
         contentTintColor = NSColor.labelColor.withAlphaComponent(0.72)
         if let cell = cell as? NSButtonCell {
             cell.imagePosition = .imageOnly

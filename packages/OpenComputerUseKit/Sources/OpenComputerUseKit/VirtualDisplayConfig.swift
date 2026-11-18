@@ -7,7 +7,10 @@ struct VirtualDisplayConfig: Equatable {
     var enabled = false
 
     static var current: VirtualDisplayConfig {
-        let environment = OCUConfiguration.environment
+        load(environment: OCUConfiguration.environment)
+    }
+
+    static func load(environment: [String: String]) -> VirtualDisplayConfig {
         var document: [String: Any] = [:]
         do {
             let url = try OCUConfiguration.fileURL(environment: environment)

@@ -76,6 +76,21 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertEqual(probe.locations.last, CGPoint(x: 180, y: 120))
     }
 
+    func testModifiedDragKeepsFlagsAndMotionTogetherUntilRelease() throws {
+        let probe = Probe()
+        let flags = try dragModifierFlags(["shift", "option"])
+        try BackgroundDragDispatcher.drag(target: target, flags: flags, io: probe.io, validateSession: {})
+        XCTAssertEqual(flags, [.maskShift, .maskAlternate])
+        let motion = probe.events.filter { $0.type == .leftMouseDragged }
+        XCTAssertTrue(probe.events.allSatisfy { $0.flags == flags })
+        XCTAssertEqual(motion.map { $0.getIntegerValueField(.mouseEventDeltaX) }, Array(repeating: 16, count: 10))
+        XCTAssertEqual(motion.map { $0.getIntegerValueField(.mouseEventDeltaY) }, Array(repeating: 8, count: 10))
+        let gesture = Set(probe.events.dropFirst().map { $0.getIntegerValueField(.mouseEventNumber) })
+        XCTAssertEqual(gesture.count, 1)
+        XCTAssertEqual(probe.events.last?.type, .leftMouseUp)
+        XCTAssertThrowsError(try dragModifierFlags(["unspecified"]))
+    }
+
     func testForegroundTargetCanDragWithoutSyntheticFocusSymbols() throws {
         let probe = Probe()
         probe.foreground = true

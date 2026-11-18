@@ -38,16 +38,57 @@ struct SoftwareCursorGlyphRenderState {
     }
 }
 
+enum CursorInteractionFeedback: Equatable {
+    case drag
+    case typing
+    case scroll(CGVector)
+
+    var phase: String {
+        switch self {
+        case .drag: "dragging"
+        case .typing: "typing"
+        case .scroll: "scrolling"
+        }
+    }
+
+    var completionDuration: TimeInterval {
+        switch self {
+        case .drag: 0.16
+        case .typing, .scroll: 0.22
+        }
+    }
+
+    /// An AppKit unit vector for the direction of the scroll. Input deltas use screen coordinates.
+    var scrollDirection: CGVector? {
+        guard case let .scroll(delta) = self else { return nil }
+        let length = hypot(delta.dx, delta.dy)
+        guard length.isFinite, length > 0 else { return nil }
+        return CGVector(dx: delta.dx / length, dy: -delta.dy / length)
+    }
+}
+
+struct CursorInteractionIndicator: Equatable {
+    let feedback: CursorInteractionFeedback
+    var isCompleted = false
+
+    var phase: String {
+        if feedback == .drag, isCompleted { return "dropped" }
+        return feedback.phase
+    }
+}
+
 /// Frame values for a click ripple centered on the actual pointer tip.
 struct CursorClickRipple {
     let radius: CGFloat
     let opacity: CGFloat
+    let isSecondary: Bool
 
-    init(progress: CGFloat, strength: CGFloat, reducesMotion: Bool) {
+    init(progress: CGFloat, strength: CGFloat, reducesMotion: Bool, isSecondary: Bool = false) {
         let time = min(max(progress, 0), 1)
         let fade = 1 - time
         radius = reducesMotion ? 8 : 5 + 11 * (1 - fade * fade)
         opacity = 0.8 * strength * fade * fade
+        self.isSecondary = isSecondary
     }
 }
 
@@ -126,6 +167,8 @@ enum SoftwareCursorGlyphRenderer {
     nonisolated(unsafe) static var tint: CursorColor?
     /// A recent picture of the screen under the cursor window and where it sits in the view, for the lens.
     nonisolated(unsafe) static var backdrop: (image: CGImage, rect: CGRect)?
+    // The falloff curve stays the same as the cursor moves. Keep only the current tint's gradient.
+    nonisolated(unsafe) private static var cachedFog: (tint: CursorColor?, gradient: CGGradient)?
     /// How much the glass enlarges what is under it.
     static let magnification: CGFloat = 1.4
     /// OPEN_COMPUTER_USE_CURSOR_STYLE=classic brings back the original grey artwork.
@@ -137,7 +180,8 @@ enum SoftwareCursorGlyphRenderer {
         context: CGContext,
         state: SoftwareCursorGlyphRenderState,
         usesReferenceArtwork: Bool = true,
-        ripple: CursorClickRipple? = nil
+        ripple: CursorClickRipple? = nil,
+        indicator: CursorInteractionIndicator? = nil
     ) {
         let drawingState = state.appKitDrawingState
         if let ripple, ripple.opacity > 0 {
@@ -151,28 +195,68 @@ enum SoftwareCursorGlyphRenderer {
                 context: context,
                 state: drawingState
             )
-            return
+        } else {
+            drawFog(
+                in: context,
+                center: CGPoint(x: bounds.midX + drawingState.fogOffset.dx, y: bounds.midY + drawingState.fogOffset.dy),
+                pulse: drawingState.clickProgress,
+                fogOpacity: state.fogOpacity,
+                fogScale: state.fogScale
+            )
+            drawSmoothPointer(in: bounds, context: context, state: drawingState)
+        }
+        if let indicator {
+            drawInteractionIndicator(indicator, in: bounds, context: context)
+        }
+    }
+
+    private static func drawInteractionIndicator(_ indicator: CursorInteractionIndicator, in bounds: CGRect, context: CGContext) {
+        let unit = bounds.width / SoftwareCursorGlyphMetrics.windowSize.width
+        let tip = SoftwareCursorGlyphMetrics.tipAnchor
+        let path = CGMutablePath()
+        switch indicator.feedback {
+        case .drag:
+            path.addEllipse(in: CGRect(x: -6, y: -6, width: 12, height: 12))
+        case .typing:
+            // An I-beam beside the point leaves the target visible.
+            path.move(to: CGPoint(x: -12, y: 3))
+            path.addLine(to: CGPoint(x: -12, y: 13))
+            path.move(to: CGPoint(x: -15, y: 3))
+            path.addLine(to: CGPoint(x: -9, y: 3))
+            path.move(to: CGPoint(x: -15, y: 13))
+            path.addLine(to: CGPoint(x: -9, y: 13))
+        case .scroll:
+            guard let direction = indicator.feedback.scrollDirection else { return }
+            // Place the chevron beside the pointer and aim it along the scroll delta.
+            let center = CGPoint(x: -13, y: 9)
+            func point(along: CGFloat, across: CGFloat) -> CGPoint {
+                CGPoint(
+                    x: center.x + along * direction.dx - across * direction.dy,
+                    y: center.y + along * direction.dy + across * direction.dx
+                )
+            }
+            path.move(to: point(along: -2, across: -4))
+            path.addLine(to: point(along: 2, across: 0))
+            path.addLine(to: point(along: -2, across: 4))
         }
 
-        let pulse = drawingState.clickProgress
-        let fogCenter = CGPoint(
-            x: bounds.midX + drawingState.fogOffset.dx,
-            y: bounds.midY + drawingState.fogOffset.dy
-        )
-        let pointerCenter = CGPoint(
-            x: bounds.midX + SoftwareCursorGlyphMetrics.pointerOffset.x + drawingState.cursorBodyOffset.dx,
-            y: bounds.midY + SoftwareCursorGlyphMetrics.pointerOffset.y + drawingState.cursorBodyOffset.dy + (pulse * 0.35)
-        )
-
-        drawFog(
-            in: context,
-            center: fogCenter,
-            pulse: pulse,
-            fogOpacity: state.fogOpacity,
-            fogScale: state.fogScale
-        )
-        _ = pointerCenter
-        drawSmoothPointer(in: bounds, context: context, state: drawingState)
+        context.saveGState()
+        context.translateBy(x: bounds.minX + tip.x * unit, y: bounds.minY + tip.y * unit)
+        context.scaleBy(x: unit, y: unit)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        if indicator.feedback == .drag, !indicator.isCompleted {
+            context.setLineDash(phase: 0, lengths: [4, 2.3])
+        }
+        context.addPath(path)
+        context.setStrokeColor(NSColor.black.withAlphaComponent(0.7).cgColor)
+        context.setLineWidth(3.2)
+        context.strokePath()
+        context.addPath(path)
+        context.setStrokeColor((tint?.lighter(0.8, alpha: 1) ?? .white).cgColor)
+        context.setLineWidth(1.5)
+        context.strokePath()
+        context.restoreGState()
     }
 
     private static func drawClickRipple(_ ripple: CursorClickRipple, in bounds: CGRect, context: CGContext) {
@@ -184,6 +268,9 @@ enum SoftwareCursorGlyphRenderer {
         let radius = ripple.radius * unit
         let ring = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
         context.saveGState()
+        if ripple.isSecondary {
+            context.setLineDash(phase: 0, lengths: [2.5 * unit, 2.5 * unit])
+        }
         context.setStrokeColor(NSColor.black.withAlphaComponent(ripple.opacity * 0.6).cgColor)
         context.setLineWidth(3 * unit)
         context.strokeEllipse(in: ring)
@@ -343,18 +430,29 @@ enum SoftwareCursorGlyphRenderer {
         // A white halo that fades like a soft light: a bell curve, so there is no ring or flat patch in it.
         let radius = (22 * fogScale) + (pulse * 3)
         let peak = min(0.55 * max(0.5, min(fogOpacity / 0.12, 1.5)) + pulse * 0.2, 0.9)
+        guard let gradient = fogGradient() else { return }
+        context.saveGState()
+        context.setAlpha(peak)
+        context.drawRadialGradient(gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: radius, options: [])
+        context.restoreGState()
+    }
+
+    private static func fogGradient() -> CGGradient? {
+        if let cachedFog, cachedFog.tint == tint { return cachedFog.gradient }
         let base = tint?.lighter(0.55, alpha: 1) ?? NSColor.white
         let falloff: CGFloat = 4.2
         let floor = exp(-falloff)
-        var colors: [CGColor] = []
-        var locations: [CGFloat] = []
-        for step in 0...24 {
-            let t = CGFloat(step) / 24
-            colors.append(base.withAlphaComponent(peak * (exp(-falloff * t * t) - floor) / (1 - floor)).cgColor)
-            locations.append(t)
+        let locations = (0...24).map { CGFloat($0) / 24 }
+        let colors = locations.map { t in
+            base.withAlphaComponent((exp(-falloff * t * t) - floor) / (1 - floor)).cgColor
         }
-        guard let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray, locations: locations) else { return }
-        context.drawRadialGradient(gradient, startCenter: center, startRadius: 0, endCenter: center, endRadius: radius, options: [])
+        guard let gradient = CGGradient(
+            colorsSpace: CGColorSpaceCreateDeviceRGB(),
+            colors: colors as CFArray,
+            locations: locations
+        ) else { return nil }
+        cachedFog = (tint, gradient)
+        return gradient
     }
 
     private static func drawPointer(

@@ -6,7 +6,7 @@ import Foundation
 /// Several agents (each its own `OpenComputerUse mcp` process) share one background app agent. What an agent
 /// was last shown, the app it last used, and its browser tab must stay its own; otherwise one agent's
 /// `browser read` lands in another's tab, or its text goes to the app the other one touched last.
-/// The proxy names its client (`OPEN_COMPUTER_USE_CLIENT`, by default the process that started it), and
+/// The proxy names its client (`OPEN_COMPUTER_USE_CLIENT`, by default the MCP proxy process), and
 /// the app agent runs every request inside `ClientScope.with`. Outside one, the scope is "main".
 public enum ClientScope {
     private static let threadKey = "godspeed.client-scope"
@@ -93,6 +93,12 @@ final class ScopedStore<Value>: @unchecked Sendable {
     init(make: @escaping (String) -> Value, drop: @escaping (Value) -> Void = { _ in }) {
         self.make = make
         self.drop = drop
+    }
+
+    var existing: Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[ClientScope.current]?.value
     }
 
     var current: Value {

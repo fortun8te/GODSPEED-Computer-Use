@@ -1,6 +1,6 @@
 # Training fixtures
 
-Default Godspeed logs are useful for counting failures and timing. They omit screenshots, inputs and UI text. Capture content only in an approved fixture session, and review the output before it enters a training set.
+Default Godspeed logs record tool latency, typed failure categories, per-step delivery and final verification. They omit screenshots, inputs and UI text. Capture content only in an approved fixture session, and review the output before it enters a training set.
 
 ## Decision and harness data
 

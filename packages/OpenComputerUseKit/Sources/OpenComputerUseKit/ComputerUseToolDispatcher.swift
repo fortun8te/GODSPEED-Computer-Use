@@ -398,12 +398,17 @@ public final class ComputerUseToolDispatcher {
                 pages: optionalDouble("pages", in: arguments) ?? 1
             )
         case "drag":
+            let modifiers = arguments["modifiers"] as? [String]
+            guard arguments["modifiers"] == nil || modifiers != nil else {
+                throw ComputerUseError.invalidArguments("drag modifiers must be an array of strings")
+            }
             return try service.drag(
                 app: requireString("app", in: arguments),
                 fromX: requireDouble("from_x", in: arguments),
                 fromY: requireDouble("from_y", in: arguments),
                 toX: requireDouble("to_x", in: arguments),
-                toY: requireDouble("to_y", in: arguments)
+                toY: requireDouble("to_y", in: arguments),
+                modifiers: modifiers ?? []
             )
         case "type_text":
             return try service.typeText(
@@ -463,13 +468,17 @@ public final class ComputerUseToolDispatcher {
         do {
             return try callTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult)
         } catch let error as ComputerUseError {
-            return ToolCallResult.text(
-                error.errorDescription ?? String(describing: error),
-                isError: error.toolResultIsError
+            let message = error.errorDescription ?? String(describing: error)
+            return ToolCallResult(
+                content: [.text(message)], isError: error.toolResultIsError,
+                failureCode: TrajectoryLog.failureCode(error: error, message: message)
             )
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            return ToolCallResult.text(message, isError: true)
+            return ToolCallResult(
+                content: [.text(message)], isError: true,
+                failureCode: TrajectoryLog.failureCode(error: error, message: message)
+            )
         }
     }
 

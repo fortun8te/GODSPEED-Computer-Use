@@ -13,10 +13,10 @@ import Foundation
 /// tabs. `obu mcp` answers one request at a time, so parallel page work uses extra "lanes": more
 /// `obu mcp` children, each with its own session (`<session>-lane<N>`) and its own tabs.
 final class BrowserBridge: @unchecked Sendable {
-    static let baseSessionID: String = {
+    static var baseSessionID: String {
         let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_BROWSER_SESSION"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (value?.isEmpty == false ? value : nil) ?? "godspeed-\(ProcessInfo.processInfo.processIdentifier)"
-    }()
+    }
 
     /// The bridge of the agent this thread works for (see `ClientScope`): each agent has its own Open Browser
     /// Use session, so its own tabs and its own current tab.
@@ -25,6 +25,8 @@ final class BrowserBridge: @unchecked Sendable {
         make: { scope in BrowserBridge(sessionID: sessionID(for: scope)) },
         drop: { $0.shutdown() }
     )
+
+    static func endClientTurn() { scoped.existing?.turnEnded() }
 
     /// At most this many pages are loaded at once by parallel actions.
     static let maxLanes = 3
@@ -45,9 +47,11 @@ final class BrowserBridge: @unchecked Sendable {
     }
 
     let sessionID: String
+    private let launchEnvironment: [String: String]
 
-    init(sessionID: String) {
+    init(sessionID: String, launchEnvironment: [String: String] = GodspeedSettings.environment) {
         self.sessionID = sessionID
+        self.launchEnvironment = launchEnvironment
     }
 
     private let tabLock = NSLock()
@@ -80,8 +84,7 @@ final class BrowserBridge: @unchecked Sendable {
 
     /// The `obu` executable: `OPEN_COMPUTER_USE_OBU_BIN`, else the copy bundled in GODSPEED.app
     /// (Contents/Helpers/obu), else the first `obu` / `open-browser-use` on PATH or in the usual folders.
-    static let executablePath: String? = {
-        let environment = GodspeedSettings.environment
+    static func executablePath(environment: [String: String]) -> String? {
         let switchValue = environment["OPEN_COMPUTER_USE_BROWSER"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let switchValue, ["0", "false", "no", "off"].contains(switchValue) { return nil }
         let files = FileManager.default
@@ -97,15 +100,15 @@ final class BrowserBridge: @unchecked Sendable {
             }
         }
         return nil
-    }()
+    }
 
-    static var isAvailable: Bool { executablePath != nil }
+    static var isAvailable: Bool { executablePath(environment: GodspeedSettings.environment) != nil }
 
     /// The app the accessibility path reads after a browser step. Default Google Chrome.
-    static let browserApp: String = {
+    static var browserApp: String {
         let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_BROWSER_APP"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (value?.isEmpty == false ? value : nil) ?? "Google Chrome"
-    }()
+    }
 
     private static func searchDirectories(environment: [String: String]) -> [String] {
         let home = NSHomeDirectory()
@@ -196,19 +199,19 @@ final class BrowserBridge: @unchecked Sendable {
 
     private func startIfNeeded() throws {
         if let process, process.isRunning { return }
-        guard let path = Self.executablePath else {
+        guard let path = Self.executablePath(environment: launchEnvironment) else {
             throw ComputerUseError.message(Self.notInstalledMessage)
         }
 
         let child = Process()
         child.executableURL = URL(fileURLWithPath: path)
         var arguments = ["mcp", "--session-id", sessionID]
-        if let profile = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_BROWSER_PROFILE"], !profile.isEmpty {
+        if let profile = launchEnvironment["OPEN_COMPUTER_USE_BROWSER_PROFILE"], !profile.isEmpty {
             arguments += ["--profile", profile]
         }
         child.arguments = arguments
         // An app bundle's PATH lacks Homebrew; an npm-installed `obu` needs `node` from there.
-        var environment = ProcessInfo.processInfo.environment
+        var environment = launchEnvironment
         environment["PATH"] = (["/opt/homebrew/bin", "/usr/local/bin"] + [environment["PATH"] ?? "/usr/bin:/bin"])
             .joined(separator: ":")
         child.environment = environment
@@ -430,6 +433,20 @@ extension ComputerUseToolDispatcher {
             let node = try target()
             return .text(try clickAndWatch(node, page: page, bridge: bridge))
 
+        case "drag":
+            guard tab["tab_id"] != nil else {
+                throw ComputerUseError.invalidArguments("browser drag needs an open or explicitly selected tab")
+            }
+            let destinationLabel = arguments["to_label"] as? String
+            let destinationIndex = Self.browserTabID(arguments["to_index"])
+            guard destinationLabel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false || destinationIndex != nil else {
+                throw ComputerUseError.invalidArguments("browser drag needs to_label or to_index for the destination")
+            }
+            let source = try target()
+            let destination = try page.resolve(label: destinationLabel, index: destinationIndex)
+            try page.drag(from: source, to: destination)
+            return .text("Drag delivered. Read the tab to verify the drop.")
+
         case "type", "type_text", "fill":
             guard let text = arguments["text"] as? String else {
                 throw ComputerUseError.invalidArguments("browser type needs text (and a label or index for the field, or it types into the focused field)")
@@ -601,7 +618,7 @@ extension ComputerUseToolDispatcher {
 
         default:
             throw ComputerUseError.invalidArguments(
-                "browser action must be one of: open, go, read, screenshot, click, type, key, hover, select, check, uncheck, scroll, back, forward, reload, wait_for, tabs, use_tab, wait, info, upload, peek"
+                "browser action must be one of: open, go, read, screenshot, click, drag, type, key, hover, select, check, uncheck, scroll, back, forward, reload, wait_for, tabs, use_tab, wait, info, upload, peek"
             )
         }
     }
@@ -666,10 +683,11 @@ extension ComputerUseToolDispatcher {
         // Worker threads do not inherit the caller's client scope: run each lane inside it, so its lane and
         // page memory are this agent's own.
         let scope = ClientScope.current
+        let bridges = (0..<laneCount).map(BrowserBridge.lane)
         DispatchQueue.concurrentPerform(iterations: laneCount) { lane in
             ClientScope.withScope(scope) {
                 BrowserCallBudget.withDeadline(deadline) {
-                    let bridge = BrowserBridge.lane(lane)
+                    let bridge = bridges[lane]
                     var index = lane
                     while index < urls.count {
                         results.set(index, BrowserCallBudget.remaining() > 4

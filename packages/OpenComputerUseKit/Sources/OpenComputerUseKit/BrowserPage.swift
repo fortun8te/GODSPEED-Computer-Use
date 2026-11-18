@@ -534,6 +534,55 @@ struct BrowserPage {
         try mouse("mouseMoved", try clickPoint(of: node), buttons: 0, clickCount: 0)
     }
 
+    /// A pointer gesture within one viewport, using live hit testing at both ends.
+    func drag(from source: BrowserNode, to destination: BrowserNode) throws {
+        restoreSetup()
+        func visiblePoint(_ node: BrowserNode) throws -> CGPoint {
+            guard let probe = try callOnNode(node, Self.clickProbeJS) as? [Any],
+                  probe.first as? String == "ok", probe.count >= 3,
+                  let x = BrowserRules.number(probe[1]), let y = BrowserRules.number(probe[2]),
+                  x.isFinite, y.isFinite else {
+                throw ComputerUseError.stateUnavailable("browser drag needs both controls visible and unobstructed in the same page. Read the tab again.")
+            }
+            return CGPoint(x: x, y: y)
+        }
+        let start = try visiblePoint(source)
+        let end = try visiblePoint(destination)
+        guard hypot(end.x - start.x, end.y - start.y) >= 4 else {
+            throw ComputerUseError.invalidArguments("browser drag needs two distinct visible positions")
+        }
+        try Self.deliverDrag(from: start, to: end, send: mouse)
+    }
+
+    static func deliverDrag(
+        from start: CGPoint, to end: CGPoint,
+        send: (String, CGPoint, Int, Int) throws -> Void
+    ) throws {
+        let remaining = BrowserCallBudget.remaining()
+        guard remaining > 4 else { throw ComputerUseError.stateUnavailable("browser drag ran out of time before pressing") }
+        let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
+        let movementDeadline = releaseDeadline - 3
+        try send("mouseMoved", start, 0, 0)
+        var last = start
+        do {
+            try BrowserCallBudget.withDeadline(movementDeadline) {
+                try send("mousePressed", start, 1, 1)
+                for step in 1...5 {
+                    let progress = Double(step) / 5
+                    last = CGPoint(x: start.x + (end.x - start.x) * progress, y: start.y + (end.y - start.y) * progress)
+                    try send("mouseMoved", last, 1, 0)
+                }
+            }
+        } catch {
+            // A missing CDP reply doesn't prove the event was never sent.
+            try? BrowserCallBudget.withDeadline(releaseDeadline) {
+                try send("mouseReleased", last, 0, 1)
+            }
+            throw ComputerUseError.stateUnavailable("browser drag was interrupted after starting. Read the tab before retrying.")
+        }
+        try send("mouseReleased", end, 0, 1)
+    }
+
     /// Where on the element to click: a point of its visible part that really reaches it (`elementFromPoint`
     /// hit-test). Says so when something else lies on top of every probed point (a banner, a dialog, a
     /// stretched link), instead of clicking that and reporting success. Elements in an iframe, and anything

@@ -5,6 +5,48 @@ import XCTest
 /// Pure-logic tests for the browser actions: key combinations, option matching, reply parsing, read
 /// rendering from synthetic accessibility JSON, and label matching. No Chrome, no OBU, no child process.
 final class BrowserPageTests: XCTestCase {
+    func testPointerDragReleasesOnceWhenMovementFails() throws {
+        let start = CGPoint(x: 10, y: 20)
+        let end = CGPoint(x: 60, y: 50)
+        var sent: [(String, CGPoint, Int)] = []
+        let deliver = {
+            try BrowserCallBudget.withDeadline(BrowserCallBudget.deadline()) {
+                try BrowserPage.deliverDrag(from: start, to: end) { kind, point, buttons, _ in
+                    sent.append((kind, point, buttons))
+                    if sent.count == 4 { throw ComputerUseError.stateUnavailable("interrupted fixture") }
+                }
+            }
+        }
+        XCTAssertThrowsError(try deliver())
+        XCTAssertEqual(sent.map { $0.0 }, ["mouseMoved", "mousePressed", "mouseMoved", "mouseMoved", "mouseReleased"])
+        XCTAssertEqual(sent.map { $0.2 }, [0, 1, 1, 1, 0])
+        XCTAssertEqual(sent.last?.1, CGPoint(x: 30, y: 32))
+    }
+
+    func testMCPListResolvesBrowserAvailabilityForEachRequest() throws {
+        let server = StdioMCPServer()
+        let request = #"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
+
+        func listsBrowser(environment: [String: String]) throws -> Bool {
+            let reply = try XCTUnwrap(server.handle(line: request, toolListingEnvironment: environment))
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(reply.utf8)) as? [String: Any])
+            let result = try XCTUnwrap(payload["result"] as? [String: Any])
+            let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
+            return tools.contains { $0["name"] as? String == "browser" }
+        }
+
+        let enabled = [
+            "OPEN_COMPUTER_USE_BROWSER": "1",
+            "OPEN_COMPUTER_USE_OBU_BIN": "/usr/bin/true",
+        ]
+        let disabled = enabled.merging(["OPEN_COMPUTER_USE_BROWSER": "0"]) { _, value in value }
+        let unavailable = enabled.merging(["OPEN_COMPUTER_USE_OBU_BIN": "/dev/null/obu"]) { _, value in value }
+        XCTAssertFalse(try listsBrowser(environment: disabled))
+        XCTAssertTrue(try listsBrowser(environment: enabled))
+        XCTAssertFalse(try listsBrowser(environment: unavailable))
+        XCTAssertTrue(try listsBrowser(environment: enabled))
+    }
+
     // MARK: - Helpers
 
     /// A synthetic accessibility node in the shape `Accessibility.getFullAXTree` returns.

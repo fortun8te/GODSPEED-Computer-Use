@@ -6,6 +6,7 @@ import OpenComputerUseKit
 private let appAgentCommand = "__open-computer-use-app-agent"
 private let appAgentDisableEnvironmentKey = "OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY"
 private let appAgentProcessStartDate = Date()
+private let appAgentLaunchEnvironment = ProcessInfo.processInfo.environment
 private let appAgentBuildIdentifier = Bundle.main.object(forInfoDictionaryKey: "OpenComputerUseBuildIdentifier") as? String ?? ""
 
 enum MacOSAppAgentProxy {
@@ -22,6 +23,7 @@ enum MacOSAppAgentProxy {
         // Swift globals initialize lazily. Capture both before the first request
         // so a later agentInfo call cannot mistake an old process for a rebuild.
         _ = appAgentProcessStartDate
+        _ = appAgentLaunchEnvironment
         _ = appAgentBuildIdentifier
         try MacOSAppAgentRuntime.run(socketPath: arguments[1])
     }
@@ -178,7 +180,7 @@ enum MacOSAppAgentProxy {
                     let response = try client.request([
                         "kind": "mcp",
                         "line": line,
-                        "environment": proxiedEnvironment(),
+                        "environment": proxiedEnvironment(mcp: true),
                     ])
 
                     if let responseLine = response["response"] as? String {
@@ -217,7 +219,7 @@ enum MacOSAppAgentProxy {
         let response = try client.request([
             "kind": "cli",
             "arguments": resolvingOpenComputerUseCallFilePaths(arguments),
-            "environment": proxiedEnvironment(),
+            "environment": proxiedEnvironment(mcp: false),
         ])
 
         return CLIProxyResponse(
@@ -227,15 +229,20 @@ enum MacOSAppAgentProxy {
         )
     }
 
-    private static func proxiedEnvironment() -> [String: String] {
+    static func proxyClientID(explicit: String?, mcp: Bool, processID: pid_t, parentProcessID: pid_t) -> String {
+        if let explicit, !explicit.isEmpty { return explicit }
+        return "p\(mcp ? processID : parentProcessID)"
+    }
+
+    private static func proxiedEnvironment(mcp: Bool) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment.filter { key, _ in
             key.hasPrefix("OPEN_COMPUTER_USE_")
         }
-        // Who this proxy works for: the process that started it (the agent harness), unless it names itself.
-        // The app agent keeps browser tabs and what-was-shown memory per client.
-        if (environment[clientEnvironmentKey] ?? "").isEmpty {
-            environment[clientEnvironmentKey] = "p\(getppid())"
-        }
+        // Each MCP proxy has its own state, even when several share a harness process.
+        // Separate CLI invocations keep using their common parent for continuity.
+        environment[clientEnvironmentKey] = proxyClientID(
+            explicit: environment[clientEnvironmentKey], mcp: mcp, processID: getpid(), parentProcessID: getppid()
+        )
         if let url = try? OCUConfiguration.fileURL(environment: OCUConfiguration.environment) {
             environment["OPEN_COMPUTER_USE_CONFIG_FILE"] = url.path
         }
@@ -557,7 +564,9 @@ private final class AppAgentConnection: @unchecked Sendable {
                 if let quick = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                    let method = quick["method"] as? String,
                    ["initialize", "notifications/initialized", "tools/list", "ping", "resources/list", "prompts/list"].contains(method) {
-                    let response = ClientScope.with(client) { server.handle(line: line) }
+                    let response = ClientScope.with(client) {
+                        server.handle(line: line, toolListingEnvironment: AppAgentEnvironment.effectiveEnvironment(environment))
+                    }
                     return ["response": response ?? NSNull()]
                 }
                 let response: String? = try AppAgentEnvironment.withOverrides(environment, client: client) {
@@ -624,7 +633,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                     let parameters = payload?["params"] as? [String: Any]
                     if payload?["method"] as? String == "tools/call",
                        let name = parameters?["name"] as? String,
-                       name != "list_apps", ToolDefinitions.all.contains(where: { $0.name == name }) {
+                       name != "list_apps", ToolDefinitions.isKnown(name) {
                         return try lockedUse.perform { server.handle(line: line) }
                     }
                     return server.handle(line: line)
@@ -736,6 +745,11 @@ private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
 
 private enum AppAgentEnvironment {
     private static let lock = NSLock()
+    private static let requestEnvironmentKeys = OCUConfiguration.environmentKeys.union([
+        "OPEN_COMPUTER_USE_BROWSER", "OPEN_COMPUTER_USE_OBU_BIN",
+        "OPEN_COMPUTER_USE_BROWSER_SESSION", "OPEN_COMPUTER_USE_BROWSER_PROFILE",
+        "OPEN_COMPUTER_USE_BROWSER_APP", "OPEN_COMPUTER_USE_BROWSER_TRACE",
+    ])
 
     /// How long a request waits behind the requests ahead of it. Past this it fails with a message, so one slow
     /// call cannot silently stall every other agent. Longer than the browser peek budget.
@@ -751,13 +765,19 @@ private enum AppAgentEnvironment {
         }
     }
 
+    static func effectiveEnvironment(_ overrides: [String: String]) -> [String: String] {
+        var environment = appAgentLaunchEnvironment
+        for key in requestEnvironmentKeys { environment[key] = nil }
+        return environment.merging(overrides) { _, request in request }
+    }
+
     private static func applying<T>(_ overrides: [String: String], _ body: () throws -> T) rethrows -> T {
 
-        let keys = Set(overrides.keys).union(OCUConfiguration.environmentKeys)
+        let keys = Set(overrides.keys).union(requestEnvironmentKeys)
         let previousValues = Dictionary(uniqueKeysWithValues: keys.map { key in
             (key, getenv(key).map { String(cString: $0) })
         })
-        for key in OCUConfiguration.environmentKeys where overrides[key] == nil { unsetenv(key) }
+        for key in requestEnvironmentKeys where overrides[key] == nil { unsetenv(key) }
         for (key, value) in overrides {
             setenv(key, value, 1)
         }

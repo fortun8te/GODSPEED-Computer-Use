@@ -26,6 +26,21 @@ final class CursorTimingTests: XCTestCase {
         XCTAssertEqual(reduced.opacity, middle.opacity)
     }
 
+    func testInteractionIndicatorDistinguishesDragFromDropAndRetainsScrollDirection() throws {
+        var indicator = CursorInteractionIndicator(feedback: .drag)
+        XCTAssertEqual(indicator.phase, "dragging")
+        indicator.isCompleted = true
+        XCTAssertEqual(indicator.phase, "dropped")
+
+        let scroll = CursorInteractionFeedback.scroll(CGVector(dx: 3, dy: 4))
+        let direction = try XCTUnwrap(scroll.scrollDirection)
+        XCTAssertEqual(direction.dx, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(direction.dy, -0.8, accuracy: 0.0001)
+        XCTAssertNil(CursorInteractionFeedback.scroll(.zero).scrollDirection)
+        XCTAssertEqual(CursorInteractionIndicator(feedback: scroll, isCompleted: true).phase, "scrolling")
+        XCTAssertEqual(CursorInteractionIndicator(feedback: .typing, isCompleted: true).phase, "typing")
+    }
+
     func testSpeedHasNoUpperLimitAndAnInstantSetting() {
         let key = "OPEN_COMPUTER_USE_CURSOR_SPEED"
         // The setting keeps the scale callers already use: unset or 4 is the default timing.

@@ -275,6 +275,21 @@ enum DragDeliveryPath: String, CaseIterable {
     case global
 }
 
+/// Modifier flags travel with the mouse events, so they never press a global key.
+func dragModifierFlags(_ modifiers: [String]) throws -> CGEventFlags {
+    var flags: CGEventFlags = []
+    for modifier in modifiers {
+        switch modifier.lowercased() {
+        case "shift": flags.insert(.maskShift)
+        case "option", "alt": flags.insert(.maskAlternate)
+        case "command", "cmd": flags.insert(.maskCommand)
+        case "control", "ctrl": flags.insert(.maskControl)
+        default: throw ComputerUseError.invalidArguments("drag modifiers must be shift, option, command, or control")
+        }
+    }
+    return flags
+}
+
 func dragDeliveryPath(environment: [String: String]) -> DragDeliveryPath {
     globalPointerFallbacksEnabled(environment: environment) ? .global : .appPost
 }
@@ -1078,43 +1093,56 @@ public final class ComputerUseService {
             return try actionResult(for: query)
         }
 
-        var scrolledByAccessibility = false
-        if let repeatCount = integralScrollPageCount(pages),
-           let rawAction = record.rawActions.first(where: { $0.caseInsensitiveCompare("AXScroll\(normalized.capitalized)ByPage") == .orderedSame }),
-           let element = record.element {
-            let outcome = try scrollPagesByAccessibility(element, action: rawAction, count: repeatCount)
-            if let refusal = outcome.refusal {
-                // Some pages moved: stop and say so, rather than repeating the scroll by another route.
-                if outcome.done > 0 {
-                    throw ComputerUseError.stateUnavailable(scrollPagesRefusedMessage(done: outcome.done, requested: repeatCount, error: refusal))
-                }
-            } else {
-                scrolledByAccessibility = true
-            }
+        let direction: CGVector = switch normalized {
+        case "up": CGVector(dx: 0, dy: -1)
+        case "down": CGVector(dx: 0, dy: 1)
+        case "left": CGVector(dx: -1, dy: 0)
+        default: CGVector(dx: 1, dy: 0)
         }
-
-        if !scrolledByAccessibility {
-            // Refused before the first page, or not a page-scrolling element: a scroll-wheel event over its frame.
-            guard let point = try globalPoint(for: record, snapshot: snapshot) else {
-                throw ComputerUseError.stateUnavailable("element \(elementIndex) has no scrollable frame")
+        let target = visualCursorTarget(for: record, snapshot: snapshot)
+        try withVisualFeedback(.scroll(direction), at: target) {
+            var scrolledByAccessibility = false
+            if let repeatCount = integralScrollPageCount(pages),
+               let rawAction = record.rawActions.first(where: { $0.caseInsensitiveCompare("AXScroll\(normalized.capitalized)ByPage") == .orderedSame }),
+               let element = record.element {
+                let outcome = try scrollPagesByAccessibility(element, action: rawAction, count: repeatCount)
+                if let refusal = outcome.refusal {
+                    // Some pages moved: stop and say so, rather than repeating the scroll by another route.
+                    if outcome.done > 0 {
+                        throw ComputerUseError.stateUnavailable(scrollPagesRefusedMessage(done: outcome.done, requested: repeatCount, error: refusal))
+                    }
+                } else {
+                    scrolledByAccessibility = true
+                }
             }
-            try performScrollEvent(
-                at: point,
-                direction: normalized,
-                pages: pages,
-                targetDescription: "element_index=\(elementIndex)",
-                snapshot: snapshot
-            )
+
+            if !scrolledByAccessibility {
+                // Refused before the first page, or not a page-scrolling element: a scroll-wheel event over its frame.
+                guard let point = try globalPoint(for: record, snapshot: snapshot) else {
+                    throw ComputerUseError.stateUnavailable("element \(elementIndex) has no scrollable frame")
+                }
+                try performScrollEvent(
+                    at: point,
+                    direction: normalized,
+                    pages: pages,
+                    targetDescription: "element_index=\(elementIndex)",
+                    snapshot: snapshot
+                )
+            }
         }
 
         pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
         return try actionResult(for: query)
     }
 
-    public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> ToolCallResult {
+    public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double, modifiers: [String] = []) throws -> ToolCallResult {
         guard [fromX, fromY, toX, toY].allSatisfy(\.isFinite) else {
             throw ComputerUseError.invalidArguments("drag requires finite coordinates")
         }
+        guard fromX != toX || fromY != toY else {
+            throw ComputerUseError.invalidArguments("drag needs distinct start and end points")
+        }
+        let flags = try dragModifierFlags(modifiers)
         let deliveryPath = dragDeliveryPath(environment: ProcessInfo.processInfo.environment)
         let recoveryPolicy = dragActionSnapshotRecoveryPolicy(for: deliveryPath)
         let snapshot = try currentSnapshot(for: query, recoveryPolicy: recoveryPolicy)
@@ -1122,6 +1150,9 @@ public final class ComputerUseService {
             throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
         }
         if snapshot.mode == .fixture {
+            guard modifiers.isEmpty else {
+                throw ComputerUseError.invalidArguments("drag modifiers require a native target window")
+            }
             try FixtureBridge.post(FixtureCommand(kind: "drag", identifier: "fixture-drag-pad", x: fromX, y: fromY, toX: toX, toY: toY))
             Thread.sleep(forTimeInterval: 0.15)
             return try actionResult(for: query)
@@ -1129,13 +1160,19 @@ public final class ComputerUseService {
 
         let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
         let end = try screenshotToGlobalPoint(snapshot: snapshot, x: toX, y: toY)
-        let path = try performDragEvent(
-            from: start,
-            to: end,
-            targetDescription: "from=(\(fromX), \(fromY)) to=(\(toX), \(toY))",
-            snapshot: snapshot,
-            path: deliveryPath
-        )
+        let startTarget = makeVisualCursorTarget(at: start, targetWindowID: snapshot.targetWindowID, targetWindowLayer: snapshot.targetWindowLayer)
+        let endTarget = makeVisualCursorTarget(at: end, targetWindowID: snapshot.targetWindowID, targetWindowLayer: snapshot.targetWindowLayer)
+        moveVisualCursor(to: startTarget)
+        let path = try withVisualFeedback(.drag, at: startTarget, completingAt: endTarget) {
+            try performDragEvent(
+                from: start,
+                to: end,
+                targetDescription: "from=(\(fromX), \(fromY)) to=(\(toX), \(toY))",
+                snapshot: snapshot,
+                path: deliveryPath,
+                flags: flags
+            )
+        }
         return appendingDragDeliveryNote(
             to: try actionResult(for: query, recoveryPolicy: recoveryPolicy),
             path: path
@@ -1153,6 +1190,15 @@ public final class ComputerUseService {
         }
 
         if text.isEmpty { return try actionResult(for: query) }
+        let target = snapshot.focusedElement.flatMap { focused in
+            snapshot.elements.values.first { record in record.element.map { CFEqual($0, focused) } == true }
+        }.flatMap { visualCursorTarget(for: $0, snapshot: snapshot) }
+        return try withVisualFeedback(.typing, at: target) {
+            try deliverText(app: query, text: text, keyMethod: keyMethod, snapshot: snapshot)
+        }
+    }
+
+    private func deliverText(app query: String, text: String, keyMethod: KeyMethod, snapshot: AppSnapshot) throws -> ToolCallResult {
 
         if keyMethod == .skyKey {
             let target = try skyKeyTarget(for: snapshot)
@@ -3071,6 +3117,33 @@ public final class ComputerUseService {
         }
     }
 
+    private func withVisualFeedback<T>(
+        _ feedback: CursorInteractionFeedback,
+        at target: VisualCursorTarget?,
+        completingAt endTarget: VisualCursorTarget? = nil,
+        _ deliver: () throws -> T
+    ) rethrows -> T {
+        guard VisualCursorSupport.isEnabled, let target else { return try deliver() }
+        if feedback != .drag { moveVisualCursor(to: target) }
+        VisualCursorSupport.performCursorAnimation {
+            SoftwareCursorOverlay.beginFeedback(feedback, at: target.point, in: target.window, anchor: target.anchor)
+        }
+        do {
+            let result = try deliver()
+            if let endTarget { moveVisualCursor(to: endTarget) }
+            let resting = endTarget ?? target
+            VisualCursorSupport.performCursorAnimation {
+                SoftwareCursorOverlay.endFeedback(feedback, at: resting.point, in: resting.window, anchor: resting.anchor)
+            }
+            return result
+        } catch {
+            VisualCursorSupport.performCursorAnimation {
+                SoftwareCursorOverlay.cancelFeedback(feedback)
+            }
+            throw error
+        }
+    }
+
     private func pulseVisualCursor(at target: VisualCursorTarget?, clickCount: Int, mouseButton: MouseButtonKind) {
         guard let target else {
             return
@@ -3164,7 +3237,8 @@ public final class ComputerUseService {
         to end: CGPoint,
         targetDescription: String,
         snapshot: AppSnapshot,
-        path: DragDeliveryPath
+        path: DragDeliveryPath,
+        flags: CGEventFlags
     ) throws -> DragDeliveryPath {
         let eventStart = inputEventPoint(fromScreenStatePoint: start)
         let eventEnd = inputEventPoint(fromScreenStatePoint: end)
@@ -3177,12 +3251,12 @@ public final class ComputerUseService {
                 snapshot: snapshot
             )
             InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
-            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd)
+            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, flags: flags)
         case .appPost:
             guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
                 throw ComputerUseError.stateUnavailable("drag requires an observed target window; run get_app_state again")
             }
-            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid)
+            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid, flags: flags)
         }
 
         return path

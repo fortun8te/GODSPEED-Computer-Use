@@ -34,7 +34,8 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 | `batch` | Up to 20 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
 | `get_app_state` | The app's numbered element tree (`App=` text). Screenshot only when asked. |
-| `click`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `drag`, `perform_secondary_action` | Element actions by `label` (visible text) or `element_index`. |
+| `click`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
+| `drag` | Two points on an app screenshot. Both must be in the observed window. Optional `modifiers` such as `["shift"]`. |
 | `press_menu` | Chooses a menu item in one call, e.g. `path: "File > Save"`, through accessibility. |
 | `query` | Finds elements by text or role. |
 | `list_apps` | Recently used apps. |
@@ -49,7 +50,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Change-only replies**: the final read is compared with what the model last saw for that app. Only changed lines are sent. If an element's number moved, the full state is sent instead. If nothing changed, the reply says so.
 - **Condensed trees**: long rows are collapsed, text is cut at 160 characters, and container noise is dropped. Every element number the model can act on stays the same.
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
-- **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
+- **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
 
 ### Works only with focus borrowing
 
@@ -153,9 +154,13 @@ Test and bench switches (`RUN_*`, `BENCH_*`, `APP_MATRIX_*`, `SMOKE_SERVER`, `FI
 
 See the [Godspeed setup guide](../README.md) for source and package installation, MCP registration, and Chrome setup.
 
+## Browser drag
+
+Open or select a tab and read its controls. For example, use `{"action":"drag","label":"Card A","to_label":"Drop zone"}` when both controls are visible in the same page. Read the tab after delivery to verify the drop. Apps can interpret pointer gestures differently.
+
 ## Local traces
 
-Tool logs at `~/.godspeed/trajectories` record timings, tool errors, failed batch steps and helper receipts. Arguments, screen text, and screenshots are omitted by default. Turn logging off with `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0`. Only set `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` on an approved fixture connection. That captures typed text and observations. Review those files before using or sharing them.
+Tool logs at `~/.godspeed/trajectories` record timing, fixed failure codes, individual batch outcomes, the remaining steps and the final verification status. Partial or uncertain delivery stays visible in the receipt. Arguments, screen text, and screenshots are omitted by default. Turn logging off with `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0`. Only set `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` on an approved fixture connection. That captures typed text and observations. Review those files before using or sharing them.
 
 Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper activity. A helper receipt records that the helper ran. Match verified fixture outcomes to exact run streams before using them as labels.
 

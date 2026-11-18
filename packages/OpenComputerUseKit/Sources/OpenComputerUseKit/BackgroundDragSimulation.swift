@@ -107,6 +107,7 @@ enum BackgroundDragDispatcher {
 
     static func drag(
         target: BackgroundDragTarget,
+        flags: CGEventFlags = [],
         io: BackgroundDragIO = .system(),
         validateSession: () throws -> Void = { try requireUsableComputerUseSession() }
     ) throws {
@@ -125,11 +126,13 @@ enum BackgroundDragDispatcher {
         // Allocate and stamp every event (including release at every possible
         // stopping point) before taking focus or pressing. Cleanup cannot fail
         // because a later allocation or private stamping call failed.
-        func prepare(_ type: CGEventType, at point: CGPoint) throws -> CGEvent {
+        let gesture = InputSimulation.dragGestureEventNumber()
+        func prepare(_ type: CGEventType, at point: CGPoint, delta: CGSize? = nil) throws -> CGEvent {
             guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else {
                 throw ComputerUseError.message("Failed to prepare background drag event")
             }
-            event.flags = []
+            InputSimulation.applyDragMotionFields(to: event, delta: delta, eventNumber: type == .mouseMoved ? nil : gesture)
+            event.flags = flags
             event.setIntegerValueField(.mouseEventClickState, value: type == .mouseMoved ? 0 : 1)
             event.setIntegerValueField(windowNumberField, value: Int64(target.windowID))
             try io.setWindowLocation(event, CGPoint(x: point.x - target.windowBounds.minX, y: point.y - target.windowBounds.minY))
@@ -138,11 +141,14 @@ enum BackgroundDragDispatcher {
         let move = try prepare(.mouseMoved, at: target.start)
         let down = try prepare(.leftMouseDown, at: target.start)
         var release = try prepare(.leftMouseUp, at: target.start)
+        var previous = target.start
         let steps = try (1...10).map { step -> (drag: CGEvent, up: CGEvent) in
             let t = CGFloat(step) / 10
             let point = CGPoint(x: target.start.x + (target.end.x - target.start.x) * t,
                                 y: target.start.y + (target.end.y - target.start.y) * t)
-            return (try prepare(.leftMouseDragged, at: point), try prepare(.leftMouseUp, at: point))
+            let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
+            previous = point
+            return (try prepare(.leftMouseDragged, at: point, delta: delta), try prepare(.leftMouseUp, at: point))
         }
         func send(_ event: CGEvent) throws {
             try validateSession()

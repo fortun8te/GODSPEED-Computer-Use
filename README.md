@@ -1,16 +1,13 @@
-# Godspeed
+<p align="center"><img src="assets/app-icons/godspeed-1024.png" width="88" alt="Godspeed's red glass cursor icon"></p>
+<h1 align="center">Godspeed</h1>
+<p align="center">Background computer use for Mac apps and Chrome.<br>For Codex, Claude Code, and other MCP clients.</p>
+<p align="center"><a href="#install">Install</a> · <a href="#examples">Examples</a> · <a href="docs/benchmarks.md">Benchmarks</a> · <a href="docs/GODSPEED.md">Tool guide</a></p>
 
-**Background computer use for macOS agents.** Drive Mac apps and Chrome from Claude Code, Codex, or any stdio MCP client. Godspeed starts with accessibility and page structure, batches familiar actions, and returns the app state needed to check what changed.
+Godspeed reads controls by name, runs related actions in one call, and checks what changed. You can keep using your Mac while an agent works in the background.
 
-- **Desktop** · Read controls, type into the live editor, and verify changes with a fresh observation. The background launcher keeps the real pointer and keyboard focus with you.
-- **Chrome** · Use semantic browser controls through Open Browser Use. Each client gets its own tab session. Peek reads several independent URLs in parallel.
-- **Small models** · Group actions with `batch`, target controls by name or identifier, and describe a verifiable `done_when`. Screenshots are available on request.
-- **Visible feedback** · A separate cursor moves to the target and gives clicks a short pulse. Reduce Motion keeps the cursor still between targets.
-- **Local measurements** · Compact tool receipts make failures, latency, and helper activity inspectable. Your desktop content stays out of the default log.
+## Install
 
-## Install on macOS
-
-Godspeed targets macOS 14 and newer. Build from source with Xcode and Swift 6.2 or newer.
+**macOS 14 or later.** Build the development package with Xcode and Swift 6.2 or newer.
 
 ```sh
 git clone https://github.com/fortun8te/godspeed.git
@@ -20,29 +17,29 @@ mkdir -p "$HOME/Applications"
 ditto -x -k "dist/godspeed/Godspeed-macOS-$(uname -m).zip" "$HOME/Applications"
 ```
 
-If you're upgrading, end active Godspeed sessions first and move the previous app bundle aside before extracting the replacement. Launch Godspeed once and grant Accessibility in System Settings. Grant Screen Recording if you want screenshot-based actions. The source packager signs locally for development. A notarized download will appear on the [Releases page](https://github.com/fortun8te/godspeed/releases) when available.
+Open **GODSPEED.app** and follow the permission screen. Accessibility enables app control. Screen Recording enables screenshots and visual targeting. When upgrading, close active Godspeed sessions and move the previous app aside before extracting the new version.
 
-### Connect your agent
-
-From the checkout, use the background launcher with either client.
+Register Godspeed from the checkout, then open a fresh agent session.
 
 ```sh
 codex mcp add godspeed -- "$PWD/scripts/godspeed-mcp"
 claude mcp add --scope user godspeed -- "$PWD/scripts/godspeed-mcp"
 ```
 
-Open a new agent session and ask it to use Godspeed to list apps. Start with a disposable app or document. Specify the app and the result you want checked. If you installed the bundle elsewhere, set `GODSPEED_APP` in the client's server environment.
+For Chrome, install [Open Browser Use](https://github.com/iFurySt/open-browser-use) and its Chrome extension. Run `obu setup` and check `obu ping`. Godspeed can also find the helper through `OPEN_COMPUTER_USE_OBU_BIN`.
 
-### Connect Chrome
+## Examples
 
-Install the Open Browser Use CLI and Chrome extension using the [upstream setup guide](https://github.com/iFurySt/open-browser-use). Run `obu setup` for the Chrome profile you intend to automate and verify it with `obu ping`. Put `obu` in your agent's PATH or set `OPEN_COMPUTER_USE_OBU_BIN` to its executable. Godspeed's native Mac tools work independently of Chrome.
+| Ask your agent | Godspeed uses |
+| --- | --- |
+| “Use Calculator to multiply 1234 by 56. Verify the result.” | One native batch with a fresh Calculator read. |
+| “Open these public URLs in separate tabs and read their headings.” | Chrome `peek` with up to three parallel reads. |
+| “Drag the selected control to the marked position in the same window.” | A targeted mouse-down, move, and release. Check the result in the app. |
 
-### Privacy and performance
+Tool replies are text-first. Ask for a screenshot when you need a visual target. Local logs record timings and outcomes by default. [Training fixtures](docs/training-fixtures.md) explains how to collect reviewed data.
 
-By default, telemetry stays on your Mac and records timing and outcomes without UI text, tool arguments, or screenshot bytes. Review the [settings and tool guide](docs/GODSPEED.md) before collecting training fixtures. For production workflows, check the actual final state before replaying any partial action.
+## Project
 
-Fewer round trips and text-first reads remove work from routine calls. Speed, input tokens, and task success depend on the model, workflow, and app. The [verification plan](docs/exec-plans/active/20261118-godspeed-workflow-reliability.md) describes how to compare the same tasks across tools.
+Development builds are locally signed. Follow [Releases](https://github.com/fortun8te/godspeed/releases) for distribution updates, and use [Issues](https://github.com/fortun8te/godspeed/issues) for reproducible failures.
 
-## License
-
-MIT. Godspeed is based on [Open Computer Use](https://github.com/iFurySt/open-computer-use). Chrome automation uses [Open Browser Use](https://github.com/iFurySt/open-browser-use). [Third-party notices](THIRD_PARTY_NOTICES.md) cover bundled dependencies.
+MIT. Based on [Open Computer Use](https://github.com/iFurySt/open-computer-use). [Third-party notices](THIRD_PARTY_NOTICES.md).

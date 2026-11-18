@@ -375,7 +375,12 @@ export function createCuaApi(native, activeOutput) {
         const targetArgs = Array.isArray(target) ? { x: target[0], y: target[1] } : { element_index: target };
         await call("click", { app, ...targetArgs, ...optionsToClickArgs(options) });
       },
-      async drag(from, to) { await call("drag", { app, from_x: from[0], from_y: from[1], to_x: to[0], to_y: to[1] }); },
+      async drag(from, to, { modifiers } = {}) {
+        await call("drag", {
+          app, from_x: from[0], from_y: from[1], to_x: to[0], to_y: to[1],
+          ...(modifiers === undefined ? {} : { modifiers }),
+        });
+      },
       async pressKey(key, options = {}) { await call("press_key", { app, key, ...optionsToKeyArgs(options) }); },
       async pressMenu(path) {
         if (typeof path !== "string" || !path.trim()) throw new Error("pressMenu requires a menu path such as \"File > Save As…\"");
