@@ -1,8 +1,6 @@
 # GODSPEED
 
-GODSPEED is the computer-use protocol inside PURE (PC + VOICE + GODSPEED). It lets an agent read and act on macOS apps and web pages through short tool calls, in the background, with the user's own apps and tabs left alone.
-
-For now it ships as a test stand: `/Applications/GODSPEED.app` (bundle id `com.michael.godspeed`). It is a background app with no Dock icon (`LSUIElement`). When PURE embeds this Swift package, the same code moves into PURE and GODSPEED.app goes away. Its macOS permissions will not carry over to PURE.
+Godspeed is a macOS computer-use server for local agents. It handles Mac apps through accessibility and Chrome through Open Browser Use. The app runs as an accessory without a Dock icon.
 
 The desktop implementation lives in `packages/OpenComputerUseKit`. See the [verification plan](exec-plans/active/20261118-godspeed-workflow-reliability.md) for current coverage.
 
@@ -171,3 +169,5 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 - The browser tool needs Chrome, the Open Browser Use extension, and the one-time setup step. It cannot use other browsers.
 - Model results are not measured yet. The fixed task set (steps, seconds, finish rate against Codex native) has not been run.
 - Apps with no usable accessibility tree can be clicked only by vision. That needs `find_on_screen` on and the helper service running.
+
+See [training fixtures](training-fixtures.md) for reviewed vision annotations and verified decision labels.
