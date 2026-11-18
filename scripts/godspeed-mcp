@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != Darwin ]]; then
+  echo "Godspeed requires macOS." >&2
+  exit 1
+fi
+
+app="${GODSPEED_APP:-$HOME/Applications/GODSPEED.app}"
+if [[ -z "${GODSPEED_APP:-}" && ! -d "$app" ]]; then
+  app="/Applications/GODSPEED.app"
+fi
+binary="$app/Contents/MacOS/OpenComputerUse"
+if [[ ! -x "$binary" ]]; then
+  echo "Godspeed is missing at $app. Install GODSPEED.app or set GODSPEED_APP." >&2
+  exit 1
+fi
+export OPEN_COMPUTER_USE_BACKGROUND_ONLY=1
+export OPEN_COMPUTER_USE_FOCUS_BORROW=0
+export OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=0
+exec "$binary" mcp

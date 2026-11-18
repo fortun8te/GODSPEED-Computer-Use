@@ -1,0 +1,3287 @@
+import AppKit
+import ApplicationServices
+import Foundation
+import ImageIO
+
+struct VisualCursorTarget: Equatable {
+    let point: CGPoint
+    let window: CursorTargetWindow?
+    /// The same point expressed relative to the window frame the snapshot
+    /// reported. The overlay keeps it so a window that moves before or during
+    /// the action can be re-derived instead of drawing on the display the
+    /// window just left.
+    var anchor: CursorRestingAnchor? = nil
+}
+
+public enum ClickMethod: String, CaseIterable, Sendable {
+    case auto
+    case accessibility
+    case appPost = "app_post"
+    case skyClick = "sky_click"
+    case global
+}
+
+func clickActionSnapshotRecoveryPolicy(for method: ClickMethod) -> SnapshotRecoveryPolicy {
+    method == .skyClick ? .readOnly : .allowActivation
+}
+
+func parseClickMethod(_ rawValue: String?) throws -> ClickMethod {
+    let normalized = rawValue?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? ClickMethod.auto.rawValue
+
+    guard let method = ClickMethod(rawValue: normalized) else {
+        let expected = ClickMethod.allCases.map(\.rawValue).joined(separator: ", ")
+        throw ComputerUseError.message(
+            "Invalid click_method '\(rawValue ?? "")'. Expected one of: \(expected)"
+        )
+    }
+
+    return method
+}
+
+func validateClickMethod(
+    _ method: ClickMethod,
+    hasElementIndex: Bool,
+    environment: [String: String]
+) throws {
+    if method == .accessibility, !hasElementIndex {
+        throw ComputerUseError.message("click_method 'accessibility' requires element_index")
+    }
+
+    if method == .global, !globalPointerFallbacksEnabled(environment: environment) {
+        throw ComputerUseError.message(
+            "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus"
+        )
+    }
+}
+
+public enum KeyMethod: String, CaseIterable, Sendable {
+    case auto
+    case skyKey = "sky_key"
+}
+
+func keyActionSnapshotRecoveryPolicy(for method: KeyMethod) -> SnapshotRecoveryPolicy {
+    method == .skyKey ? .readOnly : .allowActivation
+}
+
+func parseKeyMethod(_ rawValue: String?) throws -> KeyMethod {
+    let normalized = rawValue?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? KeyMethod.auto.rawValue
+
+    guard let method = KeyMethod(rawValue: normalized) else {
+        let expected = KeyMethod.allCases.map(\.rawValue).joined(separator: ", ")
+        throw ComputerUseError.message(
+            "Invalid key_method '\(rawValue ?? "")'. Expected one of: \(expected)"
+        )
+    }
+
+    return method
+}
+
+func validateSkyClickArguments(
+    method: ClickMethod,
+    mouseButton: String,
+    clickCount: Int
+) throws {
+    guard method == .skyClick else {
+        return
+    }
+
+    guard mouseButton.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == MouseButtonKind.left.rawValue else {
+        throw ComputerUseError.message(
+            "click_method 'sky_click' only supports mouse_button 'left'"
+        )
+    }
+
+    guard (1...2).contains(clickCount) else {
+        throw ComputerUseError.message(
+            "click_method 'sky_click' supports click_count 1 or 2"
+        )
+    }
+}
+
+struct VisualCursorScreenMapping: Equatable {
+    let screenStateFrame: CGRect
+    let appKitFrame: CGRect
+}
+
+func currentVisualCursorScreenMappings() -> [VisualCursorScreenMapping] {
+    NSScreen.screens.compactMap { screen in
+        guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+
+        return VisualCursorScreenMapping(
+            screenStateFrame: CGDisplayBounds(CGDirectDisplayID(screenNumber.uint32Value)),
+            appKitFrame: screen.frame
+        )
+    }
+}
+
+func screenStatePointToAppKitGlobalPoint(
+    fromScreenStatePoint point: CGPoint,
+    screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings()
+) -> CGPoint {
+    guard let mapping = screenMappings.first(where: { $0.screenStateFrame.contains(point) }) else {
+        return point
+    }
+
+    let localX = point.x - mapping.screenStateFrame.minX
+    let localY = point.y - mapping.screenStateFrame.minY
+
+    return CGPoint(
+        x: mapping.appKitFrame.minX + localX,
+        y: mapping.appKitFrame.maxY - localY
+    )
+}
+
+func visualCursorAppKitPoint(
+    fromScreenStatePoint point: CGPoint,
+    screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings()
+) -> CGPoint {
+    screenStatePointToAppKitGlobalPoint(
+        fromScreenStatePoint: point,
+        screenMappings: screenMappings
+    )
+}
+
+func inputEventPoint(
+    fromScreenStatePoint point: CGPoint,
+    screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings()
+) -> CGPoint {
+    point
+}
+
+/// Anchor for a cursor target built from a window-local point.
+///
+/// The click paths derive their point from the snapshot, so they carry the
+/// window frame that point belongs to; the overlay needs both to follow the
+/// window if it moves before or during the action.
+func makeCursorWindowAnchor(snapshot: AppSnapshot, windowLocalPoint: CGPoint) -> CursorRestingAnchor? {
+    guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
+        return nil
+    }
+
+    // The anchor carries the window's accessibility element; the overlay registers it as the
+    // live-frame source when the queued animation runs (the window list can lag a move by
+    // about a second, so the element is what makes the re-derivation immediate).
+    return CursorRestingAnchor(
+        windowID: windowID,
+        layer: snapshot.targetWindowLayer ?? 0,
+        windowLocalPoint: windowLocalPoint,
+        windowBounds: windowBounds,
+        frameSource: snapshot.windowElement.map(CursorFrameSource.init)
+    )
+}
+
+func makeVisualCursorTarget(
+    at point: CGPoint,
+    targetWindowID: CGWindowID?,
+    targetWindowLayer: Int?,
+    screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings(),
+    anchor: CursorRestingAnchor? = nil
+) -> VisualCursorTarget {
+    VisualCursorTarget(
+        point: screenStatePointToAppKitGlobalPoint(
+            fromScreenStatePoint: point,
+            screenMappings: screenMappings
+        ),
+        window: targetWindowID.map { CursorTargetWindow(windowID: $0, layer: targetWindowLayer ?? 0) },
+        anchor: anchor
+    )
+}
+
+func makeVisualCursorTarget(
+    localFrame: CGRect?,
+    windowBounds: CGRect?,
+    targetWindowID: CGWindowID?,
+    targetWindowLayer: Int?,
+    screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings(),
+    windowElement: AXUIElement? = nil
+) -> VisualCursorTarget? {
+    guard let localFrame, let windowBounds else {
+        return nil
+    }
+
+    let point = CGPoint(
+        x: windowBounds.minX + localFrame.midX,
+        y: windowBounds.minY + localFrame.midY
+    )
+    return makeVisualCursorTarget(
+        at: point,
+        targetWindowID: targetWindowID,
+        targetWindowLayer: targetWindowLayer,
+        screenMappings: screenMappings,
+        anchor: targetWindowID.map { windowID in
+            CursorRestingAnchor(
+                windowID: windowID,
+                layer: targetWindowLayer ?? 0,
+                windowLocalPoint: CGPoint(x: localFrame.midX, y: localFrame.midY),
+                windowBounds: windowBounds,
+                frameSource: windowElement.map(CursorFrameSource.init)
+            )
+        }
+    )
+}
+
+func inputFallbackDebugEnabled(environment: [String: String]) -> Bool {
+    guard let rawValue = environment["OPEN_COMPUTER_USE_DEBUG_INPUT_FALLBACKS"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    else {
+        return false
+    }
+
+    return ["1", "true", "yes", "on"].contains(rawValue)
+}
+
+func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
+    // The physical pointer path activates the target app and moves the real mouse.
+    guard !backgroundOnlyMode(environment: environment) else { return false }
+    guard let rawValue = environment["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    else {
+        return false
+    }
+
+    return ["1", "true", "yes", "on"].contains(rawValue)
+}
+
+/// Whether an action's result reads the window back (settle, then a full snapshot).
+/// A program driving the tools (the `js` REPL adapter) reads state explicitly and
+/// sets `OPEN_COMPUTER_USE_ACTION_READ_BACK=0`, so its actions return a short status.
+func actionReadBackEnabled(environment: [String: String]) -> Bool {
+    guard let rawValue = environment["OPEN_COMPUTER_USE_ACTION_READ_BACK"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    else {
+        return true
+    }
+
+    return !["0", "false", "no", "off"].contains(rawValue)
+}
+
+/// How a `drag` is delivered. `drag` has no method argument; the path is decided
+/// by the same process-level gate that authorizes `click_method=global`.
+enum DragDeliveryPath: String, CaseIterable {
+    /// Window-addressed `CGEvent.postToPid` with target-only synthetic focus.
+    /// Never moves the real pointer; window-server-managed drag/drop is not guaranteed.
+    case appPost = "app_post"
+    /// `.cghidEventTap`: drives window-server drag sessions and may move the
+    /// real pointer or change foreground focus.
+    case global
+}
+
+func dragDeliveryPath(environment: [String: String]) -> DragDeliveryPath {
+    globalPointerFallbacksEnabled(environment: environment) ? .global : .appPost
+}
+
+func dragActionSnapshotRecoveryPolicy(for path: DragDeliveryPath) -> SnapshotRecoveryPolicy {
+    path == .appPost ? .readOnly : .allowActivation
+}
+
+func dragDeliveryNote(for path: DragDeliveryPath) -> String {
+    switch path {
+    case .appPost:
+        return "Drag delivered via app_post: window-addressed mouse events were posted once to the target process with target-only synthetic focus when needed; the system pointer was not moved. Delivery is not verification of the target UI result. Window-server-managed gestures such as window moves or Finder drag-and-drop are not guaranteed. Global input is never a fallback; it requires explicit OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 and may move the real pointer or change foreground focus."
+    case .global:
+        return "Drag delivered via global pointer path: OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS is enabled, so the real pointer may have moved and foreground focus may have changed."
+    }
+}
+
+/// Inserts the delivery note after the snapshot text and before any screenshot,
+/// so `primaryText` remains the snapshot for existing consumers.
+func appendingDragDeliveryNote(to result: ToolCallResult, path: DragDeliveryPath) -> ToolCallResult {
+    var content = result.content
+    let insertIndex = content.firstIndex { $0.dictionary["type"] as? String == "image" } ?? content.endIndex
+    content.insert(.text(dragDeliveryNote(for: path)), at: insertIndex)
+    return ToolCallResult(content: content, isError: result.isError)
+}
+
+func selectTextErrorMessage(_ error: TextSelectionResolverError, elementIndex: String) -> String {
+    switch error {
+    case .emptyText:
+        return "select_text requires non-empty text"
+    case .notFound:
+        return "select_text could not find the requested text in element \(elementIndex); pass text exactly as it appears in the accessibility tree"
+    case .ambiguous(let occurrenceCount):
+        return "select_text found \(occurrenceCount) matches in element \(elementIndex); provide prefix or suffix to disambiguate the target"
+    }
+}
+
+func selectTextUnreadableValueErrorMessage(elementIndex: String) -> String {
+    return "element \(elementIndex) has no readable accessibility text value, so select_text cannot locate the requested text"
+}
+
+/// The keyboard fallback of `type_text` sent keys, but the field's text is the same as before.
+/// A secure field and an unreadable value prove nothing, so they never count as unchanged.
+func typedTextWasNotApplied(before: String?, after: String?, text: String, isSecureField: Bool) -> Bool {
+    guard !isSecureField, !text.isEmpty, let before, let after else {
+        return false
+    }
+    return before == after
+}
+
+let typedTextNotAppliedMessage = "type_text sent the keys, but the field's text did not change, so nothing was typed. The window may not have taken keyboard input. Read the app state before typing again: a repeat could type twice if the first keys arrive late."
+
+/// `scroll` asked the app for `requested` pages through AXScrollByPage and it accepted only `done`.
+func scrollPagesRefusedMessage(done: Int, requested: Int, error: AXError) -> String {
+    "scroll moved \(done) of \(requested) pages, then the app refused the next page (AXError \(error.rawValue)). Read the app state before scrolling again."
+}
+
+/// Appended to set_value's refusal: what to do instead for a field that cannot take a value.
+let setValueFallbackHint = ". Click the field and use type_text to enter the text, or press_menu for a command the app offers"
+
+/// The focused element could not be read. Save, open and print panels can run in their own process,
+/// whose focus is out of reach from here.
+let focusedElementUnreadableMessage = "type_text could not read the app's current focused element. Focus a text entry area and try again. If a save, open or print panel is showing, its focus may be out of reach: use the app's menu path (press_menu) or the app's own command line or URL instead."
+
+/// The reply with a note placed after the state text and before any screenshot, as the other notes are.
+func insertingNote(_ note: String, into result: ToolCallResult) -> ToolCallResult {
+    var content = result.content
+    content.insert(.text(note), at: content.firstIndex { $0.dictionary["type"] as? String == "image" } ?? content.endIndex)
+    return ToolCallResult(content: content, isError: result.isError)
+}
+
+/// Inserts a verification note after the snapshot text and before any screenshot, matching
+/// `appendingDragDeliveryNote` so `primaryText` stays the snapshot for existing consumers.
+func screenshotPixelScale(
+    screenshotPixelSize: CGSize?,
+    windowBounds: CGRect?
+) -> CGSize {
+    guard
+        let screenshotPixelSize,
+        let windowBounds,
+        windowBounds.width > 0,
+        windowBounds.height > 0,
+        screenshotPixelSize.width > 0,
+        screenshotPixelSize.height > 0
+    else {
+        return CGSize(width: 1, height: 1)
+    }
+
+    return CGSize(
+        width: screenshotPixelSize.width / windowBounds.width,
+        height: screenshotPixelSize.height / windowBounds.height
+    )
+}
+
+func screenshotPixelToWindowPoint(
+    _ point: CGPoint,
+    screenshotPixelSize: CGSize?,
+    windowBounds: CGRect?
+) -> CGPoint {
+    let scale = screenshotPixelScale(
+        screenshotPixelSize: screenshotPixelSize,
+        windowBounds: windowBounds
+    )
+    return CGPoint(
+        x: point.x / scale.width,
+        y: point.y / scale.height
+    )
+}
+
+/// Renaming a file selects its name without the extension. True when `text` is the full new name, ending in that same
+/// extension, typed over such a selection: the whole old name must be replaced, or the result is "name.txt.txt".
+func typedNameReplacesWholeValue(value: String, selection: CFRange, text: String) -> Bool {
+    let value = value as NSString
+    guard selection.location == 0, selection.length > 0, selection.length < value.length else { return false }
+    let rest = value.substring(from: selection.length)
+    guard rest.hasPrefix("."), rest.count <= 8, !rest.dropFirst().contains("."), !rest.contains(" ") else { return false }
+    return text.count > rest.count && text.lowercased().hasSuffix(rest.lowercased())
+}
+
+/// The whole-name rule runs only in Finder's own rename editor: a text field in Finder, outside any sheet or dialog.
+/// Elsewhere the same selection and typed text is ordinary editing (a word selected at the start of a document, then
+/// "Quarterly.pdf" typed over it), and ⌘A would replace the whole document.
+func isFinderRenameEditor(bundleIdentifier: String?, role: String?, insideSheetOrDialog: Bool) -> Bool {
+    bundleIdentifier == "com.apple.finder" && role == "AXTextField" && !insideSheetOrDialog
+}
+
+/// AX ranges use UTF-16. Reject unavailable, out-of-bounds or split-surrogate ranges.
+func typedTextReplacement(value: String, selection: CFRange, text: String) -> (value: String, caret: Int)? {
+    let units = Array(value.utf16)
+    guard selection.location >= 0, selection.location <= units.count,
+          selection.length >= 0, selection.length <= units.count - selection.location
+    else { return nil }
+    let end = selection.location + selection.length
+    func splitsSurrogate(_ offset: Int) -> Bool {
+        offset > 0 && offset < units.count
+            && (0xD800...0xDBFF).contains(units[offset - 1]) && (0xDC00...0xDFFF).contains(units[offset])
+    }
+    guard !splitsSurrogate(selection.location), !splitsSurrogate(end) else { return nil }
+    let range = NSRange(location: selection.location, length: selection.length)
+    return ((value as NSString).replacingCharacters(in: range, with: text), selection.location + text.utf16.count)
+}
+
+let nonSettableSetValueErrorMessage = "Cannot set a value for an element that is not settable"
+
+func setValueAttributeIsSettable(result: AXError, settable: Bool, attribute: String) throws -> Bool {
+    guard result == .success else {
+        throw ComputerUseError.message("AXUIElementIsAttributeSettable(\(attribute)) failed with \(result.rawValue)")
+    }
+
+    return settable
+}
+
+func invalidSecondaryActionErrorMessage(action: String, elementIndex: Int) -> String {
+    "\(action) is not a valid secondary action for \(elementIndex)"
+}
+
+func localClickActionPoints(frame: CGRect, isSyntheticText: Bool) -> [CGPoint] {
+    let center = CGPoint(x: frame.midX, y: frame.midY)
+    let leading = CGPoint(
+        x: frame.minX + min(max(frame.width * 0.3, 20), max(frame.width - 4, 20)),
+        y: frame.midY
+    )
+
+    if isSyntheticText {
+        return [leading]
+    }
+
+    if abs(leading.x - center.x) < 1 {
+        return [center]
+    }
+
+    return [center, leading]
+}
+
+func isLikelySyntheticSideActionCandidate(
+    parentFrame: CGRect?,
+    candidateFrame: CGRect?,
+    hasPrimaryAction: Bool,
+    labels: [String]
+) -> Bool {
+    let hasSideActionLabel = labels.contains { label in
+        let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else {
+            return false
+        }
+
+        if normalized == "完成" || normalized == "done" || normalized == "complete" || normalized == "archive" {
+            return true
+        }
+
+        if normalized.count <= 24 {
+            if normalized.contains("完成") {
+                return true
+            }
+
+            if normalized.contains("mark") && (normalized.contains("done") || normalized.contains("complete")) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    guard let parentFrame, let candidateFrame else {
+        return false
+    }
+
+    let trailingBandWidth = min(max(parentFrame.width * 0.22, 56), 140)
+    let isTrailing = candidateFrame.midX >= parentFrame.maxX - trailingBandWidth
+    let compactWidth = candidateFrame.width <= max(88, parentFrame.width * 0.18)
+    let compactHeight = candidateFrame.height <= max(44, parentFrame.height * 1.2)
+    let isCompact = compactWidth && compactHeight
+
+    if hasSideActionLabel && hasPrimaryAction && isCompact {
+        return true
+    }
+
+    return isTrailing && isCompact && (hasPrimaryAction || hasSideActionLabel)
+}
+
+func shouldScanDescendantsOfHitRecord(originalFrame: CGRect?, hitFrame: CGRect?) -> Bool {
+    guard let originalFrame, let hitFrame else {
+        return true
+    }
+
+    let originalArea = max(originalFrame.width * originalFrame.height, 1)
+    let hitArea = hitFrame.width * hitFrame.height
+    if hitArea > max(originalArea * 12, 20_000) {
+        return false
+    }
+
+    if hitFrame.height > max(originalFrame.height * 4, 96),
+       hitFrame.width > max(originalFrame.width * 2, 240)
+    {
+        return false
+    }
+
+    return true
+}
+
+/// A descendant found by scanning below a click target may be pressed only where the click was aimed:
+/// for a coordinate click its frame must contain the click point, for an element click it must overlap
+/// the element's click frame. Without this, a coordinate click on a blank spot, whose best record is
+/// the window, pressed the window's smallest button wherever it was, such as its close button.
+func isDescendantClickCandidateAtTarget(candidateFrame: CGRect?, clickPoint: CGPoint?, targetFrame: CGRect?) -> Bool {
+    guard let candidateFrame, !candidateFrame.isEmpty, !candidateFrame.isInfinite,
+          candidateFrame.minX.isFinite, candidateFrame.minY.isFinite,
+          candidateFrame.width.isFinite, candidateFrame.height.isFinite else {
+        return false
+    }
+
+    if let clickPoint {
+        return candidateFrame.contains(clickPoint)
+    }
+
+    return targetFrame.map(candidateFrame.intersects) ?? false
+}
+
+func isLikelyContainingRowActionFrame(
+    targetFrame: CGRect,
+    candidateFrame: CGRect?,
+    hasPrimaryAction: Bool
+) -> Bool {
+    let targetCenter = CGPoint(x: targetFrame.midX, y: targetFrame.midY)
+    guard
+        hasPrimaryAction,
+        let candidateFrame,
+        candidateFrame.insetBy(dx: -2, dy: -2).contains(targetCenter),
+        candidateFrame.width >= targetFrame.width,
+        candidateFrame.height >= targetFrame.height,
+        candidateFrame.height <= max(targetFrame.height + 32, targetFrame.height * 2)
+    else {
+        return false
+    }
+
+    return true
+}
+
+/// Whether a click-chain AX action ran: true when it did, false when the answer proves the app ran nothing, so the
+/// chain may try its next way. Any other answer can come after the app acted: an app busy past the AX timeout answers
+/// cannotComplete while the action runs, and AppKit answers AXConfirm on a table cell with attributeUnsupported after
+/// it started editing. Those throw, so one click never lands a second time through another way.
+func clickActionRan(_ result: AXError, action: String) throws -> Bool {
+    switch result {
+    case .success:
+        return true
+    case .attributeUnsupported where action.caseInsensitiveCompare("AXOpen") == .orderedSame:
+        return true
+    case .actionUnsupported, .illegalArgument, .notImplemented, .invalidUIElement:
+        return false
+    case .failure, .cannotComplete, .attributeUnsupported, .noValue:
+        throw ComputerUseError.message(clickMayHaveActedMessage(what: action, result: result))
+    default:
+        throw ComputerUseError.message("AXUIElementPerformAction(\(action)) failed with \(result.rawValue)")
+    }
+}
+
+/// The same for an attribute the click chain writes: a write the attribute refused never applied.
+func clickAttributeWasSet(_ result: AXError, attribute: String) throws -> Bool {
+    switch result {
+    case .success:
+        return true
+    case .attributeUnsupported, .actionUnsupported, .illegalArgument, .noValue, .notImplemented, .invalidUIElement:
+        return false
+    case .failure, .cannotComplete:
+        throw ComputerUseError.message(clickMayHaveActedMessage(what: "setting \(attribute)", result: result))
+    default:
+        throw ComputerUseError.message("AXUIElementSetAttributeValue(\(attribute)) failed with \(result.rawValue)")
+    }
+}
+
+func clickMayHaveActedMessage(what: String, result: AXError) -> String {
+    let answer = result == .cannotComplete ? "the app did not answer in time" : "the app answered AXError \(result.rawValue)"
+    return "click: \(what) went out and \(answer); it may have acted, so no other click method was tried. Read the app state before retrying; a repeat could act twice."
+}
+
+// Shared by production dispatch and sequence tests: a partially delivered multi-click
+// must never return "unhandled" and restart through another delivery method.
+func performClickActionSequence(action: String, repeatCount: Int,
+                                send: () throws -> AXError,
+                                pause: () -> Void = {}) throws -> Bool {
+    let attempts = max(repeatCount, 1)
+    for index in 0..<attempts {
+        let result = try send()
+        guard try clickActionRan(result, action: action) else {
+            guard index == 0 else {
+                throw ComputerUseError.message("click: \(action) \(index + 1) of \(attempts) was refused after \(index) went out; no other click method was tried. Read the app state before retrying.")
+            }
+            return false
+        }
+        // AXOpen answered attributeUnsupported and opened: never open it again.
+        if result != .success { return true }
+        if index < attempts - 1 {
+            pause()
+        }
+    }
+
+    return true
+}
+
+/// The refusal for an element-index press on a control that says it is disabled, or nil to go ahead. AppKit answers
+/// AXPress on a disabled NSButton with success and runs nothing, so without this the click reads as delivered. A
+/// menu item is let through: a closed menu reports its items as they were when it last opened, and the app decides.
+func disabledControlRefusal(enabled: Bool?, role: String?, elementIndex: String) -> String? {
+    guard enabled == false, role != kAXMenuItemRole as String, role != kAXMenuBarItemRole as String else {
+        return nil
+    }
+    return "element \(elementIndex) is disabled, so nothing was sent. Wait for it to be enabled, or act on another element."
+}
+
+func canUseActivationOnlyClickFallback(role: String?) -> Bool {
+    guard let role else {
+        return false
+    }
+
+    return isSnapshotRootRole(role)
+}
+
+func canUseKeyboardTextFallback(role: String?, roleDescription: String?, isValueSettable: Bool) -> Bool {
+    if isValueSettable {
+        return true
+    }
+
+    guard let role else {
+        return false
+    }
+
+    if role == kAXTextFieldRole as String || role == "AXTextArea" || role == "AXTextView" {
+        return true
+    }
+
+    guard let roleDescription = roleDescription?.lowercased() else {
+        return false
+    }
+
+    return roleDescription.contains("text field")
+        || roleDescription.contains("text area")
+        || roleDescription.contains("text entry")
+}
+
+func isElectronScopedWebRowClickOptimizationTarget(appName: String, bundleIdentifier: String?) -> Bool {
+    let normalizedBundleIdentifier = bundleIdentifier?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    let normalizedName = appName
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+
+    if let normalizedBundleIdentifier,
+       normalizedBundleIdentifier.hasPrefix("com.electron.")
+            || normalizedBundleIdentifier.contains(".electron.")
+            || normalizedBundleIdentifier.contains("lark")
+            || normalizedBundleIdentifier.contains("feishu")
+    {
+        return true
+    }
+
+    return normalizedName == "lark" || normalizedName == "feishu" || normalizedName == "飞书"
+}
+
+func shouldPreferContainingWebRowAXClickCandidate(
+    role: String?,
+    isSyntheticText: Bool,
+    hasWebAreaAncestor: Bool,
+    appName: String,
+    bundleIdentifier: String?
+) -> Bool {
+    guard hasWebAreaAncestor,
+          isElectronScopedWebRowClickOptimizationTarget(
+            appName: appName,
+            bundleIdentifier: bundleIdentifier
+          )
+    else {
+        return false
+    }
+
+    guard let role else {
+        return isSyntheticText
+    }
+
+    return role == kAXStaticTextRole as String || role == kAXGroupRole as String || isSyntheticText
+}
+
+public final class ComputerUseService {
+    private var snapshotsByApp: [String: AppSnapshot] = [:]
+    private var invalidatedSnapshotAliases: Set<String> = []
+    // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
+    // for the duration of each request.
+    private var actionReadBack: Bool { actionReadBackEnabled(environment: ProcessInfo.processInfo.environment) }
+
+    // Targeted-lookup registry. `query` stores each match here keyed by a high,
+    // monotonic element index; the existing element actions resolve that index to
+    // the queried control and act without any snapshot. Indexes sit above the
+    // snapshot tree range and are never reissued, so a later snapshot cannot
+    // reassign one to a different control.
+    private struct TargetedElement {
+        let record: ElementRecord
+        let context: TargetedAX.WindowContext
+        let criteria: TargetedAX.Criteria
+    }
+    private let targetedElements = TargetedElementRegistry<TargetedElement>()
+
+    public func clearQueryIndexes() { targetedElements.clear() }
+
+    public init() {}
+
+    /// An action's result reads the window back, so the app gets a beat to redraw
+    /// first. Without read-back nothing is read, so there is no wait.
+    /// With a target window, returns as soon as the window stops changing (WindowSettle),
+    /// capped at `interval`; without one, sleeps the fixed interval as before.
+    private func pauseBeforeReadBack(_ interval: TimeInterval, windowID: CGWindowID? = nil) {
+        guard actionReadBack else {
+            return
+        }
+
+        guard WindowSettle.enabled, let windowID, !LockedUseActionScope.requiresScreenCaptureKit else {
+            Thread.sleep(forTimeInterval: interval)
+            return
+        }
+        WindowSettle.waitUntilStill(cap: interval) {
+            SkyLightSPI.shared.hardwareCaptureWindow(windowID).flatMap(WindowSettle.fingerprint(of:))
+        }
+    }
+
+    /// The result an action returns: the after-action snapshot, or a short status
+    /// when read-back is off.
+    private func actionResult(for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ToolCallResult {
+        guard actionReadBack else {
+            return .text("ok")
+        }
+
+        return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
+    }
+
+    public func listApps() -> ToolCallResult {
+        ToolCallResult.text(
+            AppDiscovery.listCatalog()
+                .map(\.renderedLine)
+                .joined(separator: "\n")
+        )
+    }
+
+    public func getAppState(
+        app query: String,
+        textLimit: SnapshotTextLimit = .defaults,
+        treeLimits: AccessibilityTreeLimits = .defaults,
+        windowPlacement: WindowPlacement = .keep,
+        observation: SnapshotObservationOptions = .defaults,
+        settleMs: Int? = nil
+    ) throws -> ToolCallResult {
+        if windowPlacement == .agentDisplay { try VirtualDisplayConfig.current.requireEnabled() }
+        try observation.validate()
+        if let settleMs {
+            let note = try waitForWindowToSettle(app: query, timeoutMs: settleMs)
+            let result = try getAppState(app: query, textLimit: textLimit, treeLimits: treeLimits,
+                                         windowPlacement: windowPlacement, observation: observation)
+            // After the state text and before the screenshot, so primaryText stays the state.
+            var content = result.content
+            content.insert(.text(note), at: content.firstIndex { $0.dictionary["type"] as? String == "image" } ?? content.endIndex)
+            return ToolCallResult(content: content, isError: result.isError)
+        }
+        guard windowPlacement != .keep else {
+            return snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, observation: observation), style: .fullState)
+        }
+
+        // Explicit placements never activate or raise; they only move the frame.
+        let snapshot = try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, recoveryPolicy: .readOnly, observation: observation)
+        guard snapshot.mode != .fixture else {
+            throw ComputerUseError.message("window_placement '\(windowPlacement.rawValue)' is not supported for fixture apps")
+        }
+        switch windowPlacement {
+        case .agentDisplay:
+            guard var windowID = snapshot.targetWindowID, var windowElement = snapshot.windowElement else {
+                throw ComputerUseError.stateUnavailable("window_placement 'agent_display' requires a current target window. Run get_app_state again.")
+            }
+            // A sheet cannot move on its own; park its window and the sheet goes along.
+            if stringValue(of: windowElement, attribute: kAXRoleAttribute) == kAXSheetRole as String {
+                guard let parent = copyParent(of: windowElement),
+                      stringValue(of: parent, attribute: kAXRoleAttribute) == kAXWindowRole as String,
+                      let parentID = SkyLightSPI.shared.windowID(for: parent), parentID != windowID
+                else {
+                    throw ComputerUseError.stateUnavailable("window_placement 'agent_display' requires the sheet's parent window. Run get_app_state again.")
+                }
+                windowElement = parent
+                windowID = parentID
+            }
+            try AgentDisplay.shared.park(windowID: windowID, pid: snapshot.app.pid, window: windowElement)
+        case .restore:
+            try AgentDisplay.shared.restoreAll(pid: snapshot.app.pid)
+        case .keep:
+            break
+        }
+
+        return snapshotResult(for: try refreshSnapshot(for: query, textLimit: textLimit, treeLimits: treeLimits, recoveryPolicy: .readOnly, observation: observation), style: .fullState)
+    }
+
+    /// Waits while the app's window shows a busy sign, for at most `timeoutMs` (capped at 5 s).
+    /// Read-only: no activation, no capture.
+    private func waitForWindowToSettle(app query: String, timeoutMs: Int) throws -> String {
+        try requireUsableComputerUseSession()
+        let start = ProcessInfo.processInfo.systemUptime
+        guard let context = try? SnapshotBuilder.resolveTargetWindow(for: try AppDiscovery.resolve(query)) else {
+            return "Settle skipped: no window to watch yet."
+        }
+        let settled = WindowSettle.wait(timeout: TimeInterval(min(timeoutMs, 5000)) / 1000) {
+            TimingLog.measure("get_app_state.settle_scan") { WindowSettle.busy(from: context.windowElement, read: WindowSettle.readAll) }
+        }
+        let waited = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
+        return settled
+            ? "Settled: the window shows no busy sign (waited \(waited) ms)."
+            : "Not settled: the window still showed a busy sign after \(waited) ms; this is its state at that point."
+    }
+
+    public func click(
+        app query: String,
+        elementIndex: String?,
+        x: Double?,
+        y: Double?,
+        clickCount: Int,
+        mouseButton: String,
+        clickMethod: ClickMethod = .auto
+    ) throws -> ToolCallResult {
+        try validateClickMethod(
+            clickMethod,
+            hasElementIndex: elementIndex != nil,
+            environment: ProcessInfo.processInfo.environment
+        )
+        try validateSkyClickArguments(
+            method: clickMethod,
+            mouseButton: mouseButton,
+            clickCount: clickCount
+        )
+
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let button = MouseButtonKind(rawValue: mouseButton.lowercased()) ?? .left
+        if elementIndex == nil, !snapshot.observation.includeScreenshot {
+            throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
+        }
+        if snapshot.mode == .fixture {
+            guard clickMethod == .auto else {
+                throw ComputerUseError.message(
+                    "click_method '\(clickMethod.rawValue)' is not supported for fixture apps"
+                )
+            }
+
+            let cursorTarget: VisualCursorTarget?
+            if let elementIndex {
+                let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+                guard let identifier = record.identifier else {
+                    throw ComputerUseError.invalidArguments("fixture click requires an identifier-backed element")
+                }
+                cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+                moveVisualCursor(to: cursorTarget)
+                try FixtureBridge.post(FixtureCommand(kind: "click", identifier: identifier))
+            } else if let x, let y {
+                let identifier = try fixtureIdentifier(at: CGPoint(x: x, y: y), snapshot: snapshot)
+                cursorTarget = fixtureVisualCursorTarget(identifier: identifier, snapshot: snapshot)
+                moveVisualCursor(to: cursorTarget)
+                try FixtureBridge.post(FixtureCommand(kind: "click", identifier: identifier, x: x, y: y))
+            } else {
+                throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
+            }
+
+            Thread.sleep(forTimeInterval: 0.15)
+            pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+            return try actionResult(for: query)
+        }
+
+        if let elementIndex {
+            let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+            try refuseDisabledControl(record, elementIndex: elementIndex)
+            guard let windowPoint = clickPoint(for: record, snapshot: snapshot) else {
+                throw ComputerUseError.stateUnavailable("element \(elementIndex) has no clickable frame")
+            }
+            let targetPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: windowPoint)
+            let cursorTarget = makeVisualCursorTarget(
+                at: targetPoint,
+                targetWindowID: snapshot.targetWindowID,
+                targetWindowLayer: snapshot.targetWindowLayer,
+                anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: windowPoint)
+            )
+
+            moveVisualCursor(to: cursorTarget)
+
+            do {
+                switch clickMethod {
+                case .auto:
+                    if !(try performAXClickSequence(
+                        on: record,
+                        snapshot: snapshot,
+                        button: button,
+                        clickCount: clickCount,
+                        includeNearbyHitTesting: true,
+                        allowActivationFallback: true
+                    )) {
+                        try performNonAXClickFallback(
+                            at: targetPoint,
+                            button: button,
+                            clickCount: clickCount,
+                            targetDescription: "element_index=\(elementIndex)",
+                            snapshot: snapshot
+                        )
+                    }
+                case .accessibility:
+                    guard try performAXClickSequence(
+                        on: record,
+                        snapshot: snapshot,
+                        button: button,
+                        clickCount: clickCount,
+                        includeNearbyHitTesting: true,
+                        allowActivationFallback: true
+                    ) else {
+                        throw ComputerUseError.message(
+                            "click_method 'accessibility' could not click element_index=\(elementIndex)"
+                        )
+                    }
+                case .appPost, .skyClick, .global:
+                    try performExplicitMouseClick(
+                        method: clickMethod,
+                        at: targetPoint,
+                        windowPoint: windowPoint,
+                        button: button,
+                        clickCount: clickCount,
+                        targetDescription: "element_index=\(elementIndex)",
+                        snapshot: snapshot
+                    )
+                }
+            } catch {
+                settleVisualCursor(at: cursorTarget)
+                throw error
+            }
+
+            pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+        } else if let x, let y {
+            let screenshotPoint = CGPoint(x: x, y: y)
+            let point = try screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: screenshotPoint)
+            let targetPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
+            let cursorTarget = makeVisualCursorTarget(
+                at: targetPoint,
+                targetWindowID: snapshot.targetWindowID,
+                targetWindowLayer: snapshot.targetWindowLayer,
+                anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: point)
+            )
+
+            moveVisualCursor(to: cursorTarget)
+
+            do {
+                switch clickMethod {
+                case .auto:
+                    let candidates = try clickCandidates(at: point, in: snapshot)
+                    var handled = false
+                    for record in candidates {
+                        if try performAXClickSequence(
+                            on: record,
+                            snapshot: snapshot,
+                            button: button,
+                            clickCount: clickCount,
+                            includeNearbyHitTesting: false,
+                            allowActivationFallback: false,
+                            clickPoint: point
+                        ) {
+                            handled = true
+                            break
+                        }
+                    }
+
+                    if !handled {
+                        try performNonAXClickFallback(
+                            at: targetPoint,
+                            button: button,
+                            clickCount: clickCount,
+                            targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
+                            snapshot: snapshot
+                        )
+                    }
+                case .accessibility:
+                    throw ComputerUseError.message("click_method 'accessibility' requires element_index")
+                case .appPost, .skyClick, .global:
+                    try performExplicitMouseClick(
+                        method: clickMethod,
+                        at: targetPoint,
+                        windowPoint: point,
+                        button: button,
+                        clickCount: clickCount,
+                        targetDescription: "x=\(Int(screenshotPoint.x)) y=\(Int(screenshotPoint.y))",
+                        snapshot: snapshot
+                    )
+                }
+            } catch {
+                settleVisualCursor(at: cursorTarget)
+                throw error
+            }
+
+            pulseVisualCursor(at: cursorTarget, clickCount: clickCount, mouseButton: button)
+        } else {
+            throw ComputerUseError.invalidArguments("click requires either element_index or x/y")
+        }
+
+        return try actionResult(for: query, recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod))
+    }
+
+    public func performSecondaryAction(app query: String, elementIndex: String, action: String) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+
+        if snapshot.mode == .fixture {
+            guard action.caseInsensitiveCompare("Raise") == .orderedSame else {
+                throw ComputerUseError.message(invalidSecondaryActionMessage(action: action, record: record))
+            }
+
+            return try actionResult(for: query)
+        }
+
+        guard let rawAction = matchingAction(requested: action, record: record) else {
+            throw ComputerUseError.message(invalidSecondaryActionMessage(action: action, record: record))
+        }
+
+        guard let element = record.element else {
+            throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
+        }
+        try refuseDisabledControl(record, elementIndex: elementIndex)
+
+        if rawAction.caseInsensitiveCompare(kAXRaiseAction as String) == .orderedSame {
+            if backgroundOnlyMode() {
+                throw ComputerUseError.message(backgroundOnlyRaiseRefusedMessage)
+            }
+            // Raise brings the window in front of the user's work; only a borrowed app (foreground: true) may raise.
+            guard FocusBorrow.isBorrowed(pid: snapshot.app.pid) else {
+                throw ComputerUseError.message("Raise is refused in the background: it would bring the window in front of the user's work. Send it in a batch with \"foreground\": true to raise it.")
+            }
+        }
+
+        try requireUsableComputerUseSession()
+        let result = AXUIElementPerformAction(element, rawAction as CFString)
+        guard result == .success else {
+            throw ComputerUseError.message("AXUIElementPerformAction failed with \(result.rawValue)")
+        }
+
+        pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+        return try actionResult(for: query)
+    }
+
+    public func scroll(app query: String, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
+        let normalized = direction.lowercased()
+        guard ["up", "down", "left", "right"].contains(normalized) else {
+            throw ComputerUseError.message("Invalid scroll direction: \(direction)")
+        }
+        guard pages.isFinite, pages > 0 else {
+            throw ComputerUseError.message("pages must be > 0")
+        }
+
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+
+        if snapshot.mode == .fixture {
+            guard let identifier = record.identifier else {
+                throw ComputerUseError.invalidArguments("fixture scroll requires an identifier-backed element")
+            }
+            try FixtureBridge.post(FixtureCommand(kind: "scroll", identifier: identifier, direction: normalized, pages: pages))
+            Thread.sleep(forTimeInterval: 0.15)
+            return try actionResult(for: query)
+        }
+
+        var scrolledByAccessibility = false
+        if let repeatCount = integralScrollPageCount(pages),
+           let rawAction = record.rawActions.first(where: { $0.caseInsensitiveCompare("AXScroll\(normalized.capitalized)ByPage") == .orderedSame }),
+           let element = record.element {
+            let outcome = try scrollPagesByAccessibility(element, action: rawAction, count: repeatCount)
+            if let refusal = outcome.refusal {
+                // Some pages moved: stop and say so, rather than repeating the scroll by another route.
+                if outcome.done > 0 {
+                    throw ComputerUseError.stateUnavailable(scrollPagesRefusedMessage(done: outcome.done, requested: repeatCount, error: refusal))
+                }
+            } else {
+                scrolledByAccessibility = true
+            }
+        }
+
+        if !scrolledByAccessibility {
+            // Refused before the first page, or not a page-scrolling element: a scroll-wheel event over its frame.
+            guard let point = try globalPoint(for: record, snapshot: snapshot) else {
+                throw ComputerUseError.stateUnavailable("element \(elementIndex) has no scrollable frame")
+            }
+            try performScrollEvent(
+                at: point,
+                direction: normalized,
+                pages: pages,
+                targetDescription: "element_index=\(elementIndex)",
+                snapshot: snapshot
+            )
+        }
+
+        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+        return try actionResult(for: query)
+    }
+
+    public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double) throws -> ToolCallResult {
+        guard [fromX, fromY, toX, toY].allSatisfy(\.isFinite) else {
+            throw ComputerUseError.invalidArguments("drag requires finite coordinates")
+        }
+        let deliveryPath = dragDeliveryPath(environment: ProcessInfo.processInfo.environment)
+        let recoveryPolicy = dragActionSnapshotRecoveryPolicy(for: deliveryPath)
+        let snapshot = try currentSnapshot(for: query, recoveryPolicy: recoveryPolicy)
+        guard snapshot.observation.includeScreenshot else {
+            throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
+        }
+        if snapshot.mode == .fixture {
+            try FixtureBridge.post(FixtureCommand(kind: "drag", identifier: "fixture-drag-pad", x: fromX, y: fromY, toX: toX, toY: toY))
+            Thread.sleep(forTimeInterval: 0.15)
+            return try actionResult(for: query)
+        }
+
+        let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
+        let end = try screenshotToGlobalPoint(snapshot: snapshot, x: toX, y: toY)
+        let path = try performDragEvent(
+            from: start,
+            to: end,
+            targetDescription: "from=(\(fromX), \(fromY)) to=(\(toX), \(toY))",
+            snapshot: snapshot,
+            path: deliveryPath
+        )
+        return appendingDragDeliveryNote(
+            to: try actionResult(for: query, recoveryPolicy: recoveryPolicy),
+            path: path
+        )
+    }
+
+    public func typeText(app query: String, text: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
+        let recovery: SnapshotRecoveryPolicy = backgroundOnlyMode() ? .readOnly : keyActionSnapshotRecoveryPolicy(for: keyMethod)
+        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: recovery)
+        if snapshot.mode == .fixture {
+            try requireAutoKeyMethodForFixture(keyMethod)
+            try FixtureBridge.post(FixtureCommand(kind: "type_text", identifier: "fixture-input", value: text))
+            Thread.sleep(forTimeInterval: 0.15)
+            return try actionResult(for: query)
+        }
+
+        if text.isEmpty { return try actionResult(for: query) }
+
+        if keyMethod == .skyKey {
+            let target = try skyKeyTarget(for: snapshot)
+            if let focused = Self.focusedElement(pid: target.pid) {
+                try selectWholeNameForKeys(text: text, focused: focused, pid: target.pid, windowID: target.windowID)
+            }
+            try InputSimulation.typeTextWithSkyLight(text, windowID: target.windowID, pid: target.pid)
+            return snapshotResult(
+                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
+                style: .actionResult
+            )
+        }
+
+        // A keystroke can open a modal after the cached snapshot was taken.
+        guard let focused = Self.currentInputFocus(pid: snapshot.app.pid) else {
+            // A background calculator has no focused element at all; its keypad still takes keys.
+            if try typeOnKeypad(text, snapshot: snapshot, focused: nil) {
+                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                return try actionResult(for: query)
+            }
+            throw ComputerUseError.stateUnavailable(focusedElementUnreadableMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
+        }
+        if try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
+            pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+            return try actionResult(for: query)
+        }
+
+        guard canTypeTextUsingKeyboardFallback(on: focused) else {
+            // Nothing editable has focus (Calculator's keypad, a canvas, a game): send the text as key presses to the
+            // app's window, as a person typing would. The SkyLight route reaches a background window too.
+            // Only where loose keys are safe: plain characters (no Return or Tab, which press default buttons),
+            // not inside a web page (letters are shortcuts there), into the window that holds the focus now.
+            guard try typeOnKeypad(text, snapshot: snapshot, focused: focused) else {
+                throw ComputerUseError.stateUnavailable(
+                    "type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element."
+                        + FocusBorrow.retryHint(pid: snapshot.app.pid))
+            }
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            let result = try actionResult(for: query)
+            return ToolCallResult(
+                content: [.text("No text field had focus, so the text went to the window as key presses.")] + result.content,
+                isError: result.isError
+            )
+        }
+
+        try requireCurrentTextFocus(focused, pid: snapshot.app.pid)
+        let isSecure = isSecureTextField(subrole: stringValue(of: focused, attribute: kAXSubroleAttribute))
+        let before = isSecure ? nil : stringValue(of: focused, attribute: kAXValueAttribute)
+        if useSkyLightKeyRoute(snapshot: snapshot, focused: focused, opensDialogFromMenu: false, hasLiveTextFocus: true) {
+            // Keys posted to a background process reach only a window that is key; the key-window route makes it key.
+            // This is the default whenever the app is not in front (not only in background-only mode); a borrowed
+            // app, a save/open sheet and Finder's rename editor take the normal route below, which is also what a
+            // retry with focus borrowed uses when these keys had no effect.
+            let windowID = try backgroundKeyboardWindow(for: snapshot, action: "type_text", focused: focused)
+            try selectWholeNameForKeys(text: text, focused: focused, pid: snapshot.app.pid, windowID: windowID)
+            try InputSimulation.typeTextWithSkyLight(text, windowID: windowID, pid: snapshot.app.pid)
+        } else {
+            try selectWholeNameForKeys(text: text, focused: focused, pid: snapshot.app.pid, windowID: nil)
+            try InputSimulation.typeText(text, pid: snapshot.app.pid)
+        }
+        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+        let after = isSecure ? nil : stringValue(of: focused, attribute: kAXValueAttribute)
+        // Keys that never reached the field leave its text as it was: say so instead of reporting a success.
+        // Without read-back nothing settles before this read, so the comparison would be unreliable.
+        if actionReadBack, typedTextWasNotApplied(before: before, after: after, text: text, isSecureField: isSecure) {
+            throw ComputerUseError.stateUnavailable(typedTextNotAppliedMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
+        }
+        return try actionResult(for: query)
+    }
+
+    /// Keys for a rename's full new name go over the whole old name: ⌘A first, when the typed text is a name with the
+    /// same extension typed over a selection that leaves the extension out. Otherwise the keys would make "name.txt.txt".
+    /// `windowID` is set on the background route, where keys reach only the key window.
+    private func selectWholeNameForKeys(text: String, focused: AXUIElement, pid: pid_t, windowID: CGWindowID?) throws {
+        guard replacesWholeName(of: focused, pid: pid, text: text) else { return }
+        if let windowID {
+            try InputSimulation.pressKeyWithSkyLight("cmd+a", windowID: windowID, pid: pid)
+        } else {
+            try InputSimulation.pressKey("cmd+a", pid: pid)
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+
+    /// Whether keys for `snapshot`'s app go through the SkyLight key route instead of the frontmost/borrowed one.
+    private func useSkyLightKeyRoute(
+        snapshot: AppSnapshot, focused: AXUIElement?, opensDialogFromMenu: Bool, hasLiveTextFocus: Bool = false
+    ) -> Bool {
+        let pid = snapshot.app.pid
+        return shouldRouteKeysThroughSkyLight(KeyRouteContext(
+            backgroundOnly: backgroundOnlyMode(),
+            targetIsFrontmost: NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+            borrowed: FocusBorrow.isBorrowed(pid: pid),
+            skyLightAvailable: SkyLightSPI.shared.capability.isAvailable,
+            hasTargetWindow: snapshot.targetWindowID != nil || hasLiveTextFocus,
+            bundleIdentifier: snapshot.app.bundleIdentifier,
+            focusInSheetOrDialog: focused.map(Self.isInsideSheetOrDialog) ?? false,
+            opensDialogFromMenu: opensDialogFromMenu
+        ))
+    }
+
+    /// The window a background-only keyboard route delivers to. Fails with the working route when
+    /// the window is unknown or the private key-window support is missing.
+    private func backgroundKeyboardWindow(for snapshot: AppSnapshot, action: String, focused: AXUIElement? = nil) throws -> CGWindowID {
+        let windowID: CGWindowID?
+        if let focused {
+            // The last snapshot may describe the window under a newly opened panel.
+            windowID = SkyLightSPI.shared.windowID(for: focused)
+                ?? Self.elementAttribute(focused, kAXWindowAttribute).flatMap { SkyLightSPI.shared.windowID(for: $0) }
+        } else {
+            windowID = snapshot.targetWindowID
+        }
+        guard let windowID else {
+            throw ComputerUseError.stateUnavailable("\(action) needs an on-screen target window in background-only mode. Run get_app_state again.")
+        }
+        let capability = SkyLightSPI.shared.capability
+        guard capability.isAvailable else {
+            throw ComputerUseError.stateUnavailable(backgroundKeyUnavailableMessage(action: action, reason: capability.unavailableReason))
+        }
+        return windowID
+    }
+
+    /// Types `text` as single key presses into a keypad app (a calculator): only there, and only the characters
+    /// a keypad takes. Anywhere else loose keys do other things: in a Finder list they select a file by name,
+    /// and a following Return renames it. False when this is not such a case or the keys could not be sent.
+    private func typeOnKeypad(_ text: String, snapshot: AppSnapshot, focused: AXUIElement?) throws -> Bool {
+        guard !text.isEmpty, text.allSatisfy({ "0123456789+-*/=.,%()^ ".contains($0) }) else { return false }
+        let buttonNames = snapshot.elements.values.flatMap { record in
+            [record.title, record.identifier, record.identity?.name].compactMap { $0?.lowercased().filter { !$0.isWhitespace } }
+        }
+        guard LabelSpellings.isKeypad(buttonNames: buttonNames) else { return false }
+        if let focused, Self.isInsideWebArea(focused) { return false }
+        guard let windowID = focused.flatMap({ SkyLightSPI.shared.windowID(for: $0) }) ?? snapshot.targetWindowID,
+              SkyLightSPI.shared.capability.isAvailable else { return false }
+        do {
+            // One key at a time: a keypad takes only the first character of a longer string.
+            for character in text where character != " " {
+                try InputSimulation.typeTextWithSkyLight(String(character), windowID: windowID, pid: snapshot.app.pid)
+                Thread.sleep(forTimeInterval: 0.04)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Whether the element sits in web content (a browser page, an Electron app's view).
+    private static func isInsideWebArea(_ element: AXUIElement) -> Bool {
+        var current: AXUIElement? = element
+        for _ in 0..<40 {
+            guard let node = current else { return false }
+            var role: CFTypeRef?
+            if AXUIElementCopyAttributeValue(node, kAXRoleAttribute as CFString, &role) == .success,
+               (role as? String) == "AXWebArea" { return true }
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            current = (parent as! AXUIElement)
+        }
+        return false
+    }
+
+    private static func focusedElement(pid: pid_t) -> AXUIElement? {
+        var focused: CFTypeRef?
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, 0.2)
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
+        return (focused as! AXUIElement)
+    }
+
+    private static func elementAttribute(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private static func currentInputFocus(pid: pid_t) -> AXUIElement? {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        let appFocus = elementAttribute(app, kAXFocusedUIElementAttribute)
+        guard let window = elementAttribute(app, kAXFocusedWindowAttribute) else { return appFocus }
+
+        // A sheet can own the editor while the app reports focus beneath it. Only use
+        // focus exposed by the AX hierarchy, and require membership in the active sheet.
+        let attributes = [kAXRoleAttribute, kAXSubroleAttribute, "AXSheets"]
+        var rawAttributes: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(window, attributes as CFArray, [], &rawAttributes) == .success,
+              let values = rawAttributes as? [Any], values.count == attributes.count else { return nil }
+        let role = values[0] as? String
+        let subrole = values[1] as? String
+        let sheets = values[2] as? [AXUIElement] ?? []
+        let modal: AXUIElement?
+        if role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" {
+            modal = window
+        } else {
+            guard sheets.count <= 1 else { return nil }
+            modal = sheets.first
+        }
+        if let modal {
+            let modalFocus = elementAttribute(modal, kAXFocusedUIElementAttribute)
+            return [modalFocus, appFocus].compactMap { $0 }.first { candidate in
+                guard !CFEqual(candidate, modal) else { return false }
+                var owner: pid_t = 0
+                guard AXUIElementGetPid(candidate, &owner) == .success, owner == pid else { return false }
+                var ancestor = elementAttribute(candidate, kAXParentAttribute)
+                for _ in 0..<40 {
+                    guard let node = ancestor else { return false }
+                    if CFEqual(node, modal) { return true }
+                    ancestor = elementAttribute(node, kAXParentAttribute)
+                }
+                return false
+            }
+        }
+        return appFocus
+    }
+
+    /// "Command+Shift+N", "META+SHIFT+N", "⌘⇧N" → "cmd+shift+n": modifiers by one name, in a fixed order.
+    static func canonicalKey(_ key: String) -> String {
+        let spaced = key.lowercased()
+            .replacingOccurrences(of: "⌘", with: "cmd+").replacingOccurrences(of: "⇧", with: "shift+")
+            .replacingOccurrences(of: "⌥", with: "alt+").replacingOccurrences(of: "⌃", with: "ctrl+")
+            .replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "-", with: "+")
+        let names: [String: String] = [
+            "command": "cmd", "super": "cmd", "meta": "cmd", "win": "cmd", "option": "alt", "opt": "alt", "control": "ctrl",
+            "arrowdown": "down", "down_arrow": "down", "downarrow": "down", "arrowup": "up", "up_arrow": "up", "uparrow": "up",
+            "bracketleft": "[", "leftbracket": "[", "enter": "return", "esc": "escape",
+        ]
+        var parts = spaced.split(separator: "+", omittingEmptySubsequences: true).map { names[String($0)] ?? String($0) }
+        if spaced.hasSuffix("++") || spaced == "+" { parts.append("+") }
+        let modifiers = ["alt", "cmd", "ctrl", "shift"]
+        let mods = parts.filter { modifiers.contains($0) }.sorted()
+        let rest = parts.filter { !modifiers.contains($0) }
+        return (mods + rest).joined(separator: "+")
+    }
+
+    /// ⌘A and ⌘S done through the app itself: a background app's menu leaves Select All and Save disabled, so
+    /// the keys did nothing. Select All sets the text selection directly; Save uses the app's scripting when
+    /// the document already has a file. Nil when neither applies (the key then goes the normal way).
+    private func pressKeyDirectly(_ key: String, snapshot: AppSnapshot, query: String) throws -> ToolCallResult? {
+        let normalized = Self.canonicalKey(key)
+        if NSRunningApplication(processIdentifier: snapshot.app.pid)?.bundleIdentifier == "com.apple.finder",
+           let message = FinderClipboard.handle(key: normalized) {
+            return insertingNote(message, into: try actionResult(for: query))
+        }
+        func isText(_ element: AXUIElement) -> Bool {
+            var role: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+            return [kAXTextAreaRole as String, kAXTextFieldRole as String, "AXComboBox", "AXSearchField"].contains(role as? String ?? "")
+        }
+        if normalized == "cmd+a",
+           let target = Self.currentInputFocus(pid: snapshot.app.pid), isText(target),
+           !isSecureTextField(subrole: stringValue(of: target, attribute: kAXSubroleAttribute)) {
+            var raw: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(target, kAXValueAttribute as CFString, &raw) == .success,
+                  let text = raw as? String else { return nil }
+            var whole = CFRange(location: 0, length: (text as NSString).length)
+            guard isSettable(element: target, attribute: kAXSelectedTextRangeAttribute),
+                  let range = AXValueCreate(.cfRange, &whole) else { return nil }
+            try requireCurrentTextFocus(target, pid: snapshot.app.pid)
+            let result = AXUIElementSetAttributeValue(target, kAXSelectedTextRangeAttribute as CFString, range)
+            guard result == .success,
+                  let applied = selectedRange(of: target), applied.location == 0, applied.length == whole.length else {
+                throw ComputerUseError.stateUnavailable("Select All could not verify the text selection. Read the app state before retrying.")
+            }
+            return insertingNote("Selected all text (\(whole.length) characters); typing now replaces it.", into: try actionResult(for: query))
+        }
+        if normalized == "cmd+s", let bundle = NSRunningApplication(processIdentifier: snapshot.app.pid)?.bundleIdentifier,
+           ["com.apple.TextEdit", "com.apple.Preview", "com.apple.iWork.Pages", "com.apple.iWork.Numbers", "com.apple.iWork.Keynote"].contains(bundle),
+           let path = AppleEventsGate.run("tell application id \"\(bundle)\" to get path of document 1", bundle: bundle)?.stringValue, !path.isEmpty,
+           AppleEventsGate.run("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
+            return insertingNote("Saved \(path).", into: try actionResult(for: query))
+        }
+        return nil
+    }
+
+    public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
+        let snapshot = try currentSnapshot(for: query)
+        if snapshot.mode != .fixture, let direct = try pressKeyDirectly(key, snapshot: snapshot, query: query) {
+            return direct
+        }
+        if snapshot.mode == .fixture {
+            try requireAutoKeyMethodForFixture(keyMethod)
+            try FixtureBridge.post(FixtureCommand(kind: "press_key", identifier: "fixture-key-capture", value: key))
+            Thread.sleep(forTimeInterval: 0.15)
+            return try actionResult(for: query)
+        }
+
+        if keyMethod == .skyKey {
+            let target = try skyKeyTarget(for: snapshot)
+            let reportedDisabled = try InputSimulation.pressKeyWithSkyLight(key, windowID: target.windowID, pid: target.pid)
+            let result = snapshotResult(
+                for: try refreshSnapshot(for: query, recoveryPolicy: keyActionSnapshotRecoveryPolicy(for: keyMethod)),
+                style: .actionResult
+            )
+            return reportedDisabled ? insertingNote(disabledMenuKeyNote, into: result) : result
+        }
+
+        if keyMethod == .auto,
+           useSkyLightKeyRoute(
+               snapshot: snapshot,
+               focused: Self.focusedElement(pid: snapshot.app.pid),
+               opensDialogFromMenu: backgroundOnlyMode() ? false
+                   : (SkyKeyboardDispatcher.menuItemTitle(forKey: key, pid: snapshot.app.pid)
+                       .map(FocusBorrow.menuTitleOpensDialog) ?? false)
+           ) {
+            // A raw key event to a background window that is not key is dropped silently. A command
+            // chord that a menu item names is pressed as that item instead; anything else goes through
+            // the key-window route, which makes the window key for the event and then puts focus back.
+            switch try SkyKeyboardDispatcher.pressMenuKeyEquivalent(key, pid: snapshot.app.pid) {
+            case .pressed(let reportedDisabled):
+                pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+                let result = try actionResult(for: query, recoveryPolicy: .readOnly)
+                return reportedDisabled ? insertingNote(disabledMenuKeyNote, into: result) : result
+            case .notAMenuItem:
+                break
+            }
+            let windowID = try backgroundKeyboardWindow(for: snapshot, action: "press_key '\(key)'")
+            try InputSimulation.pressKeyWithSkyLight(key, windowID: windowID, pid: snapshot.app.pid)
+            return snapshotResult(
+                for: try refreshSnapshot(for: query, recoveryPolicy: .readOnly),
+                style: .actionResult
+            )
+        }
+
+        try InputSimulation.pressKey(key, pid: snapshot.app.pid)
+        // The key is delivered; how long the app takes to show its effect only matters to
+        // the read-back, so that wait is frame-driven and skipped when nothing is read.
+        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+        return try actionResult(for: query)
+    }
+
+    /// A menu bar command by its path, pressed through accessibility. It needs no window or
+    /// snapshot: an app with no window shown still has its menus. The press itself is the
+    /// action, so a window that cannot be read back afterwards is not an error.
+    public func pressMenu(app query: String, path: String) throws -> ToolCallResult {
+        try pressMenu(app: query, titles: try menuPathTitles(path))
+    }
+
+    /// The same press with the path already split into titles. Background-only safe: the
+    /// lookup and AXPress never activate, raise or move the pointer, so no mode check is needed.
+    /// The reply is one line, so a batch can show it without the whole app state.
+    public func pressMenu(app query: String, titles: [String]) throws -> ToolCallResult {
+        let titles = try menuPathTitles(titles)
+        try requireUsableComputerUseSession()
+        let app = try AppDiscovery.resolveRunning(query)
+        // Finder's selection commands are disabled in a background Finder's menus; its scripting does them.
+        if NSRunningApplication(processIdentifier: app.pid)?.bundleIdentifier == "com.apple.finder",
+           let last = titles.last?.lowercased().replacingOccurrences(of: "…", with: "").trimmingCharacters(in: .whitespaces) {
+            let script: String? = [
+                "new folder": "tell application id \"com.apple.finder\"\nset f to make new folder at (target of Finder window 1)\nselect f\nreturn name of f\nend tell",
+                "duplicate": "tell application id \"com.apple.finder\" to set made to duplicate (get selection)\nreturn count of made",
+                "move to trash": "tell application id \"com.apple.finder\" to set gone to delete (get selection)\nreturn count of gone",
+            ][last]
+            if let script, let done = AppleEventsGate.run(script, bundle: "com.apple.finder") {
+                _ = done
+                return .text("pressed \(titles.joined(separator: " > ")) (done through Finder on the selected items)")
+            }
+        }
+        // File > Save is disabled in a background document app's menu; its scripting saves the document.
+        if titles.count == 2, titles[0].lowercased() == "file", titles[1].lowercased() == "save",
+           let bundle = NSRunningApplication(processIdentifier: app.pid)?.bundleIdentifier,
+           ["com.apple.TextEdit", "com.apple.Preview", "com.apple.iWork.Pages", "com.apple.iWork.Numbers", "com.apple.iWork.Keynote"].contains(bundle),
+           let path = AppleEventsGate.run("tell application id \"\(bundle)\" to get path of document 1", bundle: bundle)?.stringValue, !path.isEmpty,
+           AppleEventsGate.run("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
+            return .text("pressed File > Save (saved \(path))")
+        }
+        SkyKeyboardDispatcher.lastPressReportedDisabled = false
+        try SkyKeyboardDispatcher.pressMenuItem(path: titles, pid: app.pid)
+        let note = SkyKeyboardDispatcher.lastPressReportedDisabled
+            ? " (the closed menu listed it as disabled; check the state to see whether it ran)" : ""
+        return .text("pressed \(titles.joined(separator: " > "))\(note)")
+    }
+
+    private func requireAutoKeyMethodForFixture(_ keyMethod: KeyMethod) throws {
+        guard keyMethod == .auto else {
+            throw ComputerUseError.message(
+                "key_method '\(keyMethod.rawValue)' is not supported for fixture apps"
+            )
+        }
+    }
+
+    private func skyKeyTarget(for snapshot: AppSnapshot) throws -> SkyKeyboardTarget {
+        guard let windowID = snapshot.targetWindowID else {
+            throw ComputerUseError.stateUnavailable(
+                "key_method 'sky_key' requires a current on-screen target window. Run get_app_state again."
+            )
+        }
+
+        return SkyKeyboardTarget(windowID: windowID, pid: snapshot.app.pid)
+    }
+
+    public func setValue(app query: String, elementIndex: String, value: String) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+
+        if snapshot.mode == .fixture {
+            guard let identifier = record.identifier else {
+                throw ComputerUseError.invalidArguments("fixture set_value requires a known element identifier")
+            }
+
+            let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+            moveVisualCursor(to: cursorTarget)
+            try FixtureBridge.post(FixtureCommand(kind: "set_value", identifier: identifier, value: value))
+            Thread.sleep(forTimeInterval: 0.15)
+            settleVisualCursor(at: cursorTarget)
+            return try actionResult(for: query)
+        }
+
+        guard let element = record.element else {
+            throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
+        }
+
+        guard try isSettableForSetValue(element: element, attribute: kAXValueAttribute) else {
+            throw ComputerUseError.message(nonSettableSetValueErrorMessage + setValueFallbackHint)
+        }
+
+        let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+        moveVisualCursor(to: cursorTarget)
+
+        do {
+            try requireUsableComputerUseSession()
+            let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
+            guard result == .success else {
+                throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
+            }
+
+            try requireUsableComputerUseSession()
+            // A password field's value is never read back: AppKit answers "" whatever it holds, so the check failed a
+            // write that had worked and invited sending it again.
+            if !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) {
+                try verifySetValueReadBack(requested: value, elementIndex: elementIndex, read: {
+                    // Direct AX reads: never verify against a cached snapshot value.
+                    var actual: CFTypeRef?
+                    return AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &actual) == .success ? actual : nil
+                }, validate: { try requireUsableComputerUseSession() })
+            }
+        } catch {
+            settleVisualCursor(at: cursorTarget)
+            throw error
+        }
+
+        settleVisualCursor(at: cursorTarget)
+        return try actionResult(for: query)
+    }
+
+    public func selectText(
+        app query: String,
+        elementIndex: String,
+        text: String,
+        prefix: String?,
+        suffix: String?,
+        selection: TextSelectionMode
+    ) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+
+        if snapshot.mode == .fixture {
+            guard let identifier = record.identifier, identifier == "fixture-input",
+                  let state = try FixtureBridge.readState(),
+                  let value = state.elements.first(where: { $0.identifier == identifier })?.value else {
+                throw ComputerUseError.invalidArguments("fixture select_text requires a readable input element")
+            }
+            let target = try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
+                                                 selection: selection, elementIndex: elementIndex)
+            let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+            moveVisualCursor(to: cursorTarget)
+            defer { settleVisualCursor(at: cursorTarget) }
+            try FixtureBridge.post(FixtureCommand(kind: "select_text", identifier: identifier, value: text,
+                                                 selection: selection.rawValue, prefix: prefix, suffix: suffix))
+            let deadline = Date().addingTimeInterval(1)
+            while Date() < deadline {
+                if let applied = try FixtureBridge.readState(), applied.focusedIdentifier == identifier,
+                   applied.selectedRangeLocation == target.location, applied.selectedRangeLength == target.length,
+                   let current = applied.elements.first(where: { $0.identifier == identifier })?.value,
+                   current.utf16.elementsEqual(value.utf16) {
+                    return try actionResult(for: query, recoveryPolicy: .readOnly)
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            throw ComputerUseError.message("select_text could not verify fixture selection")
+        }
+
+        try requireUsableComputerUseSession()
+        guard let element = record.element else {
+            throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
+        }
+        guard let value = stringValue(of: element, attribute: kAXValueAttribute) else {
+            throw ComputerUseError.message(selectTextUnreadableValueErrorMessage(elementIndex: elementIndex))
+        }
+        let target = try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
+                                             selection: selection, elementIndex: elementIndex)
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &settable) == .success,
+              settable.boolValue else {
+            throw ComputerUseError.message("element \(elementIndex) does not support setting an accessibility text range")
+        }
+        let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+        moveVisualCursor(to: cursorTarget)
+        defer { settleVisualCursor(at: cursorTarget) }
+        try applyVerifiedTextSelection(
+            target: target, originalValue: value,
+            validate: { try requireUsableComputerUseSession() },
+            readValue: { stringValue(of: element, attribute: kAXValueAttribute) },
+            writeRange: { try AccessibilityTextSelection.writeRange($0, to: element) },
+            readRange: { AccessibilityTextSelection.readRange(of: element) }
+        )
+        return try actionResult(for: query, recoveryPolicy: .readOnly)
+    }
+
+    private func resolveTextSelection(value: String, text: String, prefix: String?, suffix: String?,
+                                      selection: TextSelectionMode, elementIndex: String) throws -> TextSelectionTarget {
+        do {
+            return try TextSelectionResolver.resolve(value: value, text: text, prefix: prefix, suffix: suffix, selection: selection)
+        } catch let error as TextSelectionResolverError {
+            throw ComputerUseError.message(selectTextErrorMessage(error, elementIndex: elementIndex))
+        }
+    }
+
+    /// Find controls in the app's current window by text and/or role, using the
+    /// app's own accessibility search where it offers one. No tree render, no
+    /// screenshot. Each result carries an `index` the existing element actions
+    /// (click, set_value, select_text, scroll, perform_secondary_action) accept.
+    public func query(
+        app query: String,
+        text: String? = nil,
+        role: String? = nil,
+        exact: Bool = false,
+        limit: Int = 20,
+        maxNodes: Int = 500,
+        windowID: CGWindowID? = nil
+    ) throws -> [String: Any] {
+        guard (text.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false) || (role.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false) else {
+            throw ComputerUseError.invalidArguments("query requires at least one of text or role")
+        }
+
+        guard text.map({ $0.utf16.count <= 1000 }) ?? true, role.map({ $0.utf16.count <= 1000 }) ?? true else {
+            throw ComputerUseError.invalidArguments("query text and role must be at most 1000 UTF-16 code units")
+        }
+        try requireUsableComputerUseSession()
+        let app = try AppDiscovery.resolveRunning(query)
+        let context = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID)
+        let criteria = TargetedAX.Criteria(text: text, exact: exact, role: role,
+                                          limit: min(100, max(1, limit)), maxNodes: min(5000, max(1, maxNodes)))
+        let result = try SnapshotBuilder.targetedSearch(criteria, in: context)
+        try requireUsableComputerUseSession()
+        let matches = result.records.map { registerTargetedElement(record: $0, context: context, criteria: criteria) }
+        return ["matches": matches, "truncated": result.truncated,
+                "stop_reason": result.stopReason ?? "complete", "visited_nodes": result.visitedNodes,
+                "window_id": context.windowID.map { Int($0) } ?? 0,
+                "max_nodes": criteria.maxNodes, "limit": criteria.limit]
+    }
+
+    /// A snapshot carrying real window context but no rendered tree or screenshot,
+    /// so the existing action internals run unchanged against a queried element.
+    private func liteSnapshot(context: TargetedAX.WindowContext, elements: [Int: ElementRecord]) -> AppSnapshot {
+        AppSnapshot(
+            app: context.app,
+            windowTitle: nil,
+            windowBounds: context.windowBounds,
+            targetWindowID: context.windowID,
+            targetWindowLayer: context.windowLayer,
+            screenshotData: nil,
+            mode: .accessibility,
+            treeLines: [],
+            focusedSummary: nil,
+            focusedElement: context.focusedElement,
+            selectedText: nil,
+            windowElement: context.windowElement,
+            elements: elements
+        )
+    }
+
+    /// The snapshot an element action runs against. A queried index resolves to
+    /// that control's own window context with no snapshot; any other index uses
+    /// the normal current snapshot.
+    private func snapshotForAction(app query: String, elementIndex: String?) throws -> AppSnapshot {
+        if let elementIndex, let index = Int(elementIndex), index > TargetedElementRegistry<TargetedElement>.indexBase {
+            try requireUsableComputerUseSession()
+            let app = try AppDiscovery.resolveRunning(query)
+            let target = try targetedElements.resolve(index, app: TargetedAppIdentity(app: app))
+            do {
+                let (context, record) = try SnapshotBuilder.currentGeometry(of: target.record, in: target.context, criteria: target.criteria)
+                return liteSnapshot(context: context, elements: [index: record])
+            } catch {
+                targetedElements.remove(index)
+                throw error
+            }
+        }
+        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil)
+    }
+
+    private func registerTargetedElement(record source: ElementRecord, context: TargetedAX.WindowContext,
+                                         criteria: TargetedAX.Criteria) -> [String: Any] {
+        var record: ElementRecord!
+        _ = targetedElements.insert(app: TargetedAppIdentity(app: context.app)) { index in
+            record = ElementRecord(index: index, identifier: source.identifier, element: source.element,
+                                   localFrame: source.localFrame, role: source.role, title: source.title, value: source.value,
+                                   rawActions: source.rawActions, prettyActions: source.prettyActions, isSyntheticText: source.isSyntheticText)
+            return TargetedElement(record: record, context: context, criteria: criteria)
+        }
+        return compactRecordDictionary(record)
+    }
+
+    private func compactRecordDictionary(_ record: ElementRecord) -> [String: Any] {
+        var dict: [String: Any] = ["index": record.index]
+        if let role = record.role, !role.isEmpty { dict["role"] = role }
+        if let title = record.title, !title.isEmpty { dict["title"] = title }
+        if let value = record.value, !value.isEmpty { dict["value"] = value }
+        if let identifier = record.identifier, !identifier.isEmpty { dict["identifier"] = identifier }
+        if let frame = record.localFrame {
+            dict["bounds"] = ["x": frame.origin.x, "y": frame.origin.y, "w": frame.size.width, "h": frame.size.height]
+        }
+        if !record.prettyActions.isEmpty { dict["actions"] = record.prettyActions }
+        return dict
+    }
+
+    func currentSnapshot(for query: String, needScreenshot: Bool = true, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
+        if let snapshot = snapshotsByApp[query.lowercased()] {
+            if snapshot.mode != .fixture {
+                do {
+                    try requireUsableComputerUseSession()
+                } catch {
+                    snapshotsByApp.removeAll()
+                    throw error
+                }
+            }
+            return snapshot
+        }
+
+        if invalidatedSnapshotAliases.contains(query.lowercased()) {
+            throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.accessibilityOmittedNote)
+        }
+        // Element-targeted actions only need the AX tree: skip the screenshot (it cost ~0.3-0.5 s on
+        // the first action of every call and was thrown away).
+        return try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy,
+                                   observation: needScreenshot ? .defaults : SnapshotObservationOptions(includeAX: true, includeScreenshot: false))
+    }
+
+    /// Element index for the first of `labels` (a title, AX identifier, or value-as-title; then aliases)
+    /// in the app's current window. Clickable roles win over others; a partial match (3+ characters)
+    /// is the last resort. A miss re-reads the window once, so an item that appeared after an earlier
+    /// step (an opened menu) is found. Returns the record too, so callers can see role and value.
+    func resolveLabel(app query: String, labels: [String]) throws -> ElementRecord {
+        // Compared without spaces, so "All Clear" matches the identifier "AllClear".
+        func norm(_ s: String?) -> String {
+            (s ?? "").replacingOccurrences(of: " External link", with: "").lowercased().filter { !$0.isWhitespace }
+        }
+        func roleKey(_ r: String?) -> String {
+            var k = (r ?? "").lowercased().replacingOccurrences(of: " ", with: "")
+            if k.hasPrefix("ax") { k.removeFirst(2) }
+            return k
+        }
+        let clickable: Set<String> = ["button", "menuitem", "menubutton", "menubaritem", "checkbox", "radiobutton", "popupbutton",
+                                      "tab", "switch", "link", "cell", "row", "disclosuretriangle", "toggle", "segment"]
+        let given = labels.map { norm($0) }.filter { !$0.isEmpty }
+        guard !given.isEmpty else { throw ComputerUseError.invalidArguments("label is empty") }
+        // Each label plus the spellings apps use for it: Calculator's keys are "one", "add", "multiply".
+        var wanted: [String] = []
+        for label in given {
+            for spelling in [label] + LabelSpellings.alternatives(label) where !wanted.contains(spelling) {
+                wanted.append(spelling)
+            }
+        }
+
+        // Several different controls with the same label are never guessed between: the first "Delete" in a
+        // list is rarely the one meant. A control and the row or cell around it count as one.
+        func single(_ hits: [ElementRecord], names: (ElementRecord) -> [String]) throws -> ElementRecord? {
+            guard hits.count > 1 else { return hits.first }
+            var distinct: [ElementRecord] = []
+            for hit in hits {
+                let nested = distinct.contains { kept in
+                    guard let a = kept.localFrame, let b = hit.localFrame else { return true }
+                    return a.insetBy(dx: -1, dy: -1).contains(b) || b.insetBy(dx: -1, dy: -1).contains(a)
+                }
+                if !nested { distinct.append(hit) }
+            }
+            guard distinct.count > 1 else { return distinct.first }
+            let listed = distinct.prefix(6).map { "\($0.index) \(roleKey($0.role)) \(names($0).first ?? "")" }.joined(separator: ", ")
+            throw ComputerUseError.invalidArguments(
+                "'\(labels[0])' \(SmartSteps.ambiguousPhrase) (\(distinct.count)): \(listed). Pick one with element_index."
+            )
+        }
+
+        func find(in snapshot: AppSnapshot) throws -> ElementRecord? {
+            let all = snapshot.elements.values.sorted { $0.index < $1.index }
+            // Title, identifier and accessibility description first; a value only when nothing else names it.
+            let names: (ElementRecord) -> [String] = { r in
+                let t = norm(r.title)
+                return [t, norm(r.identifier), norm(r.identity?.name), t.isEmpty ? norm(r.value) : ""].filter { !$0.isEmpty }
+            }
+            let buttons = all.filter { clickable.contains(roleKey($0.role)) }
+            for pool in [buttons, all] {
+                for w in given {
+                    if let hit = try single(pool.filter { names($0).contains(w) }, names: names) { return hit }
+                }
+            }
+            // Other spellings ("1" for "one", "+" for "add") only on a keypad, and only for its buttons: in any
+            // other app "+" must not find a button that happens to be called Add.
+            if LabelSpellings.isKeypad(buttonNames: buttons.flatMap(names)) {
+                for w in wanted where !given.contains(w) {
+                    if let hit = try single(buttons.filter { names($0).contains(w) }, names: names) { return hit }
+                }
+            }
+            // A row that is drawn as one line (a Finder file, a table row) has no name of its own: its line in
+            // the state is its name. The line is "<index> <role, state> <text>".
+            var lineText: [Int: String] = [:]
+            for line in snapshot.treeLines {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard let space = trimmed.firstIndex(of: " "), let index = Int(trimmed[..<space]) else { continue }
+                lineText[index] = String(trimmed[trimmed.index(after: space)...]).lowercased()
+            }
+            for label in labels {
+                let wantedText = label.trimmingCharacters(in: .whitespaces).lowercased()
+                guard wantedText.count >= 2 else { continue }
+                let rows = all.filter { record in
+                    guard ["row", "cell"].contains(roleKey(record.role)), let text = lineText[record.index],
+                          text.hasSuffix(" " + wantedText) else { return false }
+                    return text.dropLast(wantedText.count).split(separator: " ").count <= 3
+                }
+                if let hit = try single(rows, names: names) { return hit }
+            }
+            // A file or row is often named only by its text value (Finder lists, table cells).
+            for w in given where w.count >= 2 {
+                let valued = all.filter { norm($0.value) == w }
+                if valued.count == 1 { return valued[0] }
+            }
+            // A label copied from a state line with its identifier in front ("First Text View Bench line one.").
+            for w in given {
+                let prefixed = all.filter { r in
+                    let id = norm(r.identifier)
+                    return id.count >= 4 && w.hasPrefix(id) && w.count > id.count
+                }
+                if prefixed.count == 1 { return prefixed[0] }
+            }
+            // Part of a button's name, at least four characters: "Save As" finds "Save As…".
+            if let w = given.first, w.count >= 4 {
+                return try single(buttons.filter { names($0).contains(where: { $0.contains(w) }) }, names: names)
+            }
+            return nil
+        }
+
+        // A cached state may list controls that are gone, so an ambiguity there is checked against a fresh read.
+        if let hit = try? find(in: try currentSnapshot(for: query, needScreenshot: false)) { return hit }
+        let fresh = try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false))
+        if let hit = try find(in: fresh) { return hit }
+        // A text field or document named by what it contains ("The quick blue fox."): the one field holding it.
+        if let w = given.first, w.count >= 4 {
+            let holders = fresh.elements.values.filter { r in
+                let role = (r.role ?? "").lowercased()
+                return (role.contains("text") || role.contains("field") || role.contains("entry")) && norm(r.value).contains(w)
+            }
+            if holders.count == 1 { return holders[0] }
+        }
+        // The document named by what it is ("text entry area", "text area", "document"): the window's one text area.
+        if let w = given.first, ["text entry area", "text area", "textarea", "text view", "document", "text", "body", "editor", "text field"].contains(w) {
+            let areas = fresh.elements.values.filter { ($0.role ?? "") == (kAXTextAreaRole as String) }
+            if areas.count == 1 { return areas[0] }
+            let fields = fresh.elements.values.filter { ($0.role ?? "") == (kAXTextFieldRole as String) }
+            if areas.isEmpty, fields.count == 1 { return fields[0] }
+        }
+        let avail = Set(fresh.elements.values.filter { clickable.contains(roleKey($0.role)) }
+            .map { norm($0.title).isEmpty ? norm($0.identifier) : norm($0.title) }.filter { !$0.isEmpty }).sorted()
+        if LabelSpellings.menuBarTitles.contains(given[0]) {
+            throw ComputerUseError.invalidArguments("'\(labels[0])' is a menu bar menu, not a window control. Use press_menu, e.g. {\"app\": \"\(query)\", \"path\": \"\(labels[0]) > Save\"}; press_menu with just \"\(labels[0])\" lists its items.")
+        }
+        let shown = avail.isEmpty
+            ? "none with a name; use element_index from the state, or query to find text"
+            : avail.prefix(60).joined(separator: ", ")
+        throw ComputerUseError.invalidArguments("no element labelled '\(labels[0])'. Clickable labels now: \(shown)")
+    }
+
+    static func isToggleRole(_ role: String?) -> Bool {
+        var k = (role ?? "").lowercased().replacingOccurrences(of: " ", with: "")
+        if k.hasPrefix("ax") { k.removeFirst(2) }
+        return ["menuitem", "checkbox", "switch", "radiobutton", "toggle"].contains(k)
+    }
+
+    @discardableResult
+    private func refreshSnapshot(
+        for query: String,
+        textLimit: SnapshotTextLimit = .defaults,
+        treeLimits: AccessibilityTreeLimits = .defaults,
+        recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+        observation: SnapshotObservationOptions = .defaults
+    ) throws -> AppSnapshot {
+        let app = try AppDiscovery.resolve(query)
+        let snapshot = try SnapshotBuilder.build(
+            for: app,
+            textLimit: textLimit,
+            treeLimits: treeLimits,
+            recoveryPolicy: recoveryPolicy,
+            observation: observation
+        )
+
+        rememberSnapshot(snapshot, for: query)
+        return snapshot
+    }
+
+    func rememberSnapshot(_ snapshot: AppSnapshot, for query: String) {
+        let app = snapshot.app
+        // Remember each element's role and name per number (for "gone" messages and restore healing), for every
+        // read that is stored, not only get_app_state: an action's own re-read may show new elements too.
+        if ElementNumbering.isEnabled, snapshot.numberingHighWater != nil {
+            ElementNumbering.forApp(pid: app.pid).remember(snapshot: snapshot)
+        }
+        if !snapshot.observation.includeAX {
+            var pids: Set<Int32> = [app.pid]
+            if let previous = snapshotsByApp[query.lowercased()] { pids.insert(previous.app.pid) }
+            let aliases = snapshotsByApp.compactMap { pids.contains($0.value.app.pid) ? $0.key : nil }
+            for alias in aliases {
+                snapshotsByApp.removeValue(forKey: alias)
+                invalidatedSnapshotAliases.insert(alias)
+            }
+            targetedElements.removeAll(forPIDs: pids)
+        }
+
+        let keys = Set([
+            query.lowercased(),
+            String(app.pid),
+            app.name.lowercased(),
+            (app.bundleIdentifier ?? "").lowercased(),
+        ].filter { !$0.isEmpty })
+
+        for key in keys {
+            snapshotsByApp[key] = snapshot
+            invalidatedSnapshotAliases.remove(key)
+        }
+
+    }
+
+    private func lookupElement(snapshot: AppSnapshot, index: String) throws -> ElementRecord {
+        guard let parsedIndex = Int(index), let record = snapshot.elements[parsedIndex] else {
+            // Numbers are stable across reads: one that was handed out before but is not shown now is gone.
+            if let parsedIndex = Int(index), parsedIndex >= 0, let high = snapshot.numberingHighWater, parsedIndex < high {
+                let known = ElementNumbering.forApp(pid: snapshot.app.pid).remembered(parsedIndex)
+                throw ComputerUseError.stateUnavailable(ElementNumbering.goneMessage(index: index, role: known?.role, label: known?.label))
+            }
+            throw ComputerUseError.invalidArguments("unknown element_index '\(index)'")
+        }
+
+        return try keptRecord(record, index: index, snapshot: snapshot)
+    }
+
+    private func keptRecord(_ record: ElementRecord, index: String, snapshot: AppSnapshot) throws -> ElementRecord {
+        guard let recorded = record.identity, let element = record.element else { return record }
+        let now = try ElementIdentity.read(element)
+        // An element that cannot be read at all has left the app: say so plainly (the number is never reused).
+        if now == nil, snapshot.numberingHighWater != nil, Self.elementIsGone(element) {
+            throw ComputerUseError.stateUnavailable(ElementNumbering.goneMessage(
+                index: index, role: SmartSteps.roleKey(record.role), label: SmartSteps.name(of: record)
+            ))
+        }
+        try ElementIdentity.validate(index: index, recorded: recorded, now: now)
+        return record
+    }
+
+    /// True only when the app answers that this element no longer exists. A busy or slow app (cannotComplete,
+    /// a timeout) is not "gone": the caller then gets the "could not be checked" message instead.
+    static func elementIsGone(_ element: AXUIElement) -> Bool {
+        var raw: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &raw) == .invalidUIElement
+    }
+
+    /// Reads AXEnabled now, not from the snapshot: the control may have changed since the read.
+    private func refuseDisabledControl(_ record: ElementRecord, elementIndex: String) throws {
+        guard let element = record.element else { return }
+        var enabled: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled)
+        if let refusal = disabledControlRefusal(enabled: enabled as? Bool, role: record.role, elementIndex: elementIndex) {
+            throw ComputerUseError.message(refusal)
+        }
+    }
+
+    func matchingAction(requested: String, record: ElementRecord) -> String? {
+        if let exact = record.rawActions.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
+            return exact
+        }
+        let visibleActions = record.role.map { meaningfulRawActions(record.rawActions, role: $0) } ?? record.rawActions
+        let matches = visibleActions.filter { rawAction in
+            secondaryActionNamesEquivalent(requested, secondaryActionDisplayName(rawAction))
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private func invalidSecondaryActionMessage(action: String, record: ElementRecord) -> String {
+        invalidSecondaryActionErrorMessage(action: action, elementIndex: record.index)
+    }
+
+    private func performPreferredClick(on record: ElementRecord, button: MouseButtonKind, clickCount: Int) throws -> Bool {
+        guard let element = record.element else {
+            return false
+        }
+
+        switch button {
+        case .left:
+            if clickCount <= 1,
+               !hasAncestorRole("AXWebArea", of: element),
+               try selectContainingListItem(for: element)
+            {
+                return true
+            }
+
+            if try performAction(named: kAXPressAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+                return true
+            }
+
+            if try performAction(named: kAXConfirmAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+                return true
+            }
+
+            if try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+                return true
+            }
+        case .right:
+            if try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+                return true
+            }
+        case .middle:
+            break
+        }
+
+        return false
+    }
+
+    private func clickCandidates(at point: CGPoint, in snapshot: AppSnapshot) throws -> [ElementRecord] {
+        var candidates: [ElementRecord] = []
+
+        if let bestRecord = bestElement(containing: point, in: snapshot) {
+            candidates.append(bestRecord)
+        }
+
+        if let hitRecord = try hitTestElement(at: point, in: snapshot) {
+            candidates.append(hitRecord)
+        }
+
+        return candidates.reduce(into: []) { uniqueCandidates, candidate in
+            if !uniqueCandidates.contains(where: { sameElement($0.element, candidate.element) }) {
+                uniqueCandidates.append(candidate)
+            }
+        }
+    }
+
+    private func sameElement(_ lhs: AXUIElement?, _ rhs: AXUIElement?) -> Bool {
+        guard let lhs, let rhs else {
+            return false
+        }
+
+        return CFEqual(lhs, rhs)
+    }
+
+    private func selectContainingListItem(for element: AXUIElement) throws -> Bool {
+        guard let target = selectableListItem(containing: element) else {
+            return false
+        }
+
+        try requireUsableComputerUseSession()
+        let result = AXUIElementSetAttributeValue(
+            target.list,
+            kAXSelectedChildrenAttribute as CFString,
+            [target.item] as CFArray
+        )
+
+        guard try clickAttributeWasSet(result, attribute: kAXSelectedChildrenAttribute) else {
+            return false
+        }
+        pauseBeforeReadBack(0.15)
+        return true
+    }
+
+    /// Selects the outline or table row that `record` is (or whose text, cell or icon it is), when that row
+    /// is not selected yet. Buttons, checkboxes and other controls inside a row are left to the normal click,
+    /// and so is a row that is already selected (a second click there may start editing). Native tables only.
+    private func selectContainingTableRow(for record: ElementRecord) throws -> Bool {
+        guard let element = record.element,
+              let role = stringValue(of: element, attribute: kAXRoleAttribute),
+              [kAXRowRole as String, kAXCellRole as String, kAXStaticTextRole as String,
+               kAXTextFieldRole as String, kAXImageRole as String].contains(role)
+        else { return false }
+        var row: AXUIElement?
+        var current: AXUIElement? = element
+        for _ in 0..<5 {
+            guard let node = current else { break }
+            if stringValue(of: node, attribute: kAXRoleAttribute) == kAXRowRole as String {
+                row = node
+                break
+            }
+            current = copyParent(of: node)
+        }
+        guard let row, let table = copyParent(of: row),
+              let tableRole = stringValue(of: table, attribute: kAXRoleAttribute),
+              [kAXOutlineRole as String, kAXTableRole as String].contains(tableRole),
+              !Self.isInsideWebArea(row)
+        else { return false }
+
+        func isSelected() -> Bool {
+            var value: CFTypeRef?
+            return AXUIElementCopyAttributeValue(row, kAXSelectedAttribute as CFString, &value) == .success
+                && (value as? NSNumber)?.boolValue == true
+        }
+        guard !isSelected() else { return false }
+        try requireUsableComputerUseSession()
+        // Replacing the table's selection selects only this row; setting the row's own flag is the fallback.
+        if isSettable(element: table, attribute: kAXSelectedRowsAttribute) {
+            _ = AXUIElementSetAttributeValue(table, kAXSelectedRowsAttribute as CFString, [row] as CFArray)
+        }
+        if !isSelected(), isSettable(element: row, attribute: kAXSelectedAttribute) {
+            _ = AXUIElementSetAttributeValue(row, kAXSelectedAttribute as CFString, kCFBooleanTrue)
+        }
+        pauseBeforeReadBack(0.1)
+        return isSelected()
+    }
+
+    private func selectableListItem(containing element: AXUIElement) -> (list: AXUIElement, item: AXUIElement)? {
+        var current = element
+        var directChild = element
+
+        for _ in 0..<8 {
+            guard let parent = copyParent(of: current) else {
+                return nil
+            }
+
+            if stringValue(of: parent, attribute: kAXRoleAttribute) == kAXListRole as String,
+               isSettable(element: parent, attribute: kAXSelectedChildrenAttribute)
+            {
+                return (parent, directChild)
+            }
+
+            directChild = parent
+            current = parent
+        }
+
+        return nil
+    }
+
+    private func performAXClickSequence(
+        on record: ElementRecord,
+        snapshot: AppSnapshot,
+        button: MouseButtonKind,
+        clickCount: Int,
+        includeNearbyHitTesting: Bool,
+        allowActivationFallback: Bool,
+        clickPoint: CGPoint? = nil
+    ) throws -> Bool {
+        // The activation fallback raises and focuses the window, which takes the user's focus. It only runs while
+        // the app is borrowed (a batch with foreground: true), in every mode.
+        let allowActivationFallback = allowActivationFallback
+            && FocusBorrow.isBorrowed(pid: snapshot.app.pid)
+        let targetFrame = clickFrame(for: record, snapshot: snapshot)
+        let isAtTarget = { (candidate: ElementRecord) in
+            isDescendantClickCandidateAtTarget(candidateFrame: candidate.localFrame, clickPoint: clickPoint, targetFrame: targetFrame)
+        }
+        // A plain click on a row of a native list or table means "select it". Pressing the row's text did not
+        // select it in Finder, so a following Return renamed whichever file was selected before.
+        if button == .left, clickCount == 1, clickPoint == nil, try selectContainingTableRow(for: record) {
+            debugClickDecision("handled by selecting the table row of \(clickDebugDescription(record))")
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            return true
+        }
+
+        let preferContainingWebRowAXClick = shouldPreferContainingWebRowAXClick(record, in: snapshot)
+        debugClickDecision("record=\(clickDebugDescription(record)) preferContainingWebRowAXClick=\(preferContainingWebRowAXClick)")
+
+        if preferContainingWebRowAXClick,
+           try performContainingWebRowClick(for: record, snapshot: snapshot, button: button, clickCount: clickCount)
+        {
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            return true
+        }
+
+        // Selecting a window or sheet index means the root itself, not a button inside it.
+        // Skip both descendant and nearby-point searches and use the existing raise path.
+        let windowIndexClick = clickPoint == nil && record.element.map {
+            canUseActivationOnlyClickFallback(role: stringValue(of: $0, attribute: kAXRoleAttribute))
+        } == true
+        if !preferContainingWebRowAXClick && !windowIndexClick {
+            if try performPreferredClick(on: record, button: button, clickCount: clickCount) {
+                debugClickDecision("handled by preferred target \(clickDebugDescription(record))")
+                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                return true
+            }
+
+            for candidate in descendantClickCandidates(for: record, snapshot: snapshot) where isAtTarget(candidate) {
+                if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
+                    debugClickDecision("handled by descendant \(clickDebugDescription(candidate))")
+                    pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                    return true
+                }
+            }
+
+            if includeNearbyHitTesting {
+                for localPoint in clickActionPoints(for: record, snapshot: snapshot) {
+                    guard let hitRecord = try hitTestElement(at: localPoint, in: snapshot) ?? bestElement(containing: localPoint, in: snapshot) else {
+                        continue
+                    }
+
+                    if !isLikelySyntheticSideAction(hitRecord, in: record),
+                       try performPreferredClick(on: hitRecord, button: button, clickCount: clickCount)
+                    {
+                        debugClickDecision("handled by hit record \(clickDebugDescription(hitRecord))")
+                        pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                        return true
+                    }
+
+                    if shouldScanDescendantsOfHitRecord(
+                        originalFrame: targetFrame,
+                        hitFrame: hitRecord.localFrame
+                    ) {
+                        for candidate in descendantClickCandidates(
+                            for: hitRecord,
+                            snapshot: snapshot,
+                            sideActionScope: record
+                        ) where isAtTarget(candidate) {
+                            if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
+                                debugClickDecision("handled by hit descendant \(clickDebugDescription(candidate))")
+                                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        guard
+            allowActivationFallback,
+            !record.isSyntheticText,
+            button == .left,
+            let element = record.element,
+            canUseActivationOnlyClickFallback(role: stringValue(of: element, attribute: kAXRoleAttribute))
+        else {
+            return false
+        }
+
+        if try activateClickTarget(element: element, availableActions: record.rawActions) {
+            debugClickDecision("handled by activation fallback \(clickDebugDescription(record))")
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            return true
+        }
+
+        return false
+    }
+
+    private func performAction(named action: String, on element: AXUIElement, availableActions: [String], repeatCount: Int = 1) throws -> Bool {
+        guard availableActions.contains(where: { $0.caseInsensitiveCompare(action) == .orderedSame }) else {
+            return false
+        }
+
+        // A short gap between repeated presses only (a single click never waits): sent back-to-back,
+        // some apps merge a double-click into one press.
+        return try performClickActionSequence(action: action, repeatCount: repeatCount, send: {
+            try requireUsableComputerUseSession()
+            return AXUIElementPerformAction(element, action as CFString)
+        }, pause: { Thread.sleep(forTimeInterval: 0.04) })
+    }
+
+    private func activateClickTarget(element: AXUIElement, availableActions: [String]) throws -> Bool {
+        var activated = false
+
+        if try performAction(named: kAXRaiseAction as String, on: element, availableActions: availableActions) {
+            activated = true
+        }
+
+        if try setBoolAttribute(named: kAXMainAttribute, on: element) {
+            activated = true
+        }
+
+        if try setBoolAttribute(named: kAXFocusedAttribute, on: element) {
+            activated = true
+        }
+
+        return activated
+    }
+
+    private func setBoolAttribute(named attribute: String, on element: AXUIElement) throws -> Bool {
+        try requireUsableComputerUseSession()
+        return try clickAttributeWasSet(AXUIElementSetAttributeValue(element, attribute as CFString, kCFBooleanTrue), attribute: attribute)
+    }
+
+    private func isSettable(element: AXUIElement, attribute: String) -> Bool {
+        var settable: DarwinBoolean = false
+        let result = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
+        return result == .success && settable.boolValue
+    }
+
+    private func isSettableForSetValue(element: AXUIElement, attribute: String) throws -> Bool {
+        var settable = DarwinBoolean(false)
+        let result = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
+        return try setValueAttributeIsSettable(
+            result: result,
+            settable: settable.boolValue,
+            attribute: attribute
+        )
+    }
+
+    private func bestElement(containing point: CGPoint, in snapshot: AppSnapshot) -> ElementRecord? {
+        snapshot.elements.values
+            .filter { $0.localFrame?.contains(point) ?? false }
+            .sorted { lhs, rhs in
+                let lhsPriority = clickPriority(for: lhs)
+                let rhsPriority = clickPriority(for: rhs)
+                if lhsPriority != rhsPriority {
+                    return lhsPriority < rhsPriority
+                }
+
+                return frameArea(of: lhs) < frameArea(of: rhs)
+            }
+            .first
+    }
+
+    /// `point` is a window point (the space of `ElementRecord.localFrame`), not a screenshot pixel.
+    private func hitTestElement(at point: CGPoint, in snapshot: AppSnapshot) throws -> ElementRecord? {
+        let appElement = AXUIElementCreateApplication(snapshot.app.pid)
+        let globalPoint = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
+        var hitElement: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(appElement, Float(globalPoint.x), Float(globalPoint.y), &hitElement)
+        debugClickDecision("hit test window=\(point) screen=\(globalPoint) result=\(result.rawValue)")
+        guard result == .success, let hitElement else {
+            return nil
+        }
+
+        let rawActions = copyActions(for: hitElement) ?? []
+        return ElementRecord(
+            index: -1,
+            identifier: nil,
+            element: hitElement,
+            localFrame: localFrame(of: hitElement, windowBounds: snapshot.windowBounds),
+            rawActions: rawActions,
+            prettyActions: rawActions
+        )
+    }
+
+    private func clickPriority(for record: ElementRecord) -> Int {
+        if record.rawActions.contains(where: {
+            $0.caseInsensitiveCompare(kAXPressAction as String) == .orderedSame ||
+            $0.caseInsensitiveCompare(kAXConfirmAction as String) == .orderedSame ||
+            $0.caseInsensitiveCompare(kAXShowMenuAction as String) == .orderedSame ||
+            $0.caseInsensitiveCompare(kAXRaiseAction as String) == .orderedSame
+        }) {
+            return 0
+        }
+
+        if let element = record.element,
+           isSettable(element: element, attribute: kAXMainAttribute) ||
+           isSettable(element: element, attribute: kAXFocusedAttribute) {
+            return 1
+        }
+
+        return 2
+    }
+
+    private func frameArea(of record: ElementRecord) -> CGFloat {
+        guard let frame = record.localFrame else {
+            return .greatestFiniteMagnitude
+        }
+
+        return frame.width * frame.height
+    }
+
+    private func localCenter(for record: ElementRecord) -> CGPoint? {
+        guard let frame = record.localFrame else {
+            return nil
+        }
+
+        return CGPoint(x: frame.midX, y: frame.midY)
+    }
+
+    private func clickActionPoints(for record: ElementRecord, snapshot: AppSnapshot) -> [CGPoint] {
+        guard let frame = clickFrame(for: record, snapshot: snapshot) else {
+            return []
+        }
+
+        return localClickActionPoints(frame: frame, isSyntheticText: record.isSyntheticText)
+    }
+
+    private func descendantClickCandidates(
+        for record: ElementRecord,
+        snapshot: AppSnapshot,
+        sideActionScope: ElementRecord? = nil
+    ) -> [ElementRecord] {
+        guard let element = record.element else {
+            return []
+        }
+
+        let sideActionParent = sideActionScope ?? record
+        return descendantClickCandidates(of: element, windowBounds: snapshot.windowBounds)
+            .filter { candidate in
+                !isLikelySyntheticSideAction(candidate, in: sideActionParent)
+            }
+            .sorted { lhs, rhs in
+                let lhsPriority = clickPriority(for: lhs)
+                let rhsPriority = clickPriority(for: rhs)
+                if lhsPriority != rhsPriority {
+                    return lhsPriority < rhsPriority
+                }
+
+                return frameArea(of: lhs) < frameArea(of: rhs)
+            }
+    }
+
+    private func descendantClickCandidates(of element: AXUIElement, windowBounds: CGRect?, depth: Int = 0) -> [ElementRecord] {
+        guard depth < 3 else {
+            return []
+        }
+
+        var results: [ElementRecord] = []
+        for child in copyChildren(of: element) {
+            let rawActions = copyActions(for: child) ?? []
+            results.append(
+                ElementRecord(
+                    index: -1,
+                    identifier: nil,
+                    element: child,
+                    localFrame: localFrame(of: child, windowBounds: windowBounds),
+                    rawActions: rawActions,
+                    prettyActions: rawActions
+                )
+            )
+            results.append(contentsOf: descendantClickCandidates(of: child, windowBounds: windowBounds, depth: depth + 1))
+        }
+
+        return results
+    }
+
+    private func isLikelySyntheticSideAction(_ candidate: ElementRecord, in parent: ElementRecord) -> Bool {
+        isLikelySyntheticSideActionCandidate(
+            parentFrame: parent.localFrame,
+            candidateFrame: candidate.localFrame,
+            hasPrimaryAction: hasPrimaryClickAction(candidate),
+            labels: accessibilityLabels(for: candidate.element)
+        )
+    }
+
+    private func hasPrimaryClickAction(_ record: ElementRecord) -> Bool {
+        record.rawActions.contains { action in
+            action.caseInsensitiveCompare(kAXPressAction as String) == .orderedSame ||
+                action.caseInsensitiveCompare(kAXConfirmAction as String) == .orderedSame ||
+                action.caseInsensitiveCompare("AXOpen") == .orderedSame ||
+                action.caseInsensitiveCompare(kAXShowMenuAction as String) == .orderedSame
+        }
+    }
+
+    private func shouldPreferContainingWebRowAXClick(_ record: ElementRecord, in snapshot: AppSnapshot) -> Bool {
+        guard
+            let element = record.element
+        else {
+            return false
+        }
+
+        return shouldPreferContainingWebRowAXClickCandidate(
+            role: stringValue(of: element, attribute: kAXRoleAttribute),
+            isSyntheticText: record.isSyntheticText,
+            hasWebAreaAncestor: hasAncestorRole("AXWebArea", of: element),
+            appName: snapshot.app.name,
+            bundleIdentifier: snapshot.app.bundleIdentifier
+        )
+    }
+
+    private func performContainingWebRowClick(
+        for record: ElementRecord,
+        snapshot: AppSnapshot,
+        button: MouseButtonKind,
+        clickCount: Int
+    ) throws -> Bool {
+        guard
+            button == .left,
+            clickCount <= 1,
+            let element = record.element,
+            let targetFrame = record.localFrame
+        else {
+            return false
+        }
+
+        var current = element
+
+        for _ in 0..<6 {
+            guard let parent = copyParent(of: current) else {
+                return false
+            }
+
+            let rawActions = copyActions(for: parent) ?? []
+            let candidate = ElementRecord(
+                index: -1,
+                identifier: nil,
+                element: parent,
+                localFrame: localFrame(of: parent, windowBounds: snapshot.windowBounds),
+                rawActions: rawActions,
+                prettyActions: rawActions
+            )
+
+            if isLikelyContainingWebRowAction(targetFrame: targetFrame, candidate: candidate),
+               !isLikelySyntheticSideAction(candidate, in: record),
+               try performAction(named: kAXPressAction as String, on: parent, availableActions: rawActions)
+            {
+                debugClickDecision("handled by containing web row \(clickDebugDescription(candidate))")
+                return true
+            }
+
+            current = parent
+        }
+
+        return false
+    }
+
+    private func isLikelyContainingWebRowAction(
+        targetFrame: CGRect,
+        candidate: ElementRecord
+    ) -> Bool {
+        isLikelyContainingRowActionFrame(
+            targetFrame: targetFrame,
+            candidateFrame: candidate.localFrame,
+            hasPrimaryAction: hasPrimaryClickAction(candidate)
+        )
+    }
+
+    private func hasAncestorRole(_ role: String, of element: AXUIElement) -> Bool {
+        var current = element
+
+        for _ in 0..<12 {
+            guard let parent = copyParent(of: current) else {
+                return false
+            }
+
+            if stringValue(of: parent, attribute: kAXRoleAttribute) == role {
+                return true
+            }
+
+            current = parent
+        }
+
+        return false
+    }
+
+    private func accessibilityLabels(for element: AXUIElement?) -> [String] {
+        guard let element else {
+            return []
+        }
+
+        return [
+            kAXTitleAttribute as String,
+            kAXDescriptionAttribute as String,
+            kAXHelpAttribute as String,
+            kAXValueAttribute as String,
+            "AXIdentifier"
+        ].compactMap { attribute in
+            stringValue(of: element, attribute: attribute)
+        }
+    }
+
+    private func requireCurrentTextFocus(_ element: AXUIElement, pid: pid_t) throws {
+        try requireUsableComputerUseSession()
+        guard let current = Self.currentInputFocus(pid: pid), CFEqual(element, current) else {
+            throw ComputerUseError.stateUnavailable("type_text focus changed before input. Read the app state and try again.")
+        }
+    }
+
+    private func selectedRange(of element: AXUIElement) -> CFRange? {
+        var raw: CFTypeRef?
+        var range = CFRange()
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &raw) == .success,
+              let raw, CFGetTypeID(raw) == AXValueGetTypeID(),
+              AXValueGetType(raw as! AXValue) == .cfRange,
+              AXValueGetValue(raw as! AXValue, .cfRange, &range) else { return nil }
+        return range
+    }
+
+    private func typeTextUsingAccessibility(_ text: String, on element: AXUIElement, pid: pid_t) throws -> Bool {
+        if isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) { return false }
+        // Renaming a file selects its name without the extension. A model types the whole new name, extension
+        // included, and over that selection it became "name.txt.txt". The whole old name is replaced instead.
+        if replacesWholeName(of: element, pid: pid, text: text) {
+            return try replaceWholeName(text, on: element, pid: pid)
+        }
+        let attribute: String
+        let value: String
+        var caret: Int?
+        var valueExpectedToChange: String?
+        // SelectedText preserves the selection/caret and rich text. It can be
+        // writable even when replacing the entire AXValue is not supported.
+        if isSettable(element: element, attribute: kAXSelectedTextAttribute) {
+            attribute = kAXSelectedTextAttribute
+            value = text
+            if let original = stringValue(of: element, attribute: kAXValueAttribute),
+               let selection = selectedRange(of: element),
+               let replacement = typedTextReplacement(value: original, selection: selection, text: text),
+               replacement.value != original {
+                valueExpectedToChange = original
+            }
+        } else {
+            let valueWritable = isSettable(element: element, attribute: kAXValueAttribute)
+            let rangeWritable = isSettable(element: element, attribute: kAXSelectedTextRangeAttribute)
+            let originalValue = stringValue(of: element, attribute: kAXValueAttribute)
+            let currentSelection = selectedRange(of: element)
+            if inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) {
+                fputs("[open-computer-use] type_text value_writable=\(valueWritable) range_writable=\(rangeWritable) value_readable=\(originalValue != nil) selection_readable=\(currentSelection != nil)\n", stderr)
+            }
+            guard valueWritable, rangeWritable, let original = originalValue, let selection = currentSelection else { return false }
+            // Retain placeholder handling, but never splice a range into a
+            // synthesized descendant string that differs from the reported value.
+            let editable = editableBaseValue(for: element)
+            let base = editable.isEmpty && !normalizeEditablePlaceholderText(original).isEmpty ? editable : original
+            guard let replacement = typedTextReplacement(value: base, selection: selection, text: text) else { return false }
+            guard stringValue(of: element, attribute: kAXValueAttribute) == original,
+                  let current = selectedRange(of: element), current.location == selection.location, current.length == selection.length
+            else { throw ComputerUseError.stateUnavailable("type_text text or selection changed before input. Read the app state and try again.") }
+            attribute = kAXValueAttribute
+            value = replacement.value
+            caret = replacement.caret
+        }
+
+        try requireCurrentTextFocus(element, pid: pid)
+        let result = AXUIElementSetAttributeValue(element, attribute as CFString, value as CFString)
+        guard result == .success else {
+            // A failed/timed-out write may already have changed the control.
+            // Never append or resend the same input through another path.
+            throw ComputerUseError.message("type_text AXUIElementSetAttributeValue(\(attribute)) failed with \(result.rawValue). Read the current text before retrying.")
+        }
+        if let original = valueExpectedToChange,
+           stringValue(of: element, attribute: kAXValueAttribute) == original {
+            throw ComputerUseError.stateUnavailable("type_text sent an accessibility write, but the field's text did not change. Read the app state before retrying.")
+        }
+        if let caret {
+            try requireCurrentTextFocus(element, pid: pid)
+            guard stringValue(of: element, attribute: kAXValueAttribute) == value else {
+                throw ComputerUseError.stateUnavailable("type_text value changed after writing; caret was not moved. Read the current text before retrying.")
+            }
+            var range = CFRange(location: caret, length: 0)
+            guard let axRange = AXValueCreate(.cfRange, &range),
+                  AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, axRange) == .success,
+                  let applied = selectedRange(of: element), applied.location == caret, applied.length == 0
+            else { throw ComputerUseError.stateUnavailable("type_text wrote the text but could not restore the caret. Read the current text before retrying.") }
+        }
+        return true
+    }
+
+    /// Whether `text` is a full new name typed over a rename selection in Finder's rename editor `element`
+    /// (see typedNameReplacesWholeValue and isFinderRenameEditor). Any other text field is never renamed this way.
+    private func replacesWholeName(of element: AXUIElement, pid: pid_t, text: String) -> Bool {
+        let bundleIdentifier = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        guard isFinderRenameEditor(
+            bundleIdentifier: bundleIdentifier,
+            role: stringValue(of: element, attribute: kAXRoleAttribute),
+            insideSheetOrDialog: Self.isInsideSheetOrDialog(element)
+        ) else { return false }
+        guard let value = stringValue(of: element, attribute: kAXValueAttribute),
+              let selection = selectedRange(of: element) else { return false }
+        return typedNameReplacesWholeValue(value: value, selection: selection, text: text)
+    }
+
+    /// Whether `element` sits in a sheet or dialog (checked up the parents, a bounded walk).
+    private static func isInsideSheetOrDialog(_ element: AXUIElement) -> Bool {
+        var current: AXUIElement? = element
+        for _ in 0..<40 {
+            guard let node = current else { return false }
+            let role = copyStringAttribute(node, kAXRoleAttribute)
+            let subrole = copyStringAttribute(node, kAXSubroleAttribute)
+            if role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" { return true }
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            current = (parent as! AXUIElement)
+        }
+        return false
+    }
+
+    private static func copyStringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
+    /// Writes a whole new name over an old one. The selection is widened to the whole value first when it can be
+    /// set, and then written as selected text; otherwise the whole value is written. False when neither can be set.
+    private func replaceWholeName(_ text: String, on element: AXUIElement, pid: pid_t) throws -> Bool {
+        let valueSettable = isSettable(element: element, attribute: kAXValueAttribute)
+        var selectedWhole = false
+        if isSettable(element: element, attribute: kAXSelectedTextRangeAttribute),
+           let original = stringValue(of: element, attribute: kAXValueAttribute) {
+            var whole = CFRange(location: 0, length: (original as NSString).length)
+            if let range = AXValueCreate(.cfRange, &whole),
+               AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, range) == .success,
+               let applied = selectedRange(of: element), applied.location == 0, applied.length == whole.length {
+                selectedWhole = true
+            }
+        }
+        let attribute: String
+        if selectedWhole, isSettable(element: element, attribute: kAXSelectedTextAttribute) {
+            attribute = kAXSelectedTextAttribute
+        } else if valueSettable {
+            attribute = kAXValueAttribute
+        } else {
+            return false
+        }
+        try requireCurrentTextFocus(element, pid: pid)
+        let result = AXUIElementSetAttributeValue(element, attribute as CFString, text as CFString)
+        guard result == .success else {
+            throw ComputerUseError.message("type_text AXUIElementSetAttributeValue(\(attribute)) failed with \(result.rawValue). Read the current text before retrying.")
+        }
+        return true
+    }
+
+    private func canTypeTextUsingKeyboardFallback(on element: AXUIElement) -> Bool {
+        let role = stringValue(of: element, attribute: kAXRoleAttribute)
+        let roleDescription = role.flatMap {
+            stringValue(of: element, attribute: kAXRoleDescriptionAttribute) ?? humanizedRoleDescription(for: $0)
+        }
+        return canUseKeyboardTextFallback(
+            role: role,
+            roleDescription: roleDescription,
+            isValueSettable: isSettable(element: element, attribute: kAXValueAttribute)
+        )
+    }
+
+    private func humanizedRoleDescription(for role: String) -> String {
+        if role == kAXTextFieldRole as String {
+            return "text field"
+        }
+
+        switch role {
+        case "AXTextArea", "AXTextView":
+            return "text entry area"
+        default:
+            return ""
+        }
+    }
+
+    private func editableBaseValue(for element: AXUIElement) -> String {
+        let childTextValues = editableDescendantTextValues(in: element)
+            .filter { !looksLikeEditablePlaceholder($0) }
+        if !childTextValues.isEmpty {
+            return childTextValues.joined()
+        }
+
+        guard let currentValue = stringValue(of: element, attribute: kAXValueAttribute) else {
+            return ""
+        }
+
+        let normalizedValue = normalizeEditablePlaceholderText(currentValue)
+        if normalizedValue.isEmpty || looksLikeEditablePlaceholder(normalizedValue) {
+            return ""
+        }
+
+        for attribute in ["AXPlaceholderValue", "AXPlaceholder"] {
+            guard let placeholder = stringValue(of: element, attribute: attribute) else {
+                continue
+            }
+
+            if normalizedValue == normalizeEditablePlaceholderText(placeholder) {
+                return ""
+            }
+        }
+
+        return currentValue
+    }
+
+    private func editableDescendantTextValues(in element: AXUIElement, depth: Int = 0) -> [String] {
+        guard depth < 4 else {
+            return []
+        }
+
+        var values: [String] = []
+        for child in copyChildren(of: element) {
+            if stringValue(of: child, attribute: kAXRoleAttribute) == kAXStaticTextRole as String,
+               let value = stringValue(of: child, attribute: kAXValueAttribute)
+                    ?? stringValue(of: child, attribute: kAXTitleAttribute)
+            {
+                let normalized = normalizeEditablePlaceholderText(value)
+                if !normalized.isEmpty {
+                    values.append(normalized)
+                }
+            }
+
+            values.append(contentsOf: editableDescendantTextValues(in: child, depth: depth + 1))
+        }
+
+        return values
+    }
+
+    private func looksLikeEditablePlaceholder(_ value: String) -> Bool {
+        let normalized = normalizeEditablePlaceholderText(value)
+        return normalized == "沟通时请保持“公开可接受”"
+    }
+
+    private func normalizeEditablePlaceholderText(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\u{200B}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func clickFrame(for record: ElementRecord, snapshot: AppSnapshot) -> CGRect? {
+        guard let frame = record.localFrame else {
+            return nil
+        }
+
+        guard
+            !record.isSyntheticText,
+            let element = record.element,
+            stringValue(of: element, attribute: kAXRoleAttribute) == kAXStaticTextRole as String,
+            let rowFrame = containingRowFrame(for: element, textFrame: frame, windowBounds: snapshot.windowBounds)
+        else {
+            return frame
+        }
+
+        return rowFrame
+    }
+
+    private func containingRowFrame(for element: AXUIElement, textFrame: CGRect, windowBounds: CGRect?) -> CGRect? {
+        let textCenter = CGPoint(x: textFrame.midX, y: textFrame.midY)
+        var current = element
+
+        for _ in 0..<4 {
+            guard let parent = copyParent(of: current) else {
+                return nil
+            }
+
+            if let frame = localFrame(of: parent, windowBounds: windowBounds),
+               frame.insetBy(dx: -2, dy: -2).contains(textCenter),
+               frame.width >= textFrame.width + 40,
+               frame.height >= textFrame.height,
+               frame.height <= max(textFrame.height * 4, 96)
+            {
+                return frame
+            }
+
+            current = parent
+        }
+
+        return nil
+    }
+
+    private func copyActions(for element: AXUIElement) -> [String]? {
+        var actions: CFArray?
+        let result = AXUIElementCopyActionNames(element, &actions)
+        guard result == .success else {
+            return nil
+        }
+
+        return actions as? [String]
+    }
+
+    private func copyChildren(of element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
+        guard result == .success, let value else {
+            return []
+        }
+
+        return value as? [AXUIElement] ?? []
+    }
+
+    private func copyParent(of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &value)
+        guard result == .success, let value else {
+            return nil
+        }
+
+        return (value as! AXUIElement)
+    }
+
+    private func stringValue(of element: AXUIElement, attribute: String) -> String? {
+        if (attribute == kAXValueAttribute as String || attribute == kAXSelectedTextAttribute as String),
+           isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) {
+            return nil
+        }
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
+        guard result == .success, let value else {
+            return nil
+        }
+
+        return value as? String
+    }
+
+    private func localFrame(of element: AXUIElement, windowBounds: CGRect?) -> CGRect? {
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        let positionResult = AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue)
+        let sizeResult = AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue)
+
+        guard
+            positionResult == .success,
+            sizeResult == .success,
+            let positionValue,
+            let sizeValue,
+            CFGetTypeID(positionValue) == AXValueGetTypeID(),
+            CFGetTypeID(sizeValue) == AXValueGetTypeID()
+        else {
+            return nil
+        }
+
+        let positionAXValue = positionValue as! AXValue
+        let sizeAXValue = sizeValue as! AXValue
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionAXValue, .cgPoint, &position), AXValueGetValue(sizeAXValue, .cgSize, &size) else {
+            return nil
+        }
+
+        return validatedAXFrame(position: position, size: size, windowBounds: windowBounds)
+    }
+
+    private func globalPoint(for record: ElementRecord, snapshot: AppSnapshot) throws -> CGPoint? {
+        guard let frame = record.localFrame else {
+            return nil
+        }
+
+        return try windowPointToGlobalPoint(
+            snapshot: snapshot,
+            point: CGPoint(x: frame.midX, y: frame.midY)
+        )
+    }
+
+    private func clickPoint(for record: ElementRecord, snapshot: AppSnapshot) -> CGPoint? {
+        clickActionPoints(for: record, snapshot: snapshot).first ?? localCenter(for: record)
+    }
+
+    private func screenshotToGlobalPoint(snapshot: AppSnapshot, x: Double, y: Double) throws -> CGPoint {
+        try windowPointToGlobalPoint(
+            snapshot: snapshot,
+            point: try screenshotPixelToWindowPointInSnapshot(
+                snapshot: snapshot,
+                point: CGPoint(x: x, y: y)
+            )
+        )
+    }
+
+    private func screenshotPixelToWindowPointInSnapshot(snapshot: AppSnapshot, point: CGPoint) throws -> CGPoint {
+        if snapshot.screenshotData == nil, let note = snapshot.screenshotNote {
+            throw ComputerUseError.stateUnavailable(note + "; coordinate input requires a delivered screenshot")
+        }
+        return screenshotPixelToWindowPoint(
+            point,
+            screenshotPixelSize: screenshotPixelSize(snapshot: snapshot),
+            windowBounds: snapshot.windowBounds
+        )
+    }
+
+    private func screenshotPixelSize(snapshot: AppSnapshot) -> CGSize? {
+        guard
+            let screenshotData = snapshot.screenshotData,
+            let imageSource = CGImageSourceCreateWithData(screenshotData as CFData, nil),
+            let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any],
+            let pixelWidth = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+            let pixelHeight = properties[kCGImagePropertyPixelHeight] as? CGFloat,
+            pixelWidth > 0,
+            pixelHeight > 0
+        else {
+            return nil
+        }
+
+        return CGSize(width: pixelWidth, height: pixelHeight)
+    }
+
+    private func windowPointToGlobalPoint(snapshot: AppSnapshot, point: CGPoint) throws -> CGPoint {
+        guard let windowBounds = snapshot.windowBounds else {
+            let appReference = snapshot.app.bundleIdentifier ?? snapshot.app.name
+            throw ComputerUseError.stateUnavailable("No window bounds are available for \(appReference). Run get_app_state after bringing the app on screen.")
+        }
+
+        return CGPoint(x: windowBounds.minX + point.x, y: windowBounds.minY + point.y)
+    }
+
+    private func fixtureIdentifier(at point: CGPoint, snapshot: AppSnapshot) throws -> String {
+        let candidates = snapshot.elements.values
+            .filter { $0.identifier != nil && ($0.localFrame?.contains(point) ?? false) }
+            .sorted { lhs, rhs in
+                let lhsArea = (lhs.localFrame?.width ?? 0) * (lhs.localFrame?.height ?? 0)
+                let rhsArea = (rhs.localFrame?.width ?? 0) * (rhs.localFrame?.height ?? 0)
+                return lhsArea < rhsArea
+            }
+
+        guard let identifier = candidates.first?.identifier else {
+            throw ComputerUseError.invalidArguments("No fixture element contains coordinate (\(Int(point.x)), \(Int(point.y)))")
+        }
+
+        return identifier
+    }
+
+    private func visualCursorTarget(for record: ElementRecord, snapshot: AppSnapshot) -> VisualCursorTarget? {
+        // The accessibility element is the overlay's only immediate source of
+        // truth for the window frame: the window list can keep reporting the
+        // pre-move origin for about a second. The anchor carries it and the
+        // overlay registers it when the animation runs.
+        return makeVisualCursorTarget(
+            localFrame: record.localFrame,
+            windowBounds: snapshot.windowBounds,
+            targetWindowID: snapshot.targetWindowID,
+            targetWindowLayer: snapshot.targetWindowLayer,
+            windowElement: snapshot.windowElement
+        )
+    }
+
+    private func fixtureVisualCursorTarget(identifier: String, snapshot: AppSnapshot) -> VisualCursorTarget? {
+        let record = snapshot.elements.values.first { $0.identifier == identifier }
+        return record.flatMap { visualCursorTarget(for: $0, snapshot: snapshot) }
+    }
+
+    private func moveVisualCursor(to target: VisualCursorTarget?) {
+        guard let target else {
+            return
+        }
+
+        VisualCursorSupport.performCursorAnimation(kind: .move) {
+            SoftwareCursorOverlay.moveCursor(to: target.point, in: target.window, anchor: target.anchor)
+        }
+    }
+
+    private func settleVisualCursor(at target: VisualCursorTarget?) {
+        guard let target else {
+            return
+        }
+
+        VisualCursorSupport.performCursorAnimation {
+            SoftwareCursorOverlay.settle(at: target.point, in: target.window, anchor: target.anchor)
+        }
+    }
+
+    private func pulseVisualCursor(at target: VisualCursorTarget?, clickCount: Int, mouseButton: MouseButtonKind) {
+        guard let target else {
+            return
+        }
+
+        VisualCursorSupport.performCursorAnimation {
+            SoftwareCursorOverlay.pulseClick(
+                at: target.point,
+                clickCount: clickCount,
+                mouseButton: mouseButton,
+                in: target.window,
+                anchor: target.anchor
+            )
+        }
+    }
+
+    private func debugInputFallback(tool: String, targetDescription: String, snapshot: AppSnapshot) {
+        guard inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) else {
+            return
+        }
+
+        let appReference = snapshot.app.bundleIdentifier ?? snapshot.app.name
+        fputs(
+            "[open-computer-use] global pointer fallback tool=\(tool) app=\(appReference) target=\(targetDescription)\n",
+            stderr
+        )
+    }
+
+    private func debugClickDecision(_ message: String) {
+        guard inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) else {
+            return
+        }
+
+        fputs("[open-computer-use] click decision \(message)\n", stderr)
+    }
+
+    private func clickDebugDescription(_ record: ElementRecord) -> String {
+        let role = record.element.flatMap { stringValue(of: $0, attribute: kAXRoleAttribute) } ?? "nil"
+        let actions = record.rawActions.joined(separator: ",")
+        let frame = record.localFrame.map { "x=\(Int($0.minX)) y=\(Int($0.minY)) w=\(Int($0.width)) h=\(Int($0.height))" } ?? "nil"
+        return "index=\(record.index) role=\(role) synthetic=\(record.isSyntheticText) actions=[\(actions)] frame=\(frame)"
+    }
+
+    /// AXScrollByPage once per page. Stops at the first refusal and reports how many pages were accepted.
+    private func scrollPagesByAccessibility(_ element: AXUIElement, action: String, count: Int) throws -> (done: Int, refusal: AXError?) {
+        var done = 0
+        for _ in 0..<count {
+            try requireUsableComputerUseSession()
+            let result = AXUIElementPerformAction(element, action as CFString)
+            guard result == .success else {
+                return (done, result)
+            }
+            done += 1
+        }
+        return (done, nil)
+    }
+
+    private func integralScrollPageCount(_ pages: Double) -> Int? {
+        let rounded = pages.rounded(.toNearestOrAwayFromZero)
+        guard abs(pages - rounded) < 0.000001 else {
+            return nil
+        }
+        return max(Int(rounded), 1)
+    }
+
+    private func performScrollEvent(
+        at point: CGPoint,
+        direction: String,
+        pages: Double,
+        targetDescription: String,
+        snapshot: AppSnapshot
+    ) throws {
+        let eventPoint = inputEventPoint(fromScreenStatePoint: point)
+
+        if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
+            debugInputFallback(
+                tool: "scroll",
+                targetDescription: targetDescription,
+                snapshot: snapshot
+            )
+            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.scrollGlobally(at: eventPoint, direction: direction, pages: pages)
+            return
+        }
+
+        try InputSimulation.scrollTargeted(at: eventPoint, direction: direction, pages: pages, pid: snapshot.app.pid)
+    }
+
+    private func performDragEvent(
+        from start: CGPoint,
+        to end: CGPoint,
+        targetDescription: String,
+        snapshot: AppSnapshot,
+        path: DragDeliveryPath
+    ) throws -> DragDeliveryPath {
+        let eventStart = inputEventPoint(fromScreenStatePoint: start)
+        let eventEnd = inputEventPoint(fromScreenStatePoint: end)
+
+        switch path {
+        case .global:
+            debugInputFallback(
+                tool: "drag",
+                targetDescription: targetDescription,
+                snapshot: snapshot
+            )
+            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd)
+        case .appPost:
+            guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
+                throw ComputerUseError.stateUnavailable("drag requires an observed target window; run get_app_state again")
+            }
+            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid)
+        }
+
+        return path
+    }
+
+    private func performNonAXClickFallback(
+        at point: CGPoint,
+        button: MouseButtonKind,
+        clickCount: Int,
+        targetDescription: String,
+        snapshot: AppSnapshot
+    ) throws {
+        let eventPoint = inputEventPoint(fromScreenStatePoint: point)
+
+        if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
+            debugInputFallback(
+                tool: "click",
+                targetDescription: targetDescription,
+                snapshot: snapshot
+            )
+            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.clickGlobally(at: eventPoint, button: button, clickCount: clickCount)
+            return
+        }
+
+        do {
+            try InputSimulation.clickTargeted(
+                at: eventPoint,
+                button: button,
+                clickCount: clickCount,
+                pid: snapshot.app.pid
+            )
+            return
+        } catch {
+            guard globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) else {
+                throw ComputerUseError.message(
+                    "click could not be handled through accessibility, and global pointer fallback is disabled. Set OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 to allow physical-pointer fallback for this process."
+                )
+            }
+        }
+    }
+
+    private func performExplicitMouseClick(
+        method: ClickMethod,
+        at point: CGPoint,
+        windowPoint: CGPoint,
+        button: MouseButtonKind,
+        clickCount: Int,
+        targetDescription: String,
+        snapshot: AppSnapshot
+    ) throws {
+        let eventPoint = inputEventPoint(fromScreenStatePoint: point)
+
+        switch method {
+        case .appPost:
+            debugClickDecision("requested=app_post executed=pid_post target=\(targetDescription)")
+            try InputSimulation.clickTargeted(
+                at: eventPoint,
+                button: button,
+                clickCount: clickCount,
+                pid: snapshot.app.pid
+            )
+        case .skyClick:
+            guard let windowBounds = snapshot.windowBounds, let windowID = snapshot.targetWindowID else {
+                throw ComputerUseError.stateUnavailable(
+                    "click_method 'sky_click' requires a current on-screen target window. Run get_app_state again."
+                )
+            }
+            debugClickDecision("requested=sky_click executed=skylight_pid_post target=\(targetDescription)")
+            try InputSimulation.clickWithSkyLight(
+                at: eventPoint,
+                windowPoint: windowPoint,
+                windowBounds: windowBounds,
+                windowID: windowID,
+                clickCount: clickCount,
+                pid: snapshot.app.pid
+            )
+        case .global:
+            guard globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) else {
+                throw ComputerUseError.message(
+                    "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus"
+                )
+            }
+            debugClickDecision("requested=global executed=global_hid target=\(targetDescription)")
+            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try InputSimulation.clickGlobally(at: eventPoint, button: button, clickCount: clickCount)
+        case .auto, .accessibility:
+            throw ComputerUseError.message(
+                "click_method '\(method.rawValue)' is not a direct mouse event method"
+            )
+        }
+    }
+
+    private func snapshotResult(for snapshot: AppSnapshot, style: SnapshotTextStyle) -> ToolCallResult {
+        var content = [ToolResultContentItem.text(snapshot.renderedText(style: style))]
+        if let note = snapshot.screenshotNote { content.append(.text(note)) }
+        if let screenshotData = snapshot.screenshotData {
+            content.append(.screenshotImage(screenshotData))
+        }
+        return ToolCallResult(content: content)
+    }
+}

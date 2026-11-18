@@ -1,0 +1,37 @@
+name: macOS
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Verify Godspeed behavior
+        run: swift test --filter 'TrajectoryLogTests|CursorTimingTests/testClickRipple|GodspeedLeanTests|BrowserPageTests|ClientScopeTests|ClientScopeSafetyTests'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+      - name: Verify the JavaScript API
+        run: node --test scripts/node-repl/open-computer-use-repl.test.mjs
+      - name: Package a development build
+        if: github.event_name == 'workflow_dispatch'
+        run: ./scripts/package-godspeed.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: Godspeed-macOS-development
+          path: dist/godspeed/
+          if-no-files-found: error
