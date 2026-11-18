@@ -8,7 +8,7 @@ Use Godspeed for Mac apps and Chrome. Keep actions in the background.
 - Use the final state in the reply to check the goal. A Check hint is advisory. After a partial failure, read fresh state before retrying. Never replay a step that already changed the app.
 - Use save_as for supported documents and open for apps or files. Use file tools for files without an active GUI session.
 - Use remember: true only for a verified repeatable batch. Use handoff for a bounded subtask with a checkable finish.
-- Preserve the user's clipboard. Ask before sending, deleting, or purchasing.
+- Use the private clipboard for copy, cut and paste between apps and Chrome. Ask before sending, deleting, or purchasing.
 """
 
 public final class StdioMCPServer {

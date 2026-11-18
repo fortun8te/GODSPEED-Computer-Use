@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import ImageIO
 
@@ -12,32 +13,41 @@ import ImageIO
 enum VisionFallback {
     static let baseURL: URL? = {
         guard let raw = GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-        return URL(string: raw)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), let host = url.host, !host.isEmpty else { return nil }
+        return url
     }()
 
     /// Default 8 s: one answer takes about 2.3 s warm, more on the first call after the model unloaded.
     static let timeout: TimeInterval = {
-        let milliseconds = GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_TIMEOUT_MS"].flatMap(Double.init) ?? 8_000
+        let configured = GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_TIMEOUT_MS"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let milliseconds = configured.flatMap(Double.init).flatMap { (0...30_000).contains($0) ? $0 : nil } ?? 8_000
         return max(500, milliseconds) / 1000
     }()
 
     static var isEnabled: Bool { baseURL != nil }
 
     /// Where `query` is in the image, as fractions of its width and height, or nil.
-    static func locate(imageBase64: String, query: String) -> CGPoint? {
+    static func locate(imageBase64: String, query: String, remaining: TimeInterval? = nil) -> CGPoint? {
         guard let baseURL else { return nil }
+        let wait = min(timeout, remaining ?? timeout)
+        guard wait > 0 else { return nil }
         let body: [String: Any] = ["image_base64": imageBase64, "query": query]
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("locate"), body: body, timeout: timeout) else {
-            HelperAutoStarter.shared.helperUnreachable(baseURL)
+        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("locate"), body: body, timeout: wait) else {
+            if wait == timeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
-        guard (object["found"] as? Bool) == true,
-              let x = (object["x"] as? NSNumber)?.doubleValue,
-              let y = (object["y"] as? NSNumber)?.doubleValue,
-              (0...1).contains(x), (0...1).contains(y)
+        return location(in: object)
+    }
+
+    static func location(in object: [String: Any]) -> CGPoint? {
+        guard let found = object["found"] as? NSNumber, CFGetTypeID(found) == CFBooleanGetTypeID(), found.boolValue,
+              let x = object["x"] as? NSNumber, CFGetTypeID(x) != CFBooleanGetTypeID(),
+              let y = object["y"] as? NSNumber, CFGetTypeID(y) != CFBooleanGetTypeID(),
+              (0...1).contains(x.doubleValue), (0...1).contains(y.doubleValue)
         else { return nil }
-        return CGPoint(x: x, y: y)
+        return CGPoint(x: x.doubleValue, y: y.doubleValue)
     }
 
     /// Pixel width and height of an encoded image (PNG, JPEG or WebP).

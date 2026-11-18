@@ -99,6 +99,14 @@ final class DoneCheckTests: XCTestCase {
         XCTAssertFalse(DoneCheck.fieldEquals("Volume = 10", label: "Volume", value: "1"))
     }
 
+    func testFieldChecksLabelAndPreservesLiteralValue() {
+        XCTAssertFalse(DoneCheck.fieldEquals("Notes = Result = 42", label: "Result", value: "42"))
+        XCTAssertFalse(DoneCheck.fieldEquals("Username = Ada", label: "Name", value: "Ada"))
+        XCTAssertFalse(DoneCheck.fieldEquals("Result = Ready (pending)", label: "Result", value: "Ready"))
+        XCTAssertTrue(DoneCheck.fieldEquals("Result = Ready (pending)", label: "Result", value: "Ready (pending)"))
+        XCTAssertTrue(DoneCheck.fieldEquals("Name [focused] = a = b", label: "Name", value: "a = b"))
+    }
+
     func testGoneMeansNoStateLineMentionsTheLabel() {
         XCTAssertEqual(
             DoneCheck.check([.gone("Loading")], evidence: evidence(screen: "Notes window\n\t3 button Save")),
@@ -267,5 +275,52 @@ final class DoneCheckTests: XCTestCase {
         let state = (0..<40).map { "\($0) button Item \($0)" }.joined(separator: "\n")
         let lines = RefereeSummary.screen(from: state).split(separator: "\n")
         XCTAssertEqual(lines.count, RefereeSummary.screenLineLimit)
+    }
+}
+
+extension DoneCheckTests {
+    func testRefereeLongHistoryCannotCrowdOutCurrentWebsiteEvidence() {
+        let screen = "Page: Checkout\n1 button Submit [disabled]\n# Payment pending"
+        let steps = (1...40).map { (step: "Step \($0) " + String(repeating: "history ", count: 25), result: "ok") }
+        let summary = RefereeSummary.build(
+            goal: "Check payment", steps: steps, repeatedFailures: 2, screenChanged: true,
+            dialogOpen: false, changes: String(repeating: "old diff ", count: 60), screen: screen,
+            maxCharacters: 1_200
+        )
+        XCTAssertLessThanOrEqual(summary.count, 1_200)
+        XCTAssertTrue(summary.contains("40. Step 40"))
+        XCTAssertTrue(summary.contains("Repeated failures: 2"))
+        XCTAssertTrue(summary.hasSuffix("Screen:\n" + screen))
+    }
+}
+
+extension DoneCheckTests {
+    func testBrowserDecisionViewKeepsConfirmationAndAccessibleControlState() {
+        let filler = (1...28).map { "\($0) link Related item \($0)" }.joined(separator: "\n")
+        let input = "Page: Checkout\nControls:\n\(filler)\n29 button Submit [disabled]\n30 textbox Name [focused]\nText:\n# Order confirmed"
+        let screen = RefereeSummary.screen(from: input)
+        XCTAssertTrue(screen.hasPrefix("Page: Checkout"))
+        XCTAssertTrue(screen.contains("# Order confirmed"))
+        XCTAssertTrue(screen.contains("Submit [disabled]"))
+        XCTAssertTrue(screen.contains("Name [focused]"))
+        XCTAssertLessThanOrEqual(screen.count, RefereeSummary.screenCharacterLimit)
+    }
+
+    func testDecisionBudgetMatchesHelperUnicodeCounting() {
+        let screen = "Page: Rapport\n# Opgeslagen"
+        let complex = String(repeating: "👩🏽‍💻e\u{301}", count: 100)
+        let view = RefereeSummary.build(goal: complex, steps: [(complex, "ok")], repeatedFailures: 0,
+                                        screenChanged: true, dialogOpen: false, changes: complex, screen: screen)
+        XCTAssertLessThanOrEqual(view.unicodeScalars.count, 1_200)
+        XCTAssertTrue(view.hasSuffix("Screen:\n" + screen))
+    }
+
+    func testBrowserLookAgainHintUsesTheSameTab() {
+        let verdict = Referee.Verdict(label: "look_again", confidence: 1, milliseconds: 1)
+        let browserHint = Referee.hint(for: verdict, browser: true) ?? ""
+        XCTAssertTrue(browserHint.contains("browser wait_for"))
+        XCTAssertTrue(browserHint.contains("same tab"))
+        XCTAssertFalse(browserHint.contains("get_app_state"))
+        XCTAssertTrue(Referee.hint(for: verdict)?.contains("get_app_state") == true)
     }
 }

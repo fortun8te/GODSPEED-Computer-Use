@@ -58,6 +58,21 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertThrowsError(try HandoffTool.parse(["goal": "g", "done_when": ["text": "x"]]))
     }
 
+    func testBoundsModelGeneratedNumbersBeforeConvertingToInt() throws {
+        for invalid in ["NaN", "Infinity", "-Infinity"] {
+            let request = try HandoffTool.parse([
+                "app": "Notes", "goal": "Save", "done_when": ["text": "Saved"],
+                "max_steps": invalid, "time_budget_s": invalid,
+            ])
+            XCTAssertEqual(request.maxSteps, HandoffTool.defaultMaxSteps)
+            XCTAssertEqual(request.timeBudget, HandoffTool.defaultTimeBudget)
+        }
+        let large = try HandoffTool.parse([
+            "app": "Notes", "goal": "Save", "done_when": ["text": "Saved"], "max_steps": "1e100",
+        ])
+        XCTAssertEqual(large.maxSteps, 30)
+    }
+
     // MARK: Candidates
 
     func testCandidatesTypeValueIntoMatchingFieldAndOfferSave() {
@@ -141,9 +156,10 @@ final class HandoffToolTests: XCTestCase {
     private final class FakeApp {
         var name = ""
         var saved = false
-        var clock = Date(timeIntervalSince1970: 0)
+        var clock: TimeInterval = 0
         var acts: [String] = []
         var chooseCalls = 0
+        var reads = 0
 
         var state: String {
             """
@@ -159,10 +175,10 @@ final class HandoffToolTests: XCTestCase {
         func deps(choose: @escaping ([(id: String, text: String)]) -> [String: Double]?, stuck: Bool = false,
                   replay: Bool? = nil, stepSeconds: TimeInterval = 0, changes: Bool = true) -> HandoffTool.Dependencies {
             HandoffTool.Dependencies(
-                readState: { self.state },
+                readState: { self.reads += 1; return self.state },
                 act: { candidate, _ in
                     self.acts.append(candidate.text)
-                    self.clock.addTimeInterval(stepSeconds)
+                    self.clock += stepSeconds
                     if changes {
                         if candidate.kind == .setValue { self.name = candidate.arguments["value"] as! String }
                         if candidate.text == "click \"Save\"" { self.saved = true }
@@ -234,7 +250,7 @@ final class HandoffToolTests: XCTestCase {
         let app = FakeApp()
         let outcome = HandoffTool.run(request(), app.deps(choose: { _ in nil }))
         XCTAssertEqual(outcome.kind, .escalate)
-        XCTAssertEqual(app.chooseCalls, 2, "one retry")
+        XCTAssertEqual(app.chooseCalls, 1, "unavailable helper should not be retried immediately")
         XCTAssertTrue(app.acts.isEmpty)
     }
 
@@ -265,10 +281,21 @@ final class HandoffToolTests: XCTestCase {
         let timed = HandoffTool.run(request(budget: 5), slow.deps(choose: pick(["type", "scroll"]), stepSeconds: 10))
         XCTAssertEqual(timed.kind, .budget)
         XCTAssertEqual(slow.acts.count, 1)
+        XCTAssertEqual(slow.reads, 1, "the initial state is the only read when an action uses the budget")
         let capped = FakeApp()
         let steps = HandoffTool.run(request(maxSteps: 1), capped.deps(choose: pick(["type"])))
         XCTAssertEqual(steps.kind, .budget)
         XCTAssertEqual(capped.acts.count, 1)
+    }
+
+    func testSpentReplayBudgetDoesNotStartNewReadOrAction() {
+        let app = FakeApp()
+        var deps = app.deps(choose: pick(["type"]))
+        deps.replay = { app.clock += 5; return false }
+        let outcome = HandoffTool.run(request(budget: 5), deps)
+        XCTAssertEqual(outcome.kind, .budget)
+        XCTAssertEqual(app.reads, 1)
+        XCTAssertTrue(app.acts.isEmpty)
     }
 
     func testReplayedRecipeFinishes() {

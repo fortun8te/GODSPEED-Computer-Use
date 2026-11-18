@@ -27,9 +27,11 @@ const SERVER_INSTRUCTIONS = `UI automation through a persistent JavaScript REPL 
 
 On the first call after startup or js_reset, bind the requested app with await cua.getApp("Example App"), or call await cua.getState() only when an app inventory is actually needed. On macOS, use getApp(name, { initialState: false }) followed by app.query({ text, role }) for targeted lookup without an initial snapshot. App bindings persist across js calls. Batch deterministic actions and the resulting getAXState() in one js call, then verify the returned UI state. Use nodeRepl.write(value) for additional text and await nodeRepl.emitImage(image) for additional images. Ask the user before destructive or externally visible actions such as sending, deleting, or purchasing.`;
 
-const JS_DESCRIPTION = `Run JavaScript in a persistent Node.js REPL with top-level await and an initialized asynchronous cua API for Open Computer Use. Use this for all desktop interactions. Bind an app with let app = await cua.getApp("Example App"); then call await app.click(...), await app.typeText(...), and await app.getAXState(). Top-level bindings persist until js_reset, so prefer top-level var for names that may be assigned again. Batch deterministic actions and the resulting state read in one call to reduce round trips. Use nodeRepl.write(value) for extra text and await nodeRepl.emitImage(image) for extra images. If timeout_ms is omitted, execution times out after 30000 ms.`;
+const JS_DESCRIPTION = `Run JavaScript in a persistent Node.js REPL with top-level await and an initialized asynchronous cua API for Open Computer Use. Use this for all desktop interactions. Bind an app with let app = await cua.getApp("Example App"); then call await app.click(...), await app.typeText(...), and await app.getAXState(). For known steps, use app.batch(steps, { goal, doneWhen }) and check receipt.completion. Top-level bindings persist until js_reset, so prefer top-level var for names that may be assigned again. Batch deterministic actions and the resulting state read in one call to reduce round trips. Use cua.browser(action, args) for a browser action, cua.peekPages(urls) for independent web reads, and cua.batch for an ordered mix of browser and desktop steps. Use nodeRepl.write(value) for extra text and await nodeRepl.emitImage(image) for extra images. If timeout_ms is omitted, execution times out after 30000 ms.`;
 
 const RESET_DESCRIPTION = `Reset the persistent Open Computer Use JavaScript session and discard all bindings created by prior js calls. The next js call starts with a freshly initialized cua API. This does not close native apps or erase their state.`;
+
+const STARTUP_GUIDANCE = `Use cua.browser(action, args) for web tasks, and cua.getApp(name, { initialState: false }) with app.query({ text, role }) for targeted Mac lookup. Batch known steps and check receipt.completion against the observed result. Read fresh state before using old indexes or retrying an uncertain action. Use cua.clipboard(action, text?) for private copy and paste workflows. Call await cua.rewriteDocumentation() for the full API and platform options.`;
 
 const COMPUTER_USE_GUIDANCE = `## Open Computer Use JavaScript API
 
@@ -37,9 +39,11 @@ The runtime exposes an asynchronous app-bound API:
 
 - \`await cua.getState({ emit? })\`: list current apps.
 - \`await cua.listApps({ emit? })\`: list current apps.
+- \`await cua.clipboard("read" | "write" | "clear", text?)\`: access the private clipboard shared by this session’s Mac and Chrome tools.
 - \`await cua.getApp(nameOrBundleID, { initialState? })\`: bind an app; initialState defaults to true. Use false for a lightweight binding before query.
 - \`await app.query({ text?, role?, exact?, limit?, maxNodes?, windowId? })\`: macOS-only AX lookup; returns matches and truncation metadata, with indexes usable in this native session.
 - \`await app.getAXState({ emit?, textLimit?, maxTreeNodes?, maxTreeDepth?, windowPlacement?, settleMs? })\`: settleMs (macOS) first waits up to that long (at most 5000 ms) while the window shows a busy sign, instead of a fixed sleep after an action.
+- \`await app.batch(steps, { goal?, doneWhen?, windowId?, remember?, screenshot?, emit? })\`: execute known steps and return text plus the native receipt. Check \`receipt.completion\` before reporting success.
 - macOS AX text starts with a legend line. By default one tab is one tree level ([w=settable]); [tab=4 w=settable] means a tab advances four levels and each leading space one level. group denotes a container. w means settable; w:str, w:bool and w:float add the native value type. An equals sign introduces a value. These spellings keep every name, value and action index.
 - \`await app.getScreenshot({ emit? })\`
 - \`await app.getAXStateAndScreenshot(options?)\`
@@ -181,9 +185,18 @@ export class JsonLinePeer extends EventEmitter {
     this.emit("close", error);
   }
 
-  request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
-    if (this.reopening && method !== "initialize") return this.reopening.then(() => this.request(method, params, timeoutMs));
-    if (this.closed && !this.injected && !this.disposed) return this.#reopen().then(() => this.request(method, params, timeoutMs));
+  request(method, params = {}, timeoutMs = DEFAULT_TIMEOUT_MS, mayDispatch = () => true) {
+    if (!mayDispatch()) return Promise.reject(new Error("JavaScript execution ended before the action was sent"));
+    const deadline = timeoutMs > 0 ? performance.now() + timeoutMs : null;
+    const afterReconnect = reconnect => reconnect.then(() => {
+      const remaining = deadline == null ? timeoutMs : Math.floor(deadline - performance.now());
+      if (deadline != null && remaining <= 0) {
+        throw new Error("Native connection setup used the remaining time before the action was sent");
+      }
+      return this.request(method, params, remaining, mayDispatch);
+    });
+    if (this.reopening && method !== "initialize") return afterReconnect(this.reopening);
+    if (this.closed && !this.injected && !this.disposed) return afterReconnect(this.#reopen());
     if (this.closed) return Promise.reject(new Error("native MCP is closed"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -294,8 +307,16 @@ function optionsToSnapshotArgs(options = {}) {
   return args;
 }
 
+function optionsToWindowArgs({ windowId } = {}) {
+  if (windowId === undefined) return {};
+  if (!Number.isSafeInteger(windowId) || windowId < 1 || windowId > 0xffffffff) {
+    throw new Error("windowId must be a positive integer up to 4294967295");
+  }
+  return { window_id: windowId };
+}
+
 function optionsToClickArgs(options = {}) {
-  const args = {};
+  const args = optionsToWindowArgs(options);
   if (options.mouseButton !== undefined) args.mouse_button = options.mouseButton;
   if (options.clickCount !== undefined) args.click_count = options.clickCount;
   if (options.clickMethod !== undefined) args.click_method = options.clickMethod;
@@ -303,7 +324,7 @@ function optionsToClickArgs(options = {}) {
 }
 
 function optionsToKeyArgs(options = {}) {
-  const args = {};
+  const args = optionsToWindowArgs(options);
   if (options.keyMethod !== undefined) args.key_method = options.keyMethod;
   return args;
 }
@@ -325,11 +346,33 @@ export function createCuaApi(native, activeOutput) {
   }
   async function emitDocs() {
     if (docsEmitted) return;
-    activeOutput().write(computerUseGuidance(), "cua.core");
+    activeOutput().write(STARTUP_GUIDANCE, "cua.core");
     docsEmitted = true;
+  }
+  async function runBatch(steps, options, app) {
+    if (!Array.isArray(steps) || !steps.length || !steps.every(isPlainObject)) {
+      throw new Error("batch requires a nonempty array of step objects");
+    }
+    if (!isPlainObject(options)) throw new Error("batch expects an options object");
+    const args = { steps, ...optionsToWindowArgs(options) };
+    if (app !== undefined) args.app = app;
+    for (const [option, nativeKey] of [
+      ["goal", "goal"], ["doneWhen", "done_when"], ["remember", "remember"],
+      ["screenshot", "screenshot"], ["compact", "compact"], ["effects", "effects"], ["returnState", "return_state"],
+    ]) {
+      if (options[option] !== undefined) args[nativeKey] = options[option];
+    }
+    const result = await native.request("tools/call", { name: "batch", arguments: args });
+    const text = toolResultText(result);
+    await emitText(text, options);
+    await emitImages(toolResultImages(result), options);
+    return { text, isError: result?.isError === true, receipt: result?._meta?.["godspeed/batch"] ?? null };
   }
   function appBinding(app) {
     return Object.freeze({
+      async batch(steps, options = {}) {
+        return runBatch(steps, options, app);
+      },
       async query(options = {}) {
         if (!isPlainObject(options)) throw new Error("app.query expects an options object");
         for (const key of Object.keys(options)) {
@@ -375,10 +418,14 @@ export function createCuaApi(native, activeOutput) {
         const targetArgs = Array.isArray(target) ? { x: target[0], y: target[1] } : { element_index: target };
         await call("click", { app, ...targetArgs, ...optionsToClickArgs(options) });
       },
-      async drag(from, to, { modifiers } = {}) {
+      async hover(target, options = {}) {
+        await call("hover", { app, element_index: target, ...optionsToWindowArgs(options) });
+      },
+      async drag(from, to, options = {}) {
         await call("drag", {
           app, from_x: from[0], from_y: from[1], to_x: to[0], to_y: to[1],
-          ...(modifiers === undefined ? {} : { modifiers }),
+          ...(options.modifiers === undefined ? {} : { modifiers: options.modifiers }),
+          ...optionsToWindowArgs(options),
         });
       },
       async pressKey(key, options = {}) { await call("press_key", { app, key, ...optionsToKeyArgs(options) }); },
@@ -413,6 +460,34 @@ export function createCuaApi(native, activeOutput) {
     });
   }
   const api = {
+    async browser(action, args = {}, options = {}) {
+      if (typeof action !== "string" || !action.trim()) throw new Error("browser requires an action name");
+      if (!isPlainObject(args) || !isPlainObject(options)) throw new Error("browser expects argument and output objects");
+      const result = await native.request("tools/call", { name: "browser", arguments: { ...args, action } });
+      const text = toolResultText(result);
+      await emitText(text, options);
+      await emitImages(toolResultImages(result), options);
+      return { text, isError: result?.isError === true, pages: result?._meta?.["godspeed/preview_pages"] ?? [] };
+    },
+    async clipboard(action, text) {
+      if (!["read", "write", "clear"].includes(action)) throw new Error("clipboard expects read, write, or clear");
+      if (action === "write" && typeof text !== "string") throw new Error("clipboard write expects text");
+      return toolResultText(await call("clipboard", action === "write" ? { action, text } : { action }));
+    },
+    async batch(steps, options = {}) {
+      return runBatch(steps, options);
+    },
+    async peekPages(urls, options = {}) {
+      if (!Array.isArray(urls) || urls.length < 1 || urls.length > 6 ||
+          !urls.every(url => typeof url === "string" && url.trim())) {
+        throw new Error("peekPages expects one to six nonempty browser addresses");
+      }
+      if (!isPlainObject(options)) throw new Error("peekPages expects an options object");
+      const result = await call("browser", { action: "peek", urls });
+      const text = toolResultText(result);
+      await emitText(text, options);
+      return { text, pages: result?._meta?.["godspeed/preview_pages"] ?? [] };
+    },
     async getState(options = {}) {
       await emitDocs();
       const result = await call("list_apps", {});
@@ -519,7 +594,13 @@ export class PersistentJavaScriptSession {
     Object.freeze(nodeRepl);
     this.nodeRepl = nodeRepl;
     Object.defineProperty(this.repl.context, "nodeRepl", { value: nodeRepl, configurable: false, writable: false });
-    Object.defineProperty(this.repl.context, "cua", { value: createCuaApi(this.native, () => this.#currentOutput()), configurable: false, writable: false });
+    const ownedNative = {
+      request: (...args) => {
+        this.#currentOutput();
+        return this.native.request(...args);
+      },
+    };
+    Object.defineProperty(this.repl.context, "cua", { value: createCuaApi(ownedNative, () => this.#currentOutput()), configurable: false, writable: false });
   }
 
   async run(code, timeoutMs = DEFAULT_TIMEOUT_MS, requestMeta = {}) {
@@ -539,7 +620,7 @@ export class PersistentJavaScriptSession {
         evaluationOwner.run(active, () => this.repl.eval(code, this.repl.context, "open-computer-use-repl", (error, result) => error ? reject(error) : resolve(result)));
       });
       const value = enforceTimeout
-        ? await Promise.race([evaluation, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`js execution timed out after ${timeoutMs} ms; session reset`)), timeoutMs); })])
+        ? await Promise.race([evaluation, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`js execution timed out after ${timeoutMs} ms; session reset. Inspect the target before retrying any action that may have been sent.`)), timeoutMs); })])
         : await evaluation;
       if (content.length === 0) content.push({ type: "text", text: "(no output)" });
       return { content, isError: false };
@@ -564,6 +645,7 @@ export class WorkerJavaScriptSession {
     this.nextId = 1;
     this.pending = new Map();
     this.runQueue = Promise.resolve();
+    this.nativeQueue = Promise.resolve();
     this.invalidatedWorkers = new WeakSet();
     this.#start();
   }
@@ -593,12 +675,38 @@ export class WorkerJavaScriptSession {
       return;
     }
     if (message.type === "native_request") {
-      try {
-        const result = await this.native.request(message.method, message.params, message.timeoutMs);
-        if (this.worker === worker) worker.postMessage({ type: "native_response", id: message.id, result });
-      } catch (error) {
-        if (this.worker === worker) worker.postMessage({ type: "native_response", id: message.id, error: asError(error).message });
-      }
+      const respond = payload => {
+        if (this.worker === worker && !this.invalidatedWorkers.has(worker)) {
+          worker.postMessage({ type: "native_response", id: message.id, ...payload });
+        }
+      };
+      // The native peer executes serially. Keep unsent actions here so an expired
+      // evaluation cannot leave extra commands queued on the other side of the pipe.
+      const dispatch = async () => {
+        if (this.worker !== worker || this.invalidatedWorkers.has(worker)) return;
+        const execution = this.pending.get(message.executionId);
+        if (!execution || execution.worker !== worker) {
+          respond({ error: "JavaScript execution ended before the action was sent" });
+          return;
+        }
+        const remaining = Math.floor(execution.deadline - performance.now());
+        if (remaining <= 0) {
+          respond({ error: "JavaScript time budget elapsed before the action was sent" });
+          return;
+        }
+        const requested = Number.isFinite(message.timeoutMs) && message.timeoutMs > 0
+          ? Math.min(message.timeoutMs, remaining) : remaining;
+        try {
+          const mayDispatch = () => this.worker === worker && !this.invalidatedWorkers.has(worker)
+            && this.pending.get(message.executionId) === execution;
+          const result = await this.native.request(message.method, message.params, requested, mayDispatch);
+          respond({ result });
+        } catch (error) {
+          respond({ error: asError(error).message });
+        }
+      };
+      const queued = this.nativeQueue.then(dispatch);
+      this.nativeQueue = queued.catch(() => {});
     }
   }
 
@@ -646,9 +754,9 @@ export class WorkerJavaScriptSession {
         this.native.endSession?.();
         await worker.terminate();
         if (this.worker === worker) this.#start();
-        resolve({ content: [{ type: "text", text: `Error: js execution timed out after ${timeoutMs} ms; session reset` }], isError: true });
+        resolve({ content: [{ type: "text", text: `Error: js execution timed out after ${timeoutMs} ms; session reset. Inspect the target before retrying any action that may have been sent.` }], isError: true });
       }, timeoutMs);
-      this.pending.set(id, { resolve, timer, worker });
+      this.pending.set(id, { resolve, timer, worker, deadline: performance.now() + timeoutMs });
       worker.postMessage({ type: "exec", id, code, timeoutMs, requestMeta });
     });
   }

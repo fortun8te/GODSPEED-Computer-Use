@@ -56,6 +56,57 @@ try {
   await waitFor(()=>existsSync(statePath));
   native = new JsonLinePeer({command:nativePath,args:['mcp'],env});
   await native.initialize();
+  const clipboardCount = state().pasteboardChangeCount;
+  await reset();
+  await call('press_key', {key:'Cmd+C'});
+  assert.equal(text(await call('clipboard', {action:'read'})), 'hello');
+  await call('press_key', {key:'Cmd+X'});
+  await expectView(' world');
+  await call('press_key', {key:'Cmd+V'});
+  await expectView('hello world');
+  assert.equal(state().pasteboardChangeCount, clipboardCount);
+
+  const browserFixture = process.env.GODSPEED_CLIPBOARD_FIXTURE_URL;
+  if (browserFixture) {
+    const web = async (action, args = {}) => {
+      const result = await native.request('tools/call', {name:'browser',arguments:{action,...args}}, 40_000);
+      assert.equal(!!result.isError, false, text(result));
+      return text(result);
+    };
+    const browserState = new URL('/state', browserFixture);
+    async function expectWebField(value) {
+      const deadline = Date.now() + 6000;
+      do {
+        const response = await fetch(browserState);
+        if (await response.text() === value) return;
+        await sleep(40);
+      } while (Date.now() < deadline);
+      assert.fail('Chrome fixture did not observe the expected field value');
+    }
+    await web('open', {url:browserFixture});
+    try {
+      await web('paste', {label:'Browser target'});
+      await expectWebField('hello');
+      await web('cut');
+      assert.equal(text(await call('clipboard', {action:'read'})), 'hello');
+      await expectWebField('');
+      await web('fill_field', {label:'Browser target',text:'from Chrome'});
+      await expectWebField('from Chrome');
+      await web('copy');
+      assert.equal(text(await call('clipboard', {action:'read'})), 'from Chrome');
+      await reset();
+      await call('press_key', {key:'Cmd+V'});
+      await expectView('from Chrome world');
+      assert.equal(state().pasteboardChangeCount, clipboardCount);
+      console.log('Native to Chrome and Chrome to native clipboard transfer passed.');
+    } finally {
+      await native.notify('notifications/turn-ended', {});
+    }
+  }
+  await call('clipboard', {action:'clear'});
+  await call('press_key', {key:'Cmd+V'}, true);
+  assert.equal(state().pasteboardChangeCount, clipboardCount);
+  console.log('Native copy, cut, paste and empty clipboard protection passed without a system clipboard write.');
   await reset();
   await call('type_text',{text:'X'});
   await expectView('X world');
@@ -194,6 +245,12 @@ try {
   assert.ok(!JSON.stringify(byValue).includes('Password input'), 'Password matched by value');
   await configure({target:'secure'}); // publish any reads made during snapshot/query
   assert.equal(state().secretReads,0, 'Snapshot/query requested a password value or selection');
+  await call('clipboard', {action:'write',text:'safe fixture text'});
+  await call('press_key', {key:'Cmd+C'}, true);
+  assert.equal(text(await call('clipboard', {action:'read'})), 'safe fixture text');
+  await configure({target:'secure'});
+  assert.equal(state().secretReads,0, 'Clipboard copy requested a password value or selection');
+  await call('clipboard', {action:'clear'});
   console.log('Password provider: snapshot, selected text and query do not request secret attributes.');
 
 

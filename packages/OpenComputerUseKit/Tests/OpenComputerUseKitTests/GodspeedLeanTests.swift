@@ -358,6 +358,12 @@ final class GodspeedLeanTests: XCTestCase {
         XCTAssertNil(Referee.hint(for: verdict("stuck", 0.1)))
     }
 
+    func testRefereeRejectsInvalidConfidence() {
+        for confidence in [Double.infinity, -Double.infinity, Double.nan, -0.1, 1.1] {
+            XCTAssertNil(Referee.hint(for: verdict("stuck", confidence)))
+        }
+    }
+
     func testRefereeActAndUnknownLabelsAddNothing() throws {
         try XCTSkipIf(
             ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE"] != nil,
@@ -493,6 +499,18 @@ final class GodspeedLeanTests: XCTestCase {
         XCTAssertEqual(BrowserPage.normalize("Sign In"), BrowserPage.normalize("sign in"))
     }
 
+    func testVisionLocationRejectsWrongJSONTypesAndOutOfBoundsPoints() throws {
+        func point(_ json: String) throws -> CGPoint? {
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            return VisionFallback.location(in: object)
+        }
+        XCTAssertEqual(try point(#"{"found":true,"x":0.25,"y":1}"#), CGPoint(x: 0.25, y: 1))
+        XCTAssertNil(try point(#"{"found":1,"x":0.25,"y":1}"#))
+        XCTAssertNil(try point(#"{"found":true,"x":true,"y":0.25}"#))
+        XCTAssertNil(try point(#"{"found":true,"x":0.25,"y":1.2}"#))
+        XCTAssertNil(try point(#"{"found":false,"x":0.25,"y":0.25}"#))
+    }
+
     // MARK: - VisionFallback.pixelSize
 
     func testPixelSizeReadsEncodedPNGDimensions() throws {
@@ -595,5 +613,27 @@ final class GodspeedLeanTests: XCTestCase {
     func testIndexOnlyActionStepStaysNativeWhenAppIsKnown() throws {
         let steps = try BatchTool.parseSteps([["action": "click", "index": 3]], defaultApp: "Finder")
         XCTAssertEqual(steps.first?.tool, "click")
+    }
+}
+
+extension GodspeedLeanTests {
+    func testCompactRepeatedSuccessesPreservesNotesAndStepBoundaries() {
+        XCTAssertEqual(BatchTool.compactRepeatedSuccesses([
+            "1. type: ok", "2. type: ok", "3. query: ok\nResult",
+            "4. type: ok", "   effect: changed", "5. type: ok", "6. type: ok - outcome unknown",
+            "Done: verified"
+        ]), [
+            "1–2. type: ok", "3. query: ok\nResult",
+            "4. type: ok", "   effect: changed", "5. type: ok", "6. type: ok - outcome unknown",
+            "Done: verified"
+        ])
+    }
+}
+
+extension GodspeedLeanTests {
+    func testCompactRepeatedSuccessesKeepsAnAnnotatedStepSeparate() {
+        XCTAssertEqual(BatchTool.compactRepeatedSuccesses([
+            "1. type: ok", "2. type: ok", "3. type: ok", "   effect: opened a dialog",
+        ]), ["1–2. type: ok", "3. type: ok", "   effect: opened a dialog"])
     }
 }

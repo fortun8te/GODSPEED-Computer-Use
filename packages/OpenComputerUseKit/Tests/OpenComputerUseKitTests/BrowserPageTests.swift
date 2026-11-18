@@ -124,6 +124,33 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(parse.framedControls, 1)
     }
 
+    func testCompactBrowserSnapshotCarriesObservedControlStates() {
+        func property(_ name: String, _ value: Any) -> [String: Any] {
+            ["name": name, "value": ["value": value]]
+        }
+        var checkbox = ax("checkbox", "Include files", backend: 12)
+        checkbox["properties"] = [property("focused", true), property("checked", "mixed"), property("disabled", false)]
+        var button = ax("button", "More", backend: 13)
+        button["properties"] = [property("expanded", false), property("disabled", true)]
+        let lines = BrowserPage.parseAX([checkbox, button], textBudget: 0).controls.map(\.line)
+        XCTAssertEqual(lines, ["1 checkbox Include files [focused, mixed]", "2 button More [collapsed, disabled]"])
+        var field = ax("textbox", "Name", backend: 14, value: "Ada")
+        field["properties"] = [property("focused", true)]
+        let line = BrowserPage.parseAX([field], textBudget: 0).controls.first?.line ?? ""
+        XCTAssertTrue(DoneCheck.fieldEquals(line, label: "Name", value: "Ada"))
+    }
+
+    func testClippedBrowserFieldCannotVerifyItsPrefix() throws {
+        let prefix = String(repeating: "a", count: 80)
+        func line(_ value: String) throws -> String {
+            try XCTUnwrap(BrowserPage.parseAX([
+                ax("textbox", "Name", backend: 14, value: value),
+            ]).controls.first).line
+        }
+        XCTAssertTrue(DoneCheck.fieldEquals(try line(prefix), label: "Name", value: prefix))
+        XCTAssertFalse(DoneCheck.fieldEquals(try line(prefix + "b"), label: "Name", value: prefix))
+    }
+
     func testRenderPutsControlsBeforeTextAndAddsAddress() {
         let text = BrowserPage.renderRead(
             BrowserPage.parseAX(page()), href: "https://demo.test/", title: "Demo", readyState: "complete"
@@ -374,6 +401,10 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertTrue(BrowserRules.sameAddress("https://x.com/", "https://X.com"))
         XCTAssertTrue(BrowserRules.sameAddress("https://x.com/a", "https://x.com"))
         XCTAssertFalse(BrowserRules.sameAddress("https://y.com", "https://x.com"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com.example.test", "https://x.com"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com/cartoon", "https://x.com/cart"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com/Cart", "https://x.com/cart"))
+        XCTAssertFalse(BrowserRules.sameAddress("https://x.com?q=Wrong", "https://x.com?q=Right"))
     }
 
     func testURLNormalisationKeepsPathsAndTrimsSpaces() {
@@ -656,5 +687,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertTrue(BrowserPage.settleJS(cap: 800).contains("quiet:"))
         XCTAssertFalse(BrowserPage.settleJS(cap: 800).contains("Promise"))
         XCTAssertTrue(BrowserPage.pageStateJS.contains("beforeunload"))
+    }
+}
+
+extension BrowserPageTests {
+    func testUploadVerificationRejectsWrongFilesWithSameCount() {
+        let expected = [BrowserPage.UploadFile(name: "fixture.txt", size: 4)]
+        XCTAssertTrue(BrowserPage.matchesUploadSelection([["fixture.txt", 4]], expected: expected))
+        XCTAssertFalse(BrowserPage.matchesUploadSelection([["wrong.txt", 4]], expected: expected))
+        XCTAssertFalse(BrowserPage.matchesUploadSelection([["fixture.txt", 5]], expected: expected))
+        XCTAssertFalse(BrowserPage.matchesUploadSelection(nil, expected: expected))
     }
 }

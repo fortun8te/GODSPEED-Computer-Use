@@ -62,6 +62,8 @@ final class SelectiveObservationTests: XCTestCase {
         let full = snapshot()
         XCTAssertEqual(full.selectedText, "中文🙂")
         XCTAssertEqual(full.elements.count, 1)
+        XCTAssertEqual(full.elements[7]?.title, "Input")
+        XCTAssertEqual(full.elements[7]?.value, "中文🙂")
         let image = snapshot(options: .init(includeAX: false))
         XCTAssertTrue(image.elements.isEmpty)
         XCTAssertTrue(image.treeLines.isEmpty)

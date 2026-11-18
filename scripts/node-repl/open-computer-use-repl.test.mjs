@@ -35,6 +35,22 @@ test("advertises only js and js_reset", () => {
   assert.equal(toolDefinitions()[0].inputSchema.properties.timeout_ms.maximum, 300_000);
 });
 
+test("the REPL routes clipboard operations to the same native peer as browser actions", async () => {
+  const native = mockNative();
+  const session = new PersistentJavaScriptSession({ native });
+  const result = await session.run(`
+    await cua.clipboard("write", "fixture text");
+    await cua.browser("paste", { tab_id: 7, label: "Editor" }, { emit: false });
+    await cua.clipboard("clear");
+  `);
+  assert.equal(result.isError, false);
+  assert.deepEqual(native.calls, [
+    { name: "clipboard", arguments: { action: "write", text: "fixture text" } },
+    { name: "browser", arguments: { action: "paste", tab_id: 7, label: "Editor" } },
+    { name: "clipboard", arguments: { action: "clear" } },
+  ]);
+});
+
 test("normalizes native app-list text across macOS, Linux, and Windows", () => {
   assert.deepEqual(parseListApps([
     "TextEdit — com.apple.TextEdit [frontmost, running, last-used=2026-09-22, uses=42]",
@@ -360,6 +376,31 @@ test("reset drops old worker native requests before a replacement kernel starts"
   } finally { await session.close(); }
 });
 
+test("a timed out turn drops queued actions and the next turn can send input", async t => {
+  const native = mockNative();
+  const request = native.request;
+  let release;
+  native.request = async (method, params, timeoutMs) => {
+    if (params.name !== "click") return request(method, params);
+    assert.ok(timeoutMs > 0 && timeoutMs < 600);
+    native.calls.push(params);
+    return new Promise(resolve => { release = resolve; });
+  };
+  native.endSession = () => release?.(textResult("interrupted", true));
+  const session = new WorkerJavaScriptSession({ native });
+  t.after(() => session.close());
+  assert.equal((await session.run("nodeRepl.write('ready');", 5_000)).isError, false);
+  const expired = await session.run(`
+    var target = await cua.getApp('com.example.Text', { initialState: false });
+    await Promise.all([target.click(1), target.click(2)]);
+  `, 600);
+  assert.match(expired.content.at(-1).text, /execution timed out/);
+  assert.deepEqual(native.calls.map(call => call.arguments.element_index), [1]);
+  const next = await session.run("var nextApp = await cua.getApp('com.example.Text', { initialState: false }); await nextApp.typeText('ready');", 5_000);
+  assert.equal(next.isError, false);
+  assert.deepEqual(native.calls.map(call => call.name), ["click", "type_text"]);
+});
+
 test("lightweight app binding queries and acts across persistent JS calls without a snapshot", async () => {
   const native = mockNative();
   const request = native.request;
@@ -496,3 +537,15 @@ for (const Session of [PersistentJavaScriptSession, WorkerJavaScriptSession]) {
     assert.match(result.content.at(-1).text, /Items: New, Open…/);
   });
 }
+
+test("startup guidance stays brief and the full API remains available on demand", async () => {
+  const session = new PersistentJavaScriptSession({ native: mockNative() });
+  const first = await session.run('await cua.getApp("Text", { initialState: false });');
+  const brief = first.content.find(item => item._meta?.id === "cua.core")?.text;
+  assert.ok(brief?.includes("cua.rewriteDocumentation()"));
+  assert.ok(Buffer.byteLength(brief) < Buffer.byteLength(computerUseGuidance()) / 3);
+  const again = await session.run('await cua.getApp("Text", { initialState: false });');
+  assert.ok(!again.content.some(item => item._meta?.id === "cua.core"));
+  const requested = await session.run("await cua.rewriteDocumentation();");
+  assert.equal(requested.content.find(item => item._meta?.id === "cua.core")?.text, computerUseGuidance());
+});

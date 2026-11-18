@@ -100,6 +100,29 @@ enum AXTreeCondenser {
         return output.joined(separator: "\n")
     }
 
+    /// A batch already checked the complete driver observation. Its compact reply can omit
+    /// surplus plain text while keeping the controls and state available for recovery.
+    static func batchReply(_ text: String) -> String {
+        let lines = compactObservation(text).components(separatedBy: "\n").map(parseLine)
+        var contextLeft = 6
+        var omitted = 0
+        var kept: [String] = []
+        for line in lines {
+            if line.isTree, line.role == "text", !isProtectedLine(line), !holdsStateOrAction(line) {
+                if contextLeft == 0 {
+                    omitted += 1
+                    continue
+                }
+                contextLeft -= 1
+            }
+            kept.append(line.raw)
+        }
+        if omitted > 0 {
+            kept.append("[Compact batch: \(omitted) text lines omitted. Read the app for all available text.]")
+        }
+        return kept.joined(separator: "\n")
+    }
+
     /// Same output as `condense`, plus line counts before and after (header included).
     static func condenseWithStats(_ text: String, options: Options = .default) -> (text: String, before: Int, after: Int) {
         condenseLines(text, options: options)

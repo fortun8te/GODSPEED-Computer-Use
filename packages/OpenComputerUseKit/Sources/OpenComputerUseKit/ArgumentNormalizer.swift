@@ -14,6 +14,11 @@ enum ArgumentNormalizer {
         "type_text", "press_key", "press_menu", "set_value", "select_text",
     ]
 
+    static let windowBoundTools: Set<String> = [
+        "click", "hover", "perform_secondary_action", "scroll", "drag", "type_text", "press_key",
+        "set_value", "select_text",
+    ]
+
     /// Tools that act on one accessibility element, by `element_index` or `label`.
     static let elementTools: Set<String> = ["click", "hover", "perform_secondary_action", "scroll", "set_value", "select_text"]
 
@@ -394,7 +399,9 @@ enum ArgumentNormalizer {
         switch key {
         case "screenshot", "remember", "foreground", "replace", "include_ax", "include_screenshot", "exact":
             return .bool
-        case "click_count", "limit", "max_nodes", "max_tree_nodes", "max_tree_depth", "settle_ms", "window_id", "tab_id":
+        case "window_id":
+            return tool == "query" ? .int : .none
+        case "click_count", "limit", "max_nodes", "max_tree_nodes", "max_tree_depth", "settle_ms", "tab_id":
             return .int
         case "index":
             return tool == "browser" ? .int : .elementIndex

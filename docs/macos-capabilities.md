@@ -10,7 +10,7 @@ This audit describes the source and available routes. Individual app behavior ne
 | 2. Trackpad and gestures | Use app controls, keyboard shortcuts or scroll and drag for equivalent app results. Raw multi-touch, pressure and system gestures are unimplemented. |
 | 3. Keyboard | Type text with Unicode and send a key or shortcut through the app-scoped route. Physical held-key streams, keyboard layout changes and media-specific keys are outside the generic contract. |
 | 4. Text editing | Use type, set value, select text, and supported app menu commands or shortcuts for editing and formatting. Verify selection and persistence in the target app. Dictation belongs to the voice layer. |
-| 5. Clipboard | App menu shortcuts can copy and paste when explicitly authorized. Standalone global clipboard reads, format conversions and clipboard clearing are outside the Godspeed API. |
+| 5. Clipboard | Godspeed keeps a private per-client clipboard for plain text and Finder files. Standard copy, cut and paste use it in supported controls. Chrome can also paste copied Finder files into a labelled file input. |
 | 6. Accessibility | Read and query AX trees, resolve controls by label or index, set values, select text and perform supported secondary actions. A given element's supported actions come from the app. |
 | 7. UI controls | Compose click, value setting, menus, keys and secondary actions. Use snapshots to discover actual controls in custom apps and dialogs. |
 | 8. Windows | Observe the current app window and use supported window placement or app actions. Exact-window addressing across all native tools and general window management are gaps. |

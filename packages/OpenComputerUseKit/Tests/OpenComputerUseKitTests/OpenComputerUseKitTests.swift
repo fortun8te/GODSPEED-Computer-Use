@@ -1931,6 +1931,17 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(double.last?.delayAfter, 0)
     }
 
+    func testClickRejectsMalformedOrExcessiveClickCountsBeforeReadingTheApp() {
+        let dispatcher = ComputerUseToolDispatcher()
+        for count: Any in [Double(Int.max), 1e100, 1.5, 33, true] {
+            let reply = dispatcher.callToolAsResult(name: "click", arguments: [
+                "app": "com.example.fixture-does-not-exist", "label": "Save", "click_count": count,
+            ])
+            XCTAssertTrue(reply.isError)
+            XCTAssertTrue(reply.textContent.contains("click_count"), reply.textContent)
+        }
+    }
+
     func testSkyClickRecipeRejectsUnsupportedClickCounts() {
         for count in [0, 3] {
             XCTAssertThrowsError(try skyClickEventRecipe(clickCount: count)) { error in
@@ -2543,7 +2554,9 @@ final class OpenComputerUseKitTests: XCTestCase {
     }
 
     func testSoftwareCursorGlyphLoadsCursorMotionReferenceImage() throws {
-        let image = try XCTUnwrap(loadReferenceCursorWindowImage())
+        guard let image = loadReferenceCursorWindowImage() else {
+            throw XCTSkip("Optional classic artwork is absent. Godspeed uses the procedural cursor.")
+        }
         let bitmap = try XCTUnwrap(image.representations.first)
 
         XCTAssertEqual(bitmap.pixelsWide, 252)
