@@ -528,6 +528,40 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNil(BrowserRequestContext.current)
     }
 
+    func testCloseVerifiesAnUncertainReplyWithoutResending() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        let script = #"""
+        #!/bin/sh
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"result\":{\"tab\":{\"id\":12}}}"}]}}'
+        IFS= read -r request
+        case "$request" in *Page.close*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":"close acknowledgement lost"}]}}'
+        IFS= read -r request
+        case "$request" in *'"name":"tabs"'*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"result\":[{\"id\":12}]}"}]}}'
+        IFS= read -r request
+        case "$request" in *'"name":"tabs"'*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"result\":[]}"}]}}'
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "close-ack-test", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        let opened = try bridge.callTool("open_tab", arguments: [:], timeout: 3)
+        XCTAssertFalse(opened.isError)
+        bridge.currentTab = 12
+        try bridge.closeOpenedTab(12)
+        XCTAssertNil(bridge.currentTab)
+    }
+
     func testPeekWorkersApplyRequestValidationBeforeLaunchingTheirHelpers() throws {
         let environment = [
             "OPEN_COMPUTER_USE_BROWSER": "1",

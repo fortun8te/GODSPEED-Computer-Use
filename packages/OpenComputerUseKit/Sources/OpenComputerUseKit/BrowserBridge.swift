@@ -350,17 +350,28 @@ final class BrowserBridge: @unchecked Sendable {
             }
             // The regular OBU MCP exposes scoped CDP. Its IAB close_tab uses this same Chrome operation.
             // Send it once without the BrowserPage CDP recovery path, which can dismiss page prompts.
-            let closed = try requestTool("cdp", arguments: ["tab_id": id, "method": "Page.close"], timeout: 10)
-            guard !closed.isError else { throw ComputerUseError.message("browser: \(BrowserReply.explain(closed.text))") }
-            openedTabs.remove(id)
-            tabLock.lock()
-            if preferredTab == id { preferredTab = nil }
-            tabLock.unlock()
-            BrowserPageMemory.shared.forgetTab(bridge: self, tab: id)
-            let listed = try requestTool("tabs", arguments: [:], timeout: 5)
-            guard !listed.isError, let remaining = BrowserReply.sessionTabIDs(in: listed.text), !remaining.contains(id) else {
-                throw ComputerUseError.stateUnavailable("browser could not confirm tab \(id) closed. Check browser tabs before retrying.")
+            let deadline = BrowserCallBudget.deadline(after: min(12, BrowserCallBudget.remaining()))
+            // Keep time for a readback if the close took effect before its reply arrived.
+            let closeWait = min(8, deadline - ProcessInfo.processInfo.systemUptime - 2)
+            guard closeWait > 0 else {
+                throw ComputerUseError.stateUnavailable("browser close_tab did not run because little time remained.")
             }
+            _ = try? requestTool("cdp", arguments: ["tab_id": id, "method": "Page.close"], timeout: closeWait)
+            for attempt in 0..<3 {
+                if attempt > 0 { Thread.sleep(forTimeInterval: 0.15) }
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0.3, process?.isRunning == true else { break }
+                guard let listed = try? requestTool("tabs", arguments: [:], timeout: min(1, remaining)),
+                      !listed.isError, let tabs = BrowserReply.sessionTabIDs(in: listed.text),
+                      !tabs.contains(id) else { continue }
+                openedTabs.remove(id)
+                tabLock.lock()
+                if preferredTab == id { preferredTab = nil }
+                tabLock.unlock()
+                BrowserPageMemory.shared.forgetTab(bridge: self, tab: id)
+                return
+            }
+            throw ComputerUseError.stateUnavailable("browser could not confirm tab \(id) closed. Check browser tabs before retrying.")
         }
     }
 
