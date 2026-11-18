@@ -84,7 +84,7 @@ final class RecipeSafetyTests: XCTestCase {
         run.doneWhen = done
         for (i, step) in steps.enumerated() { _ = run.prepared(step, number: i + 1, before: nil) }
         return run.finish(app: "Safari", steps: steps, lines: [], failed: false, stopped: false,
-                          remember: remember, verifiedDone: verified, refereeSaysDone: false)
+                          remember: remember, verifiedDone: verified)
     }
 
     func testDoneWhenAlreadyTrueIsNotSaved() {
@@ -134,7 +134,7 @@ final class RecipeSafetyTests: XCTestCase {
         run.store = store
         _ = run.find(app: "Safari")
         XCTAssertNotNil(run.recipe)
-        _ = run.finish(app: "Safari", steps: [], lines: [], failed: false, stopped: true, remember: nil, verifiedDone: false, refereeSaysDone: false)
+        _ = run.finish(app: "Safari", steps: [], lines: [], failed: false, stopped: true, remember: nil, verifiedDone: false)
         XCTAssertEqual(store.find(app: "Safari", goal: "log in as bob")?.uses, 0)
         _ = recipe
     }
@@ -176,7 +176,7 @@ final class RecipeSafetyTests: XCTestCase {
             readState: { "App=x\nWindow: \"w\"\n\t1 static text Saved" }, act: { _, _ in .init(ok: true, message: "") },
             choose: { _, _, _, _, _ in nil }, looksStuck: { _, _, _ in false },
             check: { DoneCheck.check([.text("Saved")], evidence: .init(screenText: $0, pageURL: { nil })) },
-            replay: { replayed = true; return true }, now: { Date() })
+            replay: { replayed = true; return true }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "g", doneWhen: [.text("Saved")], values: [], maxSteps: 3, timeBudget: 30), deps)
         XCTAssertEqual(outcome.kind, .done)
         XCTAssertFalse(replayed)
@@ -188,7 +188,7 @@ final class RecipeSafetyTests: XCTestCase {
             choose: { _, _, _, _, options in Dictionary(uniqueKeysWithValues: options.map { ($0.id, 0.4) }).merging(["none": 0.1]) { a, _ in a } },
             looksStuck: { _, _, _ in false },
             check: { DoneCheck.check([.text("42")], evidence: .init(screenText: $0, pageURL: { nil })) },
-            replay: { nil }, now: { Date() })
+            replay: { nil }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "add numbers", doneWhen: [.text("42")], values: [], maxSteps: 3, timeBudget: 30), deps)
         XCTAssertEqual(outcome.kind, .escalate)
         let reply = outcome.reply()

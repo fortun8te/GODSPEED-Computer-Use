@@ -10,6 +10,7 @@ enum LeanOutput {
     enum ObservationMode {
         case standard
         case compact
+        case compactBatch
     }
 
     static let condenses: Bool = flag("OPEN_COMPUTER_USE_CONDENSE")
@@ -28,7 +29,7 @@ enum LeanOutput {
     static func condensed(
         _ result: ToolCallResult, mode: ObservationMode = .standard, preserving indexes: Set<String> = []
     ) -> ToolCallResult {
-        guard condenses || mode == .compact else { return result }
+        guard condenses || mode != .standard else { return result }
         var changed = false
         let content = result.content.map { item -> ToolResultContentItem in
             guard item.dictionary["type"] as? String == "text",
@@ -38,6 +39,7 @@ enum LeanOutput {
             switch mode {
             case .standard: return .text(AXTreeCondenser.condense(text))
             case .compact: return .text(AXTreeCondenser.compactObservation(text, preserving: indexes))
+            case .compactBatch: return .text(AXTreeCondenser.batchReply(text))
             }
         }
         return changed ? ToolCallResult(content: content, isError: result.isError) : result
@@ -53,6 +55,8 @@ enum LeanOutput {
         let content = observation.content.map { item -> ToolResultContentItem in
             guard !replaced, item.dictionary["type"] as? String == "text",
                   let text = item.dictionary["text"] as? String, isStateText(text),
+                  previous.split(separator: "\n").prefix(2).elementsEqual(text.split(separator: "\n").prefix(2)),
+                  windowIDLine(in: previous) == windowIDLine(in: text),
                   let summary = AXStateDiff.diff(previous: previous, current: text, matchIndexes: ElementNumbering.isEnabled)
             else { return item }
             replaced = true
@@ -62,6 +66,11 @@ enum LeanOutput {
             return .text(header + "\n" + summary)
         }
         return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+    }
+
+    private static func windowIDLine(in state: String) -> Substring? {
+        state.split(separator: "\n", maxSplits: 3).dropFirst(2).first
+            .flatMap { $0.hasPrefix("Window ID: ") ? $0 : nil }
     }
 
     /// The element number at the start of a tree line ("\t\t12 button Send" gives "12"), or nil.

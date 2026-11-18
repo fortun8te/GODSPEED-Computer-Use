@@ -35,6 +35,10 @@ public struct ToolCallResult: @unchecked Sendable {
     public let isError: Bool
     let batchReceipt: TrajectoryLog.BatchReceipt?
     let failureCode: TrajectoryLog.FailureCode?
+    let browserObservationURL: String?
+    let browserFullObservationText: String?
+    let browserContinuationTabID: Int?
+    let browserPreviewPages: [[String: Any]]?
 
     public init(content: [ToolResultContentItem], isError: Bool = false) {
         self.init(content: content, isError: isError, batchReceipt: nil)
@@ -42,12 +46,18 @@ public struct ToolCallResult: @unchecked Sendable {
 
     init(
         content: [ToolResultContentItem], isError: Bool,
-        batchReceipt: TrajectoryLog.BatchReceipt? = nil, failureCode: TrajectoryLog.FailureCode? = nil
+        batchReceipt: TrajectoryLog.BatchReceipt? = nil, failureCode: TrajectoryLog.FailureCode? = nil,
+        browserObservationURL: String? = nil, browserContinuationTabID: Int? = nil,
+        browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil
     ) {
         self.content = content
         self.isError = isError
         self.batchReceipt = batchReceipt
         self.failureCode = failureCode
+        self.browserObservationURL = browserObservationURL
+        self.browserFullObservationText = browserFullObservationText
+        self.browserContinuationTabID = browserContinuationTabID
+        self.browserPreviewPages = browserPreviewPages
     }
 
     public var primaryText: String? {
@@ -62,10 +72,26 @@ public struct ToolCallResult: @unchecked Sendable {
     }
 
     public var asDictionary: [String: Any] {
-        [
+        var result: [String: Any] = [
             "content": content.map(\.dictionary),
             "isError": isError,
         ]
+        var metadata: [String: Any] = [:]
+        metadata["godspeed/preview_pages"] = browserPreviewPages
+        if let receipt = batchReceipt {
+            var batch: [String: Any] = [
+                "total_steps": receipt.totalSteps,
+                "steps": receipt.steps.enumerated().map { $0.element.metadata(number: $0.offset + 1) },
+                "not_run": max(0, receipt.totalSteps - receipt.steps.count),
+                "observation": receipt.observation.rawValue,
+                "completion": receipt.doneCheck.rawValue,
+            ]
+            batch["stop"] = receipt.stop?.rawValue
+            batch["recovery"] = receipt.recovery
+            metadata["godspeed/batch"] = batch
+        }
+        if !metadata.isEmpty { result["_meta"] = metadata }
+        return result
     }
 
     public static func text(_ text: String, isError: Bool = false) -> ToolCallResult {

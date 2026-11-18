@@ -168,6 +168,13 @@ public struct AppSnapshot {
     /// shown at some point, so one this snapshot lacks belongs to an element that is gone. Nil: fixture or numbered per read.
     var numberingHighWater: Int? = nil
 
+    /// The capture and AX tree have a confirmed, shared native window identity.
+    public var observedWindowID: CGWindowID? {
+        guard let windowElement, let targetWindowID, targetWindowID != kCGNullWindowID,
+              SkyLightSPI.shared.windowID(for: windowElement) == targetWindowID else { return nil }
+        return targetWindowID
+    }
+
     public var renderedText: String {
         renderedText(style: .fullState)
     }
@@ -179,6 +186,7 @@ public struct AppSnapshot {
 
         lines.append("App=\(appReference) (pid \(app.pid))")
         lines.append("Window: \(quoted(displayTitle)), App: \(app.name).")
+        if let observedWindowID { lines.append("Window ID: \(observedWindowID)") }
         if observation.includeAX && mode == .accessibility { lines.append(AXTreeTextFormatting.legend(for: treeIndentationStyle)) }
         lines.append(contentsOf: treeLines)
         if !observation.includeAX {
@@ -208,9 +216,29 @@ enum SnapshotBuilder {
         textLimit: SnapshotTextLimit = .defaults,
         treeLimits: AccessibilityTreeLimits = .defaults,
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
-        observation: SnapshotObservationOptions = .defaults
+        observation: SnapshotObservationOptions = .defaults,
+        windowID: CGWindowID? = nil
     ) throws -> AppSnapshot {
         try observation.validate()
+        if let windowID {
+            try requireUsableComputerUseSession()
+            let context = try resolveTargetWindow(for: app, windowID: windowID)
+            guard let capture = WindowCapture.resolve(
+                for: app.pid, exactWindowID: windowID, capture: observation.includeScreenshot
+            ), capture.bounds == context.windowBounds else {
+                throw ComputerUseError.stateUnavailable("The requested window changed during observation. Read it again.")
+            }
+            let systemWide = AXUIElementCreateSystemWide()
+            return buildAccessibilitySnapshot(
+                app: app, appElement: context.appElement, rootElement: context.windowElement,
+                windowTitle: stringValue(of: context.windowElement, attribute: kAXTitleAttribute),
+                windowCapture: capture,
+                focusedApplication: copyElement(systemWide, attribute: kAXFocusedApplicationAttribute),
+                systemWide: systemWide, textLimit: textLimit, treeLimits: treeLimits,
+                lazyWebAccessibility: appHasLazyWebAccessibility(bundleURL: app.runningApplication.bundleURL),
+                observation: observation, scopeFocusToWindow: true
+            )
+        }
         // OPEN_COMPUTER_USE_BACKGROUND_ONLY=1: never raise, unhide or activate the app to read it.
         let recoveryPolicy: SnapshotRecoveryPolicy = backgroundOnlyMode() ? .readOnly : recoveryPolicy
         if app.name == FixtureBridge.appName, let fixtureState = try FixtureBridge.readState() {
@@ -296,7 +324,8 @@ enum SnapshotBuilder {
         textLimit: SnapshotTextLimit,
         treeLimits: AccessibilityTreeLimits,
         lazyWebAccessibility: Bool,
-        observation: SnapshotObservationOptions
+        observation: SnapshotObservationOptions,
+        scopeFocusToWindow: Bool = false
     ) -> AppSnapshot {
         let windowBounds = windowCapture.bounds
         // The image is already captured; encoding it is pure CPU work, so it runs beside the
@@ -315,7 +344,10 @@ enum SnapshotBuilder {
                                windowElement: rootElement, elements: [:], screenshotNote: screenshot.note,
                                observation: observation)
         }
-        let focusedElement = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+        let appFocus = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
+        let focusedElement = appFocus.flatMap { element in
+            !scopeFocusToWindow || belongsToWindow(element, window: rootElement) ? element : nil
+        }
         let selectedText = focusedElement.flatMap { copySelectedText($0, textLimit: textLimit) }
         var context = RenderContext(
             windowBounds: windowBounds,
@@ -518,7 +550,7 @@ enum SnapshotBuilder {
         return element
     }
 
-    private static func isUsableWindowElement(_ element: AXUIElement) -> Bool {
+    static func isUsableWindowElement(_ element: AXUIElement) -> Bool {
         isSnapshotRootRole(stringValue(of: element, attribute: kAXRoleAttribute))
             && boolValue(of: element, attribute: kAXMinimizedAttribute) != true
     }
@@ -554,6 +586,8 @@ enum SnapshotBuilder {
                 element: nil,
                 localFrame: element.frame.cgRect,
                 role: element.role,
+                title: element.title,
+                value: element.value,
                 rawActions: element.actions,
                 prettyActions: element.actions
             )
@@ -2634,7 +2668,7 @@ extension SnapshotBuilder {
         return (freshContext, fresh)
     }
 
-    private static func belongsToWindow(_ element: AXUIElement, window: AXUIElement) -> Bool {
+    static func belongsToWindow(_ element: AXUIElement, window: AXUIElement) -> Bool {
         if CFEqual(element, window) { return true }
         // AppKit sheet controls can report the enclosing document as AXWindow.
         // A different AXWindow is not decisive: verify the bounded parent chain.

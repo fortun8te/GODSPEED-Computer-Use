@@ -70,6 +70,7 @@ public enum ToolDefinitions {
             inputSchema: objectSchema(
                 properties: [
                     "app": stringProperty(description: "App name, used by steps that name none"),
+                    "window_id": positiveIntegerProperty(description: "Pin all native steps in this batch to one observed window. Requires app, explicit steps and background delivery."),
                     "steps": [
                         "type": "array",
                         "maxItems": BatchTool.maxSteps,
@@ -87,9 +88,12 @@ public enum ToolDefinitions {
                         ],
                     ],
                     "goal": stringProperty(description: "One sentence: what you are trying to get done. The reply may then say done or stuck. With no steps, replays the saved recipe for it."),
-                    "done_when": ["type": ["object", "array"], "description": "How the reply knows the goal is done, checked directly: {\"text\": \"Message sent\"} (on screen), {\"field\": \"Volume\", \"equals\": \"40\"}, {\"gone\": \"Loading\"}, {\"file_exists\": \"~/Desktop/out.pdf\"}, {\"url_contains\": \"/thanks\"}. One object or a list. Met: the reply says \"Done: verified\"."],
+                    "done_when": ["type": ["object", "array"], "description": "How the reply knows the goal is done, checked directly: {\"text\": \"Message sent\"} (on screen), {\"field\": \"Volume\", \"equals\": \"40\"}, {\"gone\": \"Loading\"} (native, requires an untruncated read), {\"file_exists\": \"~/Desktop/out.pdf\"}, {\"url_contains\": \"/thanks\"}. One object or a list. Met: the reply says \"Done: verified\"."],
                     "foreground": ["type": "boolean", "default": false, "description": "Last resort only: bring the app forward (skipped while the user is using the Mac). Steps, dialogs included, normally work in the background."],
                     "remember": ["type": "boolean", "default": false, "description": "Save these steps as the recipe for goal once they all succeed."],
+                    "return_state": ["type": "boolean", "default": true, "description": "False skips the final browser snapshot when a URL-only completion check already passed. Recovery still includes state."],
+                    "compact": ["type": "boolean", "default": false, "description": "Return a smaller final native observation after completion checks."],
+                    "effects": ["type": "boolean", "default": true, "description": "False skips per-step effect reads. Use a pinned window and a final completion check for known sequences."],
                     "screenshot": ["type": "boolean", "default": false, "description": "Also return a screenshot."],
                 ],
                 required: []
@@ -113,18 +117,26 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "browser",
-            description: "Use for web pages, in your own background Chrome tab; the user's tab is never touched. Not for native Mac apps (use batch or app tools), and never app tools in Google Chrome. Actions: open, go, read (numbered links, buttons, fields, headings; find: \"words\" lists only matching lines, full: true lists more), screenshot (visible page), click, drag (between visible controls in one tab), type, key, select, check, uncheck, hover, scroll, back, forward, reload, wait_for, peek (up to 6 URLs), tabs, use_tab, wait, info, upload. A whole form is ONE call: batch {\"steps\": [{\"tool\": \"fill\", \"web\": true, \"fields\": {\"Name\": \"Ada\", \"Plan\": \"Team\"}, \"submit\": \"Send\"}]} (text boxes, dropdowns and checkboxes). Replies already show what changed; read again only when unsure.",
+            description: "Use for web pages, in your own background Chrome tab; the user's tab is never touched. Not for native Mac apps (use batch or app tools), and never app tools in Google Chrome. Actions: open, go, read (numbered links, buttons, fields, headings; find: \"words\" lists only matching lines, full: true lists more), screenshot (visible page), click, drag (between visible controls in one tab), fill_field (default for replacing a form value), type (when the field needs key events or appending), copy, cut, paste (private clipboard), key, select, check, uncheck, hover, scroll, scroll_into_view, back, forward, reload, wait_for, peek (up to 6 URLs), tabs, use_tab, close_tab, wait, location (URL and title without page text), info, outline (visible headings), frames (document tree), read_text (read a named control or region), link_destination, control_state (visibility, enabled, checked), value (read one editable field), upload. Batch related field changes and use done_when to verify the result. For ordinary forms, use fill_field for text, select for dropdowns, and check for checkboxes. Replies already show what changed; read again only when unsure.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "action": stringProperty(
                         description: "What to do",
-                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "key", "hover", "select", "check", "uncheck", "scroll", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "wait", "info", "upload", "peek"]
+                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "check", "uncheck", "scroll", "scroll_into_view", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
                     ),
                     "label": stringProperty(description: "Visible text of the target, e.g. \"Sign in\""),
                     "find": stringProperty(description: "read: only controls and text that mention these words"),
                     "full": ["type": "boolean", "default": false, "description": "read: list about four times as much"],
+                    "diff": ["type": "boolean", "default": false, "description": "read: return a shorter change summary when the same tab, document, snapshot mode and control references are still valid."],
+                    "if_changed": ["type": "boolean", "default": false, "description": "screenshot: omit the image when it exactly matches the last capture of this tab and URL."],
+                    "include_link_urls": ["type": "boolean", "default": false, "description": "read: include HTTP(S) link destinations where exposed by the accessibility tree."],
+                    "interactive": ["type": "boolean", "default": false, "description": "read: show controls and their references without surrounding page text. Leave off to read or verify page text."],
                     "index": integerProperty(description: "Element number from read"),
+                    "mouse_button": stringProperty(description: "click: pointer button, default left.", enumValues: ["left", "right", "middle"]),
+                    "click_count": integerProperty(description: "click: 1 by default, or 2 for a left double-click."),
+                    "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
+                                  "description": "click or drag: optional modifier keys."],
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
                     "to_index": integerProperty(description: "drag: destination element number from read"),
                     "text": stringProperty(description: "type: text to enter. wait_for: text to wait for"),
@@ -132,6 +144,8 @@ public enum ToolDefinitions {
                     "option": stringProperty(description: "select: option text or value, e.g. Canada"),
                     "direction": stringProperty(description: "scroll: default down", enumValues: ["up", "down", "left", "right", "top", "bottom"]),
                     "amount": ["type": "number", "description": "scroll: pixels. Default most of a screen"],
+                    "condition": stringProperty(description: "wait_for with a label: require this control state.", enumValues: ["visible", "enabled", "checked", "unchecked"]),
+                    "url_contains": stringProperty(description: "wait_for: wait until the actual tab URL contains this text and the page is ready."),
                     "timeout": ["type": "number", "description": "wait_for, wait: seconds, max 30"],
                     "key": stringProperty(description: "key: Enter, Tab, Escape, ArrowDown, or Cmd+A"),
                     "url": stringProperty(description: "open, go: URL, e.g. example.com"),
@@ -141,12 +155,12 @@ public enum ToolDefinitions {
                         "maxItems": 6,
                         "description": "peek: up to 6 URLs",
                     ],
-                    "tab_id": integerProperty(description: "use_tab: tab id from tabs"),
+                    "tab_id": integerProperty(description: "Tab ID from tabs. close_tab requires the explicit ID of a tab opened by this connection and never claimed."),
                     "state": stringProperty(description: "wait: load (default) or domcontentloaded", enumValues: ["load", "domcontentloaded"]),
                     "files": [
                         "type": "array",
                         "items": ["type": "string"],
-                        "description": "upload: local file paths",
+                        "description": "upload: local file paths. Supply the file input label or index to select directly.",
                     ],
                 ],
                 required: ["action"]
@@ -158,6 +172,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": positiveIntegerProperty(description: "Read this exact window in the running app without changing focus or placement."),
                     "compact": ["type": "boolean", "default": false,
                                 "description": "Keep actionable controls and focus, omit extra layout text"],
                     "app": stringProperty(description: "App name or bundle identifier"),
@@ -181,12 +196,13 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
                     "x": numberProperty(description: "X pixel from a screenshot"),
                     "y": numberProperty(description: "Y pixel from a screenshot"),
-                    "click_count": integerProperty(description: "Default 1"),
+                    "click_count": integerProperty(description: "1 to 32, default 1. sky_click allows 1 or 2."),
                     "mouse_button": stringProperty(
                         description: "Default left.",
                         enumValues: ["left", "right", "middle"]
@@ -200,11 +216,24 @@ public enum ToolDefinitions {
             )
         ),
         ToolDefinition(
+            name: "clipboard",
+            description: "Use to read, write or clear this client's private clipboard. Use press_key with cmd+c, cmd+x or cmd+v for Mac selections, and browser copy, cut or paste in Chrome.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "action": stringProperty(description: "read, write, or clear"),
+                    "text": stringProperty(description: "Plain text for write")
+                ],
+                required: ["action"]
+            )
+        ),
+        ToolDefinition(
             name: "type_text",
             description: "Use to type literal text into the focused field; not to replace a field's value (use set_value). Click the field first. Example: {\"app\": \"Notes\", \"text\": \"hello\"}.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "text": stringProperty(description: "Text to type"),
                     "key_method": keyMethodProperty(),
@@ -218,6 +247,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "key": stringProperty(description: "Key or combination, e.g. \"cmd+s\""),
                     "key_method": keyMethodProperty(),
@@ -231,6 +261,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
@@ -282,6 +313,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "direction": stringProperty(description: "Scroll direction: up, down, left, or right"),
                     "label": labelProperty(),
@@ -320,6 +352,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Text element identifier"),
@@ -340,6 +373,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element identifier"),
@@ -350,10 +384,11 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "hover",
-            description: "Move the agent cursor over an observed Mac control to reveal a tooltip or hover state. Deliver to its window without moving the user's pointer. Check the returned state. For Chrome use browser hover.",
+            description: "Use hover over an observed Mac control to reveal a tooltip or hover state. Deliver to its window without moving the user's pointer. Check the returned state. For Chrome use browser hover.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
@@ -367,6 +402,7 @@ public enum ToolDefinitions {
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
+                    "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "from_x": numberProperty(description: "Start X coordinate"),
                     "from_y": numberProperty(description: "Start Y coordinate"),
@@ -382,6 +418,13 @@ public enum ToolDefinitions {
 }
 
 /// Shared by every element action: the element's visible name, so a model need not count indexes.
+private func observedWindowIDProperty() -> [String: Any] {
+    [
+        "type": "integer", "minimum": 1, "maximum": UInt32.max,
+        "description": "Require the native window ID from get_app_state or query. Refuses the action if its observed target changed."
+    ]
+}
+
 private func labelProperty() -> [String: Any] {
     stringProperty(description: "Visible name, e.g. \"Send\". Instead of element_index.")
 }

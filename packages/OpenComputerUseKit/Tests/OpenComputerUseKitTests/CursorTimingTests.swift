@@ -112,6 +112,16 @@ final class CursorTimingTests: XCTestCase {
         XCTAssertEqual(start.y, 600 - 76.8, accuracy: 0.001)
     }
 
+    func testFreshCursorMirrorsItsApproachInsideTheTargetDisplay() {
+        let frame = CGRect(x: -1_280, y: -200, width: 1_280, height: 800)
+        let target = CGPoint(x: frame.minX + 2, y: frame.minY + 2)
+        let forward = CGVector(dx: 0.6, dy: 0.8)
+        XCTAssertFalse(frame.contains(visualCursorFreshStartPoint(target: target, forward: forward)))
+        let start = visualCursorFreshStartPoint(target: target, forward: forward, keptInside: frame)
+        XCTAssertTrue(frame.contains(start))
+        XCTAssertEqual(hypot(start.x - target.x, start.y - target.y), 96, accuracy: 0.01)
+    }
+
     func testSettingsAreCapturedWhenTheAnimationIsQueued() {
         let key = "OPEN_COMPUTER_USE_CURSOR_SPEED"
         let original = getenv(key).map { String(cString: $0) }

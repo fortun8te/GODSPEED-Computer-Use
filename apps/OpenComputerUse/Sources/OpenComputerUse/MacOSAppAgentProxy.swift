@@ -788,9 +788,17 @@ private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
 enum AppAgentBrowserRead {
     private static let common: Set<String> = ["action", "tab_id"]
     private static let arguments: [String: Set<String>] = [
-        "read": common.union(["find", "full"]),
-        "screenshot": common,
+        "read": common.union(["find", "full", "interactive", "diff", "include_link_urls"]),
+        "screenshot": common.union(["if_changed"]),
+        "location": common,
         "info": common,
+        "outline": common,
+        "frames": common,
+        "read_text": common.union(["label", "index", "element_index"]),
+        "link_destination": common.union(["label", "index", "element_index"]),
+        "control_state": common.union(["label", "index", "element_index"]),
+        "value": common.union(["label", "index", "element_index"]),
+        "wait_for": common.union(["text", "label", "url_contains", "condition", "timeout"]),
         "tabs": ["action"],
         "peek": ["action", "urls"],
     ]
@@ -800,7 +808,12 @@ enum AppAgentBrowserRead {
               let params = payload["params"] as? [String: Any], params["name"] as? String == "browser",
               let requested = params["arguments"] as? [String: Any], let action = requested["action"] as? String,
               let allowed = arguments[action] else { return false }
-        return requested.keys.allSatisfy(allowed.contains)
+        guard requested.keys.allSatisfy(allowed.contains) else { return false }
+        if action == "wait_for" {
+            // A long wait would hold an admission slot ahead of desktop work.
+            guard let seconds = requested["timeout"] as? Int, (1...3).contains(seconds) else { return false }
+        }
+        return true
     }
 }
 
@@ -855,7 +868,7 @@ private enum AppAgentEnvironment {
 /// The app agent did not answer in time. The call is stopped; the agent and its other work are left running.
 struct AppAgentResponseTimeout: LocalizedError {
     var errorDescription: String? {
-        "Open Computer Use.app did not answer within \(Int(AppAgentSocketClient.responseTimeout)) seconds, so this call was stopped. Retry it; other agents keep running."
+        "Open Computer Use.app did not answer within \(Int(AppAgentSocketClient.responseTimeout)) seconds. The action may have taken effect. Inspect the current state before retrying."
     }
 }
 

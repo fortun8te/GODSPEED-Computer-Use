@@ -23,7 +23,6 @@ final class BatchRecipes: @unchecked Sendable {
 
     static let maxRecipes = 300
     /// Same bar as the referee's "done" hint, so a save suggestion never appears without that hint.
-    static var saveConfidence: Double { Referee.doneConfidence }
 
     struct Recipe {
         let app: String
@@ -35,6 +34,7 @@ final class BatchRecipes: @unchecked Sendable {
         var params: [String: String] = [:]
         /// Window title shape the recipe was saved in ("" for older recipes: matches any).
         var shape: String = ""
+        var doneWhen: [DoneCheck.Condition] = []
     }
 
     private let lock = NSLock()
@@ -64,13 +64,14 @@ final class BatchRecipes: @unchecked Sendable {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    func save(app: String, goal: String, steps: [Any], params: [String: String] = [:], shape: String = "") {
+    func save(app: String, goal: String, steps: [Any], params: [String: String] = [:], shape: String = "",
+              doneWhen: [DoneCheck.Condition] = []) {
         guard JSONSerialization.isValidJSONObject(steps) else { return }
         mutate {
             let appKey = Self.normalize(app)
         let wanted = Self.templateKey(goal, values: Array(params.values))
             recipes.removeAll { Self.same($0, appKey: appKey, key: wanted, shape: shape) }
-            recipes.append(Recipe(app: app, goal: goal, steps: steps, uses: 0, failures: 0, params: params, shape: shape))
+            recipes.append(Recipe(app: app, goal: goal, steps: steps, uses: 0, failures: 0, params: params, shape: shape, doneWhen: doneWhen))
             if recipes.count > Self.maxRecipes { recipes.removeFirst(recipes.count - Self.maxRecipes) }
         }
     }
@@ -139,18 +140,19 @@ final class BatchRecipes: @unchecked Sendable {
             return
         }
         recipes = array.compactMap { item in
-            guard let app = item["app"] as? String, let goal = item["goal"] as? String, let steps = item["steps"] as? [Any]
+            guard let app = item["app"] as? String, let goal = item["goal"] as? String, let steps = item["steps"] as? [Any],
+                  let doneWhen = try? DoneCheck.parse(item["done_when"])
             else { return nil }
             return Recipe(app: app, goal: goal, steps: steps,
                           uses: (item["uses"] as? Int) ?? 0, failures: (item["failures"] as? Int) ?? 0,
-                          params: (item["params"] as? [String: String]) ?? [:], shape: (item["shape"] as? String) ?? "")
+                          params: (item["params"] as? [String: String]) ?? [:], shape: (item["shape"] as? String) ?? "", doneWhen: doneWhen)
         }
     }
 
     private func persist() {
         let array: [[String: Any]] = recipes.map {
             ["app": $0.app, "goal": $0.goal, "steps": $0.steps, "uses": $0.uses, "failures": $0.failures,
-             "params": $0.params, "shape": $0.shape]
+             "params": $0.params, "shape": $0.shape, "done_when": $0.doneWhen.map(\.arguments)]
         }
         guard let data = try? JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys]) else { return }
         try? data.write(to: fileURL, options: [.atomic])
@@ -323,6 +325,7 @@ extension BatchRecipes {
         private var ignored: [String] = []
         /// The batch's `done_when`, set by the caller. Used to tell whether it was already true before the steps ran.
         var doneWhen: [DoneCheck.Condition] = []
+        var canSave = true
         /// Step numbers that type into a secret field (password, code ...): such a batch is never saved.
         private var secretSteps: Set<Int> = []
         private var initialDone: Bool?
@@ -336,10 +339,13 @@ extension BatchRecipes {
             self.active = BatchRecipes.isEnabled && !goal.isEmpty
         }
 
-        private func state(of stepApp: String?) -> String? {
+        private func state(of stepApp: String?, observed: String? = nil) -> String? {
             guard let target = stepApp ?? app else { return nil }
             if let app, BatchRecipes.normalize(app) != BatchRecipes.normalize(target) { return nil }
-            if !initialRead { initialRead = true; initialState = read(target) }
+            if !initialRead {
+                initialRead = true
+                initialState = observed ?? read(target)
+            }
             return initialState
         }
 
@@ -362,27 +368,37 @@ extension BatchRecipes {
         }
 
         /// Called with each step before it runs: records its locator when saving, heals its label on replay.
-        func prepared(_ step: BatchTool.Step, number: Int, before: String?) -> BatchTool.Step {
-            guard active else { return step }
+        func prepared(_ step: BatchTool.Step, number: Int, before: String?) -> BatchTool.Step? {
+            guard active, recipe != nil || canSave else { return step }
             let stepApp = (step.arguments["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             // The first read happens before the first step runs: it is the "before" picture for saving
             // (was done_when already true?) and for secret-field checks, even if no step has a label.
-            let screenBeforeFirstStep = recipe == nil ? state(of: stepApp) : nil
-            if recipe == nil { noteSecret(step, number: number, screen: before ?? screenBeforeFirstStep) }
+            let screenBeforeFirstStep = recipe == nil ? state(of: stepApp, observed: before) : nil
+            if recipe == nil {
+                if initialDone == nil { initialDone = wasAlreadyDone() }
+                noteSecret(step, number: number, screen: before ?? screenBeforeFirstStep)
+            }
             guard let label = step.arguments["label"] as? String, !label.isEmpty else { return step }
-            // A replayed step heals against the screen as it is now, not the one read at the start.
-            let fresh: String? = (recipe != nil && number > 1 && before == nil) ? ((stepApp ?? app).flatMap(read)) : nil
-            guard let screen = before ?? fresh ?? state(of: stepApp) else { return step }
             if recipe != nil {
                 guard let locator = replayMeta[number]?.locator else { return step }
-                if case .healed(let newLabel, let newLocator) = RecipeLocator.resolve(locator, label: label, in: screen) {
+                // Later steps need current evidence. A failed read cannot justify healing
+                // a locator from the screen that was visible before the replay.
+                let screen = before ?? (number == 1 ? state(of: stepApp) : (stepApp ?? app).flatMap(read))
+                guard let screen else { return nil }
+                switch RecipeLocator.resolve(locator, label: label, in: screen) {
+                case .found:
+                    return step
+                case .missing:
+                    return nil
+                case .healed(let newLabel, let newLocator):
                     var arguments = step.arguments
                     arguments["label"] = newLabel
                     healed[number] = (newLabel, newLocator)
                     notes.append("Step \(number): \"\(label)\" is now \"\(newLabel)\"; the recipe is updated if the replay works.")
                     return BatchTool.Step(tool: step.tool, arguments: arguments)
                 }
-            } else if let locator = RecipeLocator.capture(label: label, in: screen) {
+            } else if let screen = before ?? screenBeforeFirstStep,
+                      let locator = RecipeLocator.capture(label: label, in: screen) {
                 recorded[number] = locator
             }
             return step
@@ -409,18 +425,19 @@ extension BatchRecipes {
         /// True when done_when held on the screen before any step ran, so it proves nothing about these steps.
         /// Unknown (screen unreadable) counts as true: such a batch is not saved by itself.
         private func wasAlreadyDone() -> Bool {
-            if let initialDone { return initialDone }
             let result: Bool
             if doneWhen.isEmpty {
                 result = false
-            } else if let screen = initialState {
-                if case .verified = DoneCheck.check(doneWhen, evidence: DoneCheck.Evidence(screenText: screen, pageURL: { nil })) {
+            } else if initialState != nil || doneWhen.allSatisfy({ condition in
+                if case .fileExists = condition { return true }
+                return false
+            }) {
+                if case .verified = DoneCheck.check(doneWhen, evidence: DoneCheck.Evidence(screenText: initialState, pageURL: { nil })) {
                     result = true
                 } else { result = false }
             } else {
                 result = true
             }
-            initialDone = result
             return result
         }
 
@@ -433,7 +450,7 @@ extension BatchRecipes {
 
         /// End of the batch: records a replay, or saves a new recipe. Returns the lines to add to the reply.
         func finish(app lastApp: String, steps: [BatchTool.Step], lines: [String], failed: Bool, stopped: Bool,
-                    remember: Bool?, verifiedDone: Bool, refereeSaysDone: Bool) -> [String] {
+                    remember: Bool?, verifiedDone: Bool) -> [String] {
             guard active else { return [] }
             var out: [String] = []
             if let recipe {
@@ -458,10 +475,16 @@ extension BatchRecipes {
                 return out
             }
             guard !failed, !stopped else { return [] }
+            if !doneWhen.isEmpty && !verifiedDone {
+                return remember == true ? ["Recipe was not saved because its completion check did not pass."] : []
+            }
+            if steps.contains(where: { $0.arguments["window_id"] != nil }) {
+                return remember == true ? ["Recipe was not saved because it targets a temporary window ID."] : []
+            }
             let positional = BatchTool.usesPositionalTargets(steps)
             let mutating = steps.contains { !BatchTool.readOnlyTools.contains($0.tool) && $0.tool != BatchTool.waitName }
-            let auto = verifiedDone && remember != false && !wasAlreadyDone()
-            if verifiedDone, remember != false, !auto, mutating {
+            let auto = canSave && verifiedDone && remember != false && initialDone == false
+            if canSave, verifiedDone, remember != false, !auto, mutating {
                 out.append("Not saved as a recipe: done_when was already true before these steps ran, so it does not show they worked. Send remember: true to save anyway.")
             }
             if (remember == true || auto), mutating {
@@ -476,12 +499,10 @@ extension BatchRecipes {
                     return out
                 }
                 let save = buildSave(app: lastApp, steps: steps, lines: lines)
-                store.save(app: lastApp, goal: goal, steps: save.steps, params: save.params, shape: save.shape)
+                store.save(app: lastApp, goal: goal, steps: save.steps, params: save.params, shape: save.shape, doneWhen: doneWhen)
                 let why = remember == true ? "" : " (done_when was verified)"
                 let names = save.params.isEmpty ? "" : " Variables: \(save.params.keys.sorted().joined(separator: ", ")); pass values to change them."
                 out.append("Saved these steps as the recipe for \"\(goal)\"\(why); next time send just the goal to replay them.\(names)")
-            } else if refereeSaysDone, !positional, mutating {
-                out.append("This looks like it reached the goal. Send the same batch with remember: true to save it as a recipe.")
             }
             return out
         }

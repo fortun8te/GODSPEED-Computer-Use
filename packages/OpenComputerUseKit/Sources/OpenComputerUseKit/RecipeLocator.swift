@@ -202,17 +202,27 @@ enum RecipeLocator {
     static func resolve(_ locator: Locator, label: String, in state: String) -> Resolution {
         let all = lines(of: state)
         guard !all.isEmpty else { return .missing }
-        if all.contains(where: { labelMatch(label, $0.text) > 0 }) { return .found }
+        let named = all.compactMap { line -> (line: Line, match: Int)? in
+            let match = labelMatch(label, line.text)
+            return match > 0 ? (line, match) : nil
+        }
+        if let bestMatch = named.map({ $0.match }).max() {
+            let best = named.filter { $0.match == bestMatch }
+            guard best.count == 1, let line = best.first?.line,
+                  locator.role.isEmpty || line.role == locator.role else { return .missing }
+            return .found
+        }
 
         var scored: [(index: Int, score: Double)] = []
         // Elements that were the target's neighbours or parent when saved are other elements, not the target.
-        let known = Set(locator.nearby.map(norm) + [norm(locator.parent)])
-        for i in all.indices where !all[i].text.isEmpty && !known.contains(norm(all[i].text)) {
+        let stored = Set(locator.nearby.map(norm))
+        let known = stored.union([norm(locator.parent)])
+        for i in all.indices where !all[i].text.isEmpty && !known.contains(norm(all[i].text))
+            && (locator.role.isEmpty || all[i].role == locator.role) {
             let candidate = self.locator(for: all, at: i, label: all[i].text)
             let sim = similarity(locator.label, candidate.label)
             let sameRole = !locator.role.isEmpty && candidate.role == locator.role
             let sameParent = !locator.parent.isEmpty && norm(candidate.parent) == norm(locator.parent)
-            let stored = Set(locator.nearby.map(norm))
             let overlap = candidate.nearby.filter { stored.contains(norm($0)) }.count
             // Clues alone pick a control only when they are strong (same role, same parent, two same neighbours
             // a plain rename). Otherwise some of the label must carry over.
@@ -225,9 +235,10 @@ enum RecipeLocator {
         }
         let ranked = scored.sorted { $0.score > $1.score }
         guard let best = ranked.first, best.score >= healThreshold else { return .missing }
-        // A close runner-up with different text means the clues do not single one element out.
-        if let second = ranked.dropFirst().first(where: { norm(all[$0.index].text) != norm(all[best.index].text) }),
-           best.score - second.score < healMargin {
+        let bestLabel = norm(all[best.index].text)
+        guard all.lazy.filter({ norm($0.text) == bestLabel }).prefix(2).count == 1 else { return .missing }
+        // A close runner-up means the clues do not single one element out.
+        if let second = ranked.dropFirst().first, best.score - second.score < healMargin {
             return .missing
         }
         // Never heal a calm control into a risky one (Save -> Delete): the model decides that.

@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, cpSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, cpSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { configCommand, configPath, inspectConfig } from "./ocu-config.mjs";
@@ -61,9 +61,13 @@ test("launcher config works without native artifacts or spawning", async t => {
 });
 
 test("staged npm launcher includes config module and persists without a native launch", t => {
+  const source = fileURLToPath(new URL("../../", import.meta.url));
+  if (!existsSync(path.join(source, "scripts/npm/build-packages.mjs"))) {
+    t.skip("The upstream npm package builder is absent from this checkout");
+    return;
+  }
   const env = fixture(t);
   const root = path.join(env.HOME, "repo");
-  const source = fileURLToPath(new URL("../../", import.meta.url));
   mkdirSync(root);
   for (const entry of ["scripts", "skills", "plugins", ".agents", "LICENSE", "THIRD_PARTY_NOTICES.md"]) cpSync(path.join(source, entry), path.join(root, entry), { recursive: true });
   // Debug packaging fixtures only: config must never execute these native

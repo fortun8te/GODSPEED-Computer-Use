@@ -27,15 +27,7 @@ func normalizedElementIndexArgument(_ value: Any?) -> String? {
 }
 
 private func normalizedElementIndexNumber(_ value: Double) -> String? {
-    guard value.isFinite, value.rounded(.towardZero) == value else {
-        return nil
-    }
-
-    guard value >= Double(Int.min), value <= Double(Int.max) else {
-        return nil
-    }
-
-    return String(Int(value))
+    Int(exactly: value).map(String.init)
 }
 
 public final class ComputerUseToolDispatcher {
@@ -61,6 +53,24 @@ public final class ComputerUseToolDispatcher {
         )
         if let problem = ArgumentNormalizer.problem(tool: name, arguments: arguments) {
             throw ComputerUseError.message(problem)
+        }
+        if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name {
+            guard ArgumentNormalizer.windowBoundTools.contains(name) else {
+                throw ComputerUseError.invalidArguments("\(name) cannot be bound to a native window")
+            }
+            let app = try requireString("app", in: arguments)
+            guard let windowID = try validatedQueryWindowID(arguments["window_id"]) else {
+                throw ComputerUseError.invalidArguments("window_id is required for a bound action")
+            }
+            // Routes that guess a replacement target or borrow focus are outside a bound action.
+            let result = try autoreleasepool {
+                try ComputerUseService.$requiredWindowID.withValue(windowID) {
+                    try dispatchTool(name: name, arguments: arguments, log: log)
+                }
+            }
+            RecentAppMemory.shared.remember(app)
+            let condensed = LeanOutput.condensed(result)
+            return notesInResult ? log.apply(to: condensed) : condensed
         }
         if let app = arguments["app"] as? String, !app.isEmpty {
             RecentAppMemory.shared.remember(app)
@@ -291,6 +301,9 @@ public final class ComputerUseToolDispatcher {
     /// The label resolved as usual; when no control has that name, a close match or a text query may find the
     /// one it means (noted in the reply). Several close matches are listed, never guessed between.
     private func resolveLabelHealing(app: String, labels: [String], log: SmartLog, forValue: Bool = false) throws -> ElementRecord {
+        if ComputerUseService.requiredWindowID != nil {
+            return try service.resolveLabel(app: app, labels: labels)
+        }
         do {
             return try service.resolveLabel(app: app, labels: labels)
         } catch let error as ComputerUseError where SmartSteps.isNotFound(error) || (forValue && SmartSteps.isAmbiguous(error)) {
@@ -327,6 +340,24 @@ public final class ComputerUseToolDispatcher {
             )
         case SmartSteps.openName:
             return try SmartSteps.open(arguments: arguments, browser: { try self.runBrowser(arguments: $0) })
+        case "clipboard":
+            let clipboard = PrivateClipboard.current
+            switch try requireString("action", in: arguments).lowercased() {
+            case "write":
+                try clipboard.writeText(requireString("text", in: arguments, allowEmpty: true))
+                return .text("Stored text on the private clipboard.")
+            case "read":
+                switch clipboard.payload {
+                case .text(let text): return .text(text)
+                case .files(let paths, _): return .text(paths.joined(separator: "\n"))
+                case nil: return .text("Private clipboard is empty.")
+                }
+            case "clear":
+                clipboard.clear()
+                return .text("Private clipboard cleared.")
+            default:
+                throw ComputerUseError.invalidArguments("clipboard action must be read, write, or clear.")
+            }
         case "list_apps":
             return service.listApps()
         case "query":
@@ -356,9 +387,14 @@ public final class ComputerUseToolDispatcher {
                     )
                 ),
                 settleMs: try optionalSettleMs(in: arguments),
-                compact: try strictObservationBool("compact", in: arguments, default: false)
+                compact: try strictObservationBool("compact", in: arguments, default: false),
+                windowID: try validatedQueryWindowID(arguments["window_id"])
             )
         case "click":
+            let clickCount = try optionalPositiveInt("click_count", in: arguments) ?? 1
+            guard clickCount <= 32 else {
+                throw ComputerUseError.invalidArguments("click_count must be between 1 and 32")
+            }
             let elementIndex: String?
             // A pixel click needs both points; one of them alone would click somewhere the model did not mean.
             if optionalDouble("x", in: arguments) != nil || optionalDouble("y", in: arguments) != nil,
@@ -371,8 +407,8 @@ public final class ComputerUseToolDispatcher {
             } catch let error as ComputerUseError {
                 // No accessibility element has that label: try finding it on screen, when vision is on.
                 // Several close matches are listed by the label healing, so vision never guesses between them.
-                if !SmartSteps.isAmbiguous(error), VisionFallback.isEnabled, let label = labelArguments(in: arguments)?.first,
-                   let result = try visionClick(app: requireString("app", in: arguments), label: label, arguments: arguments) {
+                if ComputerUseService.requiredWindowID == nil, !SmartSteps.isAmbiguous(error), VisionFallback.isEnabled, let label = labelArguments(in: arguments)?.first,
+                   let result = try visionClick(app: requireString("app", in: arguments), label: label, clickCount: clickCount, arguments: arguments) {
                     return result
                 }
                 throw error
@@ -382,7 +418,7 @@ public final class ComputerUseToolDispatcher {
                 elementIndex: elementIndex,
                 x: optionalDouble("x", in: arguments),
                 y: optionalDouble("y", in: arguments),
-                clickCount: Int(optionalDouble("click_count", in: arguments) ?? 1),
+                clickCount: clickCount,
                 mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
                 clickMethod: try parseClickMethod(optionalString("click_method", in: arguments))
             )
@@ -603,7 +639,8 @@ public final class ComputerUseToolDispatcher {
 
     /// Clicks `label` where a local vision model finds it on a fresh screenshot of the window, or returns
     /// nil (no screenshot, not found, service unavailable) so the caller reports the original miss.
-    private func visionClick(app: String, label: String, arguments: [String: Any]) throws -> ToolCallResult? {
+    private func visionClick(app: String, label: String, clickCount: Int, arguments: [String: Any]) throws -> ToolCallResult? {
+        guard (BrowserCallBudget.activeRemaining ?? .infinity) > 0 else { return nil }
         let state = try service.getAppState(
             app: app,
             observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: true)
@@ -612,17 +649,18 @@ public final class ComputerUseToolDispatcher {
               let encoded = image.dictionary["data"] as? String,
               let data = Data(base64Encoded: encoded),
               let size = VisionFallback.pixelSize(of: data),
-              let fraction = VisionFallback.locate(imageBase64: encoded, query: label)
+              let fraction = VisionFallback.locate(imageBase64: encoded, query: label, remaining: BrowserCallBudget.activeRemaining),
+              (BrowserCallBudget.activeRemaining ?? .infinity) > 0
         else { return nil }
 
-        let x = (fraction.x * size.width).rounded()
-        let y = (fraction.y * size.height).rounded()
+        let x = min(size.width - 1, (fraction.x * size.width).rounded())
+        let y = min(size.height - 1, (fraction.y * size.height).rounded())
         let clicked = try service.click(
             app: app,
             elementIndex: nil,
             x: x,
             y: y,
-            clickCount: Int(optionalDouble("click_count", in: arguments) ?? 1),
+            clickCount: clickCount,
             mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
             clickMethod: try parseClickMethod(optionalString("click_method", in: arguments))
         )
@@ -682,6 +720,9 @@ public final class ComputerUseToolDispatcher {
     }
 
     private func positiveInt(from value: Any, key: String, expectedDescription: String) throws -> Int {
+        if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
+            throw ComputerUseError.invalidArguments("\(key) must be \(expectedDescription)")
+        }
         if let integer = value as? Int {
             return try validatePositiveInt(integer, key: key, expectedDescription: expectedDescription)
         }
@@ -691,9 +732,6 @@ public final class ComputerUseToolDispatcher {
         }
 
         if let number = value as? NSNumber {
-            if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
-                throw ComputerUseError.invalidArguments("\(key) must be \(expectedDescription)")
-            }
             return try validatePositiveWholeNumber(number.doubleValue, key: key, expectedDescription: expectedDescription)
         }
 
@@ -705,11 +743,11 @@ public final class ComputerUseToolDispatcher {
             throw ComputerUseError.invalidArguments("\(key) must be \(expectedDescription)")
         }
 
-        guard value >= Double(Int.min), value <= Double(Int.max) else {
+        guard let integer = Int(exactly: value) else {
             throw ComputerUseError.invalidArguments("\(key) is outside the supported integer range")
         }
 
-        return try validatePositiveInt(Int(value), key: key, expectedDescription: expectedDescription)
+        return try validatePositiveInt(integer, key: key, expectedDescription: expectedDescription)
     }
 
     private func validatePositiveInt(_ value: Int, key: String, expectedDescription: String) throws -> Int {

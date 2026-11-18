@@ -2,14 +2,16 @@ import { parentPort } from "node:worker_threads";
 import { PersistentJavaScriptSession } from "./open-computer-use-repl.mjs";
 
 let nextNativeId = 1;
-let activeTimeoutMs;
+let activeExecutionId;
 const pendingNative = new Map();
 const native = {
-  request(method, params, timeoutMs = activeTimeoutMs) {
+  request(method, params, timeoutMs) {
+    const executionId = activeExecutionId;
+    if (executionId == null) return Promise.reject(new Error("no active JavaScript execution"));
     const id = nextNativeId++;
     return new Promise((resolve, reject) => {
       pendingNative.set(id, { resolve, reject });
-      parentPort.postMessage({ type: "native_request", id, method, params, timeoutMs });
+      parentPort.postMessage({ type: "native_request", id, executionId, method, params, timeoutMs });
     });
   },
 };
@@ -27,12 +29,12 @@ parentPort.on("message", async message => {
   if (message.type === "exec") {
     let result;
     try {
-      activeTimeoutMs = message.timeoutMs;
+      activeExecutionId = message.id;
       result = await session.run(message.code, 0, message.requestMeta);
     } catch (error) {
       result = { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
     }
-    activeTimeoutMs = undefined;
+    activeExecutionId = undefined;
     parentPort.postMessage({ type: "result", id: message.id, result });
   }
 });

@@ -36,6 +36,7 @@ final class TrajectoryLog: @unchecked Sendable {
 
     let isEnabled: Bool
     private let capturesContent: Bool
+    private let driverVersion: String?
     let sessionID: String
     let runID: String?
     let directory: URL
@@ -49,6 +50,7 @@ final class TrajectoryLog: @unchecked Sendable {
     // Only touched on `queue`.
     private var prepared = false
     private var bytesWritten: UInt64 = 0
+    private var sequence: UInt64 = 0
     private var stopped = false
     private var callsSinceSessionEnd = false
 
@@ -59,12 +61,14 @@ final class TrajectoryLog: @unchecked Sendable {
         directoryMaxBytes: UInt64 = TrajectoryLog.defaultDirectoryMaxBytes
     ) {
         isEnabled = Self.isEnabled(environment: environment)
+        driverVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
         capturesContent = ["1", "true", "yes", "on"].contains(
             environment[Self.contentVariable]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         )
         let run = environment[Self.runIDVariable].map(Self.safeFileComponent).flatMap { $0.isEmpty ? nil : $0 }
         runID = run
-        sessionID = run ?? UUID().uuidString.lowercased()
+        // The run groups workers. Each connection owns its stream and byte budget.
+        sessionID = UUID().uuidString.lowercased()
         self.directory = directory
         fileURL = directory.appendingPathComponent(sessionID + ".jsonl")
         self.maxBytes = maxBytes
@@ -79,12 +83,12 @@ final class TrajectoryLog: @unchecked Sendable {
         guard isEnabled else { return }
         let screenshotReturned = result.content.contains { $0.dictionary["type"] as? String == "image" }
         let primary = result.primaryText ?? ""
-        let output = capturesContent ? result.textContent : ""
+        let output = capturesContent && name != "clipboard" ? result.textContent : ""
         let redacted = Self.redactSecureLines(output)
         let (text, truncated) = Self.limit(redacted)
         // Unlabelled typing can target a secure field. Keep the full payload out of its trace.
-        let safeArguments = capturesContent && Self.focusesSecureField(output)
-            ? Self.redactTypedValues(arguments) : arguments
+        let safeArguments = name == "clipboard" ? [:] : (capturesContent && Self.focusesSecureField(output)
+            ? Self.redactTypedValues(arguments) : arguments)
         let receipts = capturesContent && name == BatchTool.name
             ? result.primaryText.flatMap { Self.parseReceipts(Self.redactSecureLines($0)) } : nil
         submitCall(
@@ -93,6 +97,9 @@ final class TrajectoryLog: @unchecked Sendable {
             isError: result.isError,
             resultText: text,
             resultTruncated: truncated,
+            replyTextBytes: result.content.reduce(0) { total, item in
+                total + ((item.dictionary["text"] as? String)?.utf8.count ?? 0)
+            },
             screenshotReturned: screenshotReturned,
             startedAt: startedAt,
             admissionMs: admissionMs,
@@ -114,7 +121,7 @@ final class TrajectoryLog: @unchecked Sendable {
         let (text, truncated) = capturesContent ? Self.limit(Self.redactSecureLines(message)) : ("", false)
         submitCall(
             name: name,
-            arguments: arguments,
+            arguments: name == "clipboard" ? [:] : arguments,
             isError: isError,
             resultText: text,
             resultTruncated: truncated,
@@ -162,6 +169,7 @@ final class TrajectoryLog: @unchecked Sendable {
         isError: Bool,
         resultText: String,
         resultTruncated: Bool,
+        replyTextBytes: Int? = nil,
         screenshotReturned: Bool,
         startedAt: Date,
         admissionMs: Double? = nil,
@@ -184,6 +192,8 @@ final class TrajectoryLog: @unchecked Sendable {
             "screenshot_returned": screenshotReturned,
             "duration_ms": duration,
         ]
+        object["driver_build"] = driverVersion
+        object["reply_text_bytes"] = replyTextBytes
         if let admissionMs, admissionMs.isFinite, admissionMs >= 0 {
             object["admission_ms"] = (admissionMs * 10).rounded() / 10
         }
@@ -197,6 +207,7 @@ final class TrajectoryLog: @unchecked Sendable {
                 step.metadata(number: offset + 1)
             }
             object["batch_stop_code"] = batchReceipt.stop?.rawValue
+            object["batch_recovery"] = batchReceipt.recovery
             object["batch_not_run"] = batchReceipt.totalSteps - batchReceipt.steps.count
             object["batch_observation"] = batchReceipt.observation.rawValue
             object["batch_done_check"] = batchReceipt.doneCheck.rawValue
@@ -225,6 +236,8 @@ final class TrajectoryLog: @unchecked Sendable {
         guard !stopped, prepareIfNeeded() else { return false }
         var body = object
         body["timestamp"] = formatter.string(from: timestamp)
+        sequence += 1
+        body["sequence"] = sequence
         guard let line = Self.encodeLine(body) else { return false }
         if bytesWritten + UInt64(line.count) > maxBytes {
             stopped = true
@@ -233,6 +246,7 @@ final class TrajectoryLog: @unchecked Sendable {
                 "session_id": sessionID,
                 "run_id": runIDValue,
                 "max_bytes": maxBytes,
+                "sequence": sequence,
                 "timestamp": formatter.string(from: Date()),
             ]
             if let noteLine = Self.encodeLine(note) {
@@ -240,7 +254,11 @@ final class TrajectoryLog: @unchecked Sendable {
             }
             return false
         }
-        guard appendData(line) else { return false }
+        guard appendData(line) else {
+            // A partial write may have left a broken line. Never append over it.
+            stopped = true
+            return false
+        }
         bytesWritten += UInt64(line.count)
         return true
     }
@@ -446,9 +464,11 @@ final class TrajectoryLog: @unchecked Sendable {
         struct Step {
             var failureCode: FailureCode?
             var observation: BatchEffects.Receipt?
+            var durationMs: Double? = nil
 
             func metadata(number: Int) -> [String: Any] {
                 var fields: [String: Any] = ["n": number, "status": failureCode == nil ? "ok" : "failed"]
+                fields["duration_ms"] = durationMs
                 fields["failure_code"] = failureCode?.rawValue
                 fields["observation"] = observation?.rawValue.replacingOccurrences(of: " ", with: "_")
                 return fields
@@ -461,6 +481,22 @@ final class TrajectoryLog: @unchecked Sendable {
         var observation: Observation = .unavailable
         var decisionHint = false
         var doneCheck: DoneCheck = .notRequested
+
+        /// Recovery uses expanded step numbers, which can differ from the caller's input array.
+        var recovery: [String: Any]? {
+            if stop == .timeBudget || stop == .windowChanged {
+                guard steps.count < totalSteps else { return nil }
+                return ["action": "refresh_then_continue", "step": steps.count + 1]
+            }
+            if stop != nil, let last = steps.last, last.failureCode != nil {
+                let action = last.observation == .notSent ? "fix_then_continue" : "inspect_before_retry"
+                return ["action": action, "step": steps.count]
+            }
+            if stop != nil || doneCheck == .unmet || observation == .failed {
+                return ["action": "inspect_result"]
+            }
+            return nil
+        }
 
         var failureCode: FailureCode? {
             stop == .recipeVerification ? .recipeVerification : steps.last?.failureCode

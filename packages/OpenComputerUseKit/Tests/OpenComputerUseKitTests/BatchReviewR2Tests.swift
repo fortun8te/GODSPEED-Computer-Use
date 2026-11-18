@@ -35,7 +35,8 @@ final class BatchReviewR2Tests: XCTestCase {
         let wait = try BatchEffects.Wait(arguments: ["window": "Export", "timeout_ms": 30_000])
         XCTAssertEqual(wait.pollSeconds(elapsedInBatch: 0, budget: 75), 30, accuracy: 0.001)
         XCTAssertEqual(wait.pollSeconds(elapsedInBatch: 60, budget: 75), 15, accuracy: 0.001)
-        XCTAssertEqual(wait.pollSeconds(elapsedInBatch: 80, budget: 75), 0.3, accuracy: 0.001)
+        XCTAssertEqual(wait.pollSeconds(elapsedInBatch: 75, budget: 75), 0)
+        XCTAssertEqual(wait.pollSeconds(elapsedInBatch: 80, budget: 75), 0)
     }
 
     // Receipts

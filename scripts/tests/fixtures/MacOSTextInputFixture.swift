@@ -24,6 +24,7 @@ final class ProbeTextView: NSTextView {
     override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
         if attribute == .value { return string }
         if attribute == .selectedTextRange { return NSValue(range: selectedRange()) }
+        if attribute == .selectedText { return (string as NSString).substring(with: selectedRange()) }
         return super.accessibilityAttributeValue(attribute)
     }
     override func accessibilityIsAttributeSettable(_ attribute: NSAccessibility.Attribute) -> Bool {
@@ -160,6 +161,7 @@ final class Controller {
         let data = try! JSONSerialization.data(withJSONObject: [
             "serial": serial, "view": view.string, "field": field.stringValue, "secure": secure.stringValue, "secretReads": secure.secretReads, "sheet": sheetField.stringValue,
             "selection": [range.location, range.length], "target": target,
+            "pasteboardChangeCount": NSPasteboard.general.changeCount,
             "valueWrites": view.valueWrites, "selectedWrites": view.selectedWrites])
         try? data.write(to: stateURL, options: .atomic)
     }

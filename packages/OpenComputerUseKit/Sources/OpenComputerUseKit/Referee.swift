@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 /// Optional local referee: a small decision model served on this Mac (see ~/.ocu-referee) that reads
@@ -23,81 +24,97 @@ enum Referee {
     /// Longest the batch waits for an answer. Default 1500 ms: a warm d1-2B (fp16) answers a 1,000-character
     /// view in about 270 ms; a cold one reloads for about 4 s and is skipped.
     static let timeout: TimeInterval = {
-        let milliseconds = environment("OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS").flatMap(Double.init) ?? 1_500
+        let milliseconds = finiteSetting("OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS", fallback: 1_500, range: 0...30_000)
         return max(50, milliseconds) / 1000
     }()
 
     /// Hints below this confidence are left out. Default 0.6.
     static let minimumConfidence: Double = {
-        environment("OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE").flatMap(Double.init) ?? 0.6
+        finiteSetting("OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE", fallback: 0.6, range: 0...1)
     }()
 
     /// "done" hints need at least this confidence. Default 0.86: the lowest value at which the d1-2B
     /// done answers on the eval2 dev split were all right (9 of 9; 0.85 gave 10 of 11). Chosen on dev only.
     static let doneConfidence: Double = {
-        environment("OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE").flatMap(Double.init) ?? 0.86
+        finiteSetting("OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE", fallback: 0.86, range: 0...1)
     }()
 
     /// The state text sent is cut to this many characters. Default 1200: longer views were slower and
     /// less accurate in the d1-2B measurements (~270 ms at 1,000 characters, ~1.1 s at 6,000).
     static let maxViewCharacters: Int = {
-        environment("OPEN_COMPUTER_USE_REFEREE_MAX_VIEW").flatMap(Int.init) ?? 1_200
+        max(0, environment("OPEN_COMPUTER_USE_REFEREE_MAX_VIEW").flatMap(Int.init) ?? 1_200)
     }()
 
     static var isEnabled: Bool { baseURL != nil }
 
+    // Completion hints are experimental. Without independent calibration, use
+    // deterministic checks for task completion and keep the model for recovery.
+    static var allowsCompletionHints: Bool {
+        ["1", "true", "yes", "on"].contains(environment("OPEN_COMPUTER_USE_REFEREE_DONE_HINTS")?.lowercased() ?? "")
+    }
+
     /// Asks the helper about one batch. `summary` is the short RefereeSummary text (goal, steps, repeated
     /// failures, screen change, dialog, changed lines), not raw screen text.
-    static func decide(goal: String, lastStep: String, result: String, summary: String) -> Verdict? {
+    static func decide(goal: String, lastStep: String, result: String, summary: String, remaining: TimeInterval? = nil) -> Verdict? {
         guard let baseURL else { return nil }
+        let wait = min(timeout, remaining ?? timeout)
+        guard wait > 0 else { return nil }
 
         let body: [String: Any] = [
             "goal": goal,
             "last_step": lastStep,
             "result": result,
-            "view": String(summary.prefix(maxViewCharacters)),
+            "view": RefereeSummary.clip(summary, to: maxViewCharacters),
         ]
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: timeout) else {
-            HelperAutoStarter.shared.helperUnreachable(baseURL)
+        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait) else {
+            if wait == timeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
-        guard let label = object["label"] as? String else { return nil }
+        guard let label = object["label"] as? String,
+              ["act", "look_again", "done", "stuck"].contains(label),
+              let number = object["confidence"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, (0...1).contains(number.doubleValue) else { return nil }
         return Verdict(
             label: label,
-            confidence: (object["confidence"] as? NSNumber)?.doubleValue ?? 0,
+            confidence: number.doubleValue,
             milliseconds: (object["ms"] as? NSNumber)?.intValue ?? 0
         )
     }
 
-    /// Longest a handoff waits for the helper to score its candidate actions. Default 3000 ms (a cold d1 is
-    /// skipped; the retry below usually finds it warm).
+    /// Longest a handoff waits for one ranking from the helper. Default 3000 ms.
     static let chooseTimeout: TimeInterval = {
-        let milliseconds = environment("OPEN_COMPUTER_USE_REFEREE_CHOOSE_TIMEOUT_MS").flatMap(Double.init) ?? 3_000
+        let milliseconds = finiteSetting("OPEN_COMPUTER_USE_REFEREE_CHOOSE_TIMEOUT_MS", fallback: 3_000, range: 0...30_000)
         return max(100, milliseconds) / 1000
     }()
 
     /// Asks the helper to score candidate actions for a handoff (POST /choose): one probability per option id
     /// plus "none". Nil when the referee is off, down or answers badly, so the handoff escalates instead of guessing.
     /// The handoff needs the helper even when batch hints are off, so it falls back to the default local helper.
-    static let chooseURL: URL? = baseURL ?? {
+    static var chooseURL: URL? {
         if let off = environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"), ["0", "false", "off", "no"].contains(off.lowercased()) { return nil }
-        return URL(string: "http://127.0.0.1:8765")
-    }()
+        return baseURL ?? URL(string: "http://127.0.0.1:8765")
+    }
 
-    static func choose(goal: String, doneWhen: String, history: String, screen: String, options: [(id: String, text: String)]) -> [String: Double]? {
+    static func choose(goal: String, doneWhen: String, history: String, screen: String, options: [(id: String, text: String)],
+                       remaining: TimeInterval? = nil) -> [String: Double]? {
         guard let baseURL = chooseURL, !options.isEmpty else { return nil }
+        let wait = min(chooseTimeout, remaining ?? chooseTimeout)
+        guard wait > 0 else { return nil }
         let body: [String: Any] = [
             "goal": goal,
             "done_when": doneWhen,
             "history": history,
-            "screen": String(screen.prefix(maxViewCharacters)),
+            "screen": RefereeSummary.clip(screen, to: maxViewCharacters),
             "options": options.map { ["id": $0.id, "text": $0.text] },
         ]
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: chooseTimeout) else {
-            HelperAutoStarter.shared.helperUnreachable(baseURL)
+        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait) else {
+            if wait == chooseTimeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
-        return parseChoose(object)
+        guard let probabilities = parseChoose(object),
+              probabilities["none"] != nil,
+              options.allSatisfy({ probabilities[$0.id] != nil }) else { return nil }
+        return probabilities
     }
 
     /// `{"probs": {"a": 0.7, "none": 0.1}}` as a dictionary; nil when it has no usable numbers.
@@ -105,15 +122,18 @@ enum Referee {
         guard let raw = object["probs"] as? [String: Any] else { return nil }
         var probs: [String: Double] = [:]
         for (key, value) in raw {
-            guard let number = (value as? NSNumber)?.doubleValue, number.isFinite, number >= 0, number <= 1 else { continue }
+            guard let numeric = value as? NSNumber, CFGetTypeID(numeric) != CFBooleanGetTypeID() else { continue }
+            let number = numeric.doubleValue
+            guard number.isFinite, number >= 0, number <= 1 else { continue }
             probs[key] = number
         }
         return probs.isEmpty ? nil : probs
     }
 
     /// The hint line for a verdict, or nil when it is not worth the model's attention.
-    static func hint(for verdict: Verdict) -> String? {
-        guard verdict.confidence >= minimumConfidence else { return nil }
+    static func hint(for verdict: Verdict, browser: Bool = false) -> String? {
+        guard verdict.confidence.isFinite, (0...1).contains(verdict.confidence),
+              verdict.confidence >= minimumConfidence else { return nil }
         let sure = "\(Int((verdict.confidence * 100).rounded()))% sure"
         switch verdict.label {
         case "done":
@@ -124,11 +144,21 @@ enum Referee {
         case "stuck":
             return "Check: this looks stuck (\(sure)). Try a different element or approach, or ask the user."
         case "look_again":
+            if browser {
+                return "Check: the page may be stale or still loading (\(sure)). Use browser wait_for or read on the same tab before acting."
+            }
             return "Check: the state may be stale or still loading (\(sure)). Read it again with get_app_state and settle_ms before acting."
         default:
             // "act": nothing to add; the model was going to continue anyway.
             return nil
         }
+    }
+
+    private static func finiteSetting(_ key: String, fallback: Double, range: ClosedRange<Double>) -> Double {
+        guard let value = environment(key).flatMap(Double.init), value.isFinite, range.contains(value) else {
+            return fallback
+        }
+        return value
     }
 
     private static func environment(_ key: String) -> String? {
