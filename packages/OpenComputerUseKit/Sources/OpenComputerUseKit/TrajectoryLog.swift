@@ -75,7 +75,7 @@ final class TrajectoryLog: @unchecked Sendable {
 
     /// Records one top-level tool call that returned a result. Argument values for secure targets and
     /// secure lines in the result text are redacted; the screenshot bytes are never stored.
-    func recordToolCall(name: String, arguments: [String: Any], result: ToolCallResult, startedAt: Date) {
+    func recordToolCall(name: String, arguments: [String: Any], result: ToolCallResult, startedAt: Date, admissionMs: Double? = nil) {
         guard isEnabled else { return }
         let screenshotReturned = result.content.contains { $0.dictionary["type"] as? String == "image" }
         let primary = result.primaryText ?? ""
@@ -95,6 +95,7 @@ final class TrajectoryLog: @unchecked Sendable {
             resultTruncated: truncated,
             screenshotReturned: screenshotReturned,
             startedAt: startedAt,
+            admissionMs: admissionMs,
             receipts: receipts,
             batchReceipt: result.batchReceipt,
             failureCode: result.isError
@@ -104,7 +105,7 @@ final class TrajectoryLog: @unchecked Sendable {
     }
 
     /// Records one top-level tool call that threw instead of returning a result.
-    func recordFailedToolCall(name: String, arguments: [String: Any], error: Error, startedAt: Date) {
+    func recordFailedToolCall(name: String, arguments: [String: Any], error: Error, startedAt: Date, admissionMs: Double? = nil) {
         guard isEnabled else { return }
         let isError = (error as? ComputerUseError)?.toolResultIsError ?? true
         let message = (error as? ComputerUseError)?.errorDescription
@@ -119,7 +120,17 @@ final class TrajectoryLog: @unchecked Sendable {
             resultTruncated: truncated,
             screenshotReturned: false,
             startedAt: startedAt,
+            admissionMs: admissionMs,
             failureCode: Self.failureCode(error: error, message: message)
+        )
+    }
+
+    func recordAdmissionTimeout(name: String, admissionMs: Double) {
+        guard isEnabled else { return }
+        submitCall(
+            name: name, arguments: [:], isError: true, resultText: "", resultTruncated: false,
+            screenshotReturned: false, startedAt: Date(), admissionMs: admissionMs,
+            admissionTimedOut: true, failureCode: .timeout
         )
     }
 
@@ -153,6 +164,8 @@ final class TrajectoryLog: @unchecked Sendable {
         resultTruncated: Bool,
         screenshotReturned: Bool,
         startedAt: Date,
+        admissionMs: Double? = nil,
+        admissionTimedOut: Bool = false,
         receipts: Receipts? = nil,
         batchReceipt: BatchReceipt? = nil,
         failureCode: FailureCode? = nil,
@@ -171,6 +184,10 @@ final class TrajectoryLog: @unchecked Sendable {
             "screenshot_returned": screenshotReturned,
             "duration_ms": duration,
         ]
+        if let admissionMs, admissionMs.isFinite, admissionMs >= 0 {
+            object["admission_ms"] = (admissionMs * 10).rounded() / 10
+        }
+        if admissionTimedOut { object["admission_timed_out"] = true }
         object["failure_code"] = failureCode?.rawValue
         if let batchReceipt {
             object["batch_steps"] = batchReceipt.steps.count

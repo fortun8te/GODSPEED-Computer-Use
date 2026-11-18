@@ -20,5 +20,5 @@ Measure independent final-state pass rate, model input and output tokens, calls 
 
 - Native modal and file chooser coverage, including the CapCut import.
 - Live Chrome separate-tab checks and timeout cleanup under load.
-- Cross-client throughput. The shared Mac app agent serializes requests while it temporarily applies settings to the process environment. Peek can parallelize its own lanes. Replacing process-global settings is the dependency for concurrent mutations from separate connections.
+- Live cross-client throughput. The shared app agent now admits up to three independent browser reads with request-local settings. Native actions, browser writes and mixed batches still run alone. Compare parallel and sequential Chrome fixtures before claiming a throughput gain.
 - A signed, notarized binary release and a fresh-machine install.

@@ -154,13 +154,19 @@ Test and bench switches (`RUN_*`, `BENCH_*`, `APP_MATRIX_*`, `SMOKE_SERVER`, `FI
 
 See the [Godspeed setup guide](../README.md) for source and package installation, MCP registration, and Chrome setup.
 
+## Parallel browser reads
+
+While the Mac is unlocked, up to three different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. Each client has its own tab state and can have one read in flight. Native actions, browser writes, mixed batches, and any Locked Use recovery get exclusive access. New reads wait when an exclusive request is queued.
+
+If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.
+
 ## Browser drag
 
 Open or select a tab and read its controls. For example, use `{"action":"drag","label":"Card A","to_label":"Drop zone"}` when both controls are visible in the same page. Read the tab after delivery to verify the drop. Apps can interpret pointer gestures differently.
 
 ## Local traces
 
-Tool logs at `~/.godspeed/trajectories` record timing, fixed failure codes, individual batch outcomes, the remaining steps and the final verification status. Partial or uncertain delivery stays visible in the receipt. Arguments, screen text, and screenshots are omitted by default. Turn logging off with `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0`. Only set `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` on an approved fixture connection. That captures typed text and observations. Review those files before using or sharing them.
+Tool logs at `~/.godspeed/trajectories` record time before dispatch, tool duration, admission timeouts, fixed failure codes, individual batch outcomes, the remaining steps and the final verification status. Partial or uncertain delivery stays visible in the receipt. Arguments, screen text, and screenshots are omitted by default. Turn logging off with `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0`. Only set `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` on an approved fixture connection. That captures typed text and observations. Review those files before using or sharing them.
 
 Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper activity. A helper receipt records that the helper ran. Match verified fixture outcomes to exact run streams before using them as labels.
 

@@ -65,6 +65,37 @@ final class LockedUseConnection: @unchecked Sendable {
         return try body()
     }
 
+    enum ParallelReadFallback: Error { case needsExclusive }
+
+    /// Shared admission is only for an unlocked session without a lease or recovery.
+    /// The shared path never attempts recovery or starts a lease.
+    func performParallelBrowserRead<T>(_ body: () throws -> T) throws -> T {
+        guard Self.parallelBrowserReadSessionIsClear() else { throw ParallelReadFallback.needsExclusive }
+        let entered = mutex.withLock {
+            guard lease == nil, !stopped, !clientDisconnected, !inFlight else { return false }
+            inFlight = true
+            return true
+        }
+        guard entered else { throw ParallelReadFallback.needsExclusive }
+        defer { mutex.withLock { inFlight = false } }
+        try validateParallelBrowserRead()
+        return try body()
+    }
+
+    /// Recheck at the transport boundary, including on peek workers. A relock after
+    /// admission stops the request and never restarts a partially executed call.
+    func validateParallelBrowserRead() throws {
+        guard Self.parallelBrowserReadSessionIsClear(),
+              mutex.withLock({ !stopped && !clientDisconnected && lease == nil && inFlight }) else {
+            throw ComputerUseError.stateUnavailable("The Mac session changed during this browser read. Inspect the tab before retrying.")
+        }
+    }
+
+    private static func parallelBrowserReadSessionIsClear() -> Bool {
+        LockedUseSession.current().state == .unlocked
+            && !FileManager.default.fileExists(atPath: LockedUseIPCEndpoint.observer.path)
+    }
+
     private func acquire(session: LockedUseSession, recoveryProbe: Bool = false) throws {
         mutex.lock(); let existing = lease; let denied = stopped || clientDisconnected; mutex.unlock()
         if existing != nil || denied { try validateAction(); return }

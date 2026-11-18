@@ -46,7 +46,7 @@ public final class StdioMCPServer {
         }
     }
 
-    public func handle(line: String, toolListingEnvironment: [String: String]? = nil) -> String? {
+    public func handle(line: String, toolListingEnvironment: [String: String]? = nil, admissionMs: Double? = nil) -> String? {
         do {
             guard let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
                 return try encodeJSONRPCError(id: nil, code: -32700, message: "Invalid JSON-RPC payload")
@@ -97,10 +97,10 @@ public final class StdioMCPServer {
                 do {
                     result = try dispatcher.callTool(name: name, arguments: arguments)
                 } catch {
-                    trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt)
+                    trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt, admissionMs: admissionMs)
                     throw error
                 }
-                trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt)
+                trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt, admissionMs: admissionMs)
                 // Remember the state the model was shown, so the next batch can reply with only the changes.
                 if name != BatchTool.name, let app = arguments["app"] as? String, let state = LeanOutput.stateText(of: result) {
                     BatchObservationMemory.shared.recordShown(app: app, text: state)
@@ -146,6 +146,14 @@ public final class StdioMCPServer {
     /// Release state that is scoped to one MCP client session. App-hosted MCP
     /// connections call this explicitly because they use `handle(line:)`
     /// instead of the stdio `run()` loop.
+    public func recordAdmissionTimeout(tool: String, elapsedMs: Double) {
+        trajectory.recordAdmissionTimeout(name: tool, admissionMs: elapsedMs)
+    }
+
+    public func flushTrajectory() {
+        trajectory.sessionEnded()
+    }
+
     public func endSession() {
         trajectory.sessionEnded()
         service.clearQueryIndexes()

@@ -169,6 +169,7 @@ enum MacOSAppAgentProxy {
     @MainActor
     private static func proxyMCP(client initialClient: AppAgentSocketClient, socketPath: String) throws {
         var client = initialClient
+        let environment = proxiedEnvironment(mcpSession: UUID())
         while let line = readLine(strippingNewline: true) {
             guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 continue
@@ -180,7 +181,7 @@ enum MacOSAppAgentProxy {
                     let response = try client.request([
                         "kind": "mcp",
                         "line": line,
-                        "environment": proxiedEnvironment(mcp: true),
+                        "environment": environment,
                     ])
 
                     if let responseLine = response["response"] as? String {
@@ -219,7 +220,7 @@ enum MacOSAppAgentProxy {
         let response = try client.request([
             "kind": "cli",
             "arguments": resolvingOpenComputerUseCallFilePaths(arguments),
-            "environment": proxiedEnvironment(mcp: false),
+            "environment": proxiedEnvironment(),
         ])
 
         return CLIProxyResponse(
@@ -229,19 +230,20 @@ enum MacOSAppAgentProxy {
         )
     }
 
-    static func proxyClientID(explicit: String?, mcp: Bool, processID: pid_t, parentProcessID: pid_t) -> String {
+    static func proxyClientID(explicit: String?, mcpSession: UUID?, parentProcessID: pid_t) -> String {
         if let explicit, !explicit.isEmpty { return explicit }
-        return "p\(mcp ? processID : parentProcessID)"
+        if let mcpSession { return "m" + mcpSession.uuidString.lowercased() }
+        return "p\(parentProcessID)"
     }
 
-    private static func proxiedEnvironment(mcp: Bool) -> [String: String] {
+    private static func proxiedEnvironment(mcpSession: UUID? = nil) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment.filter { key, _ in
             key.hasPrefix("OPEN_COMPUTER_USE_")
         }
-        // Each MCP proxy has its own state, even when several share a harness process.
-        // Separate CLI invocations keep using their common parent for continuity.
+        // A proxy keeps its identity across socket reconnects. CLI calls use their
+        // parent so a sequence of separate calls can share the observed state.
         environment[clientEnvironmentKey] = proxyClientID(
-            explicit: environment[clientEnvironmentKey], mcp: mcp, processID: getpid(), parentProcessID: getppid()
+            explicit: environment[clientEnvironmentKey], mcpSession: mcpSession, parentProcessID: getppid()
         )
         if let url = try? OCUConfiguration.fileURL(environment: OCUConfiguration.environment) {
             environment["OPEN_COMPUTER_USE_CONFIG_FILE"] = url.path
@@ -482,6 +484,7 @@ private final class AppAgentConnection: @unchecked Sendable {
     private var keychainProbe: LockedUseKeychainProbe?
     /// The agent this connection serves (from its proxy); nil until its first request.
     private var client: String?
+    private var browserEnvironment: [String: String]?
 
     init(fileDescriptor: Int32) {
         self.fileDescriptor = fileDescriptor
@@ -511,7 +514,18 @@ private final class AppAgentConnection: @unchecked Sendable {
             monitor.cancel(); monitorQueue.sync {}
             lockedUse.end(disconnecting: true)
             if let probe = keychainProbe { keychainProbe = nil; LockedUseDeferredCleanup.shared.retainIfNeeded(probe) }
-            ClientScope.with(client) { server?.endSession() }
+            server?.flushTrajectory()
+            // An explicitly shared identity must not detach browser tabs while
+            // its other connection is performing a read.
+            try? AppAgentAdmission.shared.withAdmission(.exclusive) {
+                ClientScope.with(client) {
+                    if let browserEnvironment {
+                        withBrowserRequestEnvironment(browserEnvironment) { server?.endSession() }
+                    } else {
+                        server?.endSession()
+                    }
+                }
+            }
             fclose(file)
         }
 
@@ -529,6 +543,8 @@ private final class AppAgentConnection: @unchecked Sendable {
     }
 
     private func handle(requestLine: String) -> [String: Any] {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        func admissionMs() -> Double { (ProcessInfo.processInfo.systemUptime - startedAt) * 1000 }
         do {
             guard let request = try JSONSerialization.jsonObject(with: Data(requestLine.utf8)) as? [String: Any],
                   let kind = request["kind"] as? String
@@ -556,21 +572,41 @@ private final class AppAgentConnection: @unchecked Sendable {
                 let line = request["line"] as? String ?? ""
                 let environment = request["environment"] as? [String: String] ?? [:]
                 client = environment[clientEnvironmentKey] ?? client
+                let browserEnvironment = AppAgentEnvironment.effectiveEnvironment(environment)
+                self.browserEnvironment = browserEnvironment
                 // Record settings belong to this MCP connection, not to the shared agent's launch environment.
                 let server = self.server ?? StdioMCPServer(trajectoryEnvironment: environment)
                 self.server = server
                 // Handshake and listing never wait behind another agent's running tool call: a slow call
                 // used to hold the lock, so the next session's initialize timed out and it started with no tools.
-                if let quick = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                   let method = quick["method"] as? String,
+                let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                if let method = payload?["method"] as? String,
                    ["initialize", "notifications/initialized", "tools/list", "ping", "resources/list", "prompts/list"].contains(method) {
                     let response = ClientScope.with(client) {
-                        server.handle(line: line, toolListingEnvironment: AppAgentEnvironment.effectiveEnvironment(environment))
+                        server.handle(line: line, toolListingEnvironment: browserEnvironment)
                     }
                     return ["response": response ?? NSNull()]
                 }
+                if let payload, AppAgentBrowserRead.accepts(payload), let client, !client.isEmpty {
+                    do {
+                        let response = try AppAgentAdmission.shared.withAdmission(.browserRead(client: ClientScope.sanitized(client))) {
+                            try ClientScope.with(client) { [lockedUse] in
+                                try lockedUse.performParallelBrowserRead {
+                                    try withBrowserRequestEnvironment(
+                                        browserEnvironment,
+                                        validate: { try lockedUse.validateParallelBrowserRead() }
+                                    ) {
+                                        server.handle(line: line, admissionMs: admissionMs())
+                                    }
+                                }
+                            }
+                        }
+                        return ["response": response ?? NSNull()]
+                    } catch LockedUseConnection.ParallelReadFallback.needsExclusive {
+                        // Nothing was sent. Let the normal serialized path handle the session.
+                    }
+                }
                 let response: String? = try AppAgentEnvironment.withOverrides(environment, client: client) {
-                    let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
                     if payload?["method"] as? String == "notifications/turn-ended" { lockedUse.end() }
                     if let method = payload?["method"] as? String, method.hasPrefix("ocu/locked-use/keychain/") || ["ocu/locked-use/validate", "ocu/locked-use/validate-unlocked", "ocu/locked-use/validate-recovery", "ocu/locked-use/validate-unlock", "ocu/locked-use/ready", "ocu/locked-use/protection-released"].contains(method) {
                         var passed = false
@@ -634,9 +670,9 @@ private final class AppAgentConnection: @unchecked Sendable {
                     if payload?["method"] as? String == "tools/call",
                        let name = parameters?["name"] as? String,
                        name != "list_apps", ToolDefinitions.isKnown(name) {
-                        return try lockedUse.perform { server.handle(line: line) }
+                        return try lockedUse.perform { server.handle(line: line, admissionMs: admissionMs()) }
                     }
-                    return server.handle(line: line)
+                    return server.handle(line: line, admissionMs: admissionMs())
                 }
                 if let response {
                     return ["response": response]
@@ -671,6 +707,10 @@ private final class AppAgentConnection: @unchecked Sendable {
                    let line = envelope["line"] as? String,
                    let rpc = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                    let id = rpc["id"] {
+                    if error is AppAgentAdmission.Timeout, rpc["method"] as? String == "tools/call",
+                       let params = rpc["params"] as? [String: Any], let tool = params["name"] as? String {
+                        server?.recordAdmissionTimeout(tool: tool, elapsedMs: admissionMs())
+                    }
                     let failure: [String: Any] = ["jsonrpc": "2.0", "id": id,
                         "error": ["code": -32000, "message": message]]
                     if let data = try? JSONSerialization.data(withJSONObject: failure) {
@@ -743,25 +783,41 @@ private final class AppAgentConnection: @unchecked Sendable {
 /// The environment key that names the agent a proxy works for.
 private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
 
+/// Only canonical browser reads enter the shared route. Browser batches can
+/// contain native actions, and browser mutations still need exclusive admission.
+enum AppAgentBrowserRead {
+    private static let common: Set<String> = ["action", "tab_id"]
+    private static let arguments: [String: Set<String>] = [
+        "read": common.union(["find", "full"]),
+        "screenshot": common,
+        "info": common,
+        "tabs": ["action"],
+        "peek": ["action", "urls"],
+    ]
+
+    static func accepts(_ payload: [String: Any]) -> Bool {
+        guard payload["method"] as? String == "tools/call",
+              let params = payload["params"] as? [String: Any], params["name"] as? String == "browser",
+              let requested = params["arguments"] as? [String: Any], let action = requested["action"] as? String,
+              let allowed = arguments[action] else { return false }
+        return requested.keys.allSatisfy(allowed.contains)
+    }
+}
+
 private enum AppAgentEnvironment {
-    private static let lock = NSLock()
     private static let requestEnvironmentKeys = OCUConfiguration.environmentKeys.union([
         "OPEN_COMPUTER_USE_BROWSER", "OPEN_COMPUTER_USE_OBU_BIN",
         "OPEN_COMPUTER_USE_BROWSER_SESSION", "OPEN_COMPUTER_USE_BROWSER_PROFILE",
         "OPEN_COMPUTER_USE_BROWSER_APP", "OPEN_COMPUTER_USE_BROWSER_TRACE",
     ])
 
-    /// How long a request waits behind the requests ahead of it. Past this it fails with a message, so one slow
-    /// call cannot silently stall every other agent. Longer than the browser peek budget.
-    static let waitLimit: TimeInterval = 45
-
     static func withOverrides<T>(_ overrides: [String: String], client: String? = nil, _ body: () throws -> T) throws -> T {
-        guard lock.lock(before: Date().addingTimeInterval(waitLimit)) else {
-            throw ComputerUseError.stateUnavailable("Another agent's Open Computer Use request is still running. Retry in a moment.")
-        }
-        defer { lock.unlock() }
-        return try ClientScope.with(client ?? overrides[clientEnvironmentKey]) {
-            try applying(overrides, body)
+        try AppAgentAdmission.shared.withAdmission(.exclusive) {
+            try ClientScope.with(client ?? overrides[clientEnvironmentKey]) {
+                try withBrowserRequestEnvironment(effectiveEnvironment(overrides)) {
+                    try applying(overrides, body)
+                }
+            }
         }
     }
 

@@ -957,6 +957,7 @@ struct BrowserPage {
                 if arrived { return true }
             }
             if Date() >= deadline { return false }
+            do { try BrowserRequestContext.validateCurrent() } catch { return false }
             Thread.sleep(forTimeInterval: 0.12)
         }
     }
@@ -1215,9 +1216,13 @@ struct BrowserPage {
         }
     }
 
+    private static let traceLock = NSLock()
+
     /// `OPEN_COMPUTER_USE_BROWSER_TRACE=1`: one line per Chrome command in ~/.godspeed/browser-trace.log.
     private static func trace(_ line: @autoclosure () -> String) {
-        guard getenv("OPEN_COMPUTER_USE_BROWSER_TRACE") != nil else { return }
+        guard BrowserRequestContext.environment["OPEN_COMPUTER_USE_BROWSER_TRACE"] != nil else { return }
+        traceLock.lock()
+        defer { traceLock.unlock() }
         let path = NSHomeDirectory() + "/.godspeed/browser-trace.log"
         let text = String(format: "%.3f ", Date().timeIntervalSince1970.truncatingRemainder(dividingBy: 1000)) + line() + "\n"
         if let handle = FileHandle(forWritingAtPath: path) {

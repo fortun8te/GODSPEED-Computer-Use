@@ -3,7 +3,8 @@ import XCTest
 @testable import OpenComputerUseKit
 
 /// Pure-logic tests for the browser actions: key combinations, option matching, reply parsing, read
-/// rendering from synthetic accessibility JSON, and label matching. No Chrome, no OBU, no child process.
+/// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
+/// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
     func testPointerDragReleasesOnceWhenMovementFails() throws {
         let start = CGPoint(x: 10, y: 20)
@@ -424,6 +425,71 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(alpha.sessionID == main.sessionID)
         let otherClient = ClientScope.with("alpha-lane1") { BrowserBridge.shared.sessionID }
         XCTAssertNotEqual(alpha.sessionID, otherClient)
+    }
+
+    func testRequestEnvironmentReachesEveryPeekLaneAndRestoresTheCaller() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        let script = """
+        #!/bin/sh
+        IFS= read -r initialization
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        printf '{"jsonrpc":"2.0","id":2,"result":{"isError":true,"content":[{"type":"text","text":"%s %s %s %s"}]}}\n' "$2" "$3" "$5" "$PEEK_TEST_VALUE"
+        IFS= read -r finalize
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let environment = [
+            "OPEN_COMPUTER_USE_BROWSER": "1",
+            "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+            "OPEN_COMPUTER_USE_BROWSER_SESSION": "fixture",
+            "OPEN_COMPUTER_USE_BROWSER_PROFILE": "fixture-profile",
+            "OPEN_COMPUTER_USE_BROWSER_APP": "Fixture Chrome",
+            "PEEK_TEST_VALUE": "fixture-env",
+        ]
+        let originalApp = BrowserBridge.browserApp
+        ClientScope.with("peek-environment-test") {
+            withBrowserRequestEnvironment(environment) {
+                XCTAssertTrue(BrowserBridge.isAvailable)
+                XCTAssertEqual(BrowserBridge.browserApp, "Fixture Chrome")
+                XCTAssertTrue(BrowserBridge.lane(0) === BrowserBridge.lane(0))
+                let shared = BrowserBridge.shared
+                withBrowserRequestEnvironment(environment.merging(["UNRELATED_FIXTURE_VALUE": "new"]) { _, new in new }) {
+                    XCTAssertTrue(BrowserBridge.shared === shared)
+                }
+                withBrowserRequestEnvironment(["OPEN_COMPUTER_USE_BROWSER": "0"]) {
+                    XCTAssertFalse(BrowserBridge.isAvailable)
+                }
+                let report = ComputerUseToolDispatcher.peekPages(["https://first.test", "https://second.test"])
+                for lane in 1...2 {
+                    XCTAssertTrue(report.contains(
+                        "--session-id fixture-lane\(lane)-peek-environment-test fixture-profile fixture-env"
+                    ), report)
+                }
+            }
+        }
+        XCTAssertEqual(BrowserBridge.browserApp, originalApp)
+        XCTAssertNil(BrowserRequestContext.current)
+    }
+
+    func testPeekWorkersApplyRequestValidationBeforeLaunchingTheirHelpers() throws {
+        let environment = [
+            "OPEN_COMPUTER_USE_BROWSER": "1",
+            "OPEN_COMPUTER_USE_OBU_BIN": "/usr/bin/true",
+        ]
+        try ClientScope.with("peek-validation-test") {
+            try withBrowserRequestEnvironment(environment, validate: {
+                throw ComputerUseError.stateUnavailable("fixture revoked browser access")
+            }) {
+                let report = ComputerUseToolDispatcher.peekPages(["https://first.test", "https://second.test"])
+                XCTAssertEqual(report.components(separatedBy: "fixture revoked browser access").count, 3, report)
+            }
+        }
     }
 
     func testDeadlineIsLocalAndRestoredAfterNestedCall() {

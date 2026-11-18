@@ -2,20 +2,39 @@ import XCTest
 @testable import OpenComputerUse
 
 final class AppAgentProxyTests: XCTestCase {
+    func testSharedAdmissionIsOnlyForCanonicalBrowserReads() {
+        func accepts(_ name: String = "browser", _ arguments: [String: Any]) -> Bool {
+            AppAgentBrowserRead.accepts([
+                "method": "tools/call", "params": ["name": name, "arguments": arguments],
+            ])
+        }
+        XCTAssertTrue(accepts("browser", ["action": "peek", "urls": ["https://example.test"]]))
+        XCTAssertTrue(accepts("browser", ["action": "read", "tab_id": 1, "find": "heading"]))
+        XCTAssertTrue(accepts("browser", ["action": "tabs"]))
+        XCTAssertFalse(accepts("browser", ["action": "batch", "steps": [["web": false, "tool": "click"]]]))
+        XCTAssertFalse(accepts("browser", ["action": "click", "label": "Cancel"]))
+        XCTAssertFalse(accepts("browser", ["action": "read", "app": "Calculator"]))
+        XCTAssertFalse(accepts("browser", ["action": "read", "operation": "click"]))
+        XCTAssertFalse(accepts("browser", ["url": "https://example.test"]))
+        XCTAssertFalse(accepts("batch", ["action": "read"]))
+    }
+
     func testMCPProxiesFromTheSameParentHaveSeparateDefaultIdentities() {
-        let first = MacOSAppAgentProxy.proxyClientID(explicit: nil, mcp: true, processID: 101, parentProcessID: 99)
-        let second = MacOSAppAgentProxy.proxyClientID(explicit: "", mcp: true, processID: 102, parentProcessID: 99)
-        XCTAssertEqual(first, "p101")
-        XCTAssertEqual(second, "p102")
+        let session = UUID()
+        let first = MacOSAppAgentProxy.proxyClientID(explicit: nil, mcpSession: session, parentProcessID: 99)
+        let reconnected = MacOSAppAgentProxy.proxyClientID(explicit: nil, mcpSession: session, parentProcessID: 99)
+        let second = MacOSAppAgentProxy.proxyClientID(explicit: "", mcpSession: UUID(), parentProcessID: 99)
+        XCTAssertEqual(first, reconnected)
+        XCTAssertNotEqual(first, second)
     }
 
     func testCLIUsesParentIdentityAndExplicitIdentityCanShareState() {
         XCTAssertEqual(
-            MacOSAppAgentProxy.proxyClientID(explicit: nil, mcp: false, processID: 101, parentProcessID: 99),
+            MacOSAppAgentProxy.proxyClientID(explicit: nil, mcpSession: nil, parentProcessID: 99),
             "p99"
         )
         XCTAssertEqual(
-            MacOSAppAgentProxy.proxyClientID(explicit: "shared", mcp: true, processID: 102, parentProcessID: 99),
+            MacOSAppAgentProxy.proxyClientID(explicit: "shared", mcpSession: UUID(), parentProcessID: 99),
             "shared"
         )
     }

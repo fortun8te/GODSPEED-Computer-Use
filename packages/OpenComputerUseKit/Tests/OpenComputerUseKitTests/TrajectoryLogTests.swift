@@ -61,6 +61,19 @@ final class TrajectoryLogTests: XCTestCase {
 
     // MARK: - Record format
 
+    func testAdmissionAttemptsRecordWaitSeparatelyFromDispatch() throws {
+        let log = TrajectoryLog(environment: [:], directory: directory)
+        log.recordToolCall(name: "browser", arguments: [:], result: .text("ok"), startedAt: started(), admissionMs: 12.34)
+        log.recordAdmissionTimeout(name: "browser", admissionMs: 45_000)
+        let lines = try records(log)
+        XCTAssertEqual(lines[0]["admission_ms"] as? Double, 12.3)
+        XCTAssertNil(lines[0]["admission_timed_out"])
+        XCTAssertEqual(lines[1]["admission_ms"] as? Double, 45_000)
+        XCTAssertEqual(lines[1]["admission_timed_out"] as? Bool, true)
+        XCTAssertEqual(lines[1]["failure_code"] as? String, "timeout")
+        XCTAssertNil(lines[1]["arguments"])
+    }
+
     func testDefaultLogOmitsPrivateContentButRecordsFailedBatch() throws {
         let log = TrajectoryLog(environment: [:], directory: directory)
         let receipt = TrajectoryLog.BatchReceipt(

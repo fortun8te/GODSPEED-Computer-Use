@@ -26,6 +26,7 @@ def summarize(directory):
     batch_observations = Counter()
     done_checks = Counter()
     durations = []
+    admissions = []
     for path in sorted(directory.glob("*.jsonl")):
         with path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
@@ -70,14 +71,19 @@ def summarize(directory):
                                 step_observations[observation] += 1
                 else:
                     counts["legacy_calls"] += 1
+                counts["admission_timeouts"] += row.get("admission_timed_out") is True
+                admission = row.get("admission_ms")
+                if type(admission) in (int, float) and math.isfinite(admission) and admission >= 0:
+                    admissions.append(admission)
                 value = row.get("duration_ms")
-                if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                if row.get("admission_timed_out") is not True and type(value) in (int, float) and math.isfinite(value) and value >= 0:
                     durations.append(value)
     durations.sort()
+    admissions.sort()
     out = {key: counts[key] for key in (
         "calls", "legacy_calls", "tool_errors", "screenshots_returned", "batch_failures_v2",
         "decision_hints_v2", "vision_clicks_v2", "calls_v3", "batch_failures_v3",
-        "decision_hints_v3", "vision_clicks_v3", "malformed_rows",
+        "decision_hints_v3", "vision_clicks_v3", "malformed_rows", "admission_timeouts",
     )}
     out["failure_codes"] = dict(sorted(failures.items()))
     out["batch_stops"] = dict(sorted(batch_stops.items()))
@@ -87,6 +93,10 @@ def summarize(directory):
     if durations:
         for percentile in (50, 95):
             out[f"p{percentile}_duration_ms"] = durations[math.ceil(len(durations) * percentile / 100) - 1]
+    if admissions:
+        out["admission_samples"] = len(admissions)
+        for percentile in (50, 95):
+            out[f"p{percentile}_admission_ms"] = admissions[math.ceil(len(admissions) * percentile / 100) - 1]
     return out
 
 

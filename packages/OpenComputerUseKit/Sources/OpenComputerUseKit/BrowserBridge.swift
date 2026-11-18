@@ -1,5 +1,38 @@
 import Foundation
 
+/// Runs a synchronous browser request with its own effective launch environment and authorization.
+public func withBrowserRequestEnvironment<T>(
+    _ environment: [String: String],
+    validate: (@Sendable () throws -> Void)? = nil,
+    _ body: () throws -> T
+) rethrows -> T {
+    try BrowserRequestContext.withContext(
+        BrowserRequestContext(environment: GodspeedSettings.merged(environment), validate: validate), body
+    )
+}
+
+struct BrowserRequestContext: Sendable {
+    let environment: [String: String]
+    let validate: (@Sendable () throws -> Void)?
+
+    private static let key = "godspeed.browser-request"
+
+    static var current: Self? { Thread.current.threadDictionary[key] as? Self }
+    static var environment: [String: String] { current?.environment ?? GodspeedSettings.environment }
+
+    static func withContext<T>(_ context: Self?, _ body: () throws -> T) rethrows -> T {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[key]
+        dictionary[key] = context
+        defer { dictionary[key] = previous }
+        return try body()
+    }
+
+    static func validateCurrent() throws {
+        try current?.validate?()
+    }
+}
+
 /// Bridge to Open Browser Use (`obu mcp`, https://github.com/iFurySt/open-browser-use) for what the
 /// accessibility path cannot do well in a browser: open or go to a URL, list and claim tabs, wait for a
 /// page load, read the page URL and title, and answer a file chooser. Clicking and typing inside a page
@@ -14,19 +47,87 @@ import Foundation
 /// `obu mcp` children, each with its own session (`<session>-lane<N>`) and its own tabs.
 final class BrowserBridge: @unchecked Sendable {
     static var baseSessionID: String {
-        let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_BROWSER_SESSION"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        baseSessionID(environment: BrowserRequestContext.environment)
+    }
+
+    private static func baseSessionID(environment: [String: String]) -> String {
+        let value = environment["OPEN_COMPUTER_USE_BROWSER_SESSION"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (value?.isEmpty == false ? value : nil) ?? "godspeed-\(ProcessInfo.processInfo.processIdentifier)"
     }
 
     /// The bridge of the agent this thread works for (see `ClientScope`): each agent has its own Open Browser
     /// Use session, so its own tabs and its own current tab.
-    static var shared: BrowserBridge { scoped.current }
+    static var shared: BrowserBridge {
+        guard let context = BrowserRequestContext.current else { return scoped.current }
+        return configured.current.bridge(environment: context.environment)
+    }
     private static let scoped = ScopedStore<BrowserBridge>(
         make: { scope in BrowserBridge(sessionID: sessionID(for: scope)) },
         drop: { $0.shutdown() }
     )
 
-    static func endClientTurn() { scoped.existing?.turnEnded() }
+    static func endClientTurn() {
+        if let context = BrowserRequestContext.current {
+            configured.existing?.existingBridge(environment: context.environment)?.turnEnded()
+        } else {
+            scoped.existing?.turnEnded()
+        }
+    }
+
+    private static let configured = ScopedStore<ConfiguredBridges>(
+        make: { ConfiguredBridges(scope: $0) },
+        drop: { $0.shutdown() }
+    )
+
+    private final class ConfiguredBridges: @unchecked Sendable {
+        let scope: String
+        private let lock = NSLock()
+        private var identity: [String: String] = [:]
+        private var bridges: [Int: BrowserBridge] = [:]
+
+        init(scope: String) { self.scope = scope }
+
+        private static func launchIdentity(_ environment: [String: String]) -> [String: String] {
+            environment.filter { key, _ in
+                ["PATH", "HOME", "OPEN_COMPUTER_USE_OBU_BIN", "OPEN_COMPUTER_USE_BROWSER_SESSION",
+                 "OPEN_COMPUTER_USE_BROWSER_PROFILE"].contains(key) || key.hasPrefix("OBU_")
+            }
+        }
+
+        func bridge(environment: [String: String], lane: Int? = nil) -> BrowserBridge {
+            lock.lock()
+            defer { lock.unlock() }
+            let requestedIdentity = Self.launchIdentity(environment)
+            if identity != requestedIdentity {
+                // An older helper with the same session may still have idle work scheduled.
+                // Stop it before starting a helper with the new launch settings.
+                bridges.values.forEach { $0.shutdown() }
+                bridges.removeAll()
+                identity = requestedIdentity
+            }
+            let index = lane ?? 0
+            if let bridge = bridges[index] { return bridge }
+            let bridge = BrowserBridge(
+                sessionID: sessionID(for: scope, lane: lane, base: baseSessionID(environment: environment)),
+                launchEnvironment: environment
+            )
+            bridges[index] = bridge
+            return bridge
+        }
+
+        func existingBridge(environment: [String: String]) -> BrowserBridge? {
+            lock.lock()
+            defer { lock.unlock() }
+            return identity == Self.launchIdentity(environment) ? bridges[0] : nil
+        }
+
+        func shutdown() {
+            lock.lock()
+            defer { lock.unlock() }
+            bridges.values.forEach { $0.shutdown() }
+            bridges.removeAll()
+        }
+    }
 
     /// At most this many pages are loaded at once by parallel actions.
     static let maxLanes = 3
@@ -39,11 +140,14 @@ final class BrowserBridge: @unchecked Sendable {
     )
 
     /// These bridges start their helpers lazily and expire with the client's scope.
-    static func lane(_ index: Int) -> BrowserBridge { lanes.current[index] }
+    static func lane(_ index: Int) -> BrowserBridge {
+        guard let context = BrowserRequestContext.current else { return lanes.current[index] }
+        return configured.current.bridge(environment: context.environment, lane: index + 1)
+    }
 
-    private static func sessionID(for scope: String, lane: Int? = nil) -> String {
-        if let lane { return "\(baseSessionID)-lane\(lane)-\(scope)" }
-        return scope == "main" ? baseSessionID : "\(baseSessionID)-client-\(scope)"
+    private static func sessionID(for scope: String, lane: Int? = nil, base: String = baseSessionID) -> String {
+        if let lane { return "\(base)-lane\(lane)-\(scope)" }
+        return scope == "main" ? base : "\(base)-client-\(scope)"
     }
 
     let sessionID: String
@@ -102,11 +206,11 @@ final class BrowserBridge: @unchecked Sendable {
         return nil
     }
 
-    static var isAvailable: Bool { executablePath(environment: GodspeedSettings.environment) != nil }
+    static var isAvailable: Bool { executablePath(environment: BrowserRequestContext.environment) != nil }
 
     /// The app the accessibility path reads after a browser step. Default Google Chrome.
     static var browserApp: String {
-        let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_BROWSER_APP"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = BrowserRequestContext.environment["OPEN_COMPUTER_USE_BROWSER_APP"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (value?.isEmpty == false ? value : nil) ?? "Google Chrome"
     }
 
@@ -236,6 +340,7 @@ final class BrowserBridge: @unchecked Sendable {
             buffer.append(data)
         }
 
+        try BrowserRequestContext.validateCurrent()
         try child.run()
         process = child
         input = toChild.fileHandleForWriting
@@ -251,6 +356,7 @@ final class BrowserBridge: @unchecked Sendable {
                 ],
                 timeout: 10
             )
+            try BrowserRequestContext.validateCurrent()
             try send(["jsonrpc": "2.0", "method": "notifications/initialized"])
         } catch {
             // Never keep a child that did not finish its handshake: the next call starts a fresh one.
@@ -262,6 +368,7 @@ final class BrowserBridge: @unchecked Sendable {
     }
 
     private func request(method: String, params: [String: Any], timeout: TimeInterval) throws -> [String: Any] {
+        try BrowserRequestContext.validateCurrent()
         let wait = min(timeout, BrowserCallBudget.activeRemaining ?? timeout)
         guard wait > 0 else { throw ComputerUseError.message("The browser request ran out of time.") }
         let id = nextID
@@ -366,7 +473,10 @@ extension ComputerUseToolDispatcher {
     /// The `browser` tool: a handful of OBU abilities behind one verb, so a model sees one extra tool.
     func runBrowser(arguments: [String: Any]) throws -> ToolCallResult {
         try BrowserCallBudget.withDeadline(BrowserCallBudget.deadline()) {
-            try runBrowserAction(arguments: arguments)
+            try BrowserRequestContext.validateCurrent()
+            let result = try runBrowserAction(arguments: arguments)
+            try BrowserRequestContext.validateCurrent()
+            return result
         }
     }
 
@@ -683,17 +793,20 @@ extension ComputerUseToolDispatcher {
         // Worker threads do not inherit the caller's client scope: run each lane inside it, so its lane and
         // page memory are this agent's own.
         let scope = ClientScope.current
+        let context = BrowserRequestContext.current
         let bridges = (0..<laneCount).map(BrowserBridge.lane)
         DispatchQueue.concurrentPerform(iterations: laneCount) { lane in
-            ClientScope.withScope(scope) {
-                BrowserCallBudget.withDeadline(deadline) {
-                    let bridge = bridges[lane]
-                    var index = lane
-                    while index < urls.count {
-                        results.set(index, BrowserCallBudget.remaining() > 4
-                            ? peek(urls[index], bridge: bridge, deadline: deadline - 3)
-                            : "not read: the other pages took too long; peek this one again")
-                        index += laneCount
+            BrowserRequestContext.withContext(context) {
+                ClientScope.withScope(scope) {
+                    BrowserCallBudget.withDeadline(deadline) {
+                        let bridge = bridges[lane]
+                        var index = lane
+                        while index < urls.count {
+                            results.set(index, BrowserCallBudget.remaining() > 4
+                                ? peek(urls[index], bridge: bridge, deadline: deadline - 3)
+                                : "not read: the other pages took too long; peek this one again")
+                            index += laneCount
+                        }
                     }
                 }
             }
