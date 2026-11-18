@@ -1233,8 +1233,10 @@ public final class ComputerUseService {
             guard let size = screenshotPixelSize(snapshot: snapshot) else {
                 throw ComputerUseError.stateUnavailable("Background drag requires a delivered screenshot of the target window.")
             }
-            guard [fromX, toX].allSatisfy({ $0 >= 0 && $0 < size.width }),
-                  [fromY, toY].allSatisfy({ $0 >= 0 && $0 < size.height }) else {
+            let width = Double(size.width)
+            let height = Double(size.height)
+            guard [fromX, toX].allSatisfy({ $0 >= 0 && $0 < width }),
+                  [fromY, toY].allSatisfy({ $0 >= 0 && $0 < height }) else {
                 throw ComputerUseError.invalidArguments("Background drag requires both points inside the target window screenshot.")
             }
         }
