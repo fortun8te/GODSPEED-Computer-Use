@@ -113,8 +113,8 @@ build_binary() {
   fi
 
   local binary_dir
-  binary_dir="$(swift build "${args[@]}" --show-bin-path)"
-  swift build "${args[@]}" --product OpenComputerUse >&2
+  binary_dir="$(swift build "${args[@]}" --show-bin-path)" || return
+  swift build "${args[@]}" --product OpenComputerUse >&2 || return
   printf '%s/OpenComputerUse\n' "${binary_dir}"
 }
 
@@ -310,13 +310,16 @@ mkdir -p "${macos_dir}" "${resources_dir}"
 
 case "${arch_mode}" in
   native)
-    cp "$(build_binary "" "")" "${macos_dir}/OpenComputerUse"
+    native_binary="$(build_binary "" "")"
+    cp "$native_binary" "${macos_dir}/OpenComputerUse"
     ;;
   arm64)
-    cp "$(build_binary "arm64-apple-macosx14.0" ".build/arm64-${configuration}")" "${macos_dir}/OpenComputerUse"
+    arm_binary="$(build_binary "arm64-apple-macosx14.0" ".build/arm64-${configuration}")"
+    cp "$arm_binary" "${macos_dir}/OpenComputerUse"
     ;;
   x86_64)
-    cp "$(build_binary "x86_64-apple-macosx14.0" ".build/x86_64-${configuration}")" "${macos_dir}/OpenComputerUse"
+    x86_binary="$(build_binary "x86_64-apple-macosx14.0" ".build/x86_64-${configuration}")"
+    cp "$x86_binary" "${macos_dir}/OpenComputerUse"
     ;;
   universal)
     arm_binary="$(build_binary "arm64-apple-macosx14.0" ".build/arm64-${configuration}")"

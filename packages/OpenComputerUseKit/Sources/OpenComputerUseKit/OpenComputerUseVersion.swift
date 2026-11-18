@@ -1,4 +1,12 @@
 import Foundation
 
-/// Bundled builds report the version stamped by the packager.
-public let openComputerUseVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.4"
+public let openComputerUseVersion = "1.1.4"
+
+public func resolvedOpenComputerUseVersion(bundle: Bundle = .main) -> String {
+    if let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+       !version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return version
+    }
+
+    return openComputerUseVersion
+}

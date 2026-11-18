@@ -64,7 +64,7 @@ public final class StdioMCPServer {
                         "protocolVersion": "2025-03-26",
                         "serverInfo": [
                             "name": "godspeed",
-                            "version": openComputerUseVersion,
+                            "version": resolvedOpenComputerUseVersion(),
                         ],
                         "capabilities": [
                             "tools": [

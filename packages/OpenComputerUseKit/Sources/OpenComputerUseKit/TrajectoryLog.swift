@@ -165,7 +165,7 @@ final class TrajectoryLog: @unchecked Sendable {
             "capture_mode": capturesContent ? "content" : "metadata",
             "session_id": sessionID,
             "run_id": runIDValue,
-            "tool": name,
+            "tool": ToolDefinitions.isKnown(name) ? name : "unknown",
             "is_error": isError,
             "vision_click": visionUsed,
             "screenshot_returned": screenshotReturned,
