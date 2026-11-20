@@ -782,9 +782,16 @@ public final class ComputerUseService {
             Thread.sleep(forTimeInterval: interval)
             return
         }
-        WindowSettle.waitUntilStill(cap: interval, axBusy: { WindowSettle.rootShowsBusy(window) }) {
+        // The learned settle budget for this app caps the wait, never above the call site's interval.
+        let pid = window.flatMap { element -> pid_t? in
+            var value: pid_t = 0
+            return AXUIElementGetPid(element, &value) == .success ? value : nil
+        }
+        let cap = pid.map { AppTiming.settleCap(pid: $0, fixed: interval) } ?? interval
+        let waited = WindowSettle.waitUntilStill(cap: cap, axBusy: { WindowSettle.rootShowsBusy(window) }) {
             SkyLightSPI.shared.hardwareCaptureWindow(windowID).flatMap(WindowSettle.fingerprint(of:))
         }
+        if let pid { AppTiming.shared.recordSettle(app: AppTiming.key(pid: pid), ms: waited * 1000) }
     }
 
     /// The result an action returns: the after-action snapshot, or a short status
@@ -1993,7 +2000,7 @@ public final class ComputerUseService {
     private static func focusedElement(pid: pid_t) -> AXUIElement? {
         var focused: CFTypeRef?
         let appElement = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appElement, 0.2)
+        AXUIElementSetMessagingTimeout(appElement, AppTiming.messagingTimeout(pid: pid, fixed: 0.2))
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
               let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
         return (focused as! AXUIElement)
@@ -2008,7 +2015,7 @@ public final class ComputerUseService {
 
     private static func currentInputFocus(pid: pid_t, requireModal: Bool = false) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.2)
+        AXUIElementSetMessagingTimeout(app, AppTiming.messagingTimeout(pid: pid, fixed: 0.2))
         let appFocus = elementAttribute(app, kAXFocusedUIElementAttribute)
         guard let window = elementAttribute(app, kAXFocusedWindowAttribute) else { return requireModal ? nil : appFocus }
 
@@ -2620,7 +2627,7 @@ public final class ComputerUseService {
     private func requireBoundFocusedWindow(in snapshot: AppSnapshot) throws {
         guard let windowID = Self.requiredWindowID else { return }
         let appElement = AXUIElementCreateApplication(snapshot.app.pid)
-        AXUIElementSetMessagingTimeout(appElement, 0.2)
+        AXUIElementSetMessagingTimeout(appElement, AppTiming.messagingTimeout(pid: snapshot.app.pid, fixed: 0.2))
         guard let window = snapshot.windowElement,
               let focused = Self.elementAttribute(appElement, kAXFocusedWindowAttribute),
               CFEqual(focused, window),

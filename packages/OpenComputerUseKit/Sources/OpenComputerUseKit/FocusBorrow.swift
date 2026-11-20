@@ -362,7 +362,7 @@ final class WorkspaceFocusActivator: FocusActivating {
 
     private func hasFocusedWindow(pid: pid_t) -> Bool {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.2)
+        AXUIElementSetMessagingTimeout(app, AppTiming.messagingTimeout(pid: pid, fixed: 0.2))
         var window: CFTypeRef?
         return AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &window) == .success
             && window != nil
