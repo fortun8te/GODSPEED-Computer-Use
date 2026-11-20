@@ -75,6 +75,8 @@ Godspeed uses routes that avoid app activation, temporary key focus, and physica
 
 Focus borrowing is off by default. When explicitly enabled with `OPEN_COMPUTER_USE_FOCUS_BORROW=1`, it can bring an app forward for a dialog or a batch sent with `foreground: true`. Strict background mode and `OPEN_COMPUTER_USE_BACKGROUND_ONLY=1` both disable focus borrowing. Strict mode also refuses routes that temporarily make a background window key.
 
+With borrowing off, the background route is always tried first. A step that fails only because it needs the app in front (a Save, Export or Open menu item or save chord, the save panel's Save As route, typing into a dialog editor, a `foreground: true` batch) returns `BACKGROUND_UNSUPPORTED: This needs focus borrowing: set OPEN_COMPUTER_USE_FOCUS_BORROW=1 or allow it in Settings`.
+
 ### Local action policy
 
 Godspeed reads `~/.godspeed/action-policy.json` for each action, including steps expanded from a batch, handoff, or recipe. Use bundle IDs for apps and full HTTP(S) origins for websites. Scheme and port matter. Each rule accepts `allow`, `ask`, or `deny`. A refusal takes precedence over an allow. With no rules, existing tool behavior applies.

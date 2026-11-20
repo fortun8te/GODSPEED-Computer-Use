@@ -1863,7 +1863,9 @@ public final class ComputerUseService {
                 Thread.sleep(forTimeInterval: 0.05)
             } while ProcessInfo.processInfo.systemUptime < deadline
             guard let editor else {
-                throw ComputerUseError.stateUnavailable("The Go to Folder dialog did not expose a focused text field. Read the dialog before retrying.")
+                throw FocusBorrow.focusRequiredError(
+                    "The Go to Folder dialog did not expose a focused text field. Read the dialog before retrying.",
+                    pid: snapshot.app.pid, unsent: false)
             }
             // Keys go to this editor, so it must belong to the window that was read. (An unnamed sheet is expected here:
             // this path exists to type into the one dialog the batch opened.)
@@ -1886,7 +1888,7 @@ public final class ComputerUseService {
                 pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                 return try actionResult(for: query)
             }
-            throw ComputerUseError.notSent(focusedElementUnreadableMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
+            throw FocusBorrow.focusRequiredError(focusedElementUnreadableMessage, pid: snapshot.app.pid)
         }
         if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
             pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
@@ -1904,9 +1906,9 @@ public final class ComputerUseService {
                 return try withAutoFocusNote(deliverText(app: query, text: text, keyMethod: keyMethod, snapshot: snapshot, autoFocused: true))
             }
             guard try typeOnKeypad(text, snapshot: snapshot, focused: focused) else {
-                throw ComputerUseError.notSent(
-                    "type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element."
-                        + FocusBorrow.retryHint(pid: snapshot.app.pid))
+                throw FocusBorrow.focusRequiredError(
+                    "type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element.",
+                    pid: snapshot.app.pid)
             }
             pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
             let result = try actionResult(for: query)
@@ -1938,7 +1940,7 @@ public final class ComputerUseService {
         // Keys that never reached the field leave its text as it was: say so instead of reporting a success.
         // Without read-back nothing settles before this read, so the comparison would be unreliable.
         if actionReadBack, typedTextWasNotApplied(before: before, after: after, text: text, isSecureField: isSecure) {
-            throw ComputerUseError.stateUnavailable(typedTextNotAppliedMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
+            throw FocusBorrow.focusRequiredError(typedTextNotAppliedMessage, pid: snapshot.app.pid, unsent: false)
         }
         return try actionResult(for: query)
     }
