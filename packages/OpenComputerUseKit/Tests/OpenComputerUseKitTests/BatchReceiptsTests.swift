@@ -22,6 +22,16 @@ final class BatchReceiptsTests: XCTestCase {
         XCTAssertFalse(ElementNumbering.isGone(ComputerUseError.message(ElementNumbering.goneMessage(index: "1"))))
     }
 
+    func testBatchStoppedForTimeIsAnErrorWithItsReceiptLines() throws {
+        // A deadline already past: the batch stops before step 1 and says so.
+        let result = try ComputerUseToolDispatcher().runBatch(arguments: [
+            "app": "NoSuchBatchTimeApp", "steps": [["tool": "click", "element_index": "1"]],
+        ], inheritedDeadline: ProcessInfo.processInfo.systemUptime - 1)
+        XCTAssertEqual(result.batchReceipt?.stop, .timeBudget)
+        XCTAssertTrue(result.textContent.contains("The action budget elapsed before step 1"), result.textContent)
+        XCTAssertTrue(result.isError, "a batch that did not complete is an error")
+    }
+
     func testLineAppendsReceiptToFirstLineOnly() {
         XCTAssertEqual(BatchEffects.line("2. click \"Save\": ok", receipt: .noEffectSeen), "2. click \"Save\": ok - no effect seen")
         XCTAssertEqual(BatchEffects.line("2. query: ok\nrow", receipt: .notSent), "2. query: ok - not sent\nrow")

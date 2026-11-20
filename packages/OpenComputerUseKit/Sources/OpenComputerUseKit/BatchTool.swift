@@ -1449,6 +1449,8 @@ extension ComputerUseToolDispatcher {
             content.append(contentsOf: shown.content)
         }
         content.append(contentsOf: browserImages)
-        return ToolCallResult(content: content, isError: failed && !recoveredBrowserOutcome, batchReceipt: receipt, deliveryState: receipt.deliveryState)
+        // A batch stopped for time or window change did not complete: an error, with the same receipt lines.
+        let incomplete = receipt.stop == .timeBudget || receipt.stop == .windowChanged
+        return ToolCallResult(content: content, isError: (failed || incomplete) && !recoveredBrowserOutcome, batchReceipt: receipt, deliveryState: receipt.deliveryState)
     }
 }
