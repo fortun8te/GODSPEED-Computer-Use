@@ -955,7 +955,12 @@ public final class ComputerUseService {
         // Learning row for this attempt, written on every exit below (see VisionFallback.recordLocate).
         var located: VisionFallback.Candidate?
         var verified = false
-        defer { VisionFallback.recordLocate(query: label, crop: crop, candidate: located, verified: verified, log: LearningLog.shared) }
+        // Password and secure fields keep their row but never their crop image.
+        var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
+        defer {
+            VisionFallback.recordLocate(query: label, crop: crop, candidate: located, verified: verified,
+                                        secure: secure, log: LearningLog.shared)
+        }
         let candidate = VisionFallback.candidate(scan: { accurate in
             guard clock.systemUptime < deadline else { return .missing }
             return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
@@ -968,8 +973,9 @@ public final class ComputerUseService {
         guard let candidate, let point = VisionFallback.windowPoint(candidate.fraction, bounds: bounds),
               clock.systemUptime < deadline, let live = liveWindow(),
               let fresh = SnapshotBuilder.localWindowImage(live), VisionFallback.sameCapture(original, fresh),
-              let hit = try hitTestElement(at: point, in: snapshot)?.element,
-              SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
+              let hit = try hitTestElement(at: point, in: snapshot)?.element else { return nil }
+        if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) { secure = true }
+        guard SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
               let names = visualHitNames(hit, window: live.windowElement),
               VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names),
               clock.systemUptime < deadline, liveWindow() != nil else { return nil }

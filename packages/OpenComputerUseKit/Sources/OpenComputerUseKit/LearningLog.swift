@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Local training-data log. Rows are appended as JSONL, one file per UTC day, and scrubbed before they
@@ -71,9 +72,12 @@ final class LearningLog: @unchecked Sendable {
             withJSONObject: scrubbed, options: [.sortedKeys, .withoutEscapingSlashes]
         ) else { return false }
         let url = directory.appendingPathComponent("learning-\(Self.format(now, "yyyy-MM-dd")).jsonl")
-        guard write(line + Data("\n".utf8), to: url) else { return false }
-        enforceCap(keeping: url.lastPathComponent)
-        return true
+        // Row write and cap eviction share one cross-process lock, so no other process can interleave with either.
+        return locked { () -> Bool in
+            guard write(line + Data("\n".utf8), to: url) else { return false }
+            enforceCap(keeping: url.lastPathComponent)
+            return true
+        }
     }
 
     /// Saves a PNG beside the JSONL. Returns the file name for a locate row, or nil when images are off.
@@ -83,33 +87,55 @@ final class LearningLog: @unchecked Sendable {
         defer { lock.unlock() }
         let now = clock()
         let name = "learning-\(Self.format(now, "yyyy-MM-dd-HHmmss-SSS"))-\(UUID().uuidString.lowercased().prefix(8)).png"
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try png.write(to: directory.appendingPathComponent(name), options: .atomic)
-        } catch {
-            return nil
+        return locked { () -> String? in
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try png.write(to: directory.appendingPathComponent(name), options: .atomic)
+            } catch {
+                return nil
+            }
+            enforceCap(keeping: name)
+            return name
         }
-        enforceCap(keeping: name)
-        return name
     }
 
+    /// Runs `body` while holding an exclusive flock on the folder's lock file. Separate processes (the app agent
+    /// and a stdio MCP process) then never interleave a row write with a cap eviction. If the lock file cannot be
+    /// opened, `body` still runs: O_APPEND keeps each row whole, and a log must never block an action.
+    private func locked<T>(_ body: () -> T) -> T {
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let descriptor = open(directory.appendingPathComponent(".learning.lock").path, O_RDWR | O_CREAT, 0o600)
+        guard descriptor >= 0 else { return body() }
+        defer { close(descriptor) }
+        flock(descriptor, LOCK_EX)
+        defer { flock(descriptor, LOCK_UN) }
+        return body()
+    }
+
+    /// Appends the whole line with one O_APPEND write loop, so the bytes land at the current end of the file.
     private func write(_ data: Data, to url: URL) -> Bool {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            if !FileManager.default.fileExists(atPath: url.path) {
-                FileManager.default.createFile(atPath: url.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-            return true
         } catch {
             return false
+        }
+        let descriptor = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        return data.withUnsafeBytes { buffer -> Bool in
+            guard let base = buffer.baseAddress else { return false }
+            var offset = 0
+            while offset < buffer.count {
+                let written = Darwin.write(descriptor, base + offset, buffer.count - offset)
+                if written <= 0 { return false }
+                offset += written
+            }
+            return true
         }
     }
 
     /// Deletes the oldest learning files until the folder fits the cap. The file just written is kept.
+    /// Callers hold the cross-process lock, so no other writer can add a file while this sums sizes.
     private func enforceCap(keeping name: String) {
         let files = learningFiles()
         var total = files.reduce(UInt64(0)) { $0 + $1.size }
@@ -273,6 +299,19 @@ enum LearningScrubber {
             found.contains { $0.isLetter } && found.contains { $0.isNumber }
         }
         return String(text.prefix(textLimit))
+    }
+
+    /// Words that name a password or secure field in English and Dutch. Matching is loose on purpose: a false
+    /// match only costs one crop image.
+    static let secureImageMarkers = ["password", "passcode", "wachtwoord", "secure"]
+
+    /// True when any of these texts (window text, a label, a subrole) names a secure field. Such views keep their
+    /// rows but never their crop images.
+    static func marksSecureField(_ texts: [String]) -> Bool {
+        texts.contains { text in
+            let lower = text.lowercased()
+            return secureImageMarkers.contains { lower.contains($0) }
+        }
     }
 
     static func isLuhn(_ digits: String) -> Bool {
