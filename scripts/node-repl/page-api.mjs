@@ -8,20 +8,30 @@
 // actions take no CSS selectors and no role filter, so selector strings are refused, and
 // role or text locators are checked by a read before acting (exact by default).
 
+import {
+  browserClickArgs, dragSteps, dwellMs, holdMs, scrollArgs, selectionArgs, verifyArgs, wheelArgs, BROWSER_SCROLL_DIRECTIONS,
+} from "./precise-actions.mjs";
+
 const DEFAULT_WAIT_MS = 10_000;
 const MAX_WAIT_MS = 30_000;
 const NAME_LIMIT = 100; // the browser read clips control names to this many characters
-const BUTTONS = ["left", "right", "middle"];
 // A visible label is never a selector. Strings that look like one are refused, not guessed at.
 const SELECTOR_LIKE = /^(?:[#.[]|\/\/|(?:css|xpath|text|role)=)|\s>\s|:(?:nth|has|not|visible)\b/u;
 
 const PAGE_OPTIONS = ["strictBackground"];
 const LABEL_OPTIONS = ["strictBackground", "exact"];
-const CLICK_OPTIONS = ["strictBackground", "exact", "button", "clickCount", "modifiers"];
-const LOCATOR_CLICK_OPTIONS = ["strictBackground", "button", "clickCount", "modifiers"];
+const CLICK_OPTIONS = ["strictBackground", "exact", "button", "clickCount", "modifiers", "anchor", "offset", "position"];
+const LOCATOR_CLICK_OPTIONS = ["strictBackground", "button", "clickCount", "modifiers", "anchor", "offset", "position"];
+const HOVER_OPTIONS = ["strictBackground", "exact", "dwellMs"];
+const LOCATOR_HOVER_OPTIONS = ["strictBackground", "dwellMs"];
 const WAIT_OPTIONS = ["strictBackground", "timeout"];
 const TYPE_OPTIONS = ["strictBackground", "replace"];
 const LOCATOR_OPTIONS = ["strictBackground"];
+const DRAG_TO_OPTIONS = ["strictBackground", "steps", "holdMs", "verify"];
+const SELECT_TEXT_OPTIONS = ["strictBackground"];
+const SCROLL_OPTIONS = ["strictBackground", "direction", "unit", "amount", "maxSteps", "untilVisible"];
+const KEY_OPTIONS = ["strictBackground", "holdMs"];
+const ZOOM_DIRECTIONS = { in: "zoom_in", out: "zoom_out" };
 
 const locatorDescriptions = new WeakMap();
 
@@ -76,20 +86,6 @@ function waitSeconds(options) {
   }
   if (ms > MAX_WAIT_MS) throw invalid(`timeout must be at most ${MAX_WAIT_MS} ms; the browser waits at most 30 s`);
   return Math.max(1, Math.ceil(ms / 1000));
-}
-
-function clickArgs(options) {
-  const args = {};
-  if (options.button !== undefined) {
-    if (!BUTTONS.includes(options.button)) throw invalid(`button must be ${BUTTONS.join(", ")}`);
-    args.mouse_button = options.button;
-  }
-  if (options.clickCount !== undefined) args.click_count = options.clickCount;
-  if (options.modifiers !== undefined) {
-    if (!Array.isArray(options.modifiers)) throw invalid("modifiers must be an array of key names");
-    args.modifiers = options.modifiers;
-  }
-  return args;
 }
 
 function field(text, name) {
@@ -180,8 +176,10 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
     return { kind: "label", name: collapse(name), exact };
   }
 
+  // Arguments are checked before the preflight read, so an invalid action reads nothing and sends nothing.
   async function clickOf(desc, options) {
-    return run("click", { label: await labelFor(desc, options), ...clickArgs(options) }, options);
+    const args = browserClickArgs(options);
+    return run("click", { label: await labelFor(desc, options), ...args }, options);
   }
 
   async function fillOf(desc, value, options) {
@@ -227,6 +225,34 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
         const text = await run("read_text", { label: await labelFor(desc, opts) }, opts);
         return text === "Text: (empty)" ? "" : text;
       },
+      async hover(options) {
+        const opts = checkOptions("locator.hover", options, LOCATOR_HOVER_OPTIONS);
+        const args = opts.dwellMs === undefined ? {} : { dwell_ms: dwellMs(opts.dwellMs) };
+        return run("hover", { label: await labelFor(desc, opts), ...args }, opts);
+      },
+      // Drags this control onto `target`, another locator in the same tab. `verify` is checked after the drop.
+      async dragTo(target, options) {
+        const opts = checkOptions("locator.dragTo", options, DRAG_TO_OPTIONS);
+        const destination = typeof target === "object" && target !== null ? locatorDescriptions.get(target) : undefined;
+        if (!destination) throw invalid("dragTo needs a locator from getByRole, getByLabel or getByText");
+        const args = {};
+        if (opts.steps !== undefined) args.drag_steps = dragSteps(opts.steps);
+        if (opts.holdMs !== undefined) args.hold_ms = holdMs(opts.holdMs);
+        if (opts.verify !== undefined) args.verify = verifyArgs(opts.verify);
+        const from = await labelFor(desc, opts);
+        const to = await labelFor(destination, opts);
+        return run("drag", { label: from, to_label: to, ...args }, opts);
+      },
+      async scrollIntoViewIfNeeded(options) {
+        const opts = checkOptions("locator.scrollIntoViewIfNeeded", options, LOCATOR_OPTIONS);
+        return run("scroll_into_view", { label: await labelFor(desc, opts) }, opts);
+      },
+      // selectText("exact text") or selectText({ start, length }) in UTF-16 units, or { text, prefix, suffix }.
+      async selectText(selection, options) {
+        const opts = checkOptions("locator.selectText", options, SELECT_TEXT_OPTIONS);
+        const args = selectionArgs(selection);
+        return run("select_text", { label: await labelFor(desc, opts), ...args }, opts);
+      },
     });
     locatorDescriptions.set(locator, desc);
     return locator;
@@ -267,10 +293,54 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
       return run("key", { key: nonEmptyString(key, "press key") }, opts);
     },
 
+    // Playwright-style keyboard: keyboard.press(key, { holdMs }) holds the key for up to 1000 ms.
+    keyboard: Object.freeze({
+      async press(key, options) {
+        const opts = checkOptions("keyboard.press", options, KEY_OPTIONS);
+        const args = opts.holdMs === undefined ? {} : { hold_ms: holdMs(opts.holdMs) };
+        return run("key", { key: nonEmptyString(key, "keyboard.press key"), ...args }, opts);
+      },
+    }),
+
+    // Playwright-style mouse: mouse.wheel(dx, dy) scrolls by points, one chunk per axis.
+    mouse: Object.freeze({
+      async wheel(dx, dy, options) {
+        const opts = checkOptions("mouse.wheel", options, PAGE_OPTIONS);
+        const chunks = wheelArgs(dx, dy);
+        let text = "";
+        for (const chunk of chunks) text = await run("scroll", chunk, opts);
+        return text;
+      },
+    }),
+
+    // scroll({ direction, unit, amount, maxSteps, untilVisible }): amount is the size of each chunk in
+    // the chosen unit, and maxSteps caps the chunks (up to 20). untilVisible stops at that exact label.
+    async scroll(options) {
+      const opts = checkOptions("scroll", options, SCROLL_OPTIONS);
+      const args = scrollArgs(opts, BROWSER_SCROLL_DIRECTIONS);
+      return run("scroll", args, opts);
+    },
+
+    // zoom("in") or zoom("out") changes the page scale through the browser's gesture equivalent.
+    async zoom(direction, options) {
+      const opts = checkOptions("zoom", options, PAGE_OPTIONS);
+      if (!Object.hasOwn(ZOOM_DIRECTIONS, direction)) throw invalid("zoom takes \"in\" or \"out\"");
+      return run("gesture", { kind: ZOOM_DIRECTIONS[direction] }, opts);
+    },
+
+    async goBack(options) {
+      return run("back", {}, checkOptions("goBack", options, PAGE_OPTIONS));
+    },
+
+    async goForward(options) {
+      return run("forward", {}, checkOptions("goForward", options, PAGE_OPTIONS));
+    },
+
     async hover(target, options) {
-      const opts = checkOptions("hover", options, LABEL_OPTIONS);
+      const opts = checkOptions("hover", options, HOVER_OPTIONS);
       const desc = describeTarget(target, "hover", opts.exact ?? true);
-      return run("hover", { label: await labelFor(desc, opts) }, opts);
+      const args = opts.dwellMs === undefined ? {} : { dwell_ms: dwellMs(opts.dwellMs) };
+      return run("hover", { label: await labelFor(desc, opts), ...args }, opts);
     },
 
     async selectOption(target, value, options) {

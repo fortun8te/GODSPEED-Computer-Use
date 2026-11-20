@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: '24'
       - name: Verify the JavaScript API
-        run: node --test scripts/node-repl/open-computer-use-repl.test.mjs
+        run: node --test scripts/node-repl/open-computer-use-repl.test.mjs scripts/node-repl/page-api.test.mjs scripts/node-repl/page-precise.test.mjs scripts/node-repl/native-precise.test.mjs scripts/node-repl/precise-actions.test.mjs
       - name: Verify matched benchmark scoring
         run: python3 scripts/tests/test_godspeed_benchmark_compare.py
       - name: Reject stale packages after a failed build

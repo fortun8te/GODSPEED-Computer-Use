@@ -375,6 +375,10 @@ Targets are visible labels. CSS selectors and `locator(selector)` return `UNSUPP
 
 Errors carry `error.code`. Driver codes pass through unchanged, including `STALE_REF`, `APPROVAL_REQUIRED` and `BACKGROUND_UNSUPPORTED`. Local codes are `UNSUPPORTED`, `INVALID_ARGUMENT`, `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `TIMEOUT`, `PARSE_FAILED` and `TOOL_ERROR`. Browser actions target tabs, so `windowId` is `UNSUPPORTED`.
 
+Precise additions: `click({anchor, offset, modifiers, clickCount, button})` (Playwright `Meta`, `Shift`, `Alt`, `Control` map to `cmd`, `shift`, `alt`, `ctrl`), `hover({dwellMs})` up to 2000 ms, `dragTo(target, {steps, holdMs, verify})`, `scrollIntoViewIfNeeded()`, `selectText({start, length} | text)`, `mouse.wheel(dx, dy)` as point-unit chunks, `scroll({direction, unit, amount, maxSteps, untilVisible})`, `keyboard.press(key, {holdMs})`, `zoom("in" | "out")`, `goBack()` and `goForward()`. Browser clicks have no coordinates, so `click({position})` is `UNSUPPORTED`.
+
+The same precision applies to `cua.app(name)` (no state read): `scroll({direction, unit, amount, maxSteps, untilVisible, target})`, `click(target, {anchor, offset, modifiers, clickCount, button})`, `drag(from, to, {steps, holdMs, verify})` where each end is `[x, y]`, a label or an element number, `hover(target, {dwellMs})`, `selectText(target, {start, length} | text)`, `waitFor(label, {condition, timeout, fromValue})` (timeout in seconds, 1 to 30), `pressKey(key, {holdMs})` and `gesture(name, {target | menuPath})`. Limits match the driver; anything outside them throws `INVALID_ARGUMENT` before a call is sent. Shared mapping lives in `scripts/node-repl/precise-actions.mjs`.
+
 ## Precise clicks
 
 Use `anchor` with `center`, `left`, `right`, `top` or `bottom` on a control. Optional `offset_x` and `offset_y` move right and down from that point. The target point must still hit the control. Mac offsets are window points. Chrome offsets are CSS pixels. Chrome needs the control in the main frame for precise clicks.
