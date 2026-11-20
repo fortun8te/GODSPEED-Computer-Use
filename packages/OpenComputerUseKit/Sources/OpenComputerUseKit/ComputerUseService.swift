@@ -733,6 +733,9 @@ public final class ComputerUseService {
     @TaskLocal static var defersVerifiedSetValueObservation = false
 
     private var snapshotsByApp: [String: AppSnapshot] = [:]
+    /// Counts stored reads; the label-miss cache treats each count as one snapshot generation.
+    private var snapshotStoreCount = 0
+    private let negativeLookups = NegativeLookupCache()
     private var invalidatedSnapshotAliases: Set<String> = []
     // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
     // for the duration of each request.
@@ -2848,11 +2851,21 @@ public final class ComputerUseService {
         let fresh: AppSnapshot
         if Self.requiredWindowID != nil {
             fresh = try currentSnapshot(for: query, needScreenshot: false)
+            if let hit = try find(in: fresh) { return hit }
         } else {
-            if let hit = try? find(in: try currentSnapshot(for: query, needScreenshot: false)) { return hit }
-            fresh = try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false))
+            // The expensive fresh read is skipped when this same label already missed on the current snapshot
+            // generation (the generation changes on every stored read, so a new read always searches again).
+            let labelKey = given.joined(separator: "\n")
+            let outcome = try negativeLookups.searchTwoStep(
+                keyFor: { NegativeLookupCache.Key(app: query.lowercased(), windowID: Int($0.targetWindowID ?? 0), label: labelKey, role: "") },
+                cached: try? currentSnapshot(for: query, needScreenshot: false),
+                generation: { self.snapshotStoreCount },
+                now: { TimingLog.now() },
+                find: { try find(in: $0) },
+                readFresh: { try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false)) })
+            if let hit = outcome.hit { return hit }
+            fresh = outcome.state
         }
-        if let hit = try find(in: fresh) { return hit }
         // A text field or document named by what it contains ("The quick blue fox."): the one field holding it.
         if let w = given.first, w.count >= 4 {
             let holders = fresh.elements.values.filter { r in
@@ -2933,6 +2946,8 @@ public final class ComputerUseService {
             (app.bundleIdentifier ?? "").lowercased(),
         ].filter { !$0.isEmpty })
 
+        // Every stored read is a new generation for NegativeLookupCache, so misses from an older tree are not reused.
+        snapshotStoreCount += 1
         for key in keys {
             snapshotsByApp[key] = snapshot
             invalidatedSnapshotAliases.remove(key)

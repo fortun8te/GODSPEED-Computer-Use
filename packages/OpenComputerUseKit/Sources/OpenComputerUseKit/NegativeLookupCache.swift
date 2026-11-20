@@ -74,6 +74,28 @@ final class NegativeLookupCache {
         entries.removeAll()
     }
 
+    /// A label search in two steps, as `resolveLabel` runs it: `find` on the cached state first, then, unless this
+    /// same search already missed on the current generation, one `readFresh` and `find` again. A miss is recorded
+    /// only after a fresh read, so a repeat within the TTL does not extend the trust. Returns the state the last
+    /// search ran on, its hit, and whether a fresh read ran.
+    func searchTwoStep<State, Hit>(
+        keyFor: (State) -> Key,
+        cached: State?,
+        generation: () -> Int,
+        now: () -> TimeInterval,
+        find: (State) throws -> Hit?,
+        readFresh: () throws -> State
+    ) rethrows -> (state: State, hit: Hit?, freshRead: Bool) {
+        if let cached {
+            if let hit = try find(cached) { return (cached, hit, false) }
+            if isKnownMiss(key: keyFor(cached), generation: generation(), now: now()) { return (cached, nil, false) }
+        }
+        let fresh = try readFresh()
+        let hit = try find(fresh)
+        if hit == nil { recordMiss(key: keyFor(fresh), generation: generation(), now: now()) }
+        return (fresh, hit, true)
+    }
+
     /// Drops the oldest entry when the cache grows past its capacity.
     /// Caller must hold the lock.
     private func evictIfNeeded() {
