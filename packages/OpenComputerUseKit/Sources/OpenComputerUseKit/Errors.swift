@@ -16,6 +16,8 @@ public enum ComputerUseError: Error, LocalizedError {
     case elementGone(String)
     case timedOut(String, delivery: DeliveryState)
     case acknowledged(String)
+    case staleRef
+    case windowChanged(UInt32)
 
     public var errorDescription: String? {
         switch self {
@@ -34,6 +36,10 @@ public enum ComputerUseError: Error, LocalizedError {
             return message
         case .targetNotFound(let message), .ambiguousTarget(let message):
             return "invalidArguments(\"\(message)\")"
+        case .staleRef:
+            return "STALE_REF. Nothing was sent. Run get_app_state with include_refs=true."
+        case .windowChanged(let id):
+            return "WINDOW_CHANGED. Observed window \(id) changed or is unavailable. Nothing was sent. Read the intended window again."
         }
     }
 
@@ -43,7 +49,8 @@ public enum ComputerUseError: Error, LocalizedError {
     public var deliveryState: DeliveryState {
         switch self {
         case .unsupportedTool, .invalidArguments, .appNotFound, .permissionDenied, .notSent,
-             .targetNotFound, .ambiguousTarget, .staleTarget, .elementGone:
+             .targetNotFound, .ambiguousTarget, .staleTarget, .elementGone,
+             .staleRef, .windowChanged:  // L1: refused before any input was sent
             return .notSent
         case .timedOut(_, let delivery):
             return delivery

@@ -49,6 +49,7 @@ The runtime exposes an asynchronous app-bound API:
 - \`await app.getAXStateAndScreenshot(options?)\`
 - Optional observation on macOS, Windows and Linux: \`app.getScreenshot({ includeAX: false })\` skips AX/focus/selection and invalidates prior element indexes; refresh AX before element actions. \`app.getAXState({ includeScreenshot: false })\` skips capture; screenshot-coordinate actions require a fresh screenshot. getAXState is text-only by default. Use getAXStateAndScreenshot for both.
 - \`await app.click(elementIndexOrPoint, { mouseButton?, clickCount?, clickMethod? })\`
+- On macOS, \`app.getAXState({ includeRefs: true })\` returns exact native refs. Pass \`{ ref }\` as the element target. A stale ref requires a fresh read.
 - \`await app.scroll(elementIndex, direction, pages?)\`
 - \`await app.drag([fromX, fromY], [toX, toY])\`
 - \`await app.typeText(text, { keyMethod? })\`
@@ -284,7 +285,7 @@ export function parseListApps(text) {
 }
 
 function optionsToSnapshotArgs(options = {}) {
-  const args = {};
+  const args = optionsToWindowArgs(options);
   if (options.textLimit !== undefined) args.text_limit = options.textLimit;
   if (options.maxTreeNodes !== undefined) args.max_tree_nodes = options.maxTreeNodes;
   if (options.maxTreeDepth !== undefined) args.max_tree_depth = options.maxTreeDepth;
@@ -295,7 +296,10 @@ function optionsToSnapshotArgs(options = {}) {
     args.window_placement = options.windowPlacement;
   }
   if (options.settleMs !== undefined) args.settle_ms = options.settleMs;
-  for (const [option, argument] of [["includeAX", "include_ax"], ["includeScreenshot", "include_screenshot"], ["compact", "compact"]]) {
+  for (const [option, argument] of [
+    ["includeAX", "include_ax"], ["includeScreenshot", "include_screenshot"],
+    ["includeRefs", "include_refs"], ["compact", "compact"],
+  ]) {
     if (options[option] !== undefined) {
       if (typeof options[option] !== "boolean") throw new Error(`${option} must be a boolean`);
       args[argument] = options[option];
@@ -304,6 +308,7 @@ function optionsToSnapshotArgs(options = {}) {
   if (args.include_ax === false && args.include_screenshot === false) {
     throw new Error("At least one of includeAX or includeScreenshot must be true");
   }
+  if (args.include_refs && args.include_ax === false) throw new Error("includeRefs requires includeAX");
   return args;
 }
 
@@ -313,6 +318,14 @@ function optionsToWindowArgs({ windowId } = {}) {
     throw new Error("windowId must be a positive integer up to 4294967295");
   }
   return { window_id: windowId };
+}
+
+function elementTargetArgs(target) {
+  if (!isPlainObject(target) || !Object.hasOwn(target, "ref")) return { element_index: target };
+  if (typeof target.ref !== "string" || !target.ref.length || Object.keys(target).length !== 1) {
+    throw new Error("Use { ref } as the only element target.");
+  }
+  return { ref: target.ref };
 }
 
 function optionsToClickArgs(options = {}) {
@@ -333,7 +346,12 @@ export function createCuaApi(native, activeOutput) {
   let docsEmitted = false;
   async function call(tool, args = {}) {
     const result = await native.request("tools/call", { name: tool, arguments: args });
-    if (result?.isError) throw new Error(toolResultText(result) || `${tool} failed`);
+    if (result?.isError) {
+      const error = new Error(toolResultText(result) || `${tool} failed`);
+      const code = result._meta?.["godspeed/error_code"];
+      if (typeof code === "string") error.code = code;
+      throw error;
+    }
     return result;
   }
   async function emitText(text, options = {}) {
@@ -415,11 +433,11 @@ export function createCuaApi(native, activeOutput) {
         return images[0] ? { state, screenshot: Buffer.from(images[0].data, "base64") } : { state };
       },
       async click(target, options = {}) {
-        const targetArgs = Array.isArray(target) ? { x: target[0], y: target[1] } : { element_index: target };
+        const targetArgs = Array.isArray(target) ? { x: target[0], y: target[1] } : elementTargetArgs(target);
         await call("click", { app, ...targetArgs, ...optionsToClickArgs(options) });
       },
       async hover(target, options = {}) {
-        await call("hover", { app, element_index: target, ...optionsToWindowArgs(options) });
+        await call("hover", { app, ...elementTargetArgs(target), ...optionsToWindowArgs(options) });
       },
       async drag(from, to, options = {}) {
         await call("drag", {
@@ -435,12 +453,15 @@ export function createCuaApi(native, activeOutput) {
       },
       async scroll(target, direction, pages = 1) {
         if (Array.isArray(target)) throw new Error("coordinate scroll is not supported by this Open Computer Use runtime");
-        await call("scroll", { app, element_index: target, direction, pages });
+        await call("scroll", { app, ...elementTargetArgs(target), direction, pages });
       },
-      async setValue(elementIndex, value) { await call("set_value", { app, element_index: elementIndex, value }); },
-      async selectText(elementIndex, text, options = {}) {
-        const index = typeof elementIndex === "string" && /^(0|[1-9]\d*)$/u.test(elementIndex) ? Number(elementIndex) : elementIndex;
-        if (!Number.isSafeInteger(index) || index < 0) throw new Error("selectText requires a non-negative integer element index");
+      async setValue(target, value) { await call("set_value", { app, ...elementTargetArgs(target), value }); },
+      async selectText(target, text, options = {}) {
+        const targetArgs = elementTargetArgs(target);
+        if (!targetArgs.ref) {
+          const index = typeof target === "string" && /^(0|[1-9]\d*)$/u.test(target) ? Number(target) : target;
+          if (!Number.isSafeInteger(index) || index < 0) throw new Error("selectText requires a non-negative integer element index");
+        }
         if (typeof text !== "string" || !text.length) throw new Error("selectText requires non-empty text");
         if (!isPlainObject(options)) throw new Error("selectText expects an options object");
         for (const key of Object.keys(options)) {
@@ -452,11 +473,11 @@ export function createCuaApi(native, activeOutput) {
         if (options.selection !== undefined && !["text", "cursor_before", "cursor_after"].includes(options.selection)) {
           throw new Error("selection must be text, cursor_before or cursor_after");
         }
-        await call("select_text", { app, element_index: elementIndex, text,
+        await call("select_text", { app, ...targetArgs, text,
           prefix: options.prefix, suffix: options.suffix, selection: options.selection });
       },
       async typeText(text, options = {}) { await call("type_text", { app, text, ...optionsToKeyArgs(options) }); },
-      async performSecondaryAction(elementIndex, action) { await call("perform_secondary_action", { app, element_index: elementIndex, action }); },
+      async performSecondaryAction(target, action) { await call("perform_secondary_action", { app, ...elementTargetArgs(target), action }); },
     });
   }
   const api = {
