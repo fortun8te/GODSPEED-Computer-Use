@@ -481,6 +481,13 @@ final class TrajectoryLog: @unchecked Sendable {
         case appNotFound = "app_not_found"
         case permissionDenied = "permission_denied"
         case stateUnavailable = "state_unavailable"
+        case backgroundUnsupported = "BACKGROUND_UNSUPPORTED"
+        case approvalRequired = "APPROVAL_REQUIRED"
+        case actionDenied = "ACTION_DENIED"
+
+        var isActionRefusal: Bool {
+            self == .backgroundUnsupported || self == .approvalRequired || self == .actionDenied
+        }
         case staleState = "stale_state"
         case staleRef = "STALE_REF"
         case windowChanged = "WINDOW_CHANGED"
@@ -506,6 +513,9 @@ final class TrajectoryLog: @unchecked Sendable {
         case .message, .notSent, .acknowledged: return .toolError
         case .staleRef: return .staleRef
         case .windowChanged: return .windowChanged
+        case .backgroundUnsupported: return .backgroundUnsupported
+        case .approvalRequired: return .approvalRequired
+        case .actionDenied: return .actionDenied
         }
     }
 
@@ -555,8 +565,9 @@ final class TrajectoryLog: @unchecked Sendable {
         var doneCheck: DoneCheck = .notRequested
 
         var deliveryState: DeliveryState {
-            if steps.contains(where: { $0.deliveryState == .outcomeUnknown }) { return .outcomeUnknown }
+            // A strong done_when check on fresh evidence reconciles an unacknowledged step (see BatchTool).
             if doneCheck == .verified, stop == nil { return .verified }
+            if steps.contains(where: { $0.deliveryState == .outcomeUnknown }) { return .outcomeUnknown }
             return steps.contains { [.acknowledged, .verified].contains($0.deliveryState) } ? .acknowledged : .notSent
         }
 

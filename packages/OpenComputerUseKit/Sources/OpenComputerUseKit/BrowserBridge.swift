@@ -449,6 +449,9 @@ final class BrowserBridge: @unchecked Sendable {
 
     private func startIfNeeded() throws {
         if let process, process.isRunning { return }
+        if StrictBackground.enabled() {
+            throw ComputerUseError.backgroundUnsupported("The browser helper is not connected.")
+        }
         guard let path = Self.executablePath(environment: launchEnvironment) else {
             throw ComputerUseError.message(Self.notInstalledMessage)
         }
@@ -679,12 +682,17 @@ extension ComputerUseToolDispatcher {
     }
 
     private func runBrowserAction(arguments: [String: Any]) throws -> ToolCallResult {
+        var arguments = arguments
+        let action = Self.canonicalBrowserAction(((arguments["action"] as? String) ?? "").trimmingCharacters(in: .whitespaces).lowercased())
+        let policy = try currentActionPolicy()
+        try authorizeBrowserRequest(policy, action: action, arguments: arguments)
         guard BrowserBridge.isAvailable else {
+            if StrictBackground.enabled() {
+                throw ComputerUseError.backgroundUnsupported("The browser helper is unavailable.")
+            }
             throw ComputerUseError.notSent(BrowserBridge.notInstalledMessage)
         }
         let bridge = BrowserBridge.shared
-        var arguments = arguments
-        let action = Self.canonicalBrowserAction(((arguments["action"] as? String) ?? "").trimmingCharacters(in: .whitespaces).lowercased())
         if let direction = Self.browserScrollDirection[((arguments["action"] as? String) ?? "").lowercased()], arguments["direction"] == nil {
             arguments["direction"] = direction
         }
@@ -700,7 +708,14 @@ extension ComputerUseToolDispatcher {
         let implicit = explicit == nil && !tabless.contains(action) ? try bridge.resolveImplicitTab() : nil
         if let id = explicit ?? implicit?.id { tab["tab_id"] = id }
         return try BrowserBridge.$implicitTabGeneration.withValue(implicit?.generation) {
-            return try browserAction(action, arguments: arguments, bridge: bridge, tab: tab)
+            let result = try browserAction(action, arguments: arguments, bridge: bridge, tab: tab, policy: policy)
+            // A page can navigate while a read, wait or action is in flight.
+            if !result.isError, tab["tab_id"] != nil, action != "close_tab",
+               !Self.browserOpenActions.contains(action), !Self.browserPreviewActions.contains(action),
+               !Self.browserListActions.contains(action) {
+                try Self.authorizeBrowserPage(policy, page: BrowserPage(bridge: bridge, tab: tab), afterDelivery: true)
+            }
+            return result
         }
     }
 
@@ -733,9 +748,31 @@ extension ComputerUseToolDispatcher {
     }
 
     private func browserAction(
-        _ action: String, arguments: [String: Any], bridge: BrowserBridge, tab: [String: Any]
+        _ action: String, arguments: [String: Any], bridge: BrowserBridge, tab: [String: Any], policy: ActionPolicy
     ) throws -> ToolCallResult {
         let page = BrowserPage(bridge: bridge, tab: tab)
+        if policy.checksOrigins {
+            let tabless = Self.browserOpenActions.union(Self.browserPreviewActions).union(Self.browserListActions)
+            if Self.browserClaimActions.contains(action) || action == "close_tab" {
+                guard let id = Self.browserTabID(arguments["tab_id"]) else {
+                    throw ComputerUseError.invalidArguments("A tab ID is required by the browser action policy.")
+                }
+                let list = try bridge.callTool(action == "close_tab" ? "tabs" : "user_tabs", arguments: [:], timeout: 5)
+                let own = action != "close_tab" ? try bridge.callTool("tabs", arguments: [:], timeout: 5) : list
+                guard let url = BrowserReply.tabURL(in: own.text, id: id) ?? BrowserReply.tabURL(in: list.text, id: id) else {
+                    throw ComputerUseError.actionDenied("The browser could not confirm the tab's origin.")
+                }
+                try Self.authorizeBrowserAddresses(policy, addresses: [url])
+            } else if !tabless.contains(action) {
+                try Self.authorizeBrowserPage(policy, page: page)
+            }
+        }
+        func verifyPage(_ page: BrowserPage, afterDelivery: Bool = true) throws {
+            try Self.authorizeBrowserPage(policy, page: page, afterDelivery: afterDelivery)
+        }
+        func includeTab(_ url: String) -> Bool {
+            (try? Self.authorizeBrowserAddresses(policy, addresses: [url])) != nil
+        }
         let label = Self.browserLabel(arguments)
         let index = Self.browserTabID(arguments["index"] ?? arguments["element_index"])
 
@@ -757,6 +794,7 @@ extension ComputerUseToolDispatcher {
                 return .text(operation == .copy ? "Copied selected text to the private clipboard." : "Cut selected text to the private clipboard.")
             case .paste:
                 let node = label != nil || index != nil ? try target() : nil
+                try authorizeBrowserEffect(policy, action: "paste", arguments: arguments, page: page, node: node)
                 if case .files(let paths, let move) = PrivateClipboard.current.payload {
                     guard !move, let node else {
                         throw ComputerUseError.invalidArguments("Paste copied files into a labelled Chrome file input. Cut files can only be moved in Finder.")
@@ -819,7 +857,8 @@ extension ComputerUseToolDispatcher {
             let count = try Self.browserClickCount(arguments["click_count"], button: button)
             let modifiers = try Self.browserPointerModifiers(arguments["modifiers"])
             let node = try target()
-            let click = try clickAndWatch(node, page: page, bridge: bridge, button: button, count: count, modifiers: modifiers)
+            try authorizeBrowserEffect(policy, action: action, arguments: arguments, page: page, node: node)
+            let click = try clickAndWatch(node, page: page, bridge: bridge, button: button, count: count, modifiers: modifiers, policy: policy)
             return ToolCallResult(content: [.text(click.text)], isError: false, browserContinuationTabID: click.tabID)
 
         case "drag":
@@ -849,6 +888,7 @@ extension ComputerUseToolDispatcher {
                 node = found
                 targetName = "\(found.role) \"\(found.name)\""
             }
+            try authorizeBrowserEffect(policy, action: action, arguments: arguments, page: page, node: node)
             let outcome = try page.type(text, replace: replace, into: node, keyEvents: action != "fill_field")
             let verb = replace && text.isEmpty ? "cleared" : "typed into"
             return .text(outcome.reply(verb: verb, target: targetName), deliveryState: outcome.deliveryState)
@@ -860,6 +900,7 @@ extension ComputerUseToolDispatcher {
             if let operation = PrivateClipboard.Action(key: key, browser: true) {
                 return try clipboardAction(operation)
             }
+            try authorizeBrowserEffect(policy, action: action, arguments: arguments, page: page)
             let change = try page.pressKeyAndWatch(key)
             return .text("pressed \(key); \(change.line)")
 
@@ -897,7 +938,7 @@ extension ComputerUseToolDispatcher {
             return .text(try page.scrollPage(direction: direction, amount: amount))
 
         case "back", "forward", "reload":
-            return .text(try page.history(action))
+            return .text(try page.history(action) { try Self.authorizeBrowserAddresses(policy, addresses: [$0]) })
 
         case "wait_for":
             let text = (arguments["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -939,7 +980,7 @@ extension ComputerUseToolDispatcher {
                 }
                 return url
             }
-            let pages = Self.readPreviewPages(urls)
+            let pages = Self.readPreviewPages(urls) { try Self.authorizeBrowserPage(policy, page: $0, afterDelivery: true) }
             let content = Self.renderPreviewPages(urls, pages: pages)
             return ToolCallResult(content: [.text(content)], isError: false,
                                   browserPreviewPages: zip(urls, pages).map { url, page in
@@ -983,8 +1024,10 @@ extension ComputerUseToolDispatcher {
                 loaded = BrowserReply.completedTab(in: tabs.text, id: newID, expectedURL: url)
             }
             guard loaded || fresh.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
+                try verifyPage(fresh)
                 throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but the requested page did not become ready. Inspect that tab before retrying.")
             }
+            try verifyPage(fresh)
             bridge.currentTab = newID
             if Self.defersBrowserNavigationObservation { return .text("opened tab \(newID)") }
             fresh.settle()
@@ -1005,8 +1048,10 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.message("browser: could not load \(url): \(reason). Check the address, or browser tabs if this tab is gone")
             }
             guard page.waitLoad(changedFrom: before?.href, expect: url, timeout: 20) else {
+                try verifyPage(page)
                 throw ComputerUseError.stateUnavailable("browser: navigation was sent, but the requested page did not become ready. Read the tab before retrying.")
             }
+            try verifyPage(page)
             page.settle()
             page.prime()
             if Self.defersBrowserNavigationObservation { return .text("navigation ready") }
@@ -1024,10 +1069,10 @@ extension ComputerUseToolDispatcher {
         case "tabs", "list":
             let mine = try bridge.callTool("tabs", arguments: [:], timeout: 10)
             var lines = ["Tabs in this session (browser use_tab with tab_id):"]
-            let own = BrowserReply.tabLines(in: mine.text, limit: 30)
+            let own = BrowserReply.tabLines(in: mine.text, limit: 30, include: includeTab)
             lines += own.isEmpty ? [mine.isError ? BatchTool.firstLine(mine.text) : "(none)"] : own
             if let theirs = try? bridge.callTool("user_tabs", arguments: [:], timeout: 10), !theirs.isError {
-                let user = BrowserReply.tabLines(in: theirs.text, limit: 15)
+                let user = BrowserReply.tabLines(in: theirs.text, limit: 15, include: includeTab)
                 if !user.isEmpty {
                     lines.append("Your Chrome tabs (read only; use_tab can take one):")
                     lines += user
@@ -1043,6 +1088,7 @@ extension ComputerUseToolDispatcher {
             let claimed = try call("claim_tab")
             guard !claimed.isError else { return finish([claimed]) }
             BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: id)
+            try verifyPage(page)
             guard let place = try? page.location(), !place.href.isEmpty else {
                 throw ComputerUseError.stateUnavailable("browser: tab \(id) was claimed, but its connection could not be verified. The current tab selection was kept. Inspect the listed tabs before retrying.")
             }
@@ -1105,6 +1151,7 @@ extension ComputerUseToolDispatcher {
             return .text(BatchTool.clipped("\(page.title(BrowserLocation(href: values[0] as? String ?? "", title: values[1] as? String ?? "", readyState: "complete")))\n\(text)", limit: 3_000))
 
         case "upload", "files":
+            try authorizeAction(policy, bundleIDs: [], risks: [.submit])
             let files = (arguments["files"] as? [String]) ?? ((arguments["file"] as? String).map { [$0] } ?? [])
             guard !files.isEmpty else {
                 throw ComputerUseError.invalidArguments("browser upload needs files: [\"/path/to/file\"]. Click the page's upload button in the same batch first.")
@@ -1156,12 +1203,16 @@ extension ComputerUseToolDispatcher {
     /// Clicks an element. A link is followed for a moment, so the reply says where it landed. A click that
     /// opens a new tab makes that tab the working tab, and the reply says so.
     private func clickAndWatch(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge,
-                               button: BrowserPage.PointerButton, count: Int, modifiers: Int) throws -> (text: String, tabID: Int?) {
+                               button: BrowserPage.PointerButton, count: Int, modifiers: Int, policy: ActionPolicy) throws -> (text: String, tabID: Int?) {
         // Open an explicit new-tab destination in the background. If delivery is uncertain,
         // do not fall back to clicking the link and potentially open it twice.
         let link = node.role == "link" ? page.linkTarget(node) : nil
         if button == .left, count == 1, modifiers == 0,
            let link, let url = BrowserRules.newTabLinkURL(href: link.href, target: link.target) {
+            if StrictBackground.enabled() {
+                throw ComputerUseError.backgroundUnsupported("This link needs a new tab.")
+            }
+            try Self.authorizeBrowserAddresses(policy, addresses: [url])
             let opened = try bridge.callTool("open_tab", arguments: ["url": url], timeout: 20)
             guard !opened.isError, let newID = BrowserReply.createdTabID(in: opened.text) else {
                 throw ComputerUseError.stateUnavailable("browser: the background link may have opened. List tabs before repeating the click.")
@@ -1169,8 +1220,10 @@ extension ComputerUseToolDispatcher {
             BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: newID)
             let destination = BrowserPage(bridge: bridge, tab: ["tab_id": newID])
             guard destination.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
+                try Self.authorizeBrowserPage(policy, page: destination, afterDelivery: true)
                 throw ComputerUseError.stateUnavailable("browser: link opened tab \(newID), but the destination did not become ready. Inspect that tab before retrying.")
             }
+            try Self.authorizeBrowserPage(policy, page: destination, afterDelivery: true)
             bridge.currentTab = newID
             return ("opened \"\(node.name)\" in a new background tab (id \(newID)); browser now works in that tab", newID)
         }
@@ -1183,10 +1236,12 @@ extension ComputerUseToolDispatcher {
         let verb = count == 2 ? "double-clicked" : button == .left ? "clicked" : "\(button.rawValue)-clicked"
         var message = "\(verb) \(node.role) \"\(node.name)\""
         if let hrefBefore, let place = page.followNavigation(from: hrefBefore) {
+            try Self.authorizeBrowserPage(policy, page: page, afterDelivery: true)
             message += "; \(BrowserChange.navigated(place.href).line)"
         } else {
             // One event-based wait, so the next step or read sees the result and not the old content.
             let change = page.settle()
+            try Self.authorizeBrowserPage(policy, page: page, afterDelivery: true)
             if change == .none, ["textbox", "searchbox", "combobox", "spinbutton"].contains(node.role) {
                 message += "; focused"
             } else {
@@ -1206,6 +1261,7 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.stateUnavailable("browser: the click ran and multiple tabs appeared (\(ids)). Select the intended tab before continuing.")
             }
             if let fresh = newTabs.first {
+                try Self.authorizeBrowserPage(policy, page: BrowserPage(bridge: bridge, tab: ["tab_id": fresh]), afterDelivery: true)
                 bridge.currentTab = fresh
                 BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: fresh)
                 message += "; it opened a new tab (id \(fresh)), and browser now works in that tab"
@@ -1230,7 +1286,7 @@ extension ComputerUseToolDispatcher {
         }.joined(separator: "\n\n")
     }
 
-    private static func readPreviewPages(_ urls: [String]) -> [BrowserPreviewPage] {
+    private static func readPreviewPages(_ urls: [String], verifyPage: @Sendable (BrowserPage) throws -> Void = { _ in }) -> [BrowserPreviewPage] {
         let results = PeekResults(count: urls.count)
         let laneCount = min(BrowserBridge.maxLanes, urls.count)
         let remaining = min(peekBudget, BrowserCallBudget.activeRemaining ?? peekBudget)
@@ -1252,7 +1308,7 @@ extension ComputerUseToolDispatcher {
                             guard permits.wait(timeout: .now() + wait) == .success else { break }
                             defer { permits.signal() }
                             guard BrowserCallBudget.remaining() > 4 else { break }
-                            let result = peek(urls[index], bridge: bridge, deadline: deadline - 3)
+                            let result = peek(urls[index], bridge: bridge, deadline: deadline - 3, verifyPage: verifyPage)
                             results.set(index, result)
                             if result.cleanupConfirmed != true { break }
                         }
@@ -1264,7 +1320,7 @@ extension ComputerUseToolDispatcher {
     }
 
     private static func peek(
-        _ url: String, bridge: BrowserBridge, deadline: TimeInterval
+        _ url: String, bridge: BrowserBridge, deadline: TimeInterval, verifyPage: @Sendable (BrowserPage) throws -> Void
     ) -> BrowserPreviewPage {
         let outcome: (status: String, text: String)
         do {
@@ -1279,6 +1335,7 @@ extension ComputerUseToolDispatcher {
                 guard page.waitLoad(changedFrom: nil, expect: url, timeout: 10) else {
                     return ("failed", "the page did not finish loading")
                 }
+                try verifyPage(page)
                 return ("read", BatchTool.clipped(try page.read(), limit: 2_500))
             }
         } catch {

@@ -517,16 +517,20 @@ extension ComputerUseToolDispatcher {
         let focus = FocusBorrowSession()
         defer { focus.close() }
         if foreground, !FocusBorrow.isEnabled {
-            lines.append("Focus borrowing is off (OPEN_COMPUTER_USE_FOCUS_BORROW=0), so these steps ran in the background.")
+            lines.append("Focus borrowing is off. Enable OPEN_COMPUTER_USE_FOCUS_BORROW to use foreground batches.")
         }
 
-        // Recipe bookkeeping for this batch (BatchRecipes.Run): values, locators, auto-save.
+        // Preserve a policy refusal if a recipe cannot inspect its saved target.
+        var recipeReadRefusal: ToolCallResult?
         let recipeRun = BatchRecipes.Run(goal: goal, values: arguments["values"], app: defaultApp) { [self] app in
             guard clock.systemUptime < actionDeadline else { return nil }
-            return LeanOutput.stateText(of: callToolAsResult(name: "get_app_state", arguments: [
+            let result = callToolAsResult(name: "get_app_state", arguments: [
                 "app": app, "include_screenshot": NSNumber(value: false),
-            ]))
+            ])
+            if result.failureCode?.isActionRefusal == true { recipeReadRefusal = result }
+            return LeanOutput.stateText(of: result)
         }
+        recipeRun.store = recipeStore
         // A goal with no steps replays the recipe saved for it.
         var rawSteps = arguments["steps"]
         var replayed: BatchRecipes.Recipe?
@@ -672,6 +676,7 @@ extension ComputerUseToolDispatcher {
         func windowID(_ app: String) -> UInt32? {
             (try? AppDiscovery.resolveRunning(app)).flatMap { ElementNumbering.forApp(pid: $0.pid).currentWindowID }
         }
+        var waitReadRefusal: ToolCallResult?
         func readWatch(_ app: String, settleMs: Int, optionalEffect: Bool = true) -> (
             text: String, sig: BatchEffects.WindowSig, result: ToolCallResult
         )? {
@@ -681,6 +686,7 @@ extension ComputerUseToolDispatcher {
             if let pinnedWindow, app == defaultApp { readArguments["window_id"] = pinnedWindow }
             if settleMs > 0 { readArguments["settle_ms"] = settleMs }
             let read = callToolAsResult(name: "get_app_state", arguments: readArguments)
+            if !optionalEffect, read.failureCode?.isActionRefusal == true { waitReadRefusal = read }
             let text = read.isError ? nil : LeanOutput.stateText(of: read)
             if optionalEffect {
                 effectBudget.record(seconds: clock.systemUptime - began, settleMs: settleMs, observed: text != nil)
@@ -760,6 +766,7 @@ extension ComputerUseToolDispatcher {
                     receipt.stop = .stepFailure
                     break
                 }
+                waitReadRefusal = nil
                 let waitStart = clock.systemUptime
                 // Never past the batch's own time budget: three 30 s waits must not run 90 s.
                 let limit = wait.pollSeconds(elapsedInBatch: clock.systemUptime - startedAt, budget: actionDeadline - startedAt)
@@ -779,6 +786,7 @@ extension ComputerUseToolDispatcher {
                             break
                         }
                     }
+                    if waitReadRefusal != nil { break }
                     let remaining = limit - (clock.systemUptime - waitStart)
                     if remaining <= 0 { break }
                     Thread.sleep(forTimeInterval: min(0.2, remaining))
@@ -800,14 +808,16 @@ extension ComputerUseToolDispatcher {
                     continue
                 }
                 let detail = observed ? wait.timeoutReason : "the app state could not be read"
-                let reason = "timed out after \(waited) ms: \(detail)" + (budgetCut ? " (the batch action budget was nearly used up)" : "")
+                let reason = waitReadRefusal?.primaryText
+                    ?? "timed out after \(waited) ms: \(detail)" + (budgetCut ? " (the batch action budget was nearly used up)" : "")
                 lines.append("\(number). \(lastStepText): FAILED: \(reason)")
                 if number < steps.count { lines.append("Steps \(number + 1)-\(steps.count) were not run.") }
                 lastResultText = "failed: \(reason)"
                 stepResults.append((lastStepText, "FAILED: \(reason)"))
                 failed = true
                 failedNumber = number
-                receipt.steps.append(.init(failureCode: .timeout, deliveryState: .notSent))
+                receipt.steps.append(.init(failureCode: waitReadRefusal?.failureCode ?? .timeout,
+                                           observation: waitReadRefusal == nil ? nil : .notSent, deliveryState: .notSent))
                 receipt.stop = .stepFailure
                 break
             }
@@ -848,25 +858,17 @@ extension ComputerUseToolDispatcher {
                 trailingObservation = nil
                 lastStepReturnedBrowserImage = false
                 lastStepText = BatchTool.describe(plannedStep)
-                lastResultText = "failed: the saved target could not be confirmed"
-                lines.append("\(number). \(lastStepText): FAILED: the saved target could not be confirmed. Read the app before continuing.")
+                let refusal = recipeReadRefusal
+                let reason = refusal?.primaryText ?? "the saved target could not be confirmed. Read the app before continuing."
+                lastResultText = "failed: \(reason)"
+                lines.append("\(number). \(lastStepText): FAILED: \(reason)")
                 if number < steps.count { lines.append("Steps \(number + 1)-\(steps.count) were not run.") }
-                receipt.steps.append(.init(failureCode: .stateUnavailable, observation: .notSent, deliveryState: .notSent))
-                receipt.stop = .recipeVerification
+                receipt.steps.append(.init(failureCode: refusal?.failureCode ?? .stateUnavailable,
+                                           observation: .notSent, deliveryState: .notSent))
+                receipt.stop = refusal == nil ? .recipeVerification : .stepFailure
                 failedNumber = number
                 failed = true
                 break
-            }
-
-            // Bring the app forward for the whole batch (foreground: true), or from the first step that opens
-            // a dialog or editor on. The borrow stays until the batch's final read (see FocusBorrowSession).
-            if validatedHandoffRecipe == nil, !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
-               let app = step.arguments["app"] as? String, !app.isEmpty,
-               let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
-               foreground || stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) {
-                if !focus.ensure(pid: pid) {
-                    lines.append("Could not bring \(app) to the front; the steps below ran in the background.")
-                }
             }
 
             if stopIfOutOfTime(before: number) { break }
@@ -894,7 +896,16 @@ extension ComputerUseToolDispatcher {
                 Self.$defersBrowserNavigationObservation.withValue(defersNavigationRead) {
                     Self.$clipsBrowserStepObservation.withValue(step.tool == "browser" && !isLastStep) {
                         ComputerUseService.$awaitsModalTextFocus.withValue(awaitsPathEditor) {
-                            callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false)
+                            callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false) {
+                                // An authorized step may borrow focus. Strict and window-bound steps skip this hook.
+                                guard validatedHandoffRecipe == nil, !hasPinnedSteps, FocusBorrow.isEnabled,
+                                      let app = step.arguments["app"] as? String, !app.isEmpty,
+                                      let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
+                                      foreground || self.stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) else { return }
+                                if !focus.ensure(pid: pid) {
+                                    stepLog.note("Could not bring \(app) to the front. The step ran in the background.")
+                                }
+                            }
                         }
                     }
                 }
@@ -907,7 +918,8 @@ extension ComputerUseToolDispatcher {
                 lastResultText = "failed: \(BatchTool.firstLine(result.textContent))"
                 stepResults.append((BatchTool.describe(step), "FAILED: \(BatchTool.firstLine(result.textContent))"))
                 // Never retried here: a failure that may have reached the app says "outcome unknown".
-                let failureReceipt = BatchEffects.failureReceipt(result.deliveryState)
+                let failureReceipt = result.failureCode?.isActionRefusal == true
+                    ? .notSent : BatchEffects.failureReceipt(result.deliveryState)
                 receipt.steps.append(.init(
                     failureCode: result.failureCode ?? .toolError,
                     observation: failureReceipt, durationMs: durationMs, deliveryState: result.deliveryState
@@ -1088,7 +1100,8 @@ extension ComputerUseToolDispatcher {
             }
         }
         var observation = trailingObservation
-        if !unconfirmedOpen, earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool == "browser" {
+        if receipt.failureCode?.isActionRefusal != true, !unconfirmedOpen, earlyCompletion == nil,
+           observation == nil, lastAttemptedStep?.tool == "browser" {
             if unconfirmedFinalClick, let condition = doneConditions.first {
                 _ = waitForBrowserEvidence(condition)
             }
@@ -1100,8 +1113,9 @@ extension ComputerUseToolDispatcher {
         if unconfirmedOpen {
             lines.append("List browser tabs to check whether the open created a tab before trying again.")
         }
-        // An expired ref without a window pin cannot tell us which window to read.
-        if earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool != "browser",
+        // An expired ref without a window pin cannot tell us which window to read; a policy refusal needs no read.
+        if receipt.failureCode?.isActionRefusal != true, earlyCompletion == nil, observation == nil,
+           lastAttemptedStep?.tool != "browser",
            lastAttemptedStep?.arguments["ref"] == nil || verificationWindow != nil,
            clock.systemUptime < deadline, let lastApp {
             var readArguments: [String: Any] = [
@@ -1170,6 +1184,7 @@ extension ComputerUseToolDispatcher {
         )
         // Done by check: each done_when condition is tested directly. A verified goal needs no model.
         var verifiedDone = false
+        var recoveredBrowserOutcome = false
         // A final click may have landed. Read its postcondition without replaying the click.
         let ambiguousFinalClick = unconfirmedFinalClick && observation?.isError == false
             && observation?.browserObservationURL?.isEmpty == false
@@ -1219,6 +1234,13 @@ extension ComputerUseToolDispatcher {
                 doneResult = checkConditions()
             }
             if case .verified = doneResult { verifiedDone = true }
+            // Reconciled, not retried: Chrome lost the last click's reply, and fresh page evidence (strong, not a
+            // presence-only match from before the batch) shows the requested result.
+            if ambiguousFinalClick, verifiedDone {
+                recoveredBrowserOutcome = true
+                receipt.stop = nil
+                lines.append("Chrome did not acknowledge the last click. The requested result was verified from the page.")
+            }
             switch doneResult {
             case .verified: receipt.doneCheck = .verified
             case .weak: receipt.doneCheck = .weakEvidence
@@ -1226,7 +1248,7 @@ extension ComputerUseToolDispatcher {
             }
             lines.append(DoneCheck.line(for: doneResult))
         }
-        if failed {
+        if failed, !recoveredBrowserOutcome, receipt.failureCode?.isActionRefusal != true {
             lines.append(BatchEffects.advice(for: lastDelivery, stepNumber: failedNumber))
         }
         if let stuckLine, !verifiedDone { lines.append(stuckLine) }
@@ -1257,7 +1279,8 @@ extension ComputerUseToolDispatcher {
             }
         }
 
-        if wantsScreenshot, !unconfirmedOpen, lastAttemptedStep?.tool == "browser", !lastStepReturnedBrowserImage {
+        if receipt.failureCode?.isActionRefusal != true, wantsScreenshot, !unconfirmedOpen,
+           lastAttemptedStep?.tool == "browser", !lastStepReturnedBrowserImage {
             let capture = browserObservation("screenshot")
             let images = capture.content.filter { $0.dictionary["type"] as? String == "image" }
             if images.isEmpty {
@@ -1269,7 +1292,8 @@ extension ComputerUseToolDispatcher {
         }
 
         // Recipes: save a verified clean run, record a replay, heal locators (BatchRecipes.Run).
-        lines += recipeRun.finish(app: defaultApp ?? lastApp ?? "browser", steps: steps, lines: lines, failed: failed, stopped: stoppedForTime,
+        lines += recipeRun.finish(app: defaultApp ?? lastApp ?? "browser", steps: steps, lines: lines, failed: failed,
+                                  stopped: stoppedForTime || receipt.failureCode?.isActionRefusal == true,
                                   remember: remember, verifiedDone: verifiedDone)
 
         // The final read is taken; hand focus back now rather than after the reply is composed.
@@ -1298,6 +1322,6 @@ extension ComputerUseToolDispatcher {
             content.append(contentsOf: shown.content)
         }
         content.append(contentsOf: browserImages)
-        return ToolCallResult(content: content, isError: failed, batchReceipt: receipt, deliveryState: receipt.deliveryState)
+        return ToolCallResult(content: content, isError: failed && !recoveredBrowserOutcome, batchReceipt: receipt, deliveryState: receipt.deliveryState)
     }
 }

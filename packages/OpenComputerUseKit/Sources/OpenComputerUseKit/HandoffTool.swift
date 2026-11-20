@@ -415,6 +415,7 @@ enum HandoffTool {
         let message: String
         var delivery: DeliveryState? = nil
         var observedState: String? = nil
+        var refused = false
     }
 
     struct Outcome {
@@ -591,6 +592,9 @@ enum HandoffTool {
                 }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
+                if result.refused {
+                    return finish(.failed, result.message, initial: initial, latest: state)
+                }
                 let stepDelivery = result.delivery ?? (result.ok ? .acknowledged : .outcomeUnknown)
                 if stepDelivery != .notSent {
                     deliveryState = stepDelivery == .outcomeUnknown ? .outcomeUnknown : .acknowledged
@@ -654,7 +658,7 @@ enum HandoffTool {
 
 extension ComputerUseToolDispatcher {
     /// The `handoff` tool uses a window-bound background call for every mutation.
-    func runHandoff(arguments: [String: Any]) throws -> ToolCallResult {
+    func runHandoff(arguments: [String: Any], readFixtureState: (() -> String?)? = nil) throws -> ToolCallResult {
         let request = try HandoffTool.parse(arguments)
         guard request.app.lowercased() != "browser" else {
             throw ComputerUseError.invalidArguments("Handoff ranks native Mac actions. For websites, use browser read and a batch with an observable done_when.")
@@ -662,9 +666,16 @@ extension ComputerUseToolDispatcher {
         let app = request.app
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + request.timeBudget
+        var refusal: ToolCallResult?
+        func captureRefusal(_ result: ToolCallResult) -> Bool {
+            guard (result.batchReceipt?.failureCode ?? result.failureCode)?.isActionRefusal == true else { return false }
+            refusal = result
+            return true
+        }
 
         let deps = HandoffTool.Dependencies(
             readState: { [self] in
+                if let readFixtureState { return readFixtureState() }
                 let remaining = max(0, deadline - clock.systemUptime)
                 let settleMs = min(LeanDefaults.batchSettleMs, Int(remaining * 1_000))
                 var args: [String: Any] = ["app": app, "include_screenshot": false, "settle_ms": settleMs]
@@ -672,7 +683,7 @@ extension ComputerUseToolDispatcher {
                 let read = BrowserCallBudget.withDeadline(deadline) {
                     callToolAsResult(name: "get_app_state", arguments: args)
                 }
-                guard !read.isError else { return nil }
+                guard !captureRefusal(read), !read.isError else { return nil }
                 guard let state = LeanOutput.stateText(of: read), HandoffTool.observedWindowID(in: state) != nil else { return nil }
                 return BatchTool.stateText(ofText: state)
             },
@@ -686,6 +697,10 @@ extension ComputerUseToolDispatcher {
                 if candidate.kind == .click { args["click_method"] = "accessibility" }
                 let result = BrowserCallBudget.withDeadline(deadline) {
                     callStepAsResult(name: candidate.tool, arguments: args, log: SmartLog(), notesInResult: false)
+                }
+                if captureRefusal(result) {
+                    return HandoffTool.ActResult(ok: false, message: BatchTool.firstLine(result.textContent),
+                                                delivery: .notSent, refused: true)
                 }
                 let state = !result.isError && candidate.kind != .pressReturn ? LeanOutput.stateText(of: result) : nil
                 return HandoffTool.ActResult(
@@ -714,7 +729,7 @@ extension ComputerUseToolDispatcher {
                 for (key, value) in request.values { recipeValues[BatchRecipes.variableName(label: key)] = value }
                 let shape = BatchRecipes.windowShape(title: BatchEffects.windowTitle(in: state))
                 guard BatchRecipes.isEnabled,
-                      let recipe = BatchRecipes.shared.find(app: app, goal: request.goal, values: recipeValues, shape: shape)
+                      let recipe = recipeStore.find(app: app, goal: request.goal, values: recipeValues, shape: shape)
                 else { return nil }
                 let storedSteps = BatchRecipes.substitute(recipe.steps, params: recipe.params, values: recipeValues).steps
                 guard let steps = try? BatchTool.parseSteps(storedSteps, defaultApp: app),
@@ -724,11 +739,13 @@ extension ComputerUseToolDispatcher {
                 if let doneWhen = arguments["done_when"] { batchArguments["done_when"] = doneWhen }
                 guard let result = try? runBatch(arguments: batchArguments, inheritedDeadline: deadline,
                                                  validatedHandoffRecipe: recipe) else { return .uncertain }
+                if captureRefusal(result) { return .uncertain }
                 return HandoffTool.replayResult(result)
             },
             now: { clock.systemUptime }
         )
         let outcome = HandoffTool.run(request, deps, deadline: deadline)
+        if let refusal { return refusal }
         return .text(outcome.reply(), isError: outcome.kind == .failed, deliveryState: outcome.deliveryState)
     }
 }
