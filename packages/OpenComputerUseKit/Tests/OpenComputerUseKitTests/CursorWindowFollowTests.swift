@@ -298,7 +298,8 @@ final class CursorWindowFollowTests: XCTestCase {
             while VisualCursorSupport.queuedAnimations > 0 && Date() < drainDeadline {
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
             }
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            SoftwareCursorOverlay.waitUntilIdleForTesting(timeout: 6)
+            XCTAssertEqual(window.frame.minX, original.minX + 240, accuracy: 1, "The fixture must move the live window")
             let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             let expected = window.convertPoint(toScreen: CGPoint(x: button.frame.midX, y: button.frame.midY))
             XCTAssertEqual(try XCTUnwrap(state.tipPosition).x, expected.x, accuracy: 1)
