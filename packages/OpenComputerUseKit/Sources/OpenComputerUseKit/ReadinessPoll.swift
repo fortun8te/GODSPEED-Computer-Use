@@ -11,7 +11,8 @@ enum ReadinessPoll {
     ) -> Value? {
         let deadline = now() + timeout
         repeat {
-            if let value = read() { return value }
+            guard !RequestCancellation.requested else { return nil }
+            if let value = read(), !RequestCancellation.requested { return value }
             let remaining = deadline - now()
             guard remaining > 0 else { return nil }
             sleep(min(interval, remaining))

@@ -448,7 +448,7 @@ enum HandoffTool {
     }
 
     struct Outcome {
-        enum Kind { case done, stuck, escalate, budget, failed }
+        enum Kind { case done, stuck, escalate, budget, failed, cancelled }
         let kind: Kind
         let reason: String
         let steps: [String]
@@ -471,11 +471,12 @@ enum HandoffTool {
             case .escalate: lines.append("Needs you: \(reason)")
             case .budget: lines.append("Stopped: \(reason)")
             case .failed: lines.append("Failed: \(reason)")
+            case .cancelled: lines.append("Stopped: \(reason)")
             }
             if steps.isEmpty {
                 lines.append("Steps: none")
             } else {
-                let shown = steps.count > 10 ? ["..."] + steps.suffix(10) : steps
+                let shown = steps.count > 10 && kind != .cancelled ? ["..."] + steps.suffix(10) : steps
                 lines.append("Steps (\(steps.count)): " + shown.joined(separator: "; "))
             }
             if let changes, !changes.isEmpty { lines.append("Changes: " + changes) }
@@ -506,13 +507,14 @@ enum HandoffTool {
         var now: () -> TimeInterval
     }
 
-    enum Replay: Equatable { case verified, incomplete, uncertain, blocked(String), alreadySatisfied(String) }
+    enum Replay: Equatable { case verified, incomplete, uncertain, blocked(String), alreadySatisfied(String), cancelled(String, DeliveryState) }
 
     static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
         func hasTime() -> Bool { deps.now() < deadline }
         func readState() -> String? {
-            guard hasTime(), let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
+            guard !RequestCancellation.requested, hasTime(),
+                  let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
             return state
         }
         var steps: [String] = []
@@ -547,10 +549,15 @@ enum HandoffTool {
                            screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet, deliveryState: deliveryState)
         }
 
+        func cancelled() -> Outcome {
+            finish(.cancelled, "request cancelled. Inspect any in-flight action before retrying.", initial: nil, latest: nil)
+        }
+        guard !RequestCancellation.requested else { return cancelled() }
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: nil, latest: nil)
         }
         guard var state = readState() else {
+            if RequestCancellation.requested { return cancelled() }
             let target = request.windowID.map { "\(request.app) window \($0)" } ?? request.app
             return finish(.failed, "could not read \(target)", initial: nil, latest: nil)
         }
@@ -563,9 +570,15 @@ enum HandoffTool {
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: initial, latest: state)
         }
+        if RequestCancellation.requested { return cancelled() }
         var initialControls = parseControls(state)
         var initialExact = exactAction(request: request, controls: initialControls, tried: tried)
         if initialExact == nil, request.windowID == nil, let replayed = deps.replay(state) {
+            if case .cancelled(let receipt, let delivery) = replayed {
+                steps.append(receipt)
+                deliveryState = delivery
+                return cancelled()
+            }
             if case .blocked(let reason) = replayed { return finish(.escalate, reason, initial: initial, latest: state) }
             if case .alreadySatisfied(let evidence) = replayed {
                 return finish(.done, evidence, initial: initial, latest: state)
@@ -597,6 +610,7 @@ enum HandoffTool {
         }
 
         for number in 1...request.maxSteps {
+            if RequestCancellation.requested { return cancelled() }
             if !hasTime() {
                 return finish(.budget, "\(Int(request.timeBudget)) seconds used", initial: initial, latest: state)
             }
@@ -620,6 +634,7 @@ enum HandoffTool {
                 }
                 decision = decide(candidates: options, probabilities: probabilities)
             }
+            if RequestCancellation.requested { return cancelled() }
             switch decision {
             case .escalate(let reason):
                 let ranked = options.map { option in
@@ -639,6 +654,10 @@ enum HandoffTool {
                 let stepDelivery = result.delivery ?? (result.ok ? .acknowledged : .outcomeUnknown)
                 if stepDelivery != .notSent {
                     deliveryState = stepDelivery == .outcomeUnknown ? .outcomeUnknown : .acknowledged
+                }
+                if RequestCancellation.requested {
+                    steps.append("\(choice.text) (\(stepDelivery.rawValue))")
+                    return cancelled()
                 }
                 if choice.kind == .setValue { typedAny = true }
                 if choice.kind == .scroll { scrolls += 1 }
@@ -665,6 +684,7 @@ enum HandoffTool {
                 steps.append(choice.text)
                 let actionState = result.observedState.flatMap { matchesWindow($0, windowID: request.windowID) ? $0 : nil }
                 guard let next = actionState ?? readState() else {
+                    if RequestCancellation.requested { return cancelled() }
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
                 if let met = matched(next) {
@@ -691,6 +711,7 @@ enum HandoffTool {
                 }
             }
         }
+        if RequestCancellation.requested { return cancelled() }
         return finish(.budget, "\(request.maxSteps) steps used", initial: initial, latest: state)
     }
 }
@@ -789,12 +810,13 @@ extension ComputerUseToolDispatcher {
                 guard let result = try? runBatch(arguments: batchArguments, inheritedDeadline: deadline,
                                                  validatedHandoffRecipe: recipe) else { return .uncertain }
                 if captureRefusal(result) { return .uncertain }
+                if result.batchReceipt?.stop == .cancelled { return .cancelled(result.textContent, result.deliveryState) }
                 return HandoffTool.replayResult(result)
             },
             now: { clock.systemUptime }
         )
         let outcome = HandoffTool.run(request, deps, deadline: deadline)
         if let refusal { return refusal }
-        return .text(outcome.reply(), isError: outcome.kind == .failed, deliveryState: outcome.deliveryState)
+        return .text(outcome.reply(), isError: outcome.kind == .failed || outcome.kind == .cancelled, deliveryState: outcome.deliveryState)
     }
 }

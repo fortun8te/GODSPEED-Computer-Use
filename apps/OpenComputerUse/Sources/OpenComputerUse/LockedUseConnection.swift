@@ -33,6 +33,7 @@ final class LockedUseConnection: @unchecked Sendable {
     deinit { if clientSocket >= 0 { Darwin.close(clientSocket) } }
 
     func perform<T>(_ body: () throws -> T) throws -> T {
+        try RequestCancellation.check()
         let session = LockedUseSession.current()
         guard session.state != .unavailable else {
             throw ComputerUseError.stateUnavailable("No completed GUI session for the current console user is available. Sign in normally before using Godspeed.")
@@ -68,7 +69,7 @@ final class LockedUseConnection: @unchecked Sendable {
 
     /// Shared admission is only for an unlocked session without a lease or recovery.
     /// The shared path never attempts recovery or starts a lease.
-    func performParallelBrowserRead<T>(_ body: () throws -> T) throws -> T {
+    func performParallelBrowserOperation<T>(_ body: () throws -> T) throws -> T {
         guard Self.parallelBrowserReadSessionIsClear() else { throw ParallelReadFallback.needsExclusive }
         let entered = mutex.withLock {
             guard lease == nil, !stopped, !clientDisconnected, !inFlight else { return false }
@@ -77,16 +78,16 @@ final class LockedUseConnection: @unchecked Sendable {
         }
         guard entered else { throw ParallelReadFallback.needsExclusive }
         defer { mutex.withLock { inFlight = false } }
-        try validateParallelBrowserRead()
+        try validateParallelBrowserOperation()
         return try body()
     }
 
     /// Recheck at the transport boundary, including on peek workers. A relock after
     /// admission stops the request and never restarts a partially executed call.
-    func validateParallelBrowserRead() throws {
+    func validateParallelBrowserOperation() throws {
         guard Self.parallelBrowserReadSessionIsClear(),
               mutex.withLock({ !stopped && !clientDisconnected && lease == nil && inFlight }) else {
-            throw ComputerUseError.stateUnavailable("The Mac session changed during this browser read. Inspect the tab before retrying.")
+            throw ComputerUseError.stateUnavailable("The Mac session changed during this browser request. Inspect the tab before retrying.")
         }
     }
 
@@ -146,6 +147,7 @@ final class LockedUseConnection: @unchecked Sendable {
             startPolling()
             let deadline = startupDeadline
             while ProcessInfo.processInfo.systemUptime < deadline {
+                try RequestCancellation.check()
                 let status = try connection.request(.init(operation: .status, leaseID: lease, session: .current()))
                 receive(status)
                 if status.result == .active { recoveryDeadline.cancel(); return }

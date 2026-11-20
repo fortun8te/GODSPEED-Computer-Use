@@ -76,7 +76,7 @@ enum OpenComputerUseMain {
             if VisualCursorSupport.isEnabled {
                 _ = NSApplication.shared.setActivationPolicy(.accessory)
             }
-            let output = try runOpenComputerUseCall(invocation)
+            let output = try withOperationJournal { try runOpenComputerUseCall(invocation) }
             print(try output.jsonText())
             if output.hasToolError {
                 exit(EXIT_FAILURE)

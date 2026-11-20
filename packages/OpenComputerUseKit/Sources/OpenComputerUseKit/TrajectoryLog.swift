@@ -500,7 +500,7 @@ final class TrajectoryLog: @unchecked Sendable {
 
     static func failureCode(error: Error) -> FailureCode {
         guard let error = error as? ComputerUseError else {
-            return error is CancellationError ? .cancelled : .internalError
+            return (error is CancellationError || error is RequestCancellation.Cancelled) ? .cancelled : .internalError
         }
         switch error {
         case .unsupportedTool: return .unsupportedTool
@@ -523,6 +523,7 @@ final class TrajectoryLog: @unchecked Sendable {
         enum Stop: String {
             case stepFailure = "step_failure"
             case timeBudget = "time_budget"
+            case cancelled
             case windowChanged = "window_changed"
             case recipeVerification = "recipe_verification"
         }

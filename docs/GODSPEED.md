@@ -272,9 +272,19 @@ For a file input with a visible label or current reference, pass it to `browser 
 
 Use browser `close_tab` with the explicit `tab_id` returned by `open_tab`. Godspeed checks that the current session still owns the tab and that the browser reports it closed.
 
-While the Mac is unlocked, up to four different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. An explicit `wait_for` of 1–3 seconds can also share admission. Each client has its own tab state and can have one read in flight. Native actions, browser writes, mixed batches, and any Locked Use recovery get exclusive access. Exclusive requests run in arrival order. A queued writer normally gets the next turn. When a reader has waited through two exclusive admissions, the oldest eligible reader gets a turn. One client cannot take multiple read slots. Set `OPEN_COMPUTER_USE_PARALLEL_READS` to 1, 2, 3, or 4 in the shared app agent environment to compare reader limits. The default is 3.
+MCP cancellation stops queued work and interrupts waits in a running batch or handoff. A disconnect also stops work for that connection. A cancellation reply lists the steps already attempted and the steps skipped. A step interrupted during delivery may have taken effect. Inspect it before trying again. A macOS call already in progress must return before Godspeed can finish cleanup.
+
+Godspeed records a write step's intent before dispatch and its outcome afterward in `~/.godspeed/journal/operations.jsonl`. Records contain the tool name, timestamps and generated IDs. They omit arguments, replies and screenshots. After a restart, an intent without an outcome is `outcome_unknown`. Starting Godspeed never replays it.
+
+While the Mac is unlocked, up to four different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. An explicit `wait_for` of 1–3 seconds can also share admission. Each client has its own tab state and can have one read in flight. Native actions, mixed batches, and Locked Use recovery get exclusive access. Browser writes also run one at a time by default. Exclusive requests run in arrival order. A queued writer normally gets the next turn. When a reader has waited through two exclusive admissions, the oldest eligible reader gets a turn. One client cannot take multiple read slots. Set `OPEN_COMPUTER_USE_PARALLEL_READS` to 1, 2, 3, or 4 in the shared app agent environment to compare reader limits. The default is 3.
 
 If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.
+
+Only one peek group can load pages at a time. A waiting peek leaves space for other browser reads. The active group uses up to three helpers. The app agent accepts up to 32 connections and queues up to 32 admissions. Each connection can buffer up to 16 requests.
+
+Set `OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES=1` in the app agent's launch environment to allow two or more clients to scroll or fill a named field in different tabs. Each call must name its tab ID. The current helper must have opened that tab. The same tab and the same client still run one write at a time.
+
+Local model calls release desktop admission while they wait for an answer. If another request takes admission in the meantime, Godspeed stops the interrupted workflow and asks for a fresh look. Calls skip the model during a focus borrow or Locked Use lease. The shared app agent uses an already-running model helper.
 
 ## Browser drag
 
@@ -315,4 +325,4 @@ The local `OpenComputerUse locked-use status --json` command reports `not-packag
 
 The fork's page cursor reacts to acknowledged browser movement, press, drag, drop, click, text insertion and scroll. Feedback is sent only to an active matching tab and never delays the input reply. Intermediate moves can be coalesced. Hidden pages suppress the overlay. Near a display or viewport edge, the cursor follows a straight eased path to the action point. The web renderer shares interaction meanings with the Mac cursor.
 
-Use independent browser connections for concurrent reads. Browser writes and native input retain exclusive admission. A shared budget caps active preview loads, and each helper has one rescheduled idle timer. Compare end-to-end fixture timings and slow runs before promoting the candidate.
+Use independent browser connections for concurrent reads. Each helper has one idle timer.

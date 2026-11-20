@@ -181,6 +181,8 @@ enum BackgroundDragDispatcher {
             return (try prepare(.leftMouseDragged, at: point, delta: delta), try prepare(.leftMouseUp, at: point))
         }
         func send(_ event: CGEvent) throws {
+            // The deferred release still runs if cancellation interrupts a press.
+            try RequestCancellation.check()
             try validateSession()
             try io.validateWindow(target)
             // Events were prepared earlier; AppKit must see delivery time, not

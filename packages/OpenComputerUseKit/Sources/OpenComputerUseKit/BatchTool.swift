@@ -666,6 +666,19 @@ extension ComputerUseToolDispatcher {
             return true
         }
 
+        // Preserve existing step rows and report the first step that never ran.
+        func stopIfCancelled() -> Bool {
+            guard RequestCancellation.requested else { return false }
+            if receipt.stop != .cancelled {
+                lines.append("Request cancelled.")
+                let next = receipt.steps.count + 1
+                if next <= steps.count { lines.append("Steps \(next)-\(steps.count) were not run.") }
+                receipt.stop = .cancelled
+                stoppedForTime = true
+            }
+            return true
+        }
+
         // Per-step effects and window continuity (BatchEffects). One extra read of the app per mutating step,
         // switched off for the batch when the app reads slowly or with effects: false.
         // An intermediate snapshot must not replace the observation used by a pinned action.
@@ -755,7 +768,7 @@ extension ComputerUseToolDispatcher {
 
         for (offset, plannedStep) in steps.enumerated() {
             let number = offset + 1
-            if stopIfOutOfTime(before: number) { break }
+            if stopIfCancelled() || stopIfOutOfTime(before: number) { break }
             if plannedStep.tool == BatchTool.waitName {
                 let step = plannedStep
                 lastAttemptedStep = step
@@ -786,7 +799,7 @@ extension ComputerUseToolDispatcher {
                 let fallbackInterval = BatchEffects.WaitReadGate.fallbackInterval
                 let firstFullRead = limit <= fallbackInterval ? waitStart : waitStart + fallbackInterval
                 var readGate = BatchEffects.WaitReadGate(nextFullRead: firstFullRead)
-                while clock.systemUptime - waitStart < limit {
+                while !RequestCancellation.requested, clock.systemUptime - waitStart < limit {
                     let shouldRead = readGate.shouldRead(at: clock.systemUptime) {
                         TimingLog.measure("batch.wait_readiness") {
                             BatchEffects.waitMayBeReady(wait.kind, app: app, windowID: replayed?.window?.id ?? pinnedWindow)
@@ -812,6 +825,12 @@ extension ComputerUseToolDispatcher {
                     let remaining = limit - (clock.systemUptime - waitStart)
                     if remaining <= 0 { break }
                     Thread.sleep(forTimeInterval: min(0.2, remaining))
+                }
+                if RequestCancellation.requested {
+                    receipt.steps.append(.init(failureCode: .cancelled, observation: .notSent, deliveryState: .notSent))
+                    lines.append("\(number). \(lastStepText): cancelled during wait")
+                    _ = stopIfCancelled()
+                    break
                 }
                 let waited = Int((clock.systemUptime - waitStart) * 1000)
                 if met {
@@ -882,7 +901,7 @@ extension ComputerUseToolDispatcher {
                 break
             }
 
-            if stopIfOutOfTime(before: number) { break }
+            if stopIfCancelled() || stopIfOutOfTime(before: number) { break }
             lastAttemptedStep = step
             if step.tool != "browser", let app = step.arguments["app"] as? String, !app.isEmpty {
                 lastApp = app
@@ -926,6 +945,7 @@ extension ComputerUseToolDispatcher {
                                     if !focus.ensure(pid: pid) {
                                         stepLog.note("Could not bring \(app) to the front. The step ran in the background.")
                                     }
+                                }
                             }
                         }
                     }
@@ -933,6 +953,16 @@ extension ComputerUseToolDispatcher {
             }
             let durationMs = ((clock.systemUptime - dispatchStarted) * 1000).rounded()
             lastBrowserContinuationTab = result.browserContinuationTabID
+            if RequestCancellation.requested {
+                let delivery = step.isReadOnly ? .notSent : result.deliveryState
+                let unknown = delivery == .outcomeUnknown
+                receipt.steps.append(.init(failureCode: .cancelled, observation: unknown ? .outcomeUnknown : nil,
+                                           durationMs: durationMs, deliveryState: delivery))
+                lines.append("\(number). \(BatchTool.describe(step)): cancelled during step" +
+                             (unknown ? " (outcome unknown. Inspect before retrying.)" : ""))
+                _ = stopIfCancelled()
+                break
+            }
             let stepNotes = stepLog.notes
             lastStepText = BatchTool.describe(step)
             if result.isError || result.deliveryState == .outcomeUnknown {
@@ -1032,6 +1062,10 @@ extension ComputerUseToolDispatcher {
                 receipt.stop = .recipeVerification
                 break
             }
+        }
+
+        if stopIfCancelled() {
+            return ToolCallResult(content: [.text(lines.joined(separator: "\n"))], isError: true, batchReceipt: receipt, deliveryState: receipt.deliveryState)
         }
 
         // A menu command or shortcut often opens a sheet or dialog that takes a moment to appear; give it
@@ -1357,6 +1391,10 @@ extension ComputerUseToolDispatcher {
                 browserImages.append(.text("Final browser screenshot."))
                 browserImages.append(contentsOf: images)
             }
+        }
+
+        if stopIfCancelled() {
+            return ToolCallResult(content: [.text(lines.joined(separator: "\n"))], isError: true, batchReceipt: receipt, deliveryState: receipt.deliveryState)
         }
 
         // Record the replay or save a completed explicit run.
