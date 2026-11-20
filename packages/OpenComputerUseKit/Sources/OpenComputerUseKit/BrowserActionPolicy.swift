@@ -41,6 +41,30 @@ extension ComputerUseToolDispatcher {
         }
     }
 
+    /// Text for the `tabs` action. The session's own tabs are listed by origin. The user's Chrome tabs are
+    /// read only after the browser app passes the same policy as other browser actions, and each row
+    /// still needs its origin allowed. A refused or unreadable user list is omitted, not guessed.
+    static func tabListingText(policy: ActionPolicy, own: (text: String, isError: Bool),
+                               userTabs: () throws -> (text: String, isError: Bool)) throws -> String {
+        // A helper error is not an empty inventory: report it, and do not go on to read the user's tabs.
+        guard !own.isError else {
+            throw ComputerUseError.stateUnavailable("browser: could not list this session's tabs (\(BatchTool.firstLine(own.text))). Try browser tabs again before acting.")
+        }
+        func allowed(_ url: String) -> Bool { (try? authorizeBrowserAddresses(policy, addresses: [url])) != nil }
+        var lines = ["Tabs in this session (browser use_tab with tab_id):"]
+        let mine = BrowserReply.tabLines(in: own.text, limit: 30, include: allowed)
+        lines += mine.isEmpty ? ["(none)"] : mine
+        if (try? policy.authorize(bundleIDs: [ActionPolicy.browserBundleID])) != nil,
+           let theirs = try? userTabs(), !theirs.isError {
+            let user = BrowserReply.tabLines(in: theirs.text, limit: 15, include: allowed)
+            if !user.isEmpty {
+                lines.append("Your Chrome tabs (read only; use_tab can take one):")
+                lines += user
+            }
+        }
+        return BatchTool.clipped(lines.joined(separator: "\n"), limit: 3_000)
+    }
+
     static func authorizeBrowserPage(_ policy: ActionPolicy, page: BrowserPage, afterDelivery: Bool = false) throws {
         guard policy.checksOrigins else { return }
         do {
@@ -55,17 +79,46 @@ extension ComputerUseToolDispatcher {
         }
     }
 
+    /// Risk words that the shared classifier misses: Dutch labels and a bare "Trash".
+    static func browserEffectRisks(action: String, arguments: [String: Any], target: ActionPolicy.Target?) -> Set<ActionPolicy.Risk> {
+        // A drag lands on its drop target, so classify that target the way a click on it would be classified.
+        let base = action == "drag" ? "click" : action
+        var risks = ActionPolicy.browserRisks(action: base, arguments: arguments, target: target)
+        let words: [(ActionPolicy.Risk, Set<String>)] = [
+            (.delete, ["trash", "verwijderen", "verwijder", "wissen", "prullenbak"]),
+            (.send, ["verzenden", "versturen", "verstuur", "verzend"]),
+            (.purchase, ["betalen", "afrekenen", "bestellen", "kopen"]),
+        ]
+        let names = [target?.title, target?.identifier].compactMap { $0 }.flatMap { name in
+            name.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        }
+        for (risk, vocabulary) in words where names.contains(where: vocabulary.contains) {
+            risks.insert(risk)
+        }
+        return risks
+    }
+
+    /// Actions that can send input. Their origin is re-checked even when they report an error.
+    static func browserActionMayDeliverInput(_ action: String) -> Bool {
+        let readOnly: Set<String> = [
+            "read", "state", "look", "snapshot", "screenshot", "see", "look_at", "read_text", "link_destination",
+            "location", "info", "outline", "frames", "control_state", "value", "wait", "wait_load", "wait_for",
+            "tabs", "list", "peek", "read_many", "open_many", "close_tab",
+        ]
+        return !readOnly.contains(action)
+    }
+
     func authorizeBrowserEffect(_ policy: ActionPolicy, action: String, arguments: [String: Any],
-                                page: BrowserPage, node: BrowserNode? = nil) throws {
+                                page: BrowserPage, node: BrowserNode? = nil, point: CGPoint? = nil) throws {
         guard policy.checksOrigins || policy.checksRisks || StrictBackground.enabled() else { return }
-        let evidence = try page.policyTarget(node: node, keyboard: ["key", "press_key"].contains(action))
+        let evidence = try page.policyTarget(node: node, keyboard: ["key", "press_key"].contains(action), point: point)
         if StrictBackground.enabled(), let destination = evidence.destination, ActionPolicy.origin(destination) == nil {
             throw ComputerUseError.backgroundUnsupported("The control leads outside the background tab.")
         }
         if let destination = evidence.destination {
             try Self.authorizeBrowserAddresses(policy, addresses: [destination])
         }
-        try authorizeAction(policy, bundleIDs: [], risks: ActionPolicy.browserRisks(action: action, arguments: arguments, target: evidence.target))
+        try authorizeAction(policy, bundleIDs: [], risks: Self.browserEffectRisks(action: action, arguments: arguments, target: evidence.target))
     }
 }
 
@@ -89,43 +142,100 @@ extension BrowserPage {
         return (id, addresses)
     }
 
-    func policyTarget(node: BrowserNode?, keyboard: Bool) throws -> (target: ActionPolicy.Target, destination: String?) {
+    /// A frame's focus step: the focused element, or a frame owner whose own document holds the focus.
+    enum FocusStep {
+        case element(objectID: String)
+        case frameOwner(objectID: String)
+    }
+
+    /// Follows focus through nested frames to the focused element. Each frame is its own document, so the
+    /// caller reads its focus there. Gives up with a denial instead of guessing.
+    static func focusedPolicyElement<Context>(start: Context, maxDepth: Int = 8,
+                                              focus: (Context) throws -> FocusStep,
+                                              enter: (String) throws -> Context) throws -> String {
+        var context = start
+        for _ in 0...maxDepth {
+            switch try focus(context) {
+            case .element(let objectID): return objectID
+            case .frameOwner(let objectID): context = try enter(objectID)
+            }
+        }
+        throw ComputerUseError.actionDenied("The browser could not confirm the focused control for the action policy.")
+    }
+
+    func policyTarget(node: BrowserNode?, keyboard: Bool, point: CGPoint? = nil) throws -> (target: ActionPolicy.Target, destination: String?) {
         let frame = try policyFrames()
         let world = try cdp("Page.createIsolatedWorld", ["frameId": frame.id, "worldName": "Godspeed Action Policy"])
         guard let contextID = world["executionContextId"] as? Int else {
             throw ComputerUseError.actionDenied("The browser could not inspect the control for the action policy.")
         }
-        let function = Self.policyTargetFunction
-        let payload: [String: Any]
+        let denied = ComputerUseError.actionDenied("The browser could not confirm the control for the action policy.")
+        let objectID: String
         if let node {
             let resolved = try cdp("DOM.resolveNode", ["backendNodeId": node.backendNodeID, "executionContextId": contextID])
-            guard let object = resolved["object"] as? [String: Any], let objectID = object["objectId"] as? String else {
-                throw ComputerUseError.actionDenied("The browser could not confirm the control for the action policy.")
+            guard let object = resolved["object"] as? [String: Any], let id = object["objectId"] as? String else {
+                throw denied
             }
-            payload = try cdp("Runtime.callFunctionOn", [
-                "objectId": objectID, "functionDeclaration": function,
-                "arguments": [["value": keyboard]], "returnByValue": true,
+            objectID = id
+        } else if let point {
+            // A coordinate drop lands on whatever is under the point. Frames are not classified from here,
+            // so a point inside one fails closed rather than being checked against the wrong document.
+            guard point.x.isFinite, point.y.isFinite else {
+                throw ComputerUseError.actionDenied("The browser could not confirm the drop target for the action policy.")
+            }
+            let found = try cdp("Runtime.evaluate", [
+                "contextId": contextID, "returnByValue": false,
+                "expression": "document.elementFromPoint(\(point.x), \(point.y))",
             ])
+            guard let result = found["result"] as? [String: Any], let id = result["objectId"] as? String else {
+                throw ComputerUseError.actionDenied("The browser could not confirm the drop target for the action policy.")
+            }
+            if Self.isFrameOwner(try cdp("DOM.describeNode", ["objectId": id])) {
+                throw ComputerUseError.actionDenied("A drop inside a frame cannot be checked by the action policy. Drop onto a labelled control instead.")
+            }
+            objectID = id
         } else {
-            payload = try cdp("Runtime.evaluate", [
-                "contextId": contextID, "returnByValue": true,
-                "expression": """
-                (() => {
-                    let el = document.activeElement;
-                    while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
-                    return (\(function)).call(el, \(keyboard ? "true" : "false"));
-                })()
-                """,
-            ])
+            // Keyboard input goes to the focused element of the focused frame, which can be nested.
+            objectID = try Self.focusedPolicyElement(start: (frame: frame.id, context: contextID), focus: { current in
+                let evaluated = try cdp("Runtime.evaluate", [
+                    "contextId": current.context, "returnByValue": false,
+                    "expression": Self.deepestActiveElementJS,
+                ])
+                guard let result = evaluated["result"] as? [String: Any], let id = result["objectId"] as? String else {
+                    throw denied
+                }
+                let described = try cdp("DOM.describeNode", ["objectId": id])
+                return Self.isFrameOwner(described) ? .frameOwner(objectID: id) : .element(objectID: id)
+            }, enter: { owner in
+                let described = try cdp("DOM.describeNode", ["objectId": owner])
+                guard let childFrame = (described["node"] as? [String: Any])?["frameId"] as? String else { throw denied }
+                let world = try cdp("Page.createIsolatedWorld", ["frameId": childFrame, "worldName": "Godspeed Action Policy"])
+                guard let childContext = world["executionContextId"] as? Int else { throw denied }
+                return (frame: childFrame, context: childContext)
+            })
         }
+        let payload = try cdp("Runtime.callFunctionOn", [
+            "objectId": objectID, "functionDeclaration": Self.policyTargetFunction,
+            "arguments": [["value": keyboard]], "returnByValue": true,
+        ])
         guard let result = payload["result"] as? [String: Any],
               let facts = result["value"] as? [String: Any],
               let secure = facts["secure"] as? Bool, let submits = facts["submits"] as? Bool else {
-            throw ComputerUseError.actionDenied("The browser could not confirm the control for the action policy.")
+            throw denied
         }
         return (ActionPolicy.Target(title: node?.name, identifier: facts["id"] as? String, role: node?.role,
                                     secureField: secure, submitsForm: submits), facts["destination"] as? String)
     }
+
+    /// Only a frame owner (iframe, frame, object, embed) reports a frame ID for its node.
+    private static func isFrameOwner(_ described: [String: Any]) -> Bool {
+        (described["node"] as? [String: Any])?["frameId"] != nil
+    }
+
+    /// The focused element, looking through open shadow roots.
+    private static let deepestActiveElementJS = """
+    (() => { let el = document.activeElement; while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement; return el; })()
+    """
 
     private static let policyTargetFunction = """
     function(keyboard) {
