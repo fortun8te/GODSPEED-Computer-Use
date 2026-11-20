@@ -2,6 +2,18 @@ import XCTest
 @testable import OpenComputerUse
 
 final class AppAgentProxyTests: XCTestCase {
+    func testTimeoutReplyCarriesDeliveryEvenWhenMessagesMatch() {
+        let before = MacOSAppAgentProxy.mcpFailureReply(id: 17, message: "deadline", delivery: .notSent)
+        let after = MacOSAppAgentProxy.mcpFailureReply(id: 17, message: "deadline", delivery: .outcomeUnknown)
+        let notSent = (before["error"] as? [String: Any])?["data"] as? [String: String]
+        let unknown = (after["error"] as? [String: Any])?["data"] as? [String: String]
+        XCTAssertEqual(notSent?["delivery_state"], "not_sent")
+        XCTAssertEqual(notSent?["safe_retry"], "after_correction")
+        XCTAssertEqual(unknown?["delivery_state"], "outcome_unknown")
+        XCTAssertEqual(unknown?["safe_retry"], "reconcile_first")
+        XCTAssertNotNil(unknown?["reconcile"])
+    }
+
     func testCursorNameUsesOnlyKnownClientInitializationMetadata() {
         XCTAssertEqual(
             MacOSAppAgentProxy.knownCursorClientName(initializeLine: #"{"method":"initialize","params":{"clientInfo":{"name":"codex-mcp-client","version":"1.0"}}}"#),

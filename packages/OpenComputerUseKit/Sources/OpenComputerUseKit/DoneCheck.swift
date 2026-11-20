@@ -18,6 +18,28 @@ enum DoneCheck {
         case field(label: String, equals: String)
         case urlContains(String)
         case gone(String)
+        case appeared(String)
+        case disappeared(String)
+        case fieldChanged(label: String, equals: String)
+        case urlChanged(String)
+        case fileChanged(String)
+
+        var needsTemporalScreen: Bool {
+            switch self {
+            case .appeared, .disappeared, .fieldChanged: return true
+            default: return false
+            }
+        }
+
+        var needsTemporalURL: Bool {
+            if case .urlChanged = self { return true }
+            return false
+        }
+
+        var requiresBaseline: Bool {
+            if case .fileChanged = self { return true }
+            return needsTemporalScreen || needsTemporalURL
+        }
 
         var arguments: [String: String] {
             switch self {
@@ -26,6 +48,11 @@ enum DoneCheck {
             case .field(let label, let value): return ["field": label, "equals": value]
             case .urlContains(let part): return ["url_contains": part]
             case .gone(let label): return ["gone": label]
+            case .appeared(let text): return ["appeared": text]
+            case .disappeared(let text): return ["disappeared": text]
+            case .fieldChanged(let label, let value): return ["field": label, "equals": value, "since_start": "changed"]
+            case .urlChanged(let url): return ["url_changed": url]
+            case .fileChanged(let path): return ["file_changed": path]
             }
         }
 
@@ -36,6 +63,11 @@ enum DoneCheck {
             case .field(let label, let value): return "\(label) = \(value)"
             case .urlContains(let part): return "the page URL contains \(part)"
             case .gone(let label): return "\(label) is gone"
+            case .appeared(let text): return "\"\(text)\" appeared"
+            case .disappeared(let text): return "\"\(text)\" disappeared"
+            case .fieldChanged(let label, let value): return "\(label) changed to \(value)"
+            case .urlChanged(let url): return "the address changed to \(url)"
+            case .fileChanged(let path): return "file \(path) was created or changed"
             }
         }
     }
@@ -52,6 +84,7 @@ enum DoneCheck {
 
     enum Result: Equatable {
         case verified(met: [String])
+        case weak(met: [String])
         case missing(unmet: [String])
     }
 
@@ -85,6 +118,19 @@ enum DoneCheck {
             for (alias, key) in Self.keyAliases where object[key] == nil {
                 if let value = object[alias] { object[key] = value }
             }
+            if let mode = object["since_start"] {
+                guard mode as? String == "changed", let label = object["field"] as? String, !label.isEmpty,
+                      let value = object["equals"], !(value is NSNull) else {
+                    throw ComputerUseError.invalidArguments("done_when since_start: changed needs field and equals")
+                }
+                return .fieldChanged(label: label, equals: "\(value)")
+            }
+            if let text = object["appeared"] as? String, !text.isEmpty { return .appeared(text) }
+            if let text = object["disappeared"] as? String, !text.isEmpty { return .disappeared(text) }
+            if let url = object["url_changed"] as? String, !url.isEmpty { return .urlChanged(url) }
+            if let path = object["file_changed"] as? String, !path.isEmpty {
+                return .fileChanged((path as NSString).expandingTildeInPath)
+            }
             if let path = object["file_exists"] as? String, !path.isEmpty {
                 return .fileExists((path as NSString).expandingTildeInPath)
             }
@@ -104,13 +150,14 @@ enum DoneCheck {
                 return .gone(label)
             }
             throw ComputerUseError.invalidArguments(
-                "done_when entry needs one of: file_exists, text, field + equals, url_contains, gone"
+                "done_when entry needs one of: file_changed, appeared, disappeared, url_changed, file_exists, text, field + equals, url_contains, gone"
             )
         }
     }
 
-    /// Checks every condition. Verified only when all of them are met.
-    static func check(_ conditions: [Condition], evidence: Evidence) -> Result {
+    /// A final-state match is weak evidence. Every check needs a transition to verify completion.
+    static func check(_ conditions: [Condition], evidence: Evidence, baseline: BatchCompletion? = nil,
+                      after: BatchCompletion.Observation? = nil) -> Result {
         var met: [String] = []
         var unmet: [String] = []
         var fetchedURL: String?
@@ -121,10 +168,7 @@ enum DoneCheck {
             case .fileExists(let path):
                 ok = evidence.fileExists(path)
             case .text(let text):
-                // A plain number must match a whole number on screen: "12" is not met by "120".
-                ok = evidence.screenText.map {
-                    isPlainNumber(text) ? containsNumber($0, text) : (contains($0, text) || containsLabeledNumber($0, text))
-                } ?? false
+                ok = evidence.screenText.map { textMatches($0, text) } ?? false
             case .field(let label, let value):
                 ok = evidence.screenText.map { fieldEquals($0, label: label, value: value) } ?? false
             case .urlContains(let part):
@@ -137,10 +181,13 @@ enum DoneCheck {
                 ok = evidence.supportsAbsence && (evidence.screenText.map {
                     supportsAbsenceCheck($0) && !linesMention($0, label: label)
                 } ?? false)
+            case .appeared, .disappeared, .fieldChanged, .urlChanged, .fileChanged:
+                ok = baseline?.meets(condition, after: after) == true
             }
             if ok { met.append(condition.summary) } else { unmet.append(condition.summary) }
         }
-        return unmet.isEmpty ? .verified(met: met) : .missing(unmet: unmet)
+        if !unmet.isEmpty { return .missing(unmet: unmet) }
+        return conditions.allSatisfy(\.requiresBaseline) ? .verified(met: met) : .weak(met: met)
     }
 
     /// The one line the batch reply adds: "Done: verified (...)" or "Not done yet: (...)".
@@ -148,6 +195,8 @@ enum DoneCheck {
         switch result {
         case .verified(let met):
             return "Done: verified (\(met.joined(separator: "; ")))"
+        case .weak(let met):
+            return "Weak evidence: \(met.joined(separator: ", ")). Check the result before reporting completion."
         case .missing(let unmet):
             return "Not done yet: (\(unmet.joined(separator: "; ")) not confirmed)"
         }
@@ -162,6 +211,7 @@ enum DoneCheck {
             let content = line.drop(while: \.isWhitespace)
             return content.hasPrefix("[Accessibility tree truncated:")
                 || content.hasPrefix("[Compact batch:")
+                || content.hasPrefix("Note: this window is covered")
                 || content.hasPrefix("…(")
                 || content == SnapshotObservationOptions.accessibilityOmittedNote
         }
@@ -171,6 +221,19 @@ enum DoneCheck {
     static func linesMention(_ text: String, label: String) -> Bool {
         let needle = label.lowercased()
         return text.lowercased().split(separator: "\n").contains { $0.contains(needle) }
+    }
+
+    static func textMatches(_ screen: String, _ text: String) -> Bool {
+        isPlainNumber(text) ? containsNumber(screen, text) : (contains(screen, text) || containsLabeledNumber(screen, text))
+    }
+
+    /// The temporal form requires one readable exact field on each side.
+    static func exactFieldValue(_ screen: String, label: String) -> String? {
+        let matches = HandoffTool.parseControls(screen).filter {
+            HandoffTool.fieldRoles.contains($0.role) && HandoffTool.sameLabel($0.label, label)
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].value
     }
 
     /// True when a state line for `label` ends in `= value`. A "(w:str)"-style type note after the value is ignored.

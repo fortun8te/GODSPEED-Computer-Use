@@ -370,7 +370,7 @@ final class BrowserBridge: @unchecked Sendable {
             // Keep time for a readback if the close took effect before its reply arrived.
             let closeWait = min(8, deadline - ProcessInfo.processInfo.systemUptime - 2)
             guard closeWait > 0 else {
-                throw ComputerUseError.stateUnavailable("browser close_tab did not run because little time remained.")
+                throw ComputerUseError.timedOut("browser close_tab did not run because little time remained.", delivery: .notSent)
             }
             _ = try? requestTool("cdp", arguments: ["tab_id": id, "method": "Page.close"], timeout: closeWait)
             for attempt in 0..<3 {
@@ -530,7 +530,7 @@ final class BrowserBridge: @unchecked Sendable {
             }
         }
         let wait = min(timeout, BrowserCallBudget.activeRemaining ?? timeout)
-        guard wait > 0 else { throw ComputerUseError.message("The browser request ran out of time.") }
+        guard wait > 0 else { throw ComputerUseError.timedOut("The browser request ran out of time.", delivery: .notSent) }
         let id = nextID
         nextID += 1
         try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
@@ -541,8 +541,9 @@ final class BrowserBridge: @unchecked Sendable {
             process = nil
             input = nil
             openedTabs.removeAll()
-            throw ComputerUseError.stateUnavailable(
-                "Open Browser Use did not answer \(method) within \(Int(wait.rounded())) s. Inspect the tab before repeating the action."
+            throw ComputerUseError.timedOut(
+                "Open Browser Use did not answer \(method) within \(Int(wait.rounded())) s. Inspect the tab before repeating the action.",
+                delivery: .outcomeUnknown
             )
         }
         received = true
@@ -561,7 +562,7 @@ final class BrowserBridge: @unchecked Sendable {
 
     private func send(_ object: [String: Any]) throws {
         guard let input else {
-            throw ComputerUseError.message("Open Browser Use is not running.")
+            throw ComputerUseError.notSent("Open Browser Use is not running.")
         }
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
@@ -572,7 +573,7 @@ final class BrowserBridge: @unchecked Sendable {
             process?.terminate()
             process = nil
             self.input = nil
-            throw ComputerUseError.message("Open Browser Use stopped; try again to restart it.")
+            throw ComputerUseError.stateUnavailable("Open Browser Use disconnected during the send. Inspect the tab before retrying.")
         }
     }
 }
@@ -679,7 +680,7 @@ extension ComputerUseToolDispatcher {
 
     private func runBrowserAction(arguments: [String: Any]) throws -> ToolCallResult {
         guard BrowserBridge.isAvailable else {
-            throw ComputerUseError.message(BrowserBridge.notInstalledMessage)
+            throw ComputerUseError.notSent(BrowserBridge.notInstalledMessage)
         }
         let bridge = BrowserBridge.shared
         var arguments = arguments
@@ -761,12 +762,13 @@ extension ComputerUseToolDispatcher {
                         throw ComputerUseError.invalidArguments("Paste copied files into a labelled Chrome file input. Cut files can only be moved in Finder.")
                     }
                     try page.setFiles(paths, on: node)
-                    return .text("Selected \(paths.count) file(s) in the upload control.")
+                    return .text("Selected \(paths.count) file(s) in the upload control.", deliveryState: .verified)
                 }
                 let text = try PrivateClipboard.current.textForPaste()
                 if text.isEmpty { return .text("Private clipboard text is empty.") }
                 let result = try page.type(text, replace: false, into: node, keyEvents: false)
-                return .text(result.reply(verb: "Pasted into", target: node?.name ?? "the focused Chrome field"))
+                return .text(result.reply(verb: "Pasted into", target: node?.name ?? "the focused Chrome field"),
+                             deliveryState: result.deliveryState)
             case .moveFiles:
                 throw ComputerUseError.invalidArguments("Move-paste is only available in Finder.")
             }
@@ -849,7 +851,7 @@ extension ComputerUseToolDispatcher {
             }
             let outcome = try page.type(text, replace: replace, into: node, keyEvents: action != "fill_field")
             let verb = replace && text.isEmpty ? "cleared" : "typed into"
-            return .text(outcome.reply(verb: verb, target: targetName))
+            return .text(outcome.reply(verb: verb, target: targetName), deliveryState: outcome.deliveryState)
 
         case "key", "press_key":
             guard let key = arguments["key"] as? String, !key.isEmpty else {
@@ -881,7 +883,7 @@ extension ComputerUseToolDispatcher {
         case "check", "uncheck", "tick", "untick":
             let node = try target()
             let outcome = try page.setChecked(node, desired: action == "check" || action == "tick")
-            return .text("\(outcome); \(page.settle().line)")
+            return .text("\(outcome); \(page.settle().line)", deliveryState: .verified)
 
         case "scroll":
             let raw = (arguments["direction"] as? String) ?? "down"
@@ -1017,7 +1019,7 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.invalidArguments("browser close_tab needs a positive, whole tab_id from browser tabs")
             }
             try bridge.closeOpenedTab(id)
-            return .text("closed tab \(id)")
+            return .text("closed tab \(id)", deliveryState: .verified)
 
         case "tabs", "list":
             let mine = try bridge.callTool("tabs", arguments: [:], timeout: 10)

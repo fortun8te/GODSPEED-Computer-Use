@@ -33,6 +33,7 @@ public struct ToolResultContentItem: @unchecked Sendable {
 public struct ToolCallResult: @unchecked Sendable {
     public let content: [ToolResultContentItem]
     public let isError: Bool
+    public let deliveryState: DeliveryState
     let batchReceipt: TrajectoryLog.BatchReceipt?
     let failureCode: TrajectoryLog.FailureCode?
     let browserObservationURL: String?
@@ -40,18 +41,20 @@ public struct ToolCallResult: @unchecked Sendable {
     let browserContinuationTabID: Int?
     let browserPreviewPages: [[String: Any]]?
 
-    public init(content: [ToolResultContentItem], isError: Bool = false) {
-        self.init(content: content, isError: isError, batchReceipt: nil)
+    public init(content: [ToolResultContentItem], isError: Bool = false, deliveryState: DeliveryState? = nil) {
+        self.init(content: content, isError: isError, batchReceipt: nil, deliveryState: deliveryState)
     }
 
     init(
         content: [ToolResultContentItem], isError: Bool,
         batchReceipt: TrajectoryLog.BatchReceipt? = nil, failureCode: TrajectoryLog.FailureCode? = nil,
         browserObservationURL: String? = nil, browserContinuationTabID: Int? = nil,
-        browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil
+        browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil,
+        deliveryState: DeliveryState? = nil
     ) {
         self.content = content
         self.isError = isError
+        self.deliveryState = deliveryState ?? (isError ? .outcomeUnknown : .acknowledged)
         self.batchReceipt = batchReceipt
         self.failureCode = failureCode
         self.browserObservationURL = browserObservationURL
@@ -77,6 +80,7 @@ public struct ToolCallResult: @unchecked Sendable {
             "isError": isError,
         ]
         var metadata: [String: Any] = [:]
+        for (key, value) in deliveryState.metadata { metadata["godspeed/\(key)"] = value }
         metadata["godspeed/preview_pages"] = browserPreviewPages
         if let receipt = batchReceipt {
             var batch: [String: Any] = [
@@ -94,7 +98,24 @@ public struct ToolCallResult: @unchecked Sendable {
         return result
     }
 
-    public static func text(_ text: String, isError: Bool = false) -> ToolCallResult {
-        ToolCallResult(content: [.text(text)], isError: isError)
+    func replacingContent(_ content: [ToolResultContentItem], deliveryState: DeliveryState? = nil) -> ToolCallResult {
+        ToolCallResult(
+            content: content, isError: isError, batchReceipt: batchReceipt, failureCode: failureCode,
+            browserObservationURL: browserObservationURL, browserContinuationTabID: browserContinuationTabID,
+            browserPreviewPages: browserPreviewPages, browserFullObservationText: browserFullObservationText,
+            deliveryState: deliveryState ?? self.deliveryState
+        )
+    }
+
+    static func failure(_ error: Error) -> ToolCallResult {
+        let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        return ToolCallResult(
+            content: [.text(message)], isError: true, failureCode: TrajectoryLog.failureCode(error: error),
+            deliveryState: (error as? ComputerUseError)?.deliveryState ?? .outcomeUnknown
+        )
+    }
+
+    public static func text(_ text: String, isError: Bool = false, deliveryState: DeliveryState? = nil) -> ToolCallResult {
+        ToolCallResult(content: [.text(text)], isError: isError, deliveryState: deliveryState)
     }
 }
