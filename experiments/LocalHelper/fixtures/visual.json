@@ -1,0 +1,40 @@
+[
+  {
+    "id": "map-search",
+    "image": "synthetic-map.png",
+    "query": "Search map",
+    "box": [
+      0.08,
+      0.08,
+      0.32,
+      0.22
+    ]
+  },
+  {
+    "id": "map-zoom",
+    "image": "synthetic-map.png",
+    "query": "plus zoom button",
+    "box": [
+      0.88,
+      0.18,
+      0.96,
+      0.3
+    ]
+  },
+  {
+    "id": "library-details",
+    "image": "synthetic-library.png",
+    "query": "Show details",
+    "box": [
+      0.55,
+      0.69,
+      0.84,
+      0.84
+    ]
+  },
+  {
+    "id": "library-missing",
+    "image": "synthetic-library.png",
+    "query": "Download PDF"
+  }
+]

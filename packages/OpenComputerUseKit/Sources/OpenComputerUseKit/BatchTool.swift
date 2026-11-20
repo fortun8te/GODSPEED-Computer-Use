@@ -1369,11 +1369,20 @@ extension ComputerUseToolDispatcher {
                 screenChanged: screenChanged,
                 dialogOpen: RefereeSummary.dialogOpen(in: state),
                 changes: changes,
-                screen: RefereeSummary.screen(from: state), maxCharacters: Referee.maxViewCharacters
+                // Select evidence before the summary applies its screen budget.
+                screen: RefereeView.build(state: state, goal: goal, doneWhen: lastStepText,
+                                                 limit: Referee.maxViewCharacters / 2),
+                maxCharacters: Referee.maxViewCharacters
             )
             let result = unchanged ? lastResultText + "; app unchanged since the previous batch" : lastResultText
+            // Page text has no native window binding. Do not capture a different window for it.
+            let picture = lastApp.flatMap { app in
+                Referee.picture(url: Referee.baseURL, state: state, remaining: deadline - clock.systemUptime) {
+                    localDecisionImage(app: app, state: state)
+                }
+            }
             if let verdict = Referee.decide(goal: goal, lastStep: lastStepText, result: result, summary: summary,
-                                            remaining: deadline - clock.systemUptime) {
+                                            imageBase64: picture, remaining: deadline - clock.systemUptime) {
                 let showHint = verdict.label != "done" || Referee.allowsCompletionHints
                 if showHint, let hint = Referee.hint(for: verdict, browser: lastAttemptedStep?.tool == "browser") {
                     lines.append(hint)

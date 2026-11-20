@@ -39,7 +39,7 @@ enum Referee {
         finiteSetting("OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE", fallback: 0.86, range: 0...1)
     }
 
-    /// The state text sent is cut to this many characters. Default 1200: longer views were slower and
+    /// The helper gets at most this many characters of state. Default 1200: longer views were slower and
     /// less accurate in the d1-2B measurements (~270 ms at 1,000 characters, ~1.1 s at 6,000).
     static var maxViewCharacters: Int {
         max(0, environment("OPEN_COMPUTER_USE_REFEREE_MAX_VIEW").flatMap(Int.init) ?? 1_200)
@@ -80,17 +80,19 @@ enum Referee {
 
     /// Asks the helper about one batch. `summary` is the short RefereeSummary text (goal, steps, repeated
     /// failures, screen change, dialog, changed lines), not raw screen text.
-    static func decide(goal: String, lastStep: String, result: String, summary: String, remaining: TimeInterval? = nil) -> Verdict? {
+    static func decide(goal: String, lastStep: String, result: String, summary: String,
+                       imageBase64: String? = nil, remaining: TimeInterval? = nil) -> Verdict? {
         guard let baseURL else { return nil }
         let wait = min(timeout, remaining ?? timeout)
         guard wait > 0 else { return nil }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "goal": goal,
             "last_step": lastStep,
             "result": result,
             "view": RefereeSummary.clip(summary, to: maxViewCharacters),
         ]
+        if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
         guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait) else {
             if wait == timeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
@@ -122,19 +124,31 @@ enum Referee {
         return url
     }
 
+    static var handoffURL: URL? {
+        localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"))
+    }
+
+    static func picture(url: URL?, state: String, remaining: TimeInterval?, capture: () -> Data?) -> String? {
+        RefereePicture.attachment(url: url, visionEnabled: VisionFallback.isEnabled, state: state, remaining: remaining,
+            supportsPictures: { url, timeout in
+                HelperHTTP.getJSON(url, timeout: timeout)?["decision_image"] as? String == "v1"
+            }, capture: capture)
+    }
+
     static func choose(goal: String, doneWhen: String, history: String, screen: String, options: [(id: String, text: String)],
-                       remaining: TimeInterval? = nil) -> [String: Double]? {
-        guard let baseURL = localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER")),
+                       imageBase64: String? = nil, remaining: TimeInterval? = nil) -> [String: Double]? {
+        guard let baseURL = handoffURL,
               !options.isEmpty else { return nil }
         let wait = min(chooseTimeout, remaining ?? chooseTimeout)
         guard wait > 0 else { return nil }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "goal": goal,
             "done_when": doneWhen,
             "history": history,
             "screen": RefereeSummary.clip(screen, to: maxViewCharacters),
             "options": options.map { ["id": $0.id, "text": $0.text] },
         ]
+        if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
         guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait) else {
             if wait == chooseTimeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
@@ -205,15 +219,21 @@ enum HelperHTTP {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
+        let containsImage = body["image_base64"] != nil
         let reply: Data?
         if let withoutExclusive = RequestInferenceAdmission.withoutExclusive {
             // Never release an active focus borrow or a protected desktop lease.
             guard !FocusBorrow.shared.isBorrowing, !LockedUseActionScope.requiresScreenCaptureKit else { return nil }
-            reply = withoutExclusive { send(request, timeout: timeout) }
+            reply = withoutExclusive { send(request, timeout: timeout, containsImage: containsImage) }
         } else {
-            reply = send(request, timeout: timeout)
+            reply = send(request, timeout: timeout, containsImage: containsImage)
         }
         guard let reply else { return nil }
+        return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+    }
+
+    static func getJSON(_ url: URL, timeout: TimeInterval) -> [String: Any]? {
+        guard let reply = send(URLRequest(url: url, timeoutInterval: timeout), timeout: timeout) else { return nil }
         return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
     }
 
@@ -222,11 +242,23 @@ enum HelperHTTP {
         send(URLRequest(url: url, timeoutInterval: timeout), timeout: timeout) != nil
     }
 
-    private static func send(_ request: URLRequest, timeout: TimeInterval) -> Data? {
+    private static let imageSession = URLSession(
+        configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil
+    )
+
+    private final class NoRedirects: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
+    private static func send(_ request: URLRequest, timeout: TimeInterval, containsImage: Bool = false) -> Data? {
         guard !RequestCancellation.requested else { return nil }
         let box = ReplyBox()
         let done = DispatchSemaphore(value: 0)
-        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+        let session = containsImage ? imageSession : URLSession.shared
+        let task = session.dataTask(with: request) { data, response, _ in
             defer { done.signal() }
             guard (response as? HTTPURLResponse)?.statusCode == 200, let data else { return }
             box.set(data)
