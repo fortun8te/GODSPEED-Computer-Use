@@ -8,6 +8,37 @@ import XCTest
 final class BrowserBridgeRelayGrantTests: XCTestCase {
     private static let fixedStart = Date(timeIntervalSince1970: 1_800_000_000)
     private let start = fixedStart
+    private var previousGrantSetting: String?
+
+    // Grants are opt-in until the authenticated host is installed; these tests cover the enabled path.
+    override func setUp() {
+        super.setUp()
+        previousGrantSetting = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_RELAY_GRANT"]
+        setenv("OPEN_COMPUTER_USE_RELAY_GRANT", "1", 1)
+    }
+
+    override func tearDown() {
+        if let previousGrantSetting { setenv("OPEN_COMPUTER_USE_RELAY_GRANT", previousGrantSetting, 1) } else { unsetenv("OPEN_COMPUTER_USE_RELAY_GRANT") }
+        super.tearDown()
+    }
+
+    /// With grants off (the default before the host is provisioned) the helper starts exactly as before:
+    /// no `_meta`, and the key store is never touched.
+    func testGrantsOffSendsThePlainInitializeAndNeverReadsTheKey() throws {
+        setenv("OPEN_COMPUTER_USE_RELAY_GRANT", "0", 1)
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let bridge = BrowserBridge(
+            sessionID: "godspeed-test", launchEnvironment: fixture.environment,
+            relayKeyStore: FileRelayAuthorityKeyStore(url: fixture.keyURL), relayClock: { Self.fixedStart }
+        )
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("tabs", arguments: [:], timeout: 10)
+        let initializes = try lines(fixture.capture).filter { $0["method"] as? String == "initialize" }
+        XCTAssertEqual(initializes.count, 1)
+        XCTAssertNil((initializes.first?["params"] as? [String: Any])?["_meta"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.keyURL.path), "no key is created or read")
+    }
 
     private func grant(issuedAt: Date) throws -> RelayGrant {
         let issuer = try RelayGrantIssuer(store: StaticKeyStore(key: .init()))

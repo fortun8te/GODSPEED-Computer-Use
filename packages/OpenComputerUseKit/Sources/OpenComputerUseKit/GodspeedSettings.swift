@@ -65,6 +65,7 @@ enum GodspeedSettings {
         if let value = flag("cursor_lens") { variables["OPEN_COMPUTER_USE_CURSOR_LENS"] = value }
         if let value = flag("recipes") { variables["OPEN_COMPUTER_USE_RECIPES"] = value }
         if let value = flag("strict_background") { variables["OPEN_COMPUTER_USE_STRICT_BACKGROUND"] = value }
+        if let value = flag("relay_grant") { variables["OPEN_COMPUTER_USE_RELAY_GRANT"] = value }
         if let value = flag("browser") { variables["OPEN_COMPUTER_USE_BROWSER"] = value }
         return variables
     }

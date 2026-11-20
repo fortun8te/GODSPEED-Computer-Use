@@ -211,6 +211,8 @@ export OBU_RELAY_AUTHORITY_KEY="$("<GODSPEED app>/Contents/MacOS/OpenComputerUse
 
 The command creates the Keychain key on first use and prints the public key as unpadded base64url. The private key is never printed. Without the provisioned key, the browser tool reports "Chrome helper needs the Godspeed relay key; run the installer." Grants last at most 15 minutes and the helper renews them on its own.
 
+Grants are off by default, so today's Chrome helper keeps working unchanged. Turn them on only after installing the authenticated Chrome host with the key above: set `"relay_grant": true` in `~/.godspeed/settings.json` (or `OPEN_COMPUTER_USE_RELAY_GRANT=1`). With grants off, Godspeed never reads the Keychain key and sends no grant or renewal.
+
 ## Private clipboard
 
 Each Godspeed client has an in-memory clipboard shared by its Mac and Chrome actions. In Mac apps, select text and use `press_key` with `cmd+c`, `cmd+x`, or `cmd+v`. In Chrome, use `browser` with `action: "copy"`, `"cut"`, or `"paste"`. To paste into a named field, pass its label. A single batch can alternate these actions between apps.
