@@ -232,6 +232,8 @@ struct LearningStepRow: Codable {
     var after: String?
     /// Step number within the batch.
     var n: Int?
+    /// The window the batch started in, the same identity recipes use (see LearningWindow).
+    var window: LearningWindow?
 }
 
 /// The end of a goal, with its final outcome.
@@ -242,6 +244,52 @@ struct LearningEpisodeRow: Codable {
     var app: String?
     var goal: String?
     var outcome: String?
+    /// The batch's done_when in its JSON form (see LearningDoneWhen). Absent when the batch had none.
+    var done_when: [[String: String]]?
+    /// The done_when result: verified, weak or unmet. Absent when no check ran.
+    var done: String?
+    var window: LearningWindow?
+}
+
+/// Window identity for a recipe: the app's bundle id and the window title line. The pid and window number are left out,
+/// so the same window keeps its identity across runs. Element numbers are never part of it.
+struct LearningWindow: Codable, Equatable {
+    var app: String
+    var title: String
+
+    init(_ window: BatchRecipes.Window) {
+        // The process header reads "App=<bundle id> (pid N)". Only the bundle id is kept.
+        var bundle = window.process
+        if bundle.hasPrefix("App=") { bundle.removeFirst(4) }
+        if let range = bundle.range(of: " (pid ") { bundle = String(bundle[..<range.lowerBound]) }
+        app = bundle
+        title = window.titleLine
+    }
+
+    init?(state: String?) {
+        guard let window = BatchRecipes.Window(state: state) else { return nil }
+        self.init(window)
+    }
+}
+
+/// done_when conditions in the same JSON form the tool accepts. A field value is redacted when its label names a
+/// secure or code field, so the condition keeps its label but never its value.
+enum LearningDoneWhen {
+    static func rows(_ conditions: [DoneCheck.Condition]) -> [[String: String]]? {
+        guard !conditions.isEmpty else { return nil }
+        return conditions.map { condition in
+            var arguments = condition.arguments
+            if let label = arguments["field"], arguments["equals"] != nil, isSensitive(label) {
+                arguments["equals"] = LearningScrubber.redacted
+            }
+            return arguments
+        }
+    }
+
+    private static func isSensitive(_ label: String) -> Bool {
+        let lower = label.lowercased()
+        return LearningScrubber.marksSecureField([label]) || LearningScrubber.codeMarkers.contains { lower.contains($0) }
+    }
 }
 
 /// Removes secrets and private values from a JSON row. Works on the encoded object, so every row type is covered.
