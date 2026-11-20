@@ -3004,6 +3004,12 @@ enum BrowserReply {
         return id
     }
 
+    /// A helper failure as one plain line: the message inside a JSON error envelope, else the text itself.
+    static func failureText(_ text: String) -> String {
+        let message = (json(text) as? [String: Any]).flatMap { BrowserPage.find("message", in: $0) as? String } ?? text
+        return explain(message)
+    }
+
     /// ACT-01: the selected count from `upload_via_button`, only when Chrome verified the names and sizes.
     static func uploadSelected(in text: String) -> Int? {
         guard let object = json(text) as? [String: Any], object["error"] == nil else { return nil }

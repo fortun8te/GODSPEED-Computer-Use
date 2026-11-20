@@ -1473,7 +1473,7 @@ extension ComputerUseToolDispatcher {
         ], timeout: 20)
         if reply.isError, BrowserReply.isUnsupportedTool(reply.text) { return nil }
         guard !reply.isError, let selected = BrowserReply.uploadSelected(in: reply.text) else {
-            throw ComputerUseError.stateUnavailable("browser: \(BatchTool.firstLine(reply.text)) Inspect the upload control before retrying.")
+            throw ComputerUseError.stateUnavailable("browser: \(BrowserReply.failureText(reply.text)). Inspect the upload control before retrying.")
         }
         return selected
     }
@@ -1489,7 +1489,7 @@ extension ComputerUseToolDispatcher {
         ], timeout: 20)
         if reply.isError, BrowserReply.isUnsupportedTool(reply.text) { return nil }
         guard !reply.isError, let clicked = BrowserReply.clickedTab(in: reply.text), clicked.clicked else {
-            throw ComputerUseError.stateUnavailable("browser: \(BatchTool.firstLine(reply.text)) Inspect the tab before repeating the click.")
+            throw ComputerUseError.stateUnavailable("browser: \(BrowserReply.failureText(reply.text)). Inspect the tab before repeating the click.")
         }
         return ClickedNewTab(openedTabID: clicked.openedTabID)
     }
