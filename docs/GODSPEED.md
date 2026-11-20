@@ -197,6 +197,16 @@ Test and bench switches (`RUN_*`, `BENCH_*`, `APP_MATRIX_*`, `SMOKE_SERVER`, `FI
 
 See the [Godspeed setup guide](../README.md) for source and package installation, MCP registration, and Chrome setup.
 
+### Chrome relay authority key
+
+The Chrome helper authenticates to the native host with a signed relay grant. Each GODSPEED install keeps its Ed25519 signing key in the login Keychain (service `com.godspeed.relay-authority`, this device only, never synced). The installer must provision only the public half on the host:
+
+```sh
+export OBU_RELAY_AUTHORITY_KEY="$("<GODSPEED app>/Contents/MacOS/OpenComputerUse" relay-authority-public-key)"
+```
+
+The command creates the Keychain key on first use and prints the public key as unpadded base64url. The private key is never printed. Without the provisioned key, the browser tool reports "Chrome helper needs the Godspeed relay key; run the installer." Grants last at most 15 minutes and the helper renews them on its own.
+
 ## Private clipboard
 
 Each Godspeed client has an in-memory clipboard shared by its Mac and Chrome actions. In Mac apps, select text and use `press_key` with `cmd+c`, `cmd+x`, or `cmd+v`. In Chrome, use `browser` with `action: "copy"`, `"cut"`, or `"paste"`. To paste into a named field, pass its label. A single batch can alternate these actions between apps.
