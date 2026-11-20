@@ -41,7 +41,7 @@ final class CursorDeliveryTests: XCTestCase {
         XCTAssertEqual(moves[right], 1)
 
         SoftwareCursorOverlay.waitUntilIdleForTesting()
-        let anchor = SoftwareCursorGlyphMetrics.tipAnchor
+        let anchor = SoftwareCursorPanelMetrics.tipAnchor
         for client in [left, right] {
             let point = try XCTUnwrap(lastPoints[client])
             let panel = try XCTUnwrap(ClientScope.with(client) { SoftwareCursorOverlay.overlayPanelForTesting })

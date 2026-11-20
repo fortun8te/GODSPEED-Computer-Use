@@ -12,6 +12,7 @@ final class BackgroundDragTests: XCTestCase {
         var events: [CGEvent] = []
         var locations: [CGPoint] = []
         var lifecycle: [String] = []
+        var pauses: [TimeInterval] = []
         var foreground = false
         var validations = 0
         var failValidation: Int?
@@ -55,9 +56,29 @@ final class BackgroundDragTests: XCTestCase {
                     self.events.append(event)
                     self.lifecycle.append("release")
                 },
-                pause: { _ in }
+                pause: { self.pauses.append($0) }
             )
         }
+    }
+
+    func testPreciseClickPairsPreserveModifiersAndRecheckTarget() throws {
+        let probe = Probe()
+        let flags: CGEventFlags = [.maskCommand, .maskShift]
+        var checks = 0
+        try BackgroundDragDispatcher.click(target: target, button: .left, count: 3, flags: flags,
+                                            io: probe.io, validateSession: {}) { checks += 1 }
+        XCTAssertEqual(checks, 3)
+        XCTAssertEqual(probe.events.map(\.type), [.leftMouseDown, .leftMouseUp, .leftMouseDown, .leftMouseUp, .leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(probe.events.map { $0.getIntegerValueField(.mouseEventClickState) }, [1, 1, 2, 2, 3, 3])
+        XCTAssertTrue(probe.events.allSatisfy { $0.flags == flags })
+        XCTAssertFalse(probe.lifecycle.contains("activate"))
+
+        let stale = Probe()
+        XCTAssertThrowsError(try BackgroundDragDispatcher.click(target: target, button: .left, count: 2,
+            flags: [], io: stale.io, validateSession: {}) {
+            if !stale.events.isEmpty { throw ComputerUseError.stateUnavailable("Control moved.") }
+        }) { XCTAssertTrue($0.localizedDescription.contains("Sent 1 of 2")) }
+        XCTAssertEqual(stale.events.map(\.type), [.leftMouseDown, .leftMouseUp])
     }
 
     func testHoverPostsOneMoveWithoutFocusOrButtonEvents() throws {
@@ -88,6 +109,20 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertTrue(probe.locations.allSatisfy { CGRect(origin: .zero, size: target.windowBounds.size).contains($0) })
         XCTAssertEqual(probe.locations.first, CGPoint(x: 20, y: 40))
         XCTAssertEqual(probe.locations.last, CGPoint(x: 180, y: 120))
+    }
+
+    func testDragHonorsHoldStepsAndRefusesChangedEndpointsBeforeDown() throws {
+        let probe = Probe()
+        try BackgroundDragDispatcher.drag(target: target, steps: 4, hold: 0.4, io: probe.io, validateSession: {})
+        XCTAssertEqual(probe.events.filter { $0.type == .leftMouseDragged }.count, 4)
+        XCTAssertTrue(probe.pauses.contains(0.4))
+        XCTAssertEqual(probe.events.last?.location, target.end)
+
+        let stale = Probe()
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: stale.io, validateSession: {}) {
+            throw ComputerUseError.stateUnavailable("Endpoint moved.")
+        })
+        XCTAssertEqual(stale.events.map(\.type), [.mouseMoved])
     }
 
     func testModifiedDragKeepsFlagsAndMotionTogetherUntilRelease() throws {
@@ -209,6 +244,17 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {
             if revoked { throw ComputerUseError.stateUnavailable("lease ended") }
         }))
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(Array(probe.lifecycle.suffix(2)), ["release", "deactivate"])
+    }
+
+    func testCancellationAfterPressStillReleasesExactlyOnce() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        probe.posted = { if $0.type == .leftMouseDown { token.cancel() } }
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {})
+        })
         XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
         XCTAssertEqual(Array(probe.lifecycle.suffix(2)), ["release", "deactivate"])
     }

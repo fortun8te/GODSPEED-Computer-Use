@@ -12,6 +12,7 @@ public enum OpenComputerUseCLICommand: Equatable {
     case turnEnded(payload: String?)
     case help(command: String?)
     case version
+    case relayAuthorityPublicKey
 }
 
 public enum OpenComputerUseCallInvocation: Equatable {
@@ -37,7 +38,7 @@ public func shouldUseMacOSAppAgentProxy(
         return !runningFromLaunchServicesAppInstance
     case .mcp, .doctor, .lockedUseStatus, .listApps, .snapshot, .call:
         return true
-    case .lockedUseManagement, .turnEnded, .help, .version:
+    case .lockedUseManagement, .turnEnded, .help, .version, .relayAuthorityPublicKey:
         return false
     }
 }
@@ -117,6 +118,10 @@ public func parseOpenComputerUseCLI(arguments: [String]) throws -> OpenComputerU
         return try parseLockedUse(arguments: Array(arguments.dropFirst()))
     case "list-apps":
         return try parseSimpleCommand(name: "list-apps", arguments: Array(arguments.dropFirst()), result: .listApps)
+    case "relay-authority-public-key":
+        return try parseSimpleCommand(
+            name: "relay-authority-public-key", arguments: Array(arguments.dropFirst()), result: .relayAuthorityPublicKey
+        )
     case "call":
         return try parseCall(arguments: Array(arguments.dropFirst()))
     case "turn-ended":
@@ -150,6 +155,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           snapshot <app>       Print the current accessibility snapshot for an app.
           call <tool>           Call one tool, or run a JSON array of tool calls.
           turn-ended           Notify the running MCP process that the host turn ended.
+          relay-authority-public-key  Print the Chrome relay public key for the installer.
           help [command]       Show general or command-specific help.
           version              Print the CLI version.
 
@@ -205,7 +211,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
     case "snapshot":
         return """
         Usage:
-          open-computer-use snapshot [--include-ax true|false] [--include-screenshot true|false] [--text-limit <positive-int|max>] [--max-tree-nodes <positive-int>] [--max-tree-depth <positive-int>] <app>
+          open-computer-use snapshot [--include-ax true|false] [--include-screenshot true|false] [--include-menu-bar true|false] [--text-limit <positive-int|max>] [--max-tree-nodes <positive-int>] [--max-tree-depth <positive-int>] <app>
 
         Arguments:
           <app>                App name or bundle identifier to inspect.
@@ -213,6 +219,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         Options:
           --include-ax         Include AX/focus/selection (true by default). False invalidates prior indexes.
           --include-screenshot Include screenshot capture (true by default). At least one channel must be true.
+          --include-menu-bar   Add the menu bar to the AX list (false by default).
           --text-limit         Override the default 500 character text limit. Use `max` for full text.
           --max-tree-nodes     Override the default 1200 node accessibility tree budget.
           --max-tree-depth     Override the default 64 level accessibility tree depth.
@@ -237,6 +244,15 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         can reuse the app state and element indices captured by get_app_state.
         Sequence execution stops after the first tool result with isError=true.
         Sequence runs do not pause between operations unless --sleep is given.
+        """
+    case "relay-authority-public-key":
+        return """
+        Usage:
+          open-computer-use relay-authority-public-key
+
+        Print the public half of the Chrome relay signing key (unpadded base64url, 32 raw bytes).
+        The installer provisions it as OBU_RELAY_AUTHORITY_KEY for the native host.
+        Creates the Keychain key on first use. The private key never leaves this machine.
         """
     case "turn-ended":
         return """
@@ -343,13 +359,16 @@ private func parseSnapshot(arguments: [String]) throws -> OpenComputerUseCLIComm
     while index < arguments.count {
         let argument = arguments[index]
         switch argument {
-        case "--include-ax", "--include-screenshot":
+        case "--include-ax", "--include-screenshot", "--include-menu-bar":
             index += 1
             guard index < arguments.count, let value = Bool(arguments[index].lowercased()) else {
                 throw OpenComputerUseCLIError(message: "\(argument) requires true or false", helpCommand: "snapshot")
             }
-            if argument == "--include-ax" { observation.includeAX = value }
-            else { observation.includeScreenshot = value }
+            switch argument {
+            case "--include-ax": observation.includeAX = value
+            case "--include-menu-bar": observation.includeMenuBar = value
+            default: observation.includeScreenshot = value
+            }
         case "--text-limit":
             index += 1
             guard index < arguments.count else {

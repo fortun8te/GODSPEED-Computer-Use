@@ -9,11 +9,11 @@ import Foundation
 /// One registry per app (pid) per agent (`ClientScope`), so parallel agents never share or disturb numbers.
 /// `OPEN_COMPUTER_USE_STABLE_INDEXES=0` brings back per-read numbering from 0.
 final class ElementNumbering: @unchecked Sendable {
-    static let isEnabled: Bool = {
+    static var isEnabled: Bool {
         let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_STABLE_INDEXES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     /// The registry for `pid` in the current agent's scope.
     static func forApp(pid: pid_t) -> ElementNumbering {
@@ -178,10 +178,9 @@ final class ElementNumbering: @unchecked Sendable {
         return "stale: element \(index)\(what) is gone, nothing sent. Call get_app_state for the current numbers."
     }
 
-    static let gonePhrase = " is gone, nothing sent"
-
     static func isGone(_ error: Error) -> Bool {
-        SmartSteps.messageText(error).contains(gonePhrase)
+        if case .elementGone? = error as? ComputerUseError { return true }
+        return false
     }
 }
 

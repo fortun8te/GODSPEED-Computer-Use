@@ -114,6 +114,39 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(Set(found.map(\.id)).count, 12)
     }
 
+    func testExplicitClickSurvivesMoreThanTwelveLooseFieldMatches() {
+        let values = (1...12).map { ("Value \($0)", "entry \($0)") }
+        let rows = (1...12).map { "\($0) text field Value \($0) =" } + ["13 button Export PDF"]
+        let found = build(goal: "Click Export PDF", values: values, state: HandoffTool.parseControls(rows.joined(separator: "\n")))
+        XCTAssertTrue(found.contains { $0.text == "click \"Export PDF\"" })
+    }
+
+    func testExactClickUsesNoModel() {
+        var acted: [String] = []
+        let initial = "App=x\nWindow: Export\nWindow ID: 12\n1 button Export PDF"
+        let request = HandoffTool.Request(app: "x", goal: "Click Export PDF", doneWhen: [.text("Exported")],
+                                          values: [], maxSteps: 2, timeBudget: 5)
+        let deps = HandoffTool.Dependencies(
+            readState: { initial },
+            act: { action, _ in
+                acted.append(action.text)
+                return .init(ok: true, message: "", observedState: initial + "\n2 static text Exported")
+            },
+            choose: { _, _, _, _, _ in XCTFail("exact action called chooser"); return nil },
+            looksStuck: { _, _, _ in XCTFail("exact action called referee"); return false },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) },
+            replay: { _ in XCTFail("exact action tried recipe first"); return nil }, now: { 0 }
+        )
+        XCTAssertEqual(HandoffTool.run(request, deps).kind, .done)
+        XCTAssertEqual(acted, ["click \"Export PDF\""])
+    }
+
+    func testChooserUsesOnlyLoopbackReferee() {
+        XCTAssertEqual(Referee.localChooseURL(refereeURL: nil, setting: nil)?.host, "127.0.0.1")
+        XCTAssertNil(Referee.localChooseURL(refereeURL: URL(string: "https://example.test"), setting: nil))
+        XCTAssertNil(Referee.localChooseURL(refereeURL: nil, setting: "0"))
+    }
+
     func testRiskWords() {
         for label in ["Delete", "Send message", "Buy now", "Pay", "Submit order", "Remove item"] {
             XCTAssertTrue(HandoffTool.isRisky(label: label), label)
@@ -217,6 +250,34 @@ final class HandoffToolTests: XCTestCase {
         }
     }
 
+    func testGoalAlreadyOnScreenIsWeakAndNeverActs() {
+        // "Saved" is already on screen before anything runs: weak evidence, so no action is taken and the
+        // caller decides. It must not end as done.
+        let app = FakeApp()
+        app.saved = true
+        let outcome = HandoffTool.run(request(), app.deps(choose: { _ in
+            XCTFail("a weak match must not reach the chooser")
+            return nil
+        }))
+        XCTAssertEqual(outcome.kind, .notVerified)
+        XCTAssertTrue(outcome.steps.isEmpty)
+        XCTAssertTrue(app.acts.isEmpty)
+        XCTAssertTrue(outcome.reply().hasPrefix("Not verified:"), outcome.reply())
+        XCTAssertTrue(outcome.reply().contains("already satisfied (weak evidence"), outcome.reply())
+    }
+
+    func testSavedRecipeReportingWeakEvidenceIsNotDone() {
+        let app = FakeApp()
+        var deps = app.deps(choose: { _ in XCTFail("no choice after a weak recipe check"); return nil })
+        deps.replay = { _ in
+            .alreadySatisfied("Already satisfied before replay (weak evidence): Saved. No steps ran.")
+        }
+        let outcome = HandoffTool.run(request(), deps)
+        XCTAssertEqual(outcome.kind, .notVerified)
+        XCTAssertTrue(outcome.steps.isEmpty)
+        XCTAssertTrue(app.acts.isEmpty)
+    }
+
     func testRunsToDone() {
         let app = FakeApp()
         let outcome = HandoffTool.run(request(), app.deps(choose: { options in
@@ -228,7 +289,7 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(app.acts, ["type \"Ann\" into \"Name\"", "click \"Save\""])
         XCTAssertEqual(outcome.steps.count, 2)
         XCTAssertEqual(app.chooseCalls, 2, "ambiguous steps have one local scoring request each")
-        XCTAssertTrue(outcome.reply().hasPrefix("Done:"))
+        XCTAssertTrue(outcome.reply().hasPrefix("Weak evidence:"))
         XCTAssertTrue(outcome.reply().contains("Changes:"))
     }
 
@@ -260,7 +321,7 @@ final class HandoffToolTests: XCTestCase {
                       "1 secure text field Name =", "1 text field (disabled) Name ="] {
             let controls = HandoffTool.parseControls(state)
             XCTAssertNil(HandoffTool.exactFieldFill(request: request, controls: controls,
-                                                    candidates: build(state: controls)), state)
+                                                    tried: []), state)
         }
     }
 
@@ -296,9 +357,12 @@ final class HandoffToolTests: XCTestCase {
         var deps = app.deps(choose: pick(["type"]))
         deps.act = { candidate, _ in
             app.acts.append(candidate.text)
+            app.saved = true
             return HandoffTool.ActResult(ok: false, message: "transport interrupted")
         }
-        XCTAssertEqual(HandoffTool.run(request(), deps).kind, .escalate)
+        let outcome = HandoffTool.run(request(), deps)
+        XCTAssertEqual(outcome.kind, .escalate)
+        XCTAssertEqual(outcome.deliveryState, .outcomeUnknown)
         XCTAssertEqual(app.acts.count, 1)
         XCTAssertEqual(app.reads, 2)
         XCTAssertEqual(app.chooseCalls, 1)
@@ -345,7 +409,8 @@ final class HandoffToolTests: XCTestCase {
         let app = FakeApp()
         app.saved = true
         let outcome = HandoffTool.run(request(), app.deps(choose: { _ in nil }))
-        XCTAssertEqual(outcome.kind, .done)
+        // A match already on screen is weak evidence: no steps, and the caller decides.
+        XCTAssertEqual(outcome.kind, .notVerified)
         XCTAssertTrue(app.acts.isEmpty)
     }
 

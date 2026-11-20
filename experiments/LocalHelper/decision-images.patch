@@ -1,0 +1,93 @@
+--- a/server_mlx.py
++++ b/server_mlx.py
+@@ -43,6 +43,9 @@
+ MAX_VIEW = int(os.environ.get("OCU_REFEREE_MAX_VIEW_CHARS", "1200"))
+ MAX_SIDE = int(os.environ.get("OCU_VISION_MAX_SIDE", "1280"))
+ MAX_DECIDE_BODY = 64 * 1024
++MAX_PICTURE_BODY = 2 * 1024 * 1024
++MAX_PICTURE_BASE64 = 1_398_104  # 1 MiB encoded as base64
++MAX_PICTURE_SIDE = 1280
+ MAX_LOCATE_BODY = 16 * 1024 * 1024
+
+ CRITERIA = {
+@@ -119,13 +122,29 @@
+                     clear_cache()
+
+
+-def two_question_probs(d1, state):
++def decision_media(body):
++    """Absent or unusable optional media keeps the original text-only request."""
++    encoded = body.get("image_base64")
++    if not isinstance(encoded, str) or not 0 < len(encoded) <= MAX_PICTURE_BASE64:
++        return {}
++    from PIL import Image
++
++    try:
++        with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True)), formats=["JPEG", "PNG"]) as image:
++            if not 0 < min(image.size) <= max(image.size) <= MAX_PICTURE_SIDE:
++                return {}
++            return {"media": [image.convert("RGB")]}
++    except (OSError, ValueError, Image.DecompressionBombError):
++        return {}
++
++
++def two_question_probs(d1, state, **media):
+     """One d1 call, two yes/no questions. done = goal reached; stuck = repeating failure.
+
+     Maps onto the four-label reply: done and stuck are the "yes" probabilities, act is what neither
+     claims. look_again is not asked in this mode, so it stays 0.
+     """
+-    answers = d1.system_one(state, {"goal": GOAL_QUESTION, "stuck": STUCK_QUESTION})["answers"]
++    answers = d1.system_one(state, {"goal": GOAL_QUESTION, "stuck": STUCK_QUESTION}, **media)["answers"]
+     done = float(answers["goal"]["probabilities"].get("yes", 0.0))
+     stuck = float(answers["stuck"]["probabilities"].get("yes", 0.0))
+     return {"act": max(0.0, 1.0 - max(done, stuck)), "look_again": 0.0, "done": done, "stuck": stuck}
+@@ -138,14 +157,15 @@
+         "result": str(body.get("result", ""))[:500],
+         "view": str(body.get("view", ""))[:MAX_VIEW],
+     }, ensure_ascii=False)
++    media = decision_media(body)
+     with lock:
+         d1, _ = get("d1")
+         start = time.perf_counter()
+         if MODE == "single":
+-            probs = d1.system_one(state, {"d": QUESTION})["answers"]["d"]["probabilities"]
++            probs = d1.system_one(state, {"d": QUESTION}, **media)["answers"]["d"]["probabilities"]
+             probs = {k: float(probs.get(k, 0.0)) for k in CRITERIA}
+         else:
+-            probs = two_question_probs(d1, state)
++            probs = two_question_probs(d1, state, **media)
+         ms = int((time.perf_counter() - start) * 1000)
+     label = max(probs, key=probs.get)
+     reply = {"label": label, "confidence": round(probs[label], 4), "probs": probs, "ms": ms}
+@@ -185,10 +205,11 @@
+         "history": str(body.get("history", ""))[:500],
+         "screen": str(body.get("screen", ""))[:MAX_VIEW],
+     }, ensure_ascii=False)
++    media = decision_media(body)
+     with lock:
+         d1, _ = get("d1")
+         start = time.perf_counter()
+-        raw = d1.system_one(state, {"c": question})["answers"]["c"]["probabilities"]
++        raw = d1.system_one(state, {"c": question}, **media)["answers"]["c"]["probabilities"]
+         ms = int((time.perf_counter() - start) * 1000)
+     probs = {name: round(float(raw.get(code, 0.0)), 4) for name, code in zip(ids, OPTION_CODES)}
+     probs["none"] = round(float(raw.get("none", 0.0)), 4)
+@@ -269,10 +290,15 @@
+             return self.reply(202, {"ok": True, "warming": True, "loaded": sorted(models)})
+         if self.path != "/health":
+             return self.reply(404, {"error": "not found"})
+-        self.reply(200, {"ok": True, "runtime": "mlx", "loaded": sorted(models), "d1": D1_PATH, "lfm": LFM_PATH})
++        self.reply(200, {"ok": True, "runtime": "mlx", "decision_image": "v1", "loaded": sorted(models), "d1": D1_PATH, "lfm": LFM_PATH})
+
+     def do_POST(self):
+-        limit = MAX_LOCATE_BODY if self.path == "/locate" else MAX_DECIDE_BODY
++        if self.path == "/locate":
++            limit = MAX_LOCATE_BODY
++        elif self.path in ("/decide", "/choose"):
++            limit = MAX_PICTURE_BODY
++        else:
++            limit = MAX_DECIDE_BODY
+         length = int(self.headers.get("Content-Length") or 0)
+         if length > limit:
+             return self.reply(413, {"error": "body too large"})

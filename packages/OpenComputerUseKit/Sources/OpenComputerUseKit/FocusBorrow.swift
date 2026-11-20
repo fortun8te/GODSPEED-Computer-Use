@@ -25,16 +25,14 @@ enum FocusBorrow {
         "save", "save as", "export", "rename", "new folder", "open", "print", "duplicate", "move to",
     ]
 
-    /// Whether the feature is on (`OPEN_COMPUTER_USE_FOCUS_BORROW`, default on; "0" or "off" disables).
+    /// Focus borrowing is opt-in and unavailable in either background-only mode.
     static var isEnabled: Bool {
         isEnabled(environment: GodspeedSettings.environment)
     }
 
     static func isEnabled(environment: [String: String]) -> Bool {
         guard !backgroundOnlyMode(environment: environment) else { return false }
-        let raw = environment["OPEN_COMPUTER_USE_FOCUS_BORROW"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
-        return !["0", "false", "no", "off"].contains(raw)
+        return StrictBackground.enabledFlag(environment["OPEN_COMPUTER_USE_FOCUS_BORROW"])
     }
 
     /// Whether a menu item with this title opens a dialog or editor (ends with an ellipsis, or is one of
@@ -59,7 +57,7 @@ enum FocusBorrow {
 
     /// Whether the app of `pid` is currently borrowed (so input may use the normal frontmost paths).
     static func isBorrowed(pid: pid_t) -> Bool {
-        shared.isBorrowed(pid: pid)
+        !backgroundOnlyMode() && shared.isBorrowed(pid: pid)
     }
 
     /// Runs `work` with `pid` in front and gives focus back afterwards, also when `work` throws.
@@ -98,7 +96,7 @@ final class FocusBorrowSession {
     /// brought forward (the steps then run as they would in the background).
     @discardableResult
     func ensure(pid: pid_t) -> Bool {
-        guard enabled else { return false }
+        guard enabled, !backgroundOnlyMode() else { return false }
         if let startedAt, Date().timeIntervalSince(startedAt) > Self.maxAge
             || (isActive && FocusBorrowController.secondsSinceUserInput() < Date().timeIntervalSince(startedAt)) {
             // Too long, or the user came back mid-borrow: hand focus back now and run the rest in the background.
@@ -153,6 +151,8 @@ final class FocusBorrowController: @unchecked Sendable {
         self.activator = activator
     }
 
+    var isBorrowing: Bool { lock.withLock { !activePIDs.isEmpty } }
+
     /// Opens a borrow of `pid`: the first borrow records the app in front, then `pid` is brought forward.
     func acquire(pid: pid_t) -> Lease {
         let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -199,13 +199,24 @@ final class FocusBorrowController: @unchecked Sendable {
         case .handOver(let pid):
             if activator.isAlive(pid: pid) { _ = activator.activate(pid: pid) }
         case .restore(let previous):
-            // Restore only if this app is still the one in front: otherwise the user moved on by themselves.
-            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid {
+            // Restore only if this app is still the one in front (otherwise the user moved on by themselves), and
+            // only once the user has paused: taking focus mid-sentence would send their keys to the other app.
+            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid, awaitTypingPause() {
                 _ = activator.activate(pid: previous)
             }
         }
         // An app that was hidden before the borrow is hidden again once nothing borrows it.
         if !isBorrowed(pid: lease.pid) { activator.restoreVisibility(pid: lease.pid) }
+    }
+
+    /// Polls for a typing pause for up to `timeout` seconds. False when the user is still typing at the end.
+    private func awaitTypingPause(timeout: TimeInterval = 1.5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if activator.waitForTypingPause() { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        return activator.waitForTypingPause()
     }
 
     func isBorrowed(pid: pid_t) -> Bool {
@@ -362,7 +373,7 @@ final class WorkspaceFocusActivator: FocusActivating {
 
     private func hasFocusedWindow(pid: pid_t) -> Bool {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.2)
+        AXUIElementSetMessagingTimeout(app, AppTiming.messagingTimeout(pid: pid, fixed: 0.2))
         var window: CFTypeRef?
         return AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &window) == .success
             && window != nil

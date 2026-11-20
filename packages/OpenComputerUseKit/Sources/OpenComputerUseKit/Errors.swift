@@ -9,6 +9,18 @@ public enum ComputerUseError: Error, LocalizedError {
     case appNotFound(String)
     case permissionDenied(String)
     case stateUnavailable(String)
+    case notSent(String)
+    case targetNotFound(String)
+    case ambiguousTarget(String)
+    case staleTarget(String)
+    case elementGone(String)
+    case timedOut(String, delivery: DeliveryState)
+    case acknowledged(String)
+    case staleRef
+    case windowChanged(UInt32)
+    case backgroundUnsupported(String)
+    case approvalRequired(String)
+    case actionDenied(String)
 
     public var errorDescription: String? {
         switch self {
@@ -22,18 +34,45 @@ public enum ComputerUseError: Error, LocalizedError {
             return "appNotFound(\"\(app)\")"
         case .permissionDenied(let message):
             return message
-        case .stateUnavailable(let message):
+        case .backgroundUnsupported(let message):
+            return "BACKGROUND_UNSUPPORTED: \(message)"
+        case .approvalRequired(let message):
+            return "APPROVAL_REQUIRED: \(message)"
+        case .actionDenied(let message):
+            return "ACTION_DENIED: \(message)"
+        case .stateUnavailable(let message), .notSent(let message), .staleTarget(let message),
+             .elementGone(let message), .timedOut(let message, _), .acknowledged(let message):
             return message
+        case .targetNotFound(let message), .ambiguousTarget(let message):
+            return "invalidArguments(\"\(message)\")"
+        case .staleRef:
+            return "STALE_REF. Nothing was sent. Run get_app_state with include_refs=true."
+        case .windowChanged(let id):
+            return "WINDOW_CHANGED. Observed window \(id) changed or is unavailable. Nothing was sent. Read the intended window again."
         }
     }
 
-    var toolResultIsError: Bool {
-        true
+    var toolResultIsError: Bool { true }
+
+    /// Unclassified errors are conservative: they do not prove a command was never sent.
+    public var deliveryState: DeliveryState {
+        switch self {
+        case .unsupportedTool, .invalidArguments, .appNotFound, .permissionDenied, .notSent,
+             .targetNotFound, .ambiguousTarget, .staleTarget, .elementGone,
+             .staleRef, .windowChanged, .backgroundUnsupported, .approvalRequired, .actionDenied:  // refused before any input
+            return .notSent
+        case .timedOut(_, let delivery):
+            return delivery
+        case .acknowledged:
+            return .acknowledged
+        case .stateUnavailable, .message:
+            return .outcomeUnknown
+        }
     }
 }
 
 extension ComputerUseError {
     static func missingArgument(_ name: String) -> ComputerUseError {
-        .message("Missing required argument: \(name)")
+        .notSent("Missing required argument: \(name)")
     }
 }

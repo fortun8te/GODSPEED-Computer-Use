@@ -4,10 +4,8 @@ import Foundation
 /// when the goal is done, it is stuck, or it is unsure. Every action uses a background call
 /// bound to the window it was selected from.
 ///
-/// Loop: replay a saved recipe for the goal when there is one; else read the state, build up to 12 candidate
-/// actions (labelled controls the goal mentions, each given value typed into a matching field, Return, a
-/// scroll). Fill an unambiguous empty field with the exact requested value directly. For other choices,
-/// score the options with the local helper and only act on a clear winner. Check `done_when` after each step.
+/// Loop: resolve exact actions first, then try a verified recipe or ask the local helper to rank
+/// up to 12 relevant actions. Check `done_when` after every action.
 /// It stops on done, on stuck (two steps that changed nothing, two failed steps, or the checker's stuck
 /// verdict), on a risky control (Delete, Send, Buy, Pay ...: escalated, never pressed), and on budget.
 enum HandoffTool {
@@ -44,6 +42,9 @@ enum HandoffTool {
             throw ComputerUseError.invalidArguments("handoff needs \"goal\" (one bounded subtask)")
         }
         let doneWhen = try DoneCheck.parse(arguments["done_when"])
+        guard !doneWhen.contains(where: \.requiresBaseline) else {
+            throw ComputerUseError.invalidArguments("Use batch for a change-aware done_when check.")
+        }
         guard !doneWhen.isEmpty else {
             throw ComputerUseError.invalidArguments(
                 "handoff needs \"done_when\", how GODSPEED knows it is finished, e.g. {\"text\": \"Saved\"} or {\"field\": \"Name\", \"equals\": \"Ann\"}"
@@ -211,67 +212,55 @@ enum HandoffTool {
         typedAny: Bool,
         scrollsDone: Int
     ) -> [Candidate] {
-        var found: [Candidate] = []
-        func add(_ kind: Candidate.Kind, text: String, tool: String, arguments: [String: Any], risky: Bool = false, key: String) {
-            guard !tried.contains(key), !found.contains(where: { $0.key == key }) else { return }
-            found.append(Candidate(id: "", kind: kind, text: text, tool: tool, arguments: arguments, risky: risky, key: key))
+        var found: [(candidate: Candidate, score: Double)] = []
+        var seen = tried
+        func add(_ candidate: Candidate, score: Double) {
+            guard seen.insert(candidate.key).inserted else { return }
+            found.append((candidate, score))
         }
 
-        // 1. Typing: each value into the fields that fit its key, else into up to two empty fields.
-        // Never into a password or other secret field: that is the model's call (and the secret stays out of d1).
+        // Rank all actions together before applying the shared cap. A fuzzy typing suggestion should
+        // not crowd out a click the goal names, or a field named explicitly by the supplied key.
         let fields = controls.filter { fieldRoles.contains($0.role) && !$0.disabled && !RecipeLocator.looksSecret($0.label) }
         for (key, value) in values where !RecipeLocator.looksSecret(key) {
             let keyWords = Set(words(key))
-            var matches = fields.filter { field in
-                let name = field.label.lowercased()
-                let loose = key.count >= 3 && name.contains(key.lowercased())
-                return loose || !keyWords.isDisjoint(with: words(field.label))
-            }
-            if matches.isEmpty { matches = Array(fields.filter { ($0.value ?? "").isEmpty && ($0.role != "text entry area" || $0.label.isEmpty) }.prefix(2)) }
-            for field in matches.prefix(3) {
-                if field.value == value || field.label == value { continue } // already there
-                let name = field.label.isEmpty || field.role == "text entry area" ? field.role : field.label
-                let shown = value.count > 40 ? String(value.prefix(40)) + "..." : value
-                add(.setValue, text: "type \"\(shown)\" into \"\(name)\"", tool: "set_value",
-                    arguments: ["element_index": String(field.index), "value": value], key: "set|\(value)|\(field.index)")
+            let named = fields.filter { !keyWords.isDisjoint(with: words($0.label)) }
+            let fallback = fields.filter { ($0.value ?? "").isEmpty && ($0.role != "text entry area" || $0.label.isEmpty) }
+            for field in named.isEmpty ? Array(fallback.prefix(2)) : named {
+                if field.value == value || field.label == value { continue }
+                let score: Double = sameLabel(field.label, key) ? 12 : (named.isEmpty ? 0.25 : 1)
+                add(fill(field, value: value), score: score)
             }
         }
 
-        // 2. Clicks on labelled controls, ranked by how well they fit the goal.
-        var goalWords = Set(words(goal + " " + doneSummary + " " + values.map(\.key).joined(separator: " ")))
-        goalWords.subtract(stopWords)
-        let labelCounts = Dictionary(controls.map { ($0.label, 1) }, uniquingKeysWith: +)
-        let ranked = controls.enumerated().compactMap { offset, control -> (Double, Int, Control)? in
-            guard clickRoles.contains(control.role), !control.disabled, !control.label.isEmpty else { return nil }
-            // A risky control is offered only when the goal names it; a generic "Next" or "Save" needs no mention.
+        let explicitWords = Set(words(goal)).subtracting(stopWords)
+        let clickLabel = explicitClickLabel(goal)
+        let goalWords = explicitWords.union(words(doneSummary + " " + values.map(\.key).joined(separator: " "))).subtracting(stopWords)
+        let labelCounts = Dictionary(grouping: controls) { $0.label.lowercased() }.mapValues(\.count)
+        for control in controls where clickRoles.contains(control.role) && !control.disabled && !control.label.isEmpty {
             let risky = isRisky(label: control.label)
-            // The risky word itself (Delete, Send ...) must be in the goal, not just the control's other words.
-            if risky, Set(words(control.label)).intersection(riskyWords).isDisjoint(with: goalWords) { return nil }
+            let labelWords = Set(words(control.label)).subtracting(stopWords)
+            if risky, labelWords.intersection(riskyWords).isDisjoint(with: explicitWords) { continue }
             let score = relevance(label: control.label, goalWords: goalWords, countingProgressWords: !risky)
-            guard score > 0 else { return nil }
-            return (score, offset, control)
-        }.sorted { $0.0 != $1.0 ? $0.0 > $1.0 : $0.1 < $1.1 }
-        for (_, _, control) in ranked {
-            let unique = labelCounts[control.label] == 1
-            let args = ["element_index": String(control.index)]
-            // Same-named controls are different actions: the position is part of what was tried.
-            add(.click, text: "click \"\(control.label)\"" + (unique ? "" : " (#\(control.index))"), tool: "click", arguments: args,
-                risky: isRisky(label: control.label), key: "click|\(control.role)|\(control.label)" + (unique ? "" : "|\(control.index)"))
+            guard score > 0 else { continue }
+            let named = !labelWords.isEmpty && labelWords.isSubset(of: explicitWords)
+            let priority = clickLabel.map { sameLabel(control.label, $0) } == true ? 16 : (named ? 8 : 0)
+            add(click(control, unique: labelCounts[control.label.lowercased()] == 1), score: Double(priority) + min(3, score))
         }
 
-        // 3. Return may trigger a default submission even when no button reports its role.
         if typedAny {
-            add(.pressReturn, text: "press Return", tool: "press_key", arguments: ["key": "Return"], risky: true, key: "return")
+            add(Candidate(id: "", kind: .pressReturn, text: "press Return", tool: "press_key",
+                          arguments: ["key": "Return"], risky: true, key: "return"), score: 0)
+        }
+        if scrollsDone < maxScrolls, let area = controls.first(where: { $0.role == "scroll area" && !$0.disabled }) {
+            add(Candidate(id: "", kind: .scroll, text: "scroll down", tool: "scroll",
+                          arguments: ["direction": "down", "element_index": String(area.index)],
+                          risky: false, key: "scroll|\(scrollsDone)"), score: 0)
         }
 
-        // 4. Scroll down, a few times.
-        if scrollsDone < maxScrolls, let area = controls.first(where: { $0.role == "scroll area" }) {
-            add(.scroll, text: "scroll down", tool: "scroll",
-                arguments: ["direction": "down", "element_index": String(area.index)], key: "scroll|\(scrollsDone)")
-        }
-
-        // Typing first, then the best clicks, Return, scroll; the cut falls on the weakest clicks.
-        let limited = Array(found.prefix(maxCandidates))
+        let limited = found.enumerated().sorted {
+            $0.element.score == $1.element.score ? $0.offset < $1.offset : $0.element.score > $1.element.score
+        }.prefix(maxCandidates).map { $0.element.candidate }
         return limited.enumerated().map { offset, item in
             Candidate(id: String(Character(UnicodeScalar(UInt8(97 + offset)))), kind: item.kind, text: item.text, tool: item.tool,
                       arguments: item.arguments, risky: item.risky, key: item.key)
@@ -289,24 +278,63 @@ enum HandoffTool {
         lhs.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare(rhs.trimmingCharacters(in: .whitespaces)) == .orderedSame
     }
 
-    /// A deterministic write requires an explicit value and completion check for the same field.
-    /// Ambiguity, existing text, or inferred labels leave the selection to the local checker.
-    static func exactFieldFill(request: Request, controls: [Control], candidates: [Candidate]) -> Candidate? {
+    private static func click(_ control: Control, unique: Bool) -> Candidate {
+        let suffix = unique ? "" : " (#\(control.index))"
+        return Candidate(id: "", kind: .click, text: "click \"\(control.label)\"\(suffix)", tool: "click",
+                         arguments: ["element_index": String(control.index)], risky: isRisky(label: control.label),
+                         key: "click|\(control.role)|\(control.label)" + (unique ? "" : "|\(control.index)"))
+    }
+
+    private static func fill(_ field: Control, value: String) -> Candidate {
+        let name = field.label.isEmpty || field.role == "text entry area" ? field.role : field.label
+        let shown = value.count > 40 ? String(value.prefix(40)) + "..." : value
+        return Candidate(id: "", kind: .setValue, text: "type \"\(shown)\" into \"\(name)\"", tool: "set_value",
+                         arguments: ["element_index": String(field.index), "value": value],
+                         risky: isRisky(label: field.label) || isRisky(label: field.role), key: "set|\(value)|\(field.index)")
+    }
+
+    /// A deterministic write requires a unique empty field and an explicit equality check for the value.
+    static func exactFieldFill(request: Request, controls: [Control], tried: Set<String>) -> Candidate? {
         for (label, value) in request.values where !value.isEmpty && !RecipeLocator.looksSecret(label) && !isRisky(label: label) {
             let checks = request.doneWhen.compactMap { condition -> String? in
                 guard case .field(let field, let expected) = condition, sameLabel(field, label) else { return nil }
                 return expected
             }
             guard checks == [value], request.values.filter({ sameLabel($0.key, label) }).count == 1 else { continue }
-            let matches = controls.filter { fieldRoles.contains($0.role) && sameLabel($0.label, label) }
+            let matches = controls.filter { (fieldRoles.contains($0.role) || $0.role == "secure text field") && sameLabel($0.label, label) }
             guard matches.count == 1, let field = matches.first,
                   field.role == "text field", !field.disabled, field.value == "" else { continue }
-            if let candidate = candidates.first(where: {
-                $0.kind == .setValue && $0.arguments["element_index"] as? String == String(field.index)
-                    && $0.arguments["value"] as? String == value
-            }) { return candidate }
+            let candidate = fill(field, value: value)
+            if !tried.contains(candidate.key) { return candidate }
         }
         return nil
+    }
+
+    private static func explicitClickLabel(_ goal: String) -> String? {
+        guard goal.lowercased().hasPrefix("click ") else { return nil }
+        let label = String(goal.dropFirst("click ".count)).trimmingCharacters(in: .whitespaces)
+        return label.isEmpty ? nil : label
+    }
+
+    static func exactAction(request: Request, controls: [Control], tried: Set<String>) -> Candidate? {
+        if let fill = exactFieldFill(request: request, controls: controls, tried: tried) { return fill }
+        // Only the whole "click <label>" instruction permits a deterministic click.
+        guard !request.doneWhen.isEmpty, request.values.isEmpty, let label = explicitClickLabel(request.goal) else { return nil }
+        let matches = controls.filter { clickRoles.contains($0.role) && sameLabel($0.label, label) }
+        guard matches.count == 1, let control = matches.first, !control.disabled,
+              !RecipeLocator.looksSecret(control.label) else { return nil }
+        let candidate = click(control, unique: true)
+        return !candidate.risky && !tried.contains(candidate.key) ? candidate : nil
+    }
+
+    /// True when every condition was missing on `before` and is met on `after`: the goal became true during the handoff.
+    static func becameTrue(_ conditions: [DoneCheck.Condition], before: String, after: String) -> Bool {
+        !conditions.isEmpty && conditions.allSatisfy { condition in
+            guard case .missing = check([condition], screen: before), case .weak = check([condition], screen: after) else {
+                return false
+            }
+            return true
+        }
     }
 
     static func check(_ conditions: [DoneCheck.Condition], screen: String) -> DoneCheck.Result {
@@ -322,7 +350,7 @@ enum HandoffTool {
                 unmet.append(contentsOf: reasons)
             }
         }
-        return unmet.isEmpty ? .verified(met: conditions.map(\.summary)) : .missing(unmet: unmet)
+        return unmet.isEmpty ? .weak(met: conditions.map(\.summary)) : .missing(unmet: unmet)
     }
 
     /// Acts only on a clear winner: probability at least `minProbability`, a lead of at least `minMargin` over
@@ -330,6 +358,9 @@ enum HandoffTool {
     static func decide(candidates: [Candidate], probabilities: [String: Double]?) -> Decision {
         guard !candidates.isEmpty else { return .escalate("no action on screen fits the goal") }
         guard let probabilities else { return .escalate("the checker model is not available, so GODSPEED cannot rank the options") }
+        guard probabilities.values.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+            return .escalate("the checker returned invalid scores")
+        }
         let scored = candidates.map { ($0, probabilities[$0.id] ?? 0) }.sorted { $0.1 > $1.1 }
         let (best, p) = scored[0]
         let runnerUp = max(scored.dropFirst().first?.1 ?? 0, probabilities["none"] ?? 0)
@@ -351,11 +382,16 @@ enum HandoffTool {
 
     /// An unattended replay cannot type into an unknown focus, send shortcuts, or operate another app.
     static func isSafeRecipeStep(_ step: BatchTool.Step, app: String) -> Bool {
-        if let stepApp = step.arguments["app"] as? String, BatchRecipes.normalize(app) != BatchRecipes.normalize(stepApp) {
+        if let stepApp = step.arguments["app"] as? String, !BatchRecipes.sameApp(app, stepApp) {
             return false
         }
+        guard step.arguments["window_id"] == nil else { return false }
         switch step.tool {
-        case "get_app_state", "query", "wait":
+        case "get_app_state", "query":
+            return true
+        case "wait":
+            guard let wait = try? BatchEffects.Wait(arguments: step.arguments) else { return false }
+            if case .window = wait.kind { return false }
             return true
         case "click", "set_value":
             let args = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
@@ -375,18 +411,19 @@ enum HandoffTool {
         }
     }
 
-    /// Bind the executable step to the control it actually found, even if a stored locator healed.
+    /// Bind the executable step to fresh evidence from the original window.
     static func bindRecipeStep(_ step: BatchTool.Step, app: String, state: String?) -> BatchTool.Step? {
-        guard isSafeRecipeStep(step, app: app) else { return nil }
-        if step.isReadOnly { return step }
+        guard isSafeRecipeStep(step, app: app), let state, let window = observedWindowID(in: state) else { return nil }
         var args = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
-        guard let state, let window = observedWindowID(in: state), let label = args["label"] as? String else { return nil }
+        args["app"] = app
+        args["window_id"] = window
+        if step.isReadOnly { return BatchTool.Step(tool: step.tool, arguments: args) }
+        guard let label = args["label"] as? String else { return nil }
         let roles = step.tool == "set_value" ? fieldRoles : clickRoles
         let matches = parseControls(state).filter { roles.contains($0.role) && sameLabel($0.label, label) }
         guard matches.count == 1, let control = matches.first, !control.disabled else { return nil }
         args["label"] = nil
         args["element_index"] = String(control.index)
-        args["window_id"] = window
         if step.tool == "click" { args["click_method"] = "accessibility" }
         return BatchTool.Step(tool: step.tool, arguments: args)
     }
@@ -398,9 +435,15 @@ enum HandoffTool {
 
     static func replayResult(_ result: ToolCallResult) -> Replay {
         if batchReportsVerifiedDone(result) { return .verified }
-        guard let receipt = result.batchReceipt,
-              receipt.steps.allSatisfy({ $0.observation == .notSent }) else { return .uncertain }
-        return .incomplete
+        guard let receipt = result.batchReceipt else { return .uncertain }
+        if receipt.totalSteps == 0, receipt.doneCheck == .weakEvidence, let note = result.primaryText {
+            return .alreadySatisfied(note)
+        }
+        if receipt.stop == .windowChanged || receipt.stop == .recipeVerification
+            || receipt.failureCode == .windowChanged || receipt.failureCode == .staleRef {
+            return .blocked("The saved target could not be confirmed. Read the intended window before continuing.")
+        }
+        return receipt.steps.allSatisfy { $0.deliveryState == .notSent } ? .incomplete : .uncertain
     }
 
     static func percent(_ value: Double) -> String { "\(Int((value * 100).rounded()))%" }
@@ -410,12 +453,14 @@ enum HandoffTool {
     struct ActResult {
         let ok: Bool
         let message: String
-        var delivery: BatchEffects.Receipt? = nil
+        var delivery: DeliveryState? = nil
         var observedState: String? = nil
+        var refused = false
     }
 
     struct Outcome {
-        enum Kind { case done, stuck, escalate, budget, failed }
+        /// `notVerified`: the goal was already on screen as weak evidence. Nothing ran; the caller decides.
+        enum Kind { case done, notVerified, stuck, escalate, budget, failed, cancelled }
         let kind: Kind
         let reason: String
         let steps: [String]
@@ -426,21 +471,25 @@ enum HandoffTool {
         var screen: String = ""
         /// What done_when still lacks.
         var unmet: [String] = []
+        var deliveryState: DeliveryState = .notSent
 
         /// One outcome line, the steps taken, the net change and, when it needs the model, the top options.
         func reply() -> String {
             var lines: [String] = []
             switch kind {
-            case .done: lines.append("Done: \(reason)")
+            case .done:
+                lines.append(deliveryState == .verified ? "Done: \(reason)" : "Weak evidence: \(reason)")
+            case .notVerified: lines.append("Not verified: \(reason)")
             case .stuck: lines.append("Stuck: \(reason)")
             case .escalate: lines.append("Needs you: \(reason)")
             case .budget: lines.append("Stopped: \(reason)")
             case .failed: lines.append("Failed: \(reason)")
+            case .cancelled: lines.append("Stopped: \(reason)")
             }
             if steps.isEmpty {
                 lines.append("Steps: none")
             } else {
-                let shown = steps.count > 10 ? ["..."] + steps.suffix(10) : steps
+                let shown = steps.count > 10 && kind != .cancelled ? ["..."] + steps.suffix(10) : steps
                 lines.append("Steps (\(steps.count)): " + shown.joined(separator: "; "))
             }
             if let changes, !changes.isEmpty { lines.append("Changes: " + changes) }
@@ -457,27 +506,68 @@ enum HandoffTool {
         }
     }
 
+    struct DecisionView {
+        let state: String
+        let text: String
+    }
+
     /// Everything the loop touches outside itself, so tests can run it with fakes.
     struct Dependencies {
         var readState: () -> String?
         /// Runs one candidate in the window it was selected from.
         var act: (Candidate, _ state: String) -> ActResult
-        var choose: (_ goal: String, _ doneWhen: String, _ history: String, _ screen: String, _ options: [(id: String, text: String)]) -> [String: Double]?
+        var choose: (_ goal: String, _ doneWhen: String, _ history: String, _ screen: DecisionView, _ options: [(id: String, text: String)]) -> [String: Double]?
         /// The checker model's stuck verdict for a short summary.
-        var looksStuck: (_ goal: String, _ lastStep: String, _ summary: String) -> Bool
+        var looksStuck: (_ goal: String, _ lastStep: String, _ summary: DecisionView) -> Bool
         var check: (_ state: String) -> DoneCheck.Result
         /// Replay is based on this handoff's original window.
         var replay: (String) -> Replay?
         var now: () -> TimeInterval
     }
 
-    enum Replay { case verified, incomplete, uncertain }
+    enum Replay: Equatable { case verified, incomplete, uncertain, blocked(String), alreadySatisfied(String), cancelled(String, DeliveryState) }
 
-    static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
+    /// Runs the handoff and writes one `episode` row with its final outcome (see LearningLog). The row is written
+    /// after the outcome is known and cannot change it.
+    static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil,
+                    learning: LearningLog = .shared) -> Outcome {
+        let outcome = runLoop(request, deps, deadline: deadline, learning: learning)
+        learnEpisode(request: request, outcome: outcome, log: learning)
+        return outcome
+    }
+
+    /// One row per handoff: goal, app and the outcome kind. "done" is split by the check that passed.
+    static func learnEpisode(request: Request, outcome: Outcome, log: LearningLog) {
+        guard log.isEnabled else { return }
+        let kind: String
+        switch outcome.kind {
+        case .done: kind = outcome.deliveryState == .verified ? "verified" : "weak"
+        case .notVerified: kind = "not_verified"  // weak evidence only; never a training "done"
+        case .stuck: kind = "stuck"
+        case .escalate: kind = "escalate"
+        case .budget: kind = "budget"
+        case .failed: kind = "failed"
+        case .cancelled: kind = "cancelled"
+        }
+        log.append(LearningEpisodeRow(app: request.app, goal: request.goal, outcome: kind))
+    }
+
+    /// One `step` row per action the handoff ran, from the action's own result. Typed values are never written.
+    static func learnStep(app: String, choice: Candidate, result: ActResult, log: LearningLog) {
+        guard log.isEnabled else { return }
+        let failure = result.ok ? nil : (result.refused ? "refused" : "failed")
+        log.append(LearningStepRow(
+            app: app, tool: choice.tool, delivery_state: result.delivery?.rawValue, failure_code: failure
+        ))
+    }
+
+    private static func runLoop(_ request: Request, _ deps: Dependencies, deadline: TimeInterval?,
+                                learning: LearningLog) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
         func hasTime() -> Bool { deps.now() < deadline }
         func readState() -> String? {
-            guard hasTime(), let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
+            guard !RequestCancellation.requested, hasTime(),
+                  let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
             return state
         }
         var steps: [String] = []
@@ -488,10 +578,25 @@ enum HandoffTool {
         var failures = 0
         let doneSummary = request.doneWhen.map(\.summary).joined(separator: "; ")
         var lastUnmet: [String] = []
-        func verdict(_ state: String) -> DoneCheck.Result {
-            let result = deps.check(state)
-            if case .missing(let unmet) = result { lastUnmet = unmet } else { lastUnmet = [] }
-            return result
+        var deliveryState: DeliveryState = .notSent
+        // A weak match (present in the state, no proof it changed) never completes the handoff by itself.
+        var weakMatch: [String]?
+        /// `start` is the state the handoff began from: a weak match that was false there and is true now is verified.
+        func matched(_ state: String, since start: String? = nil) -> [String]? {
+            weakMatch = nil
+            switch deps.check(state) {
+            case .verified(let met):
+                lastUnmet = []
+                return met
+            case .weak(let met):
+                lastUnmet = []
+                if let start, HandoffTool.becameTrue(request.doneWhen, before: start, after: state) { return met }
+                weakMatch = met
+                return nil
+            case .missing(let unmet):
+                lastUnmet = unmet
+                return nil
+            }
         }
 
         func finish(_ kind: Outcome.Kind, _ reason: String, initial: String?, latest: String?,
@@ -503,28 +608,52 @@ enum HandoffTool {
                 if changes == AXStateDiff.noChangesMessage { changes = "the screen did not change" }
             }
             return Outcome(kind: kind, reason: reason, steps: steps, changes: changes, options: options,
-                           screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet)
+                           screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet, deliveryState: deliveryState)
         }
 
+        func cancelled() -> Outcome {
+            finish(.cancelled, "request cancelled. Inspect any in-flight action before retrying.", initial: nil, latest: nil)
+        }
+        guard !RequestCancellation.requested else { return cancelled() }
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: nil, latest: nil)
         }
         guard var state = readState() else {
+            if RequestCancellation.requested { return cancelled() }
             let target = request.windowID.map { "\(request.app) window \($0)" } ?? request.app
             return finish(.failed, "could not read \(target)", initial: nil, latest: nil)
         }
         var initial = state
         // Already true: nothing to do, and no saved recipe may run (it could undo or repeat the work).
-        if case .verified(let met) = verdict(state) {
+        if let met = matched(state) {
             return Outcome(kind: .done, reason: "already true (\(met.joined(separator: "; ")))", steps: [], changes: nil, options: [])
+        }
+        if let weak = weakMatch {
+            return finish(.notVerified, "already satisfied (weak evidence: \(weak.joined(separator: "; ")))", initial: initial, latest: state)
         }
 
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: initial, latest: state)
         }
-        if request.windowID == nil, let replayed = deps.replay(state) {
+        if RequestCancellation.requested { return cancelled() }
+        var initialControls = parseControls(state)
+        var initialExact = exactAction(request: request, controls: initialControls, tried: tried)
+        if initialExact == nil, request.windowID == nil, let replayed = deps.replay(state) {
+            if case .cancelled(let receipt, let delivery) = replayed {
+                steps.append(receipt)
+                deliveryState = delivery
+                return cancelled()
+            }
+            if case .blocked(let reason) = replayed { return finish(.escalate, reason, initial: initial, latest: state) }
+            if case .alreadySatisfied(let evidence) = replayed {
+                return finish(.notVerified, evidence, initial: initial, latest: state)
+            }
             steps.append("replayed the saved recipe")
-            if replayed == .verified { return Outcome(kind: .done, reason: "\(doneSummary) (saved recipe)", steps: steps, changes: nil, options: []) }
+            if replayed == .verified {
+                deliveryState = .verified
+                return finish(.done, "\(doneSummary) (saved recipe)", initial: initial, latest: state)
+            }
+            if replayed == .uncertain { deliveryState = .outcomeUnknown }
             guard hasTime() else {
                 return finish(.budget, "the recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: nil)
             }
@@ -533,42 +662,53 @@ enum HandoffTool {
                 return finish(.failed, "the saved recipe may have partially run; the app could not be read afterward", initial: initial, latest: nil)
             }
             state = fresh
-            if case .verified(let met) = verdict(state) {
-                return finish(.done, met.joined(separator: "; "), initial: initial, latest: state)
-            }
             if replayed == .uncertain {
                 return finish(.escalate, "the saved recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: state)
             }
+            if let met = matched(state, since: initial) {
+                return finish(.done, met.joined(separator: ", "), initial: initial, latest: state)
+            }
             steps[steps.count - 1] = "the saved recipe did not finish; continued by hand"
             initial = fresh
+            initialControls = parseControls(fresh)
+            initialExact = exactAction(request: request, controls: initialControls, tried: tried)
         }
 
         for number in 1...request.maxSteps {
+            if RequestCancellation.requested { return cancelled() }
             if !hasTime() {
                 return finish(.budget, "\(Int(request.timeBudget)) seconds used", initial: initial, latest: state)
             }
-            let controls = parseControls(state)
-            let options = candidates(
+            let controls = number == 1 ? initialControls : parseControls(state)
+            let exact = number == 1 ? initialExact : exactAction(request: request, controls: controls, tried: tried)
+            let options = exact == nil ? candidates(
                 goal: request.goal, doneSummary: doneSummary, values: request.values,
                 controls: controls, tried: tried, typedAny: typedAny, scrollsDone: scrolls
-            )
+            ) : []
             var probabilities: [String: Double]?
             let decision: Decision
-            if let exact = exactFieldFill(request: request, controls: controls, candidates: options) {
+            if let exact {
                 decision = .act(exact, probability: 1)
             } else if !options.isEmpty, options.allSatisfy(\.risky) {
                 decision = .escalate("the only available actions are risky")
             } else {
                 if !options.isEmpty {
                     let history = steps.suffix(4).joined(separator: "\n")
-                    probabilities = deps.choose(request.goal, doneSummary, history, RefereeSummary.screen(from: state),
+                    let targets = options.compactMap { Int($0.arguments["element_index"] as? String ?? "") }
+                    let view = RefereeView.build(state: state, goal: request.goal, doneWhen: doneSummary,
+                                                 optionIndexes: targets, limit: Referee.maxViewCharacters)
+                    probabilities = deps.choose(request.goal, doneSummary, history, DecisionView(state: state, text: view),
                                                 options.map { ($0.id, $0.text) })
                 }
                 decision = decide(candidates: options, probabilities: probabilities)
             }
+            if RequestCancellation.requested { return cancelled() }
             switch decision {
             case .escalate(let reason):
-                let ranked = options.map { ($0.text, probabilities?[$0.id] ?? 0) }.sorted { $0.1 > $1.1 }
+                let ranked = options.map { option in
+                    let score = probabilities?[option.id] ?? 0
+                    return (option.text, (0...1).contains(score) ? score : 0)
+                }.sorted { $0.1 > $1.1 }
                 return finish(.escalate, reason, initial: initial, latest: state, options: ranked)
             case .act(let choice, _):
                 guard hasTime() else {
@@ -576,20 +716,28 @@ enum HandoffTool {
                 }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
+                learnStep(app: request.app, choice: choice, result: result, log: learning)
+                if result.refused {
+                    return finish(.failed, result.message, initial: initial, latest: state)
+                }
+                let stepDelivery = result.delivery ?? (result.ok ? .acknowledged : .outcomeUnknown)
+                if stepDelivery != .notSent {
+                    deliveryState = stepDelivery == .outcomeUnknown ? .outcomeUnknown : .acknowledged
+                }
+                if RequestCancellation.requested {
+                    steps.append("\(choice.text) (\(stepDelivery.rawValue))")
+                    return cancelled()
+                }
                 if choice.kind == .setValue { typedAny = true }
                 if choice.kind == .scroll { scrolls += 1 }
                 if !hasTime(), result.observedState == nil {
                     steps.append(result.ok ? choice.text : "\(choice.text) failed")
                     return finish(.budget, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: nil)
                 }
-                guard result.ok else {
+                guard result.ok, stepDelivery != .outcomeUnknown else {
                     steps.append("\(choice.text) failed")
-                    if result.delivery != .notSent {
-                        let fresh = readState()
-                        if let fresh, case .verified(let met) = verdict(fresh) {
-                            return finish(.done, met.joined(separator: "; "), initial: initial, latest: fresh)
-                        }
-                        return finish(.escalate, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: fresh)
+                    if stepDelivery != .notSent {
+                        return finish(.escalate, DeliveryState.reconcileHint, initial: initial, latest: readState())
                     }
                     failures += 1
                     if failures >= 2 {
@@ -605,9 +753,10 @@ enum HandoffTool {
                 steps.append(choice.text)
                 let actionState = result.observedState.flatMap { matchesWindow($0, windowID: request.windowID) ? $0 : nil }
                 guard let next = actionState ?? readState() else {
+                    if RequestCancellation.requested { return cancelled() }
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
-                if case .verified(let met) = verdict(next) {
+                if let met = matched(next, since: initial) {
                     return finish(.done, met.joined(separator: "; "), initial: initial, latest: next)
                 }
                 let unchanged = AXStateDiff.diff(previous: state, current: next) == AXStateDiff.noChangesMessage
@@ -618,19 +767,22 @@ enum HandoffTool {
                 }
                 // A changed screen already gives the next step new evidence. Ask the checker
                 // only on a stall that the two-action rule has not yet handled.
-                if unchanged, number >= 2, number < request.maxSteps,
+                if exact == nil, unchanged, number >= 2, number < request.maxSteps,
                    hasTime() {
                     let summary = RefereeSummary.build(
                         goal: request.goal, steps: steps.map { ($0, "ok") }, repeatedFailures: failures,
                         screenChanged: false, dialogOpen: RefereeSummary.dialogOpen(in: state),
-                        changes: nil, screen: RefereeSummary.screen(from: state), maxCharacters: Referee.maxViewCharacters
+                        changes: nil, screen: RefereeView.build(state: state, goal: request.goal, doneWhen: doneSummary,
+                                                                        limit: Referee.maxViewCharacters / 2),
+                        maxCharacters: Referee.maxViewCharacters
                     )
-                    if deps.looksStuck(request.goal, choice.text, summary) {
+                    if deps.looksStuck(request.goal, choice.text, DecisionView(state: state, text: summary)) {
                         return finish(.stuck, "the checker model says no progress is being made", initial: initial, latest: state)
                     }
                 }
             }
         }
+        if RequestCancellation.requested { return cancelled() }
         return finish(.budget, "\(request.maxSteps) steps used", initial: initial, latest: state)
     }
 }
@@ -639,7 +791,7 @@ enum HandoffTool {
 
 extension ComputerUseToolDispatcher {
     /// The `handoff` tool uses a window-bound background call for every mutation.
-    func runHandoff(arguments: [String: Any]) throws -> ToolCallResult {
+    func runHandoff(arguments: [String: Any], readFixtureState: (() -> String?)? = nil) throws -> ToolCallResult {
         let request = try HandoffTool.parse(arguments)
         guard request.app.lowercased() != "browser" else {
             throw ComputerUseError.invalidArguments("Handoff ranks native Mac actions. For websites, use browser read and a batch with an observable done_when.")
@@ -647,9 +799,16 @@ extension ComputerUseToolDispatcher {
         let app = request.app
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + request.timeBudget
+        var refusal: ToolCallResult?
+        func captureRefusal(_ result: ToolCallResult) -> Bool {
+            guard (result.batchReceipt?.failureCode ?? result.failureCode)?.isActionRefusal == true else { return false }
+            refusal = result
+            return true
+        }
 
         let deps = HandoffTool.Dependencies(
             readState: { [self] in
+                if let readFixtureState { return readFixtureState() }
                 let remaining = max(0, deadline - clock.systemUptime)
                 let settleMs = min(LeanDefaults.batchSettleMs, Int(remaining * 1_000))
                 var args: [String: Any] = ["app": app, "include_screenshot": false, "settle_ms": settleMs]
@@ -657,7 +816,7 @@ extension ComputerUseToolDispatcher {
                 let read = BrowserCallBudget.withDeadline(deadline) {
                     callToolAsResult(name: "get_app_state", arguments: args)
                 }
-                guard !read.isError else { return nil }
+                guard !captureRefusal(read), !read.isError else { return nil }
                 guard let state = LeanOutput.stateText(of: read), HandoffTool.observedWindowID(in: state) != nil else { return nil }
                 return BatchTool.stateText(ofText: state)
             },
@@ -672,22 +831,32 @@ extension ComputerUseToolDispatcher {
                 let result = BrowserCallBudget.withDeadline(deadline) {
                     callStepAsResult(name: candidate.tool, arguments: args, log: SmartLog(), notesInResult: false)
                 }
+                if captureRefusal(result) {
+                    return HandoffTool.ActResult(ok: false, message: BatchTool.firstLine(result.textContent),
+                                                delivery: .notSent, refused: true)
+                }
                 let state = !result.isError && candidate.kind != .pressReturn ? LeanOutput.stateText(of: result) : nil
                 return HandoffTool.ActResult(
                     ok: !result.isError, message: BatchTool.firstLine(result.textContent),
-                    delivery: result.isError ? BatchEffects.failureReceipt(result.textContent) : nil,
+                    delivery: result.deliveryState,
                     observedState: state.flatMap { text in
                         text.contains(SnapshotObservationOptions.accessibilityOmittedNote) ? nil : text
                     }
                 )
             },
-            choose: { goal, doneWhen, history, screen, options in
-                Referee.choose(goal: goal, doneWhen: doneWhen, history: history, screen: screen,
-                               options: options, remaining: deadline - clock.systemUptime)
+            choose: { [self] goal, doneWhen, history, screen, options in
+                let picture = Referee.picture(url: Referee.handoffURL, state: screen.state, remaining: deadline - clock.systemUptime) {
+                    localDecisionImage(app: app, state: screen.state)
+                }
+                return Referee.choose(goal: goal, doneWhen: doneWhen, history: history, screen: screen.text,
+                                      options: options, imageBase64: picture, remaining: deadline - clock.systemUptime)
             },
-            looksStuck: { goal, lastStep, summary in
-                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary,
-                                                   remaining: deadline - clock.systemUptime) else { return false }
+            looksStuck: { [self] goal, lastStep, summary in
+                let picture = Referee.picture(url: Referee.baseURL, state: summary.state, remaining: deadline - clock.systemUptime) {
+                    localDecisionImage(app: app, state: summary.state)
+                }
+                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary.text,
+                                                   imageBase64: picture, remaining: deadline - clock.systemUptime) else { return false }
                 return verdict.label == "stuck" && verdict.confidence >= Referee.minimumConfidence
             },
             check: { state in
@@ -695,25 +864,36 @@ extension ComputerUseToolDispatcher {
             },
             replay: { [self] state in
                 // Recipe variables are named after field labels ("Name" -> "name"); the handoff's value keys map to them.
+                guard BatchRecipes.isEnabled else { return nil }
                 var recipeValues: [String: String] = [:]
-                for (key, value) in request.values { recipeValues[BatchRecipes.variableName(label: key)] = value }
-                let shape = BatchRecipes.windowShape(title: BatchEffects.windowTitle(in: state))
-                guard BatchRecipes.isEnabled,
-                      let recipe = BatchRecipes.shared.find(app: app, goal: request.goal, values: recipeValues, shape: shape)
-                else { return nil }
-                let storedSteps = BatchRecipes.substitute(recipe.steps, params: recipe.params, values: recipeValues).steps
-                guard let steps = try? BatchTool.parseSteps(storedSteps, defaultApp: app),
-                      steps.allSatisfy({ HandoffTool.isSafeRecipeStep($0, app: app) }) else { return nil }
+                for (key, value) in request.values {
+                    let name = BatchRecipes.variableName(label: key)
+                    guard recipeValues.updateValue(value, forKey: name) == nil else {
+                        return .blocked("More than one value names the same recipe slot. Confirm the inputs.")
+                    }
+                }
+                let recipe: BatchRecipes.Recipe
+                switch recipeStore.lookup(app: app, goal: request.goal, values: recipeValues, state: state) {
+                case .match(let match): recipe = match
+                case .blocked(let reason): return .blocked(reason)
+                case .missing: return nil
+                }
+                guard recipe.doneWhen == request.doneWhen else {
+                    return .blocked("The recipe's done_when changed. Confirm the check and provide fresh steps.")
+                }
                 var batchArguments: [String: Any] = ["app": app, "goal": request.goal]
                 if !recipeValues.isEmpty { batchArguments["values"] = recipeValues }
                 if let doneWhen = arguments["done_when"] { batchArguments["done_when"] = doneWhen }
                 guard let result = try? runBatch(arguments: batchArguments, inheritedDeadline: deadline,
                                                  validatedHandoffRecipe: recipe) else { return .uncertain }
+                if captureRefusal(result) { return .uncertain }
+                if result.batchReceipt?.stop == .cancelled { return .cancelled(result.textContent, result.deliveryState) }
                 return HandoffTool.replayResult(result)
             },
             now: { clock.systemUptime }
         )
         let outcome = HandoffTool.run(request, deps, deadline: deadline)
-        return .text(outcome.reply(), isError: outcome.kind == .failed)
+        if let refusal { return refusal }
+        return .text(outcome.reply(), isError: outcome.kind == .failed || outcome.kind == .cancelled, deliveryState: outcome.deliveryState)
     }
 }

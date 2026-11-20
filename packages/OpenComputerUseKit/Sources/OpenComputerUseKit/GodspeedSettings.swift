@@ -14,19 +14,19 @@ import Foundation
 ///       "find_on_screen": false,           -> OPEN_COMPUTER_USE_VISION_URL = helper_url
 ///       "helper_url": "http://127.0.0.1:8765",
 ///       "recipes": true,                   -> OPEN_COMPUTER_USE_RECIPES
-///       "browser": true                    -> OPEN_COMPUTER_USE_BROWSER
+///       "browser": true,                   -> OPEN_COMPUTER_USE_BROWSER
+///       "strict_background": true          -> OPEN_COMPUTER_USE_STRICT_BACKGROUND
 ///     }
 ///
-/// The file is re-read when it changes. Cursor settings apply on the next action; the others are read
-/// once per GODSPEED process, so they apply from the next start.
+/// The file is checked for changes as requests read settings.
 enum GodspeedSettings {
     static var fileURL: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".godspeed/settings.json")
     }
 
-    /// The process environment with the settings file filled in underneath it.
+    /// The request environment with the settings file filled in underneath it.
     static var environment: [String: String] {
-        merged(ProcessInfo.processInfo.environment)
+        merged(RequestConfiguration.environment)
     }
 
     /// `base` with every setting from the file added where `base` does not already set that variable.
@@ -64,6 +64,8 @@ enum GodspeedSettings {
         if (settings["find_on_screen"] as? Bool) == true { variables["OPEN_COMPUTER_USE_VISION_URL"] = helper }
         if let value = flag("cursor_lens") { variables["OPEN_COMPUTER_USE_CURSOR_LENS"] = value }
         if let value = flag("recipes") { variables["OPEN_COMPUTER_USE_RECIPES"] = value }
+        if let value = flag("strict_background") { variables["OPEN_COMPUTER_USE_STRICT_BACKGROUND"] = value }
+        if let value = flag("relay_grant") { variables["OPEN_COMPUTER_USE_RELAY_GRANT"] = value }
         if let value = flag("browser") { variables["OPEN_COMPUTER_USE_BROWSER"] = value }
         return variables
     }

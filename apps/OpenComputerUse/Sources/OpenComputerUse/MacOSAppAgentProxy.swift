@@ -1,4 +1,5 @@
 import AppKit
+import CoreFoundation
 import Darwin
 import Foundation
 import OpenComputerUseKit
@@ -171,8 +172,24 @@ enum MacOSAppAgentProxy {
         var client = initialClient
         var environment = proxiedEnvironment(mcpSession: UUID())
         var canIdentifyClient = environment[cursorNameEnvironmentKey] == nil
-        while let line = readLine(strippingNewline: true) {
-            guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let requests = MCPRequestStream()
+        Thread.detachNewThread {
+            while let line = readLine(strippingNewline: true) {
+                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
+                if !accepted { break }
+            }
+            requests.disconnect()
+        }
+        while let request = requests.next() {
+            let line = request.line
+            if request.cancellation.isCancelled {
+                if let id = jsonRPCRequestID(line),
+                   let reply = try? JSONSerialization.data(withJSONObject: [
+                       "jsonrpc": "2.0", "id": id,
+                       "error": ["code": -32000, "message": "Request cancelled before dispatch. No steps ran."],
+                   ]) {
+                    FileHandle.standardOutput.write(reply + Data([10]))
+                }
                 continue
             }
             if canIdentifyClient {
@@ -187,7 +204,7 @@ enum MacOSAppAgentProxy {
                         "kind": "mcp",
                         "line": line,
                         "environment": environment,
-                    ])
+                    ], cancellation: request.cancellation, rpcID: jsonRPCRequestID(line))
 
                     if let responseLine = response["response"] as? String {
                         FileHandle.standardOutput.write(Data((responseLine + "\n").utf8))
@@ -196,11 +213,8 @@ enum MacOSAppAgentProxy {
                     // Answer this request with an error, then continue on a fresh connection: the late reply
                     // on the old one must not be read as the answer to the next request.
                     if let id = jsonRPCRequestID(line) {
-                        let reply: [String: Any] = [
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": ["code": -32000, "message": timeout.errorDescription ?? "timed out"],
-                        ]
+                        let reply = Self.mcpFailureReply(id: id, message: timeout.errorDescription ?? "timed out",
+                                                         delivery: .outcomeUnknown)
                         if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
                             FileHandle.standardOutput.write(data + Data("\n".utf8))
                         }
@@ -227,6 +241,10 @@ enum MacOSAppAgentProxy {
         case "opencode": return "OpenCode"
         default: return nil
         }
+    }
+
+    static func mcpFailureReply(id: Any, message: String, delivery: DeliveryState) -> [String: Any] {
+        ["jsonrpc": "2.0", "id": id, "error": ["code": -32000, "message": message, "data": delivery.metadata]]
     }
 
     /// The `id` of a JSON-RPC request line; nil for a notification (no id, no reply expected).
@@ -372,7 +390,8 @@ private final class AgentIdleClock: @unchecked Sendable {
     /// False when the agent is exiting; the caller closes the connection.
     func clientConnected() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard timer.clientConnected() else { return false }
+        guard timer.connectedClients < AppAgentAdmission.connectionLimit,
+              timer.clientConnected() else { return false }
         if timer.connectedClients == 1 { source.schedule(deadline: .distantFuture) }
         return true
     }
@@ -530,27 +549,29 @@ private final class AppAgentConnection: @unchecked Sendable {
     }
 
     func run() {
-        guard let file = fdopen(fileDescriptor, "r+") else {
+        // A dedicated reader can observe cancellation and EOF even during a long dispatch.
+        // Use independent streams so stdio's FILE lock cannot block replies behind reads.
+        let outputFD = dup(fileDescriptor)
+        guard outputFD >= 0, let output = fdopen(outputFD, "w") else {
+            if outputFD >= 0 { close(outputFD) }
             close(fileDescriptor)
             return
         }
-        let monitorQueue = DispatchQueue(label: "ocu.client-disconnect")
-        let monitor = DispatchSource.makeTimerSource(queue: monitorQueue)
-        // Polls only while a request runs (rescheduled below): between requests the blocking
-        // read sees the hang-up itself, and an idle client cost 10 wakeups a second.
-        monitor.schedule(deadline: .distantFuture)
-        monitor.setEventHandler { [self] in
-            var byte: UInt8 = 0
-            let count = recv(fileDescriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
-            if count == 0 || count < 0 && ![EAGAIN, EWOULDBLOCK, EINTR].contains(errno) {
-                lockedUse.end(disconnecting: true)
-                monitor.cancel()
-            }
+        guard let input = fdopen(fileDescriptor, "r") else {
+            fclose(output)
+            close(fileDescriptor)
+            return
         }
-        monitor.resume()
-        defer {
-            monitor.cancel(); monitorQueue.sync {}
+        _ = fcntl(fileDescriptor, F_SETFD, FD_CLOEXEC)
+        _ = fcntl(outputFD, F_SETFD, FD_CLOEXEC)
+        let requests = MCPRequestStream()
+        // The pointer belongs to the reader until EOF. The worker only writes.
+        let source = AppAgentLineSource(file: input)
+        Thread.detachNewThread { [self] in
+            source.read(into: requests, output: output)
             lockedUse.end(disconnecting: true)
+        }
+        defer {
             if let probe = keychainProbe { keychainProbe = nil; LockedUseDeferredCleanup.shared.retainIfNeeded(probe) }
             server?.flushTrajectory()
             // An explicitly shared identity must not detach browser tabs while
@@ -558,24 +579,21 @@ private final class AppAgentConnection: @unchecked Sendable {
             try? AppAgentAdmission.shared.withAdmission(.exclusive) {
                 ClientScope.with(client) {
                     if let browserEnvironment {
-                        withBrowserRequestEnvironment(browserEnvironment) { server?.endSession() }
+                        AppAgentEnvironment.withConfiguration(browserEnvironment) { server?.endSession() }
                     } else {
                         server?.endSession()
                     }
                 }
             }
-            fclose(file)
+            fclose(output)
         }
 
-        while let line = readAgentLine(file) {
-            // A pool per request: this thread's own drains only when the client disconnects.
+        while let request = requests.next() {
             autoreleasepool {
-                monitor.schedule(deadline: .now(), repeating: .milliseconds(100))
-                let response = handle(requestLine: line)
-                writeAgentLine(response, to: file)
-                // A slow reader can also block the response write. Keep disconnect
-                // monitoring active until the whole exchange has finished.
-                monitor.schedule(deadline: .distantFuture)
+                let response = RequestCancellation.$current.withValue(request.cancellation) {
+                    handle(requestLine: request.line)
+                }
+                writeAgentLine(OperationRestartNotice.attach(to: response, requestLine: request.line), to: output)
             }
         }
     }
@@ -613,7 +631,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                 let browserEnvironment = AppAgentEnvironment.effectiveEnvironment(environment)
                 self.browserEnvironment = browserEnvironment
                 // Record settings belong to this MCP connection, not to the shared agent's launch environment.
-                let server = self.server ?? StdioMCPServer(trajectoryEnvironment: environment)
+                let server = self.server ?? StdioMCPServer(trajectoryEnvironment: environment, recordOperations: true)
                 self.server = server
                 // Handshake and listing never wait behind another agent's running tool call: a slow call
                 // used to hold the lock, so the next session's initialize timed out and it started with no tools.
@@ -625,16 +643,24 @@ private final class AppAgentConnection: @unchecked Sendable {
                     }
                     return ["response": response ?? NSNull()]
                 }
-                if let payload, AppAgentBrowserRead.accepts(payload), let client, !client.isEmpty {
+                let admission = AppAgentAdmission.shared
+                if let payload, let client, !client.isEmpty,
+                   let mode = AppAgentBrowserRead.mode(payload, client: ClientScope.sanitized(client),
+                                                       allowWrites: admission.parallelTabWrites) {
                     do {
-                        let response = try AppAgentAdmission.shared.withAdmission(.browserRead(client: ClientScope.sanitized(client))) {
+                        let response = try admission.withAdmission(mode) {
                             try ClientScope.with(client) { [lockedUse] in
-                                try lockedUse.performParallelBrowserRead {
-                                    try withBrowserRequestEnvironment(
+                                try lockedUse.performParallelBrowserOperation {
+                                    try AppAgentEnvironment.withConfiguration(
                                         browserEnvironment,
-                                        validate: { try lockedUse.validateParallelBrowserRead() }
+                                        validate: { try lockedUse.validateParallelBrowserOperation() }
                                     ) {
-                                        server.handle(line: line, admissionMs: admissionMs())
+                                        if let tab = mode.tabWrite {
+                                            return try withOwnedBrowserTabWrite(tab) {
+                                                server.handle(line: line, admissionMs: admissionMs())
+                                            }
+                                        }
+                                        return server.handle(line: line, admissionMs: admissionMs())
                                     }
                                 }
                             }
@@ -642,6 +668,8 @@ private final class AppAgentConnection: @unchecked Sendable {
                         return ["response": response ?? NSNull()]
                     } catch LockedUseConnection.ParallelReadFallback.needsExclusive {
                         // Nothing was sent. Let the normal serialized path handle the session.
+                    } catch BrowserTabWriteNeedsExclusive.unconfirmedOwnership {
+                        // Only ownership preflight can take this fallback.
                     }
                 }
                 let response: String? = try AppAgentEnvironment.withOverrides(environment, client: client) {
@@ -736,7 +764,9 @@ private final class AppAgentConnection: @unchecked Sendable {
                 return ["error": "Unknown app-agent request kind: \(kind)"]
             }
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            let message = error is RequestCancellation.Cancelled
+                ? "Request cancelled before dispatch. No steps ran."
+                : (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             // Preserve the native RPC id even when lease acquisition fails
             // before the MCP server runs. The stdio proxy forwards responses,
             // not the app-agent envelope's error field.
@@ -749,8 +779,10 @@ private final class AppAgentConnection: @unchecked Sendable {
                        let params = rpc["params"] as? [String: Any], let tool = params["name"] as? String {
                         server?.recordAdmissionTimeout(tool: tool, elapsedMs: admissionMs())
                     }
-                    let failure: [String: Any] = ["jsonrpc": "2.0", "id": id,
-                        "error": ["code": -32000, "message": message]]
+                    let failure = MacOSAppAgentProxy.mcpFailureReply(
+                        id: id, message: message, delivery: error is AppAgentAdmission.Timeout
+                            ? .notSent : (error as? RequestCancellation.Cancelled)?.deliveryState ?? .outcomeUnknown
+                    )
                     if let data = try? JSONSerialization.data(withJSONObject: failure) {
                         return ["response": String(decoding: data, as: UTF8.self)]
                     }
@@ -801,7 +833,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                 return CLIProxyResponse(stdout: text + "\n", stderr: "", exitCode: EXIT_SUCCESS)
 
             case let .call(invocation):
-                let output = try runOpenComputerUseCall(invocation)
+                let output = try withOperationJournal { try runOpenComputerUseCall(invocation) }
                 return CLIProxyResponse(
                     stdout: try output.jsonText() + "\n",
                     stderr: "",
@@ -822,8 +854,8 @@ private final class AppAgentConnection: @unchecked Sendable {
 private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
 private let cursorNameEnvironmentKey = "OPEN_COMPUTER_USE_CURSOR_NAME"
 
-/// Only canonical browser reads enter the shared route. Browser batches can
-/// contain native actions, and browser mutations still need exclusive admission.
+/// Match only canonical requests. Batches and actions with shared side
+/// effects use exclusive admission.
 enum AppAgentBrowserRead {
     private static let common: Set<String> = ["action", "tab_id"]
     private static let arguments: [String: Set<String>] = [
@@ -842,6 +874,29 @@ enum AppAgentBrowserRead {
         "peek": ["action", "urls"],
     ]
 
+    static func mode(_ payload: [String: Any], client: String, allowWrites: Bool) -> AppAgentAdmission.Mode? {
+        guard payload["method"] as? String == "tools/call",
+              let params = payload["params"] as? [String: Any], params["name"] as? String == "browser",
+              let args = params["arguments"] as? [String: Any], let action = args["action"] as? String else { return nil }
+        if accepts(payload) {
+            return action == "peek" ? .browserPeek(client: client) : .browserRead(client: client)
+        }
+        guard allowWrites, let tab = args["tab_id"] as? NSNumber,
+              CFGetTypeID(tab) != CFBooleanGetTypeID(), tab.intValue > 0,
+              tab.compare(NSNumber(value: tab.intValue)) == .orderedSame else { return nil }
+        switch action {
+        case "scroll":
+            guard Set(args.keys).isSubset(of: common.union(["direction", "amount", "label", "index", "element_index"])) else { return nil }
+        case "fill_field":
+            guard Set(args.keys).isSubset(of: common.union(["label", "text"])),
+                  let text = args["text"] as? String, !text.isEmpty,
+                  let label = args["label"] as? String, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+        default: return nil
+        }
+        return .browserTabWrite(client: client, tabID: tab.intValue)
+    }
+
     static func accepts(_ payload: [String: Any]) -> Bool {
         guard payload["method"] as? String == "tools/call",
               let params = payload["params"] as? [String: Any], params["name"] as? String == "browser",
@@ -856,7 +911,7 @@ enum AppAgentBrowserRead {
     }
 }
 
-private enum AppAgentEnvironment {
+enum AppAgentEnvironment {
     private static let requestEnvironmentKeys = OCUConfiguration.environmentKeys.union([
         "OPEN_COMPUTER_USE_BROWSER", "OPEN_COMPUTER_USE_OBU_BIN",
         "OPEN_COMPUTER_USE_BROWSER_SESSION", "OPEN_COMPUTER_USE_BROWSER_PROFILE",
@@ -866,42 +921,27 @@ private enum AppAgentEnvironment {
     static func withOverrides<T>(_ overrides: [String: String], client: String? = nil, _ body: () throws -> T) throws -> T {
         try AppAgentAdmission.shared.withAdmission(.exclusive) {
             try ClientScope.with(client ?? overrides[clientEnvironmentKey]) {
-                try withBrowserRequestEnvironment(effectiveEnvironment(overrides)) {
-                    try applying(overrides, body)
-                }
+                try withConfiguration(effectiveEnvironment(overrides), body)
             }
+        }
+    }
+
+    static func withConfiguration<T>(
+        _ environment: [String: String],
+        validate: (@Sendable () throws -> Void)? = nil,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        try RequestConfiguration.withEnvironment(environment) {
+            try withBrowserRequestEnvironment(environment, validate: validate, body)
         }
     }
 
     static func effectiveEnvironment(_ overrides: [String: String]) -> [String: String] {
         var environment = appAgentLaunchEnvironment
         for key in requestEnvironmentKeys { environment[key] = nil }
-        return environment.merging(overrides) { _, request in request }
+        return environment.merging(overrides.filter { $0.key.hasPrefix("OPEN_COMPUTER_USE_") }) { _, request in request }
     }
 
-    private static func applying<T>(_ overrides: [String: String], _ body: () throws -> T) rethrows -> T {
-
-        let keys = Set(overrides.keys).union(requestEnvironmentKeys)
-        let previousValues = Dictionary(uniqueKeysWithValues: keys.map { key in
-            (key, getenv(key).map { String(cString: $0) })
-        })
-        for key in requestEnvironmentKeys where overrides[key] == nil { unsetenv(key) }
-        for (key, value) in overrides {
-            setenv(key, value, 1)
-        }
-
-        defer {
-            for (key, previousValue) in previousValues {
-                if let previousValue {
-                    setenv(key, previousValue, 1)
-                } else {
-                    unsetenv(key)
-                }
-            }
-        }
-
-        return try body()
-    }
 }
 
 /// The app agent did not answer in time. The call is stopped; the agent and its other work are left running.
@@ -913,9 +953,12 @@ struct AppAgentResponseTimeout: LocalizedError {
 
 private final class AppAgentSocketClient: @unchecked Sendable {
     private let file: UnsafeMutablePointer<FILE>
+    private let descriptor: Int32
 
     private init(file: UnsafeMutablePointer<FILE>) {
         self.file = file
+        descriptor = fileno(file)
+        _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
     }
 
     deinit {
@@ -976,14 +1019,28 @@ private final class AppAgentSocketClient: @unchecked Sendable {
     /// Set once a request timed out: the late reply would otherwise be read as the answer to the next request.
     private var timedOut = false
 
-    func request(_ object: [String: Any]) throws -> [String: Any] {
+    func request(
+        _ object: [String: Any], cancellation: RequestCancellation? = nil, rpcID: Any? = nil
+    ) throws -> [String: Any] {
         if timedOut { throw AppAgentResponseTimeout() }
         let data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
         guard let line = String(data: data, encoding: .utf8) else {
             throw ComputerUseError.message("Failed to encode app-agent request.")
         }
 
+        // Only the worker writes normal requests. The reader can send one
+        // cancellation after this line is flushed, while the worker awaits its reply.
         writeAgentLine(line, to: file)
+        let cancel = Self.cancellationEnvelope(id: rpcID)
+        cancellation?.onCancel { [self] disconnected in
+            if disconnected {
+                shutdown(descriptor, SHUT_RDWR)
+            } else if let cancel {
+                let count = cancel.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+                if count != cancel.count { shutdown(descriptor, SHUT_RDWR) }
+            }
+        }
+        defer { cancellation?.onCancel(nil) }
 
         let responseLine = readAgentLine(file)
         // A read that hit the timeout returns what arrived so far (possibly a partial line): check it before using it.
@@ -1003,6 +1060,17 @@ private final class AppAgentSocketClient: @unchecked Sendable {
         }
 
         return response
+    }
+
+    private static func cancellationEnvelope(id: Any?) -> Data? {
+        guard let id,
+              let rpc = try? JSONSerialization.data(withJSONObject: [
+                  "jsonrpc": "2.0", "method": "notifications/cancelled", "params": ["requestId": id],
+              ]),
+              let envelope = try? JSONSerialization.data(withJSONObject: [
+                  "kind": "mcp", "line": String(decoding: rpc, as: UTF8.self),
+              ]) else { return nil }
+        return envelope + Data([10])
     }
 
     func waitForDisconnect() -> Bool {
@@ -1054,6 +1122,35 @@ private final class AppAgentSocketClient: @unchecked Sendable {
             .appendingPathComponent("MacOS", isDirectory: true)
             .appendingPathComponent(executableName)
             .standardizedFileURL
+    }
+}
+
+private final class AppAgentLineSource: @unchecked Sendable {
+    private let file: UnsafeMutablePointer<FILE>
+
+    init(file: UnsafeMutablePointer<FILE>) { self.file = file }
+
+    func read(into requests: MCPRequestStream, output: UnsafeMutablePointer<FILE>) {
+        defer { fclose(file) }
+        while let line = readAgentLine(file) {
+            let intake = autoreleasepool {
+                let envelope = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                let rpc = envelope?["kind"] as? String == "mcp" ? envelope?["line"] as? String : nil
+                return requests.intake(line, rpcLine: rpc)
+            }
+            switch intake {
+            case .accepted:
+                continue
+            case .busy:
+                // Refuse this request only. The active request keeps running and the connection stays open.
+                if let reply = MCPRequestStream.busyEnvelope(for: line) { writeAgentLine(reply, to: output) }
+            case .closed:
+                shutdown(fileno(file), SHUT_RDWR)
+                requests.disconnect()
+                return
+            }
+        }
+        requests.disconnect()
     }
 }
 

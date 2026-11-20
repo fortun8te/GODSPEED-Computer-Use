@@ -1,17 +1,18 @@
+import ApplicationServices
 import Foundation
 
 /// Pure helpers for batch replies: what one step changed on screen, whether the batch is still in the
 /// window it started in, and the `wait` step's conditions. They read the state texts only (no accessibility
 /// calls), so they are cheap to test. Element numbers are stable across reads, so lines are matched by number.
 enum BatchEffects {
-    static let isEnabled: Bool = {
+    static var isEnabled: Bool {
         let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_BATCH_EFFECTS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     /// Most effect lines one step adds.
-    static let maxEffectLines = 5
+    static let maxEffectLines = 3
 
     /// Optional reads stop once they consume the budget. Failed reads count
     /// at full cost because there is no evidence that they settled a window.
@@ -38,32 +39,12 @@ enum BatchEffects {
         case outcomeUnknown = "outcome unknown"
     }
 
-    /// Phrases of errors that prove nothing was sent.
-    private static let notSentPhrases = [
-        "nothing sent", "nothing was sent", "no text was sent", "missing required argument", "invalidarguments",
-        "unknown element_index", "no element labelled", "matches several controls", "is disabled",
-        "appnotfound", "unsupportedtool", "stale:", "no longer has the identity", "permissiondenied",
-    ]
-    /// Phrases of errors raised after input may already have reached the app.
-    private static let unknownPhrases = [
-        "may have acted", "may have run", "did not answer", "did not respond", "timed out", "timeout",
-        "not responding", "outcome unknown", "a repeat could act twice",
-        "may have taken effect", "may have created a tab", "background link may have opened",
-        "navigation was sent", "navigation was not confirmed", "requested page did not become ready", "destination did not become ready",
-        "could not confirm tab", "was claimed, but", "click ran and multiple tabs appeared",
-        "drag was interrupted after starting", "helper returned an unreadable reply",
-    ]
-
-    /// The receipt for a failed step's message, or nil when it is a plain failure. Unknown wins over not sent:
-    /// a message that says the input may have gone out is never reported as safe to resend.
-    static func failureReceipt(_ message: String) -> Receipt? {
-        let text = message.lowercased()
-        if unknownPhrases.contains(where: { text.contains($0) }) { return .outcomeUnknown }
-        if notSentPhrases.contains(where: { text.contains($0) }) { return .notSent }
-        // The argument checker's own corrective line ("click needs a label or element_index. Example: ..."). A bare
-        // "needs" elsewhere proves nothing: the message may come from after the input went out.
-        if text.contains(" needs "), text.contains("example:") { return .notSent }
-        return nil
+    static func failureReceipt(_ delivery: DeliveryState) -> Receipt? {
+        switch delivery {
+        case .notSent: return .notSent
+        case .outcomeUnknown: return .outcomeUnknown
+        case .acknowledged, .verified: return nil
+        }
     }
 
     /// Tools whose success normally changes something the tree shows (scroll, drag and text selection may not).
@@ -85,12 +66,14 @@ enum BatchEffects {
     }
 
     /// The closing advice after a failed step.
-    static func advice(for receipt: Receipt?, stepNumber: Int) -> String {
-        switch receipt {
+    static func advice(for delivery: DeliveryState, stepNumber: Int) -> String {
+        switch delivery {
         case .notSent:
             return "Step \(stepNumber) was not sent. Fix it using the state below and continue from that step."
-        case .outcomeUnknown, .noEffectSeen, nil:
+        case .outcomeUnknown:
             return "Check whether step \(stepNumber) took effect before retrying. Resume at the first unfinished step."
+        case .acknowledged, .verified:
+            return "Step \(stepNumber) was sent. Inspect its result before continuing."
         }
     }
 
@@ -196,6 +179,66 @@ enum BatchEffects {
         WindowSig(id: id, title: windowTitle(in: state), dialog: dialog(in: state))
     }
 
+    /// A window's number and frame, read from the window list (no accessibility tree).
+    struct WindowIdentity: Equatable {
+        let id: UInt32
+        let bounds: CGRect
+    }
+
+    /// Whether an element-number or ref step must stop because its window is no longer the one the batch started
+    /// in. Only checked once the effect budget is spent: the optional reads that track the window have stopped by then.
+    static func elementStepMovedWindow(effectsOn: Bool, budgetExhausted: Bool, start: WindowIdentity?,
+                                       now: () -> WindowIdentity?) -> Bool {
+        guard effectsOn, budgetExhausted, let start else { return false }
+        guard let current = now() else { return true }
+        // Element numbers belong to the window, not its position: a window the user moved or resized is
+        // still the same window. A different window id means the numbers no longer apply.
+        return current.id != start.id
+    }
+
+    /// The step line when cancellation arrives during a step. A step whose input went out says so.
+    static func cancelledStepLine(number: Int, description: String, delivery: DeliveryState) -> String {
+        let head = "\(number). \(description): "
+        switch delivery {
+        case .notSent:
+            return head + "cancelled during step"
+        case .acknowledged, .verified:
+            return head + "sent, cancelled after delivery (\(delivery.rawValue))"
+        case .outcomeUnknown:
+            return head + "sent, outcome unknown after cancellation. Inspect before retrying."
+        }
+    }
+
+    struct Watch {
+        let text: String
+        let sig: WindowSig
+        let result: ToolCallResult
+
+        /// Reuse only a complete read of the same app and exact window. An
+        /// unchanged read or dialog transition still needs the original check.
+        static func afterAction(
+            snapshot: AppSnapshot?, before: String, tool: String, fallback: () -> Watch?
+        ) -> Watch? {
+            guard ["click", "type_text", "set_value", "scroll"].contains(tool),
+                  let snapshot, let id = snapshot.observedWindowID else { return fallback() }
+            let result = LeanOutput.condensed(.text(snapshot.renderedText))
+            guard let text = LeanOutput.stateText(of: result),
+                  let sig = reusableSignature(before: before, after: text, id: id) else { return fallback() }
+            return Watch(text: text, sig: sig, result: result)
+        }
+
+        static func reusableSignature(before: String, after: String, id: UInt32) -> WindowSig? {
+            let head = before.split(separator: "\n", maxSplits: 3).prefix(3)
+            guard head.count == 3, head.last == "Window ID: \(id)",
+                  head.first == after.split(separator: "\n", maxSplits: 1).first,
+                  after != before, DoneCheck.supportsAbsenceCheck(before), DoneCheck.supportsAbsenceCheck(after),
+                  !before.contains("the app hides its web content"), !after.contains("the app hides its web content")
+            else { return nil }
+            let sig = BatchEffects.windowSig(state: after, id: id)
+            return sig.dialog == BatchEffects.dialog(in: before) ? sig : nil
+        }
+    }
+
     /// The title from `Window: "Untitled", App: Notes.`
     static func windowTitle(in state: String) -> String? {
         guard let line = state.split(separator: "\n", maxSplits: 4).first(where: { $0.hasPrefix("Window: ") }),
@@ -258,6 +301,44 @@ enum BatchEffects {
 
     // MARK: - wait step
 
+    /// The cheap check only decides when to take a full verification read.
+    /// Periodic full reads cover labels and dialogs a shallow AX probe can miss.
+    struct WaitReadGate {
+        var nextFullRead: TimeInterval
+        static let fallbackInterval: TimeInterval = 0.75
+
+        mutating func shouldRead(at now: TimeInterval, probe: () -> Bool?) -> Bool {
+            guard now >= nextFullRead || probe() != false else { return false }
+            nextFullRead = now + Self.fallbackInterval
+            return true
+        }
+    }
+
+    static func waitMayBeReady(_ kind: Wait.Kind, app: String, windowID: UInt32?) -> Bool? {
+        guard (try? requireUsableComputerUseSession()) != nil,
+              let app = try? AppDiscovery.resolveRunning(app),
+              let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID) else { return nil }
+        switch kind {
+        case .window(let title):
+            if SmartSteps.axText(kAXTitleAttribute, of: context.windowElement)?.localizedCaseInsensitiveContains(title) == true {
+                return true
+            }
+            return SmartSteps.sheetCandidates(pid: app.pid).contains {
+                SmartSteps.axText(kAXTitleAttribute, of: $0)?.localizedCaseInsensitiveContains(title) == true
+            }
+        case .text(let text), .gone(let text):
+            let criteria = TargetedAX.Criteria(text: text, exact: false, role: nil, limit: 1, maxNodes: 32)
+            guard let scan = try? SnapshotBuilder.targetedSearch(criteria, in: context, timeout: 0.06) else { return nil }
+            switch kind {
+            case .text: return !scan.records.isEmpty
+            case .gone: return scan.records.isEmpty
+            default: return nil
+            }
+        case .settle:
+            return !WindowSettle.busy(from: context.windowElement, requireComplete: true, read: WindowSettle.readAll)
+        }
+    }
+
     /// `{"tool": "wait", "window": "Save"}` (or text, gone, settle: true, timeout_ms).
     struct Wait {
         enum Kind: Equatable {
@@ -273,6 +354,13 @@ enum BatchEffects {
 
         let kind: Kind
         let timeoutMs: Int
+
+        /// Whole milliseconds for a number a model sent. Clamped to 0...maxTimeoutMs before the Int conversion,
+        /// which traps on huge values; non-finite input is rejected.
+        static func milliseconds(_ value: Double, perUnit: Double = 1) throws -> Int {
+            guard value.isFinite else { throw ComputerUseError.invalidArguments("wait time must be a finite number") }
+            return Int(min(max(value * perUnit, 0), Double(maxTimeoutMs)))
+        }
 
         /// Seconds this wait may poll, limited by its own timeout and the batch's remaining time.
         func pollSeconds(elapsedInBatch: TimeInterval, budget: TimeInterval) -> TimeInterval {
@@ -305,7 +393,7 @@ enum BatchEffects {
                 let seconds = ["timeout_s", "timeout_seconds", "timeout"].lazy.compactMap { key -> Double? in
                     (arguments[key] as? NSNumber)?.doubleValue ?? Double((arguments[key] as? String) ?? "")
                 }.first
-                if let seconds { arguments["timeout_ms"] = seconds <= 60 ? Int(seconds * 1000) : Int(seconds) }
+                if let seconds { arguments["timeout_ms"] = try Self.milliseconds(seconds, perUnit: seconds <= 60 ? 1000 : 1) }
             }
             func text(_ key: String) -> String? {
                 (arguments[key] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
@@ -362,6 +450,11 @@ enum BatchEffects {
             case .gone(let wanted):
                 return DoneCheck.supportsAbsenceCheck(state) && !state.localizedCaseInsensitiveContains(wanted)
             case .settle:
+                guard DoneCheck.supportsAbsenceCheck(state) else {
+                    lastHash = nil
+                    stableSince = nil
+                    return false
+                }
                 let hash = BatchTool.stateText(ofText: state).hashValue
                 if hash != lastHash {
                     lastHash = hash

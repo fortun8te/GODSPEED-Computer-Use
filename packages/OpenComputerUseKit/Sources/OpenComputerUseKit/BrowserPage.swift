@@ -47,6 +47,24 @@ struct BrowserNode: Sendable {
     }
 }
 
+/// Where a navigation ended up against the address that was asked for. Only `arrived` confirms that address.
+enum BrowserNavigationResult: Equatable, Sendable {
+    /// The requested address loaded. `newDocument` is false when the same document was still in place.
+    case arrived(finalURL: String, newDocument: Bool)
+    /// The page loaded on another origin than the one requested (a login or redirect target).
+    case redirected(finalURL: String)
+    /// Chrome's error page (chrome-error://, net::ERR_*) replaced the requested page.
+    case errorPage(finalURL: String)
+    case timedOut
+}
+
+/// One stage of a navigation, as `BrowserRules.navigationStage` reads it.
+enum NavigationStage: Equatable {
+    case arrived
+    case redirected
+    case errorPage
+}
+
 /// What an action did to the page, in the one short line the model reads after it.
 enum BrowserChange: Equatable, Sendable {
     case navigated(String)
@@ -71,6 +89,7 @@ struct BrowserTypeOutcome: Sendable {
     /// Visible role=option entries that appeared under a combobox / autocomplete.
     var options: [String] = []
     var change: BrowserChange = .none
+    var deliveryState: DeliveryState = .acknowledged
 
     func reply(verb: String, target: String) -> String {
         if let picked { return picked }
@@ -90,6 +109,12 @@ struct BrowserAXParse: Sendable {
     /// Headings ("# …") and text lines ("  …"), in page order, already capped.
     var texts: [String] = []
     var droppedControls = 0
+    var clippedText = false
+
+    var isCompleteEvidence: Bool {
+        droppedControls == 0 && !clippedText
+            && controls.allSatisfy { $0.name.count <= 100 && $0.value.count <= 80 }
+    }
     var framedControls = 0
     /// Icon-only controls kept so far (capped by `BrowserPage.maxUnnamedControls`).
     var unnamedControls = 0
@@ -110,10 +135,11 @@ final class BrowserPage {
     let remember: Bool
     private var indexedGeneration: Int?
 
-    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true) {
+    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true, referenceGeneration: Int? = nil) {
         self.bridge = bridge
         self.tab = tab
         self.remember = remember
+        self.indexedGeneration = referenceGeneration
     }
 
     /// Roles a model can act on.
@@ -137,11 +163,18 @@ final class BrowserPage {
 
     private var tabID: Int? { tab["tab_id"] as? Int }
 
+    /// True only for a tab this helper opened (`open_tab`). Page hooks (fetch and XHR wrappers, `window.__gs`,
+    /// frame removal) are installed only on these; a tab the user owns gets read-only paths.
+    var ownsTab: Bool {
+        guard let tabID else { return false }
+        return bridge.ownedTabGeneration(tabID) != nil
+    }
+
     private static let staleIndex = ComputerUseError.invalidArguments(
         "browser: the tab or document changed; browser read again before using an element number"
     )
 
-    private func documentIdentity() throws -> BrowserDocumentIdentity? {
+    func documentIdentity() throws -> BrowserDocumentIdentity? {
         guard let frames = try cdp("Page.getFrameTree")["frameTree"] as? [String: Any] else { return nil }
         return BrowserDocumentIdentity(tree: frames)
     }
@@ -155,11 +188,31 @@ final class BrowserPage {
     }
 
     func readSnapshot(find: String?, full: Bool, interactive: Bool = false, diff: Bool = false,
-                      includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true) throws
-        -> (text: String, verifiedURL: String?, fullText: String?) {
+                      includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true,
+                      findExact: String? = nil) throws
+        -> (text: String, verifiedURL: String?, fullText: String?, evidenceScope: BrowserEvidenceScope?) {
         guardForeignFrames()
         let identity = remember && tabID != nil ? try? documentIdentity() : nil
         let generation = bridge.referenceGeneration
+        if let exact = findExact?.trimmingCharacters(in: .whitespacesAndNewlines), !exact.isEmpty {
+            let matches = try Self.exactControls(named: exact, query: { try queryNamedRaw(exact) }, fallback: fullTree)
+            var parse = BrowserAXParse()
+            parse.controls = Array(matches.prefix(150))
+            parse.droppedControls = max(0, matches.count - parse.controls.count)
+            let place = try? location()
+            // Scope this discovery to labels. An exact-name result lacks the
+            // neighboring text used to fingerprint an indexed control.
+            let stable = identity != nil && (try? documentIdentity()) == identity && generation == bridge.referenceGeneration
+            if !stable {
+                if let tabID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID) }
+                parse.controls = []
+            }
+            let text = Self.renderRead(parse, href: place?.href ?? "?", title: place?.title ?? "",
+                                       readyState: place?.readyState ?? "complete", wholePage: false, numbered: false,
+                                       includeLinkURLs: includeLinkURLs)
+            return (text + "\n(exact-name search; read the page for numbered controls or to verify page content)",
+                    stable ? place?.href : nil, "", nil)
+        }
         let raw = try fullTree()
         let query = find?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A find looks through the whole page, however long (only its matches are printed); a full read lists
@@ -173,7 +226,9 @@ final class BrowserPage {
             : Self.parseAX(raw, controlBudget: .max, textBudget: interactive ? 0 : .max, maxControls: .max,
                            includeLinkURLs: includeLinkURLs)
         var parse = parsed
-        addHints(to: &parse)
+        TimingLog.measure("browser.read_hints") {
+            addHints(to: &parse, find: query, generation: generation)
+        }
         let context = try? readContext(texts: parse.texts)
         let place = context?.location ?? (try? location())
         if let context { parse.texts = context.texts }
@@ -202,8 +257,13 @@ final class BrowserPage {
                             numbered: indicesAvailable, includeLinkURLs: includeLinkURLs)
         }
         var text = render(includeLinkURLs: includeLinkURLs)
-        // Destination annotations describe a possible next page, not the text on this page.
-        let evidence = includeLinkURLs ? render(includeLinkURLs: false) : nil
+        // A filtered or clipped page is useful for discovery. Keep its URL
+        // available, but don't use the partial text to verify a batch.
+        let evidence: String? = if !query.isEmpty || interactive || !parse.isCompleteEvidence {
+            ""
+        } else {
+            includeLinkURLs ? render(includeLinkURLs: false) : nil
+        }
         if interactive {
             text += "\n(controls only; read without interactive for page text)"
         }
@@ -213,6 +273,9 @@ final class BrowserPage {
                 : "\n(only lines mentioning \"\(query)\"; use \(indicesAvailable ? "indexes or labels" : "labels") for actions)"
         }
         let url = indicesAvailable ? place?.href : nil
+        let scope = url.flatMap { url in
+            identity.flatMap { evidenceScope(document: $0, generation: generation, url: url) }
+        }
         if indicesAvailable, let tabID, let identity {
             let mode = keepsDiffBaseline && query.isEmpty && url != nil ? "\(full):\(interactive):\(includeLinkURLs)" : nil
             BrowserPageMemory.shared.store(parse.controls, bridge: bridge, tab: tabID, document: identity,
@@ -223,35 +286,79 @@ final class BrowserPage {
                let change = AXStateDiff.diff(previous: previous, current: text, matchIndexes: true),
                let header = text.split(separator: "\n").first {
                 let compact = "\(header)\nBrowser changes (read without diff for the full page):\n\(change)"
-                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text) }
+                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text, scope) }
             }
         }
-        return (text, url, evidence)
+        return (text, url, evidence, scope)
+    }
+
+    func evidenceScope(document: BrowserDocumentIdentity, generation: Int, url: String) -> BrowserEvidenceScope? {
+        guard let tabID, generation == bridge.referenceGeneration else { return nil }
+        return .init(connection: bridge.referenceScope, generation: generation, tabID: tabID, document: document, url: url)
     }
 
     /// Labels the controls a model could not otherwise tell apart: those with no name and those that share
     /// their role and name with another (three "Edit" buttons). Unnamed ones first, then duplicates, in page
     /// order, within a small time budget, so a read never slows down noticeably.
-    private func addHints(to parse: inout BrowserAXParse) {
+    private func addHints(to parse: inout BrowserAXParse, find: String, generation: Int) {
+        let positions = Self.hintCandidates(in: parse, find: find)
+        guard !positions.isEmpty else { return }
+        let deadline = BrowserCallBudget.deadline(after: min(Self.hintBudget, BrowserCallBudget.remaining()))
+        let hints = Self.readHints(positions.map { parse.controls[$0].backendNodeID }) { commands in
+            (try? bridge.hintCommands(tab: tab, commands: commands, generation: generation, deadline: deadline)) ?? []
+        }
+        for position in positions {
+            if let hint = hints[parse.controls[position].backendNodeID] { parse.controls[position].hint = hint }
+        }
+    }
+
+    static func hintCandidates(in parse: BrowserAXParse, find: String) -> [Int] {
         var counts: [String: Int] = [:]
-        for control in parse.controls { counts["\(control.role)\u{1}\(control.name)", default: 0] += 1 }
+        func key(_ control: BrowserNode) -> String { "\(control.role)\u{1}\(control.name)" }
+        for control in parse.controls { counts[key(control), default: 0] += 1 }
+        let directMatches = find.isEmpty ? [] : filtered(parse, find: find).controls.map(\.index)
+        let matchingIndexes = Set(directMatches)
         let candidates = parse.controls.indices.filter { position in
             let control = parse.controls[position]
-            guard !control.inFrame, Self.clickableRoles.contains(control.role) || Self.fieldRoles.contains(control.role) else { return false }
-            return control.name.isEmpty || counts["\(control.role)\u{1}\(control.name)", default: 0] > 1
+            guard !control.inFrame, clickableRoles.contains(control.role) || fieldRoles.contains(control.role) else { return false }
+            if control.name.isEmpty { return true }
+            return counts[key(control), default: 0] > 1
+                && (matchingIndexes.isEmpty || matchingIndexes.contains(control.index))
         }
-        guard !candidates.isEmpty else { return }
-        let ordered = candidates.filter { parse.controls[$0].name.isEmpty } + candidates.filter { !parse.controls[$0].name.isEmpty }
-        let deadline = Date().addingTimeInterval(Self.hintBudget)
-        for position in ordered.prefix(Self.maxHintedControls) {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0.02 else { break }
-            let control = parse.controls[position]
-            let value = BrowserCallBudget.withDeadline(BrowserCallBudget.deadline(after: remaining)) {
-                try? callOnNode(control, Self.hintJS) as? String
-            }
-            if let value, !value.isEmpty { parse.controls[position].hint = value }
+        // Keep relevant named duplicates ahead of icon-only fallback probes.
+        let unnamed = candidates.filter { parse.controls[$0].name.isEmpty }
+        let named = candidates.filter { !parse.controls[$0].name.isEmpty }
+        return Array((matchingIndexes.isEmpty ? unnamed + named : named + unnamed).prefix(maxHintedControls))
+    }
+
+    static func readHints(
+        _ backendIDs: [Int], call: ([(String, [String: Any])]) -> [[String: Any]?]
+    ) -> [Int: String] {
+        let objectGroup = "godspeed-read-hints"
+        let resolves = backendIDs.map {
+            ("DOM.resolveNode", ["backendNodeId": $0, "objectGroup": objectGroup])
         }
+        let objects = zip(backendIDs, call(resolves)).compactMap { backend, reply -> (Int, String)? in
+            guard let object = reply?["object"] as? [String: Any], let id = object["objectId"] as? String else { return nil }
+            return (backend, id)
+        }
+        defer { _ = call([("Runtime.releaseObjectGroup", ["objectGroup": objectGroup])]) }
+        guard let first = objects.first else { return [:] }
+        // Every handle is from this tab and these controls are outside iframes.
+        // Detached or cross-context handles may fail this optional enrichment.
+        let function = "function(...nodes){const hint=(\(hintJS));return nodes.map(n=>{try{return n.isConnected?hint.call(n):''}catch{return ''}});}"
+        let params: [String: Any] = [
+            "objectId": first.1, "functionDeclaration": function,
+            "arguments": objects.map { ["objectId": $0.1] }, "returnByValue": true,
+        ]
+        guard let reply = call([("Runtime.callFunctionOn", params)]).first ?? nil,
+              let result = reply["result"] as? [String: Any],
+              let values = result["value"] as? [String], values.count == objects.count else { return [:] }
+        var hints: [Int: String] = [:]
+        for (object, value) in zip(objects, values) where !value.isEmpty {
+            hints[object.0] = value
+        }
+        return hints
     }
 
     /// A control's title, icon, image, stable attribute and row, as "icon:trash; testid:delete; in:Invoice 12".
@@ -296,6 +403,25 @@ final class BrowserPage {
             throw ComputerUseError.message("browser: Chrome returned no screenshot; browser wait, then try again")
         }
         return data
+    }
+
+    /// Checks only visible document text and the URL. No element resolution or saved read baseline.
+    func completionObservation(tabID: Int, needsText: Bool) -> BatchCompletion.Observation? {
+        let generation = bridge.referenceGeneration
+        let script = """
+        (() => {
+            const text = \(needsText) ? document.body?.innerText ?? null : null;
+            return [location.href, text?.slice(0, 100000) ?? null,
+                    document.readyState === 'complete' && text !== null && text.length <= 100000];
+        })()
+        """
+        guard let value = (try? evaluate(script)) as? [Any], value.count == 3,
+              let url = value[0] as? String, !url.isEmpty,
+              generation == bridge.referenceGeneration else { return nil }
+        return BatchCompletion.Observation(
+            target: .browser(tab: tabID, generation: generation), screen: value[1] as? String,
+            url: url, canProveAbsence: value[2] as? Bool == true
+        )
     }
 
     /// Fetch page metadata and filter visible AX text in one evaluation. Reference validation still
@@ -448,7 +574,9 @@ final class BrowserPage {
                 let value = collapse(axValue(node["value"]) ?? "")
                 // An icon-only control (trash, close, menu) has no name but is often the one a task needs. It is
                 // kept, up to a cap, and labelled by a hint after the parse (see `addHints`).
-                let unnamedClickable = name.isEmpty && clickableRoles.contains(role) && result.unnamedControls < maxUnnamedControls
+                let isUnnamedClickable = name.isEmpty && clickableRoles.contains(role)
+                let unnamedClickable = isUnnamedClickable && result.unnamedControls < maxUnnamedControls
+                if isUnnamedClickable, !unnamedClickable { result.droppedControls += 1 }
                 guard let backend = (node["backendDOMNodeId"] as? NSNumber)?.intValue,
                       !name.isEmpty || fieldRoles.contains(role) || unnamedClickable
                 else { continue }
@@ -501,16 +629,23 @@ final class BrowserPage {
             }
 
             if !name.isEmpty, role == "heading" || role == "StaticText" { lastText = name }
-            guard textCharacters < textBudget, !name.isEmpty else { continue }
+            guard !name.isEmpty else { continue }
+            let limit: Int
+            let prefix: String
             if role == "heading" {
-                let line = "# \(name.prefix(120))"
-                result.texts.append(line)
-                textCharacters += line.count
+                limit = 120
+                prefix = "# "
             } else if role == "StaticText", name.count >= 2, name != lastControlName {
-                let line = "  \(name.prefix(160))"
-                result.texts.append(line)
-                textCharacters += line.count
+                limit = 160
+                prefix = "  "
+            } else {
+                continue
             }
+            if name.count > limit || textCharacters >= textBudget { result.clippedText = true }
+            guard textCharacters < textBudget else { continue }
+            let line = prefix + String(name.prefix(limit))
+            result.texts.append(line)
+            textCharacters += line.count
         }
         return result
     }
@@ -584,7 +719,12 @@ final class BrowserPage {
             let matches = observation.nodes.filter { Self.hint($0.hint, matches: wanted) }
             if matches.count == 1, let node = matches.first {
                 indexedGeneration = observation.generation
-                return try verified(node, index: node.index)
+                let current = try verified(node, index: node.index)
+                guard let live = try callOnNode(current, Self.hintJS) as? String,
+                      Self.hint(live, matches: wanted), try documentIdentity() == document else {
+                    throw Self.staleIndex
+                }
+                return current
             }
         }
         let raw = try fullTree()
@@ -650,6 +790,27 @@ final class BrowserPage {
     """
 
     /// Chrome's own name search: fast, and it does not read the whole page.
+    func resolveExact(label: String?, index: Int?, allowPassive: Bool = false) throws -> BrowserNode {
+        if let index { return try resolve(label: nil, index: index) }
+        guard let label, !Self.normalize(label).isEmpty else {
+            throw ComputerUseError.invalidArguments("Give an exact label or a reference from browser read.")
+        }
+        let matches = Self.exactControls(in: try queryNamedRaw(label), label: label, allowPassive: allowPassive)
+        guard matches.count == 1, let node = matches.first else {
+            throw ComputerUseError.stateUnavailable("Expected one control named '\(label)'. Found \(matches.count). Read the tab for a reference.")
+        }
+        return node
+    }
+
+    static func exactControls(in raw: [[String: Any]], label: String, allowPassive: Bool) -> [BrowserNode] {
+        if allowPassive {
+            // Drop zones and scroll areas may have a name without an interactive role.
+            return scrollLabelCandidates(raw, label: label).filter { !$0.role.isEmpty && $0.role != "StaticText" && $0.role != "InlineTextBox" }
+        }
+        var seen: Set<Int> = []
+        return namedCandidates(raw).filter { normalize($0.name) == normalize(label) && seen.insert($0.backendNodeID).inserted }
+    }
+
     private func queryNamed(_ label: String) throws -> [BrowserNode] {
         Self.namedCandidates(try queryNamedRaw(label))
     }
@@ -662,7 +823,24 @@ final class BrowserPage {
             throw ComputerUseError.message("browser: could not reach the page's document; browser wait, then try again")
         }
         let payload = try cdp("Accessibility.queryAXTree", ["objectId": objectID, "accessibleName": label])
-        return Self.nodes(of: payload)
+        guard let nodes = payload["nodes"] as? [[String: Any]] else {
+            throw ComputerUseError.stateUnavailable("Chrome did not return accessibility search results.")
+        }
+        return nodes
+    }
+
+    static func exactControls(
+        named name: String, query: () throws -> [[String: Any]], fallback: () throws -> [[String: Any]]
+    ) throws -> [BrowserNode] {
+        let wanted = normalize(name)
+        func matches(_ raw: [[String: Any]]) -> [BrowserNode] {
+            namedCandidates(raw).filter { normalize($0.name) == wanted }
+        }
+        if let raw = try? query(), !raw.isEmpty {
+            let found = matches(raw)
+            if !found.isEmpty { return found }
+        }
+        return matches(try fallback())
     }
 
     static func namedCandidates(_ raw: [[String: Any]]) -> [BrowserNode] {
@@ -758,18 +936,20 @@ final class BrowserPage {
         }
     }
 
-    func click(_ node: BrowserNode, button: PointerButton = .left, count: Int = 1, modifiers: Int = 0) throws {
-        guard (1...2).contains(count) else { throw ComputerUseError.invalidArguments("browser click count must be 1 or 2") }
+    func click(_ node: BrowserNode, button: PointerButton = .left, count: Int = 1, modifiers: Int = 0, placement: ClickPlacement? = nil) throws {
+        guard (1...3).contains(count), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Multiple clicks need the left button and a count of 1 to 3.")
+        }
         restoreSetup()
-        let document = count == 2 ? try documentIdentity() : nil
-        if count == 2, document == nil {
+        let document = count > 1 ? try documentIdentity() : nil
+        if count > 1, document == nil {
             throw ComputerUseError.stateUnavailable("browser: could not bind the double-click to the current document")
         }
-        let firstPoint = try clickPoint(of: node, beforeFirstAction: true)
+        let firstPoint = try clickPoint(of: node, beforeFirstAction: true, placement: placement)
         // The press already carries the verified point. A separate mouse-move can stall a
         // background tab before the click is sent. Explicit hover still delivers movement.
         let remaining = BrowserCallBudget.remaining()
-        guard remaining > 2 else { throw ComputerUseError.stateUnavailable("browser click did not send a press because little time remained") }
+        guard remaining > 2 else { throw ComputerUseError.timedOut("browser click did not send a press because little time remained", delivery: .notSent) }
         let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
         do {
             for beat in 1...count {
@@ -778,7 +958,7 @@ final class BrowserPage {
                     guard try documentIdentity() == document else {
                         throw ComputerUseError.stateUnavailable("browser: the first click changed the document")
                     }
-                    point = try clickPoint(of: node)
+                    point = try clickPoint(of: node, placement: placement)
                 }
                 guard BrowserCallBudget.remaining() > 2 else {
                     throw ComputerUseError.stateUnavailable("browser click ran out of time before the next press")
@@ -802,14 +982,18 @@ final class BrowserPage {
         }
     }
 
-    func hover(_ node: BrowserNode) throws {
+    func hover(_ node: BrowserNode, dwell: TimeInterval? = nil) throws {
         restoreSetup()
         reveal(node)
-        try mouse("mouseMoved", try clickPoint(of: node), buttons: 0, clickCount: 0)
+        let point = try clickPoint(of: node)
+        if let dwell { try ActionOptions.requireTime(for: dwell + 1) }
+        try mouse("mouseMoved", point, buttons: 0, clickCount: 0)
+        if let dwell, dwell > 0 { Thread.sleep(forTimeInterval: dwell) }
     }
 
     /// A pointer gesture within one viewport, using live hit testing at both ends.
-    func drag(from source: BrowserNode, to destination: BrowserNode, modifiers: Int = 0) throws {
+    func drag(from source: BrowserNode, to destination: BrowserNode?, point: CGPoint? = nil, modifiers: Int = 0,
+              steps: Int = 5, hold: TimeInterval = 0) throws {
         restoreSetup()
         func visiblePoint(_ node: BrowserNode) throws -> CGPoint {
             guard let probe = try callOnNode(node, Self.clickProbeJS) as? [Any],
@@ -821,21 +1005,33 @@ final class BrowserPage {
             return CGPoint(x: x, y: y)
         }
         let start = try visiblePoint(source)
-        let end = try visiblePoint(destination)
+        let end: CGPoint
+        if let destination {
+            end = try visiblePoint(destination)
+        } else if let point, point.x.isFinite, point.y.isFinite,
+                  try evaluate("Boolean(document.elementFromPoint(\(point.x),\(point.y)))") as? Bool == true {
+            end = point
+        } else {
+            throw ComputerUseError.invalidArguments("Drag destination must be inside the tab viewport.")
+        }
         guard hypot(end.x - start.x, end.y - start.y) >= 4 else {
             throw ComputerUseError.invalidArguments("browser drag needs two distinct visible positions")
         }
-        try Self.deliverDrag(from: start, to: end) { type, point, buttons, count in
+        try Self.deliverDrag(from: start, to: end, steps: steps, hold: hold) { type, point, buttons, count in
             try self.mouse(type, point, buttons: buttons, clickCount: count, modifiers: modifiers)
         }
     }
 
     static func deliverDrag(
-        from start: CGPoint, to end: CGPoint,
+        from start: CGPoint, to end: CGPoint, steps: Int = 5, hold: TimeInterval = 0,
+        pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         send: (String, CGPoint, Int, Int) throws -> Void
     ) throws {
         let remaining = BrowserCallBudget.remaining()
-        guard remaining > 4 else { throw ComputerUseError.stateUnavailable("browser drag ran out of time before pressing") }
+        guard (2...30).contains(steps), (0...1).contains(hold) else {
+            throw ComputerUseError.invalidArguments("Drag timing is out of bounds.")
+        }
+        guard remaining > 4 + hold else { throw ComputerUseError.timedOut("browser drag ran out of time before pressing", delivery: .notSent) }
         let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
         let movementDeadline = releaseDeadline - 3
         try send("mouseMoved", start, 0, 0)
@@ -843,8 +1039,9 @@ final class BrowserPage {
         do {
             try BrowserCallBudget.withDeadline(movementDeadline) {
                 try send("mousePressed", start, 1, 1)
-                for step in 1...5 {
-                    let progress = Double(step) / 5
+                if hold > 0 { pause(hold) }
+                for step in 1...steps {
+                    let progress = Double(step) / Double(steps)
                     last = CGPoint(x: start.x + (end.x - start.x) * progress, y: start.y + (end.y - start.y) * progress)
                     try send("mouseMoved", last, 1, 0)
                 }
@@ -856,14 +1053,53 @@ final class BrowserPage {
             }
             throw ComputerUseError.stateUnavailable("browser drag was interrupted after starting. Read the tab before retrying.")
         }
-        try send("mouseReleased", end, 0, 1)
+        do {
+            try send("mouseReleased", end, 0, 1)
+        } catch {
+            throw ComputerUseError.stateUnavailable("The drop may have happened. Inspect the tab before repeating.")
+        }
+    }
+
+    private func precisePoint(of node: BrowserNode, placement: ClickPlacement) throws -> CGPoint {
+        let result = try callOnNode(node, """
+        function(fx,fy,dx,dy){
+          if(window!==window.top)return ['frame'];
+          if(!this.isConnected)return [];
+          const r=this.getBoundingClientRect(), ix=Math.min(1,r.width/2), iy=Math.min(1,r.height/2);
+          const x=r.left+ix+(r.width-2*ix)*fx+dx, y=r.top+iy+(r.height-2*iy)*fy+dy;
+          if(x<r.left||x>=r.right||y<r.top||y>=r.bottom)return ['offset'];
+          let hit=document.elementFromPoint(x,y);
+          for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(x,y))&&next!==hit;)hit=next;
+          for(let n=hit;n;n=n.parentNode||n.host){
+            if(n===this){
+              if(window.__gs){__gs.seen=__gs.mut;__gs.href=location.href;__gs.nav=false;}
+              return ['ok',x,y];
+            }
+          }
+          return [];
+        }
+        """, arguments: [placement.fraction.x, placement.fraction.y, placement.offset.x, placement.offset.y]) as? [Any]
+        if result?.first as? String == "frame" {
+            throw ComputerUseError.backgroundUnsupported("Precise hit testing is unavailable inside this frame.")
+        }
+        if result?.first as? String == "offset" {
+            throw ComputerUseError.invalidArguments("Click offsets place the point outside the control.")
+        }
+        guard let result, result.count == 3, result[0] as? String == "ok",
+              let x = BrowserRules.number(result[1]), let y = BrowserRules.number(result[2]) else {
+            throw ComputerUseError.stateUnavailable("The precise point is out of view or covered. Reveal the control before continuing.")
+        }
+        return CGPoint(x: x, y: y)
     }
 
     /// Where on the element to click: a point of its visible part that really reaches it (`elementFromPoint`
     /// hit-test). Says so when something else lies on top of every probed point (a banner, a dialog, a
     /// stretched link). For frames, use the browser's box geometry. In the main document
     /// a missing hit test is a refusal, since an unverified box could target another control.
-    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false) throws -> CGPoint {
+    func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
+        if let placement {
+            return try precisePoint(of: node, placement: placement)
+        }
         func probe() -> [Any] {
             let remaining = BrowserCallBudget.remaining()
             // Resolving the node and hit-testing it are separate Chrome calls.
@@ -889,15 +1125,24 @@ final class BrowserPage {
            let x = BrowserRules.number(found[1]), let y = BrowserRules.number(found[2]) {
             if kind == "covered" {
                 let what = found.count > 3 ? "\(found[3])".trimmingCharacters(in: .whitespacesAndNewlines) : ""
-                throw ComputerUseError.message(BrowserRules.coveredMessage(role: node.role, name: node.name, by: what) + delivery)
+                let message = BrowserRules.coveredMessage(role: node.role, name: node.name, by: what) + delivery
+                throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.message(message)
             }
             return CGPoint(x: x, y: y)
         }
         if kind == "frame" {
             reveal(node)
-            return try center(of: node)
+            let point = try center(of: node)
+            // The page's own hit test at the point decides. An overlay or a stale frame that is there instead is
+            // refused before any input is sent.
+            guard frameHitIsIntended(node, at: point) else {
+                let message = "browser: another element is at the click point inside the frame, so no click was sent. Reveal the control and read the tab again."
+                throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
+            }
+            return point
         }
-        throw ComputerUseError.stateUnavailable("browser: could not confirm an unobstructed click point.\(delivery) Reveal the control and read the tab again.")
+        let message = "browser: could not confirm an unobstructed click point.\(delivery) Reveal the control and read the tab again."
+        throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
     }
 
     /// ["ok", x, y]: a probed point of the element reaches it. ["covered", x, y, text]: every probed point
@@ -930,6 +1175,20 @@ final class BrowserPage {
 
     private func reveal(_ node: BrowserNode) {
         _ = try? cdp("DOM.scrollIntoViewIfNeeded", ["backendNodeId": node.backendNodeID])
+    }
+
+    /// Chrome's hit test at a point of the main page: true when the element there is the control or sits inside it.
+    /// Any failure to answer is false, so an unverified click is never sent.
+    private func frameHitIsIntended(_ node: BrowserNode, at point: CGPoint) -> Bool {
+        guard let hit = try? cdp("DOM.getNodeForLocation", [
+            "x": Int(point.x), "y": Int(point.y), "includeUserAgentShadowDOM": true,
+        ]), let hitID = hit["backendNodeId"] as? Int else { return false }
+        if hitID == node.backendNodeID { return true }
+        guard let resolved = try? cdp("DOM.resolveNode", ["backendNodeId": hitID]),
+              let hitObject = (resolved["object"] as? [String: Any])?["objectId"] as? String else { return false }
+        // Runs in the control's own frame: a descendant of the control counts as the control.
+        return (try? callOnNode(node, "function(hit){return this===hit||this.contains(hit);}",
+                                objectArguments: [hitObject])) as? Bool == true
     }
 
     private func center(of node: BrowserNode) throws -> CGPoint {
@@ -990,9 +1249,11 @@ final class BrowserPage {
             }
         }
         let (head, last) = keyEvents ? BrowserRules.splitForTyping(text) : (text, nil)
-        let document = !keyEvents && node != nil ? try? documentIdentity() : nil
+        let document = node != nil ? try? documentIdentity() : nil
         var expected = replace ? text : nil
-        if !keyEvents, !replace, let node, document != nil {
+        // An append is confirmed only against the exact value the insert should produce, so the field is read
+        // before the text goes in (this also covers text that already appears in the field).
+        if !replace, let node, document != nil {
             expected = (try? callOnNode(node, """
                 function (text) {
                   if (!this.matches('input,textarea') || this.type === 'password' ||
@@ -1011,7 +1272,8 @@ final class BrowserPage {
             if let node, let document, let expected, BrowserCallBudget.remaining() > 0.6,
                (try? documentIdentity()) == document,
                (try? fieldText(node)) == expected {
-                return BrowserTypeOutcome(note: "field value verified after Chrome did not acknowledge the input")
+                return BrowserTypeOutcome(note: "field value verified after Chrome did not acknowledge the input",
+                                          deliveryState: .verified)
             }
             throw ComputerUseError.stateUnavailable("browser: typing may have taken effect in part. Read the field before sending any more text.")
         }
@@ -1035,6 +1297,13 @@ final class BrowserPage {
                 throw ComputerUseError.stateUnavailable("browser: typing may have taken effect, but the field does not show the requested value. Read it before continuing.")
             }
             outcome.note = "(field now shows \"\(actual.prefix(80))\"; inspect the field before sending more text)"
+        }
+        if let actual, let expected, actual == expected {
+            outcome.deliveryState = .verified
+        }
+        if !replace, node != nil, outcome.note == nil,
+           let note = BrowserRules.appendNote(expected: expected, actual: actual) {
+            outcome.note = note
         }
         if watchSuggestions { outcome.options = comboOptions() }
         return outcome
@@ -1077,26 +1346,26 @@ final class BrowserPage {
     """
 
     /// Presses a key or key combination ("Enter", "Cmd+A", "ctrl+shift+z"): keyDown then keyUp.
-    func pressKey(_ raw: String) throws {
+    func pressKey(_ raw: String, hold: TimeInterval? = nil) throws {
         guard let combo = BrowserKeyCombo.parse(raw) else {
             throw ComputerUseError.invalidArguments(
                 "browser: key \"\(raw)\" is not known; use Enter, Tab, Escape, Backspace, Delete, Space, arrows, Home, End, PageUp/PageDown, or a letter or digit with Cmd, Ctrl, Alt or Shift (e.g. Cmd+A)"
             )
         }
         restoreSetup()
-        try send(combo)
+        try send(combo, hold: hold)
     }
 
     /// A key press followed by the one change line (Enter often submits or navigates).
-    func pressKeyAndWatch(_ raw: String) throws -> BrowserChange {
-        guard BrowserKeyCombo.parse(raw) != nil else { try pressKey(raw); return .none }
+    func pressKeyAndWatch(_ raw: String, hold: TimeInterval? = nil) throws -> BrowserChange {
+        guard BrowserKeyCombo.parse(raw) != nil else { try pressKey(raw, hold: hold); return .none }
         restoreSetup()
         markBaseline()
-        try pressKey(raw)
+        try pressKey(raw, hold: hold)
         return settle()
     }
 
-    private func send(_ combo: BrowserKeyCombo) throws {
+    private func send(_ combo: BrowserKeyCombo, hold: TimeInterval? = nil) throws {
         var down: [String: Any] = [
             "type": "keyDown", "key": combo.key,
             "windowsVirtualKeyCode": combo.virtualKey, "modifiers": combo.modifiers,
@@ -1108,8 +1377,31 @@ final class BrowserPage {
         if !combo.code.isEmpty { down["code"] = combo.code; up["code"] = combo.code }
         if let text = combo.text { down["text"] = text }
         if !combo.commands.isEmpty { down["commands"] = combo.commands }
-        _ = try cdp("Input.dispatchKeyEvent", down)
-        _ = try cdp("Input.dispatchKeyEvent", up)
+        if let hold {
+            try Self.deliverHeldKey(hold: hold, press: { _ = try cdp("Input.dispatchKeyEvent", down) },
+                                   release: { _ = try cdp("Input.dispatchKeyEvent", up) })
+        } else {
+            _ = try cdp("Input.dispatchKeyEvent", down)
+            _ = try cdp("Input.dispatchKeyEvent", up)
+        }
+    }
+
+    static func deliverHeldKey(hold: TimeInterval, pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+                               press: () throws -> Void, release: () throws -> Void) throws {
+        try ActionOptions.requireTime(for: hold + 3)
+        let deadline = BrowserCallBudget.deadline(after: BrowserCallBudget.remaining())
+        do {
+            try BrowserCallBudget.withDeadline(deadline - hold - 1.5, press)
+        } catch {
+            try? BrowserCallBudget.withDeadline(deadline, release)
+            throw ComputerUseError.stateUnavailable("The held key may have reached the tab. Inspect it before repeating.")
+        }
+        if hold > 0 { pause(hold) }
+        do {
+            try BrowserCallBudget.withDeadline(deadline, release)
+        } catch {
+            throw ComputerUseError.stateUnavailable("Chrome did not confirm key release. Inspect the tab before repeating.")
+        }
     }
 
     /// Verify and select within the target's own document or shadow root.
@@ -1276,7 +1568,7 @@ final class BrowserPage {
         var capacity = readCapacity()
         if case .failure = capacity, BrowserCallBudget.remaining() > 3 { capacity = readCapacity() }
         guard case .success(let value) = capacity else {
-            throw ComputerUseError.stateUnavailable("Could not confirm the Chrome file input. Nothing was sent. Read the tab and try again.")
+            throw ComputerUseError.notSent("Could not confirm the Chrome file input. Nothing was sent. Read the tab and try again.")
         }
         guard let multiple = value as? Bool else {
             throw ComputerUseError.invalidArguments("Browser upload target is not an enabled file input. Nothing was sent.")
@@ -1310,6 +1602,40 @@ final class BrowserPage {
         return zip(rows, expected).allSatisfy { row, file in
             row.count == 2 && row[0] as? String == file.name && row[1] as? Int == file.size
         }
+    }
+
+    func selectText(_ node: BrowserNode, range: TextRangeRequest?, text: String,
+                    prefix: String?, suffix: String?, mode: TextSelectionMode) throws -> String {
+        let value = try callOnNode(node, """
+        function(){
+          if(!this.isConnected||this.type==='password'||this.disabled||typeof this.selectionStart!=='number')return null;
+          return typeof this.value==='string'?this.value:null;
+        }
+        """) as? String
+        guard let value else {
+            throw ComputerUseError.backgroundUnsupported("This control does not expose a plain text range.")
+        }
+        let target: TextSelectionTarget
+        if let range {
+            target = try TextSelectionResolver.resolve(value: value, start: range.start, length: range.length)
+        } else {
+            do {
+                target = try TextSelectionResolver.resolve(value: value, text: text, prefix: prefix, suffix: suffix, selection: mode)
+            } catch let error as TextSelectionResolverError {
+                throw ComputerUseError.invalidArguments(selectTextErrorMessage(error, elementIndex: node.name))
+            }
+        }
+        let outcome = try callOnNode(node, """
+        function(start,end,expected){
+          if(!this.isConnected||this.type==='password'||this.disabled||this.value!==expected)return false;
+          this.setSelectionRange(start,end);
+          return this.selectionStart===start&&this.selectionEnd===end&&this.value===expected;
+        }
+        """, arguments: [target.location, target.location + target.length, value])
+        guard outcome as? Bool == true else {
+            throw ComputerUseError.stateUnavailable("Could not verify the selected range on the same field value.")
+        }
+        return "Selected range \(target.location), length \(target.length)."
     }
 
     func fieldText(_ node: BrowserNode) throws -> String? {
@@ -1472,8 +1798,171 @@ final class BrowserPage {
         return "\"\(node.name)\": " + BrowserRules.scrollSummary(direction: direction, top: top, bottom: bottom)
     }
 
+    func scroll(_ node: BrowserNode?, direction: String, chunks: ScrollChunks) throws -> String {
+        guard ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("Scroll chunks need up, down, left or right.")
+        }
+        guard let document = try documentIdentity() else {
+            throw ComputerUseError.stateUnavailable("Could not bind the scroll to this document.")
+        }
+        func validate() throws {
+            guard try documentIdentity() == document else {
+                throw ComputerUseError.stateUnavailable("The document changed during scroll. Read the tab before continuing.")
+            }
+        }
+        let visibilityScope = if chunks.untilVisible != nil, let node { try nodeObjectID(node) } else { "" }
+        let horizontal = direction == "left" || direction == "right"
+        let outcome = try chunks.run(visible: {
+            try validate()
+            guard let label = chunks.untilVisible else { return false }
+            let matches = Self.scrollLabelCandidates(try queryNamedAny(label), label: label)
+            var found = false
+            for match in matches {
+                if !visibilityScope.isEmpty {
+                    let inside = try callOnNode(match, Self.scrollScopeJS, arguments: [horizontal],
+                                                objectArguments: [visibilityScope]) as? Bool
+                    if inside != true { continue }
+                }
+                if try isInViewport(match) {
+                    if found { return false }
+                    found = true
+                }
+            }
+            return found
+        }, advance: {
+            try validate()
+            let args: [Any] = [direction, chunks.unit.rawValue, chunks.size]
+            let result: Any?
+            if let node {
+                result = try callOnNode(node, Self.scrollChunkJS, arguments: args, feedback: "scroll")
+            } else {
+                result = try evaluate("(\(Self.scrollChunkJS)).call(document.scrollingElement,"
+                    + "\(BrowserRules.jsLiteral(direction)),\(BrowserRules.jsLiteral(chunks.unit.rawValue)),\(chunks.size))",
+                    feedback: "scroll")
+            }
+            guard let moved = result as? Bool else {
+                throw ComputerUseError.backgroundUnsupported("Choose the page or a scrollable control in its current document.")
+            }
+            return moved
+        })
+        return try outcome.reply(label: chunks.untilVisible)
+    }
+
+    static func scrollLabelCandidates(_ raw: [[String: Any]], label: String) -> [BrowserNode] {
+        var seen: Set<Int> = []
+        return raw.compactMap { item in
+            guard (item["ignored"] as? Bool) != true, let name = axValue(item["name"]),
+                  normalize(name) == normalize(label),
+                  let id = (item["backendDOMNodeId"] as? NSNumber)?.intValue, seen.insert(id).inserted else { return nil }
+            return BrowserNode(index: 0, role: axValue(item["role"]) ?? "", name: name, value: "", backendNodeID: id)
+        }
+    }
+
+    // Scope a label match to the same axis-specific scroller used for movement.
+    private static let scrollScopeJS = """
+    function(horizontal,target){
+      \(findScrollAreaJS)
+      const area=findArea(target);
+      return Boolean(this.isConnected&&target.isConnected&&area?.contains(this));
+    }
+    """
+
+    private static let findScrollAreaJS = """
+    const findArea = target => {
+      for(let e=target;e;e=e.parentElement){
+        if(e===e.ownerDocument.scrollingElement)return e;
+        const overflow=getComputedStyle(e)[horizontal?'overflowX':'overflowY'];
+        if(/^(auto|scroll|overlay)$/.test(overflow)&&
+           (horizontal?e.scrollWidth>e.clientWidth:e.scrollHeight>e.clientHeight))return e;
+      }
+      return null;
+    };
+    """
+
+    private static let scrollChunkJS = """
+    function(direction,unit,count) {
+        if (!this?.isConnected) return null;
+        const horizontal = direction === 'left' || direction === 'right';
+        \(findScrollAreaJS)
+        const area = findArea(this);
+        if (!area) return null;
+        const property = horizontal ? 'scrollLeft' : 'scrollTop';
+        const before = area[property];
+        const size = unit === 'pages' ? (horizontal ? area.clientWidth : area.clientHeight)
+            : unit === 'lines' ? count * 40 : count;
+        const delta = direction === 'left' || direction === 'up' ? -size : size;
+        area.scrollBy({left:horizontal ? delta : 0,top:horizontal ? 0 : delta,behavior:'instant'});
+        return area[property] !== before;
+    }
+    """
+
+    private func isInViewport(_ node: BrowserNode) throws -> Bool {
+        try callOnNode(node, """
+        function(){
+          if(!this.isConnected||window!==window.top)return false;
+          const text=this.nodeType===3, element=text?this.parentElement:this;
+          if(!element?.getBoundingClientRect)return false;
+          let bounds;
+          if(text){
+            const range=document.createRange();
+            range.selectNodeContents(this);
+            bounds=range.getBoundingClientRect();
+          }else bounds=element.getBoundingClientRect();
+          const left=Math.max(0,bounds.left), right=Math.min(innerWidth,bounds.right);
+          const top=Math.max(0,bounds.top), bottom=Math.min(innerHeight,bounds.bottom);
+          if(right<=left||bottom<=top)return false;
+          for(const fraction of [0.5,0.25,0.75]){
+            let hit=document.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2);
+            for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2))&&next!==hit;)hit=next;
+            for(let current=hit;current;current=current.parentNode||current.host)
+              if(current===element)return true;
+          }
+          return false;
+        }
+        """) as? Bool == true
+    }
+
+    /// Change the tab scale once and verify the reported scale in the same document.
+    func zoom(_ gesture: GestureAction) throws -> String {
+        guard gesture.zoomIncreases != nil else {
+            throw ComputerUseError.backgroundUnsupported("Chrome has no background equivalent for this gesture.")
+        }
+        guard let document = try documentIdentity() else {
+            throw ComputerUseError.stateUnavailable("Could not bind zoom to the current tab document.")
+        }
+        func scale() throws -> Double {
+            guard let value = try evaluate("window.visualViewport?.scale") as? NSNumber,
+                  value.doubleValue.isFinite, value.doubleValue > 0 else {
+                throw ComputerUseError.backgroundUnsupported("The tab does not report a page scale.")
+            }
+            return value.doubleValue
+        }
+        let before = try scale()
+        guard let target = gesture.zoomTarget(from: before), try documentIdentity() == document else {
+            throw ComputerUseError.stateUnavailable("Tab document changed before zoom.")
+        }
+        guard abs(target - before) > 0.001 else { return "Page zoom is already at the limit." }
+        do {
+            try cdp("Emulation.setPageScaleFactor", ["pageScaleFactor": target])
+        } catch {
+            throw ComputerUseError.stateUnavailable("Could not confirm the zoom command. Inspect the tab before repeating.")
+        }
+        let deadline = BrowserCallBudget.deadline(after: min(0.4, BrowserCallBudget.remaining()))
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            guard try documentIdentity() == document else {
+                throw ComputerUseError.stateUnavailable("Tab document changed after zoom.")
+            }
+            if GestureAction.zoomWasVerified(before: before, target: target, after: try scale()) {
+                let percent = Int((target * 100).rounded())
+                return "Page scale changed to \(percent)%."
+            }
+            Thread.sleep(forTimeInterval: min(0.04, max(0, deadline - ProcessInfo.processInfo.systemUptime)))
+        }
+        throw ComputerUseError.stateUnavailable("Zoom command delivered. The tab did not report the requested scale.")
+    }
+
     /// Back, forward or reload in this tab, waiting for the page to load again.
-    func history(_ operation: String) throws -> String {
+    func history(_ operation: String, authorizeDestination: (String) throws -> Void = { _ in }) throws -> String {
         if operation == "reload" {
             guard let before = try evaluate("performance.timeOrigin") as? NSNumber else {
                 throw ComputerUseError.stateUnavailable("browser: could not identify the current document before reloading.")
@@ -1496,6 +1985,10 @@ final class BrowserPage {
         else {
             throw ComputerUseError.invalidArguments("browser: there is no page \(operation) in this tab; use browser go with a URL")
         }
+        guard let url = entries[target]["url"] as? String else {
+            throw ComputerUseError.stateUnavailable("browser: could not confirm the history destination.")
+        }
+        try authorizeDestination(url)
         _ = try cdp("Page.navigateToHistoryEntry", ["entryId": entryID])
         let place = try waitForHistoryResult {
             let history = try self.cdp("Page.getNavigationHistory")
@@ -1512,7 +2005,7 @@ final class BrowserPage {
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(20, max(0, BrowserCallBudget.remaining()))
         let observed: BrowserLocation? = try BrowserCallBudget.withDeadline(deadline) {
-            while deadline - clock.systemUptime > 0.3 {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 try BrowserRequestContext.validateCurrent()
                 if (try? reachedTarget()) == true, let place = try? location(),
                    place.readyState == "interactive" || place.readyState == "complete" {
@@ -1543,19 +2036,20 @@ final class BrowserPage {
     /// stays at the same address, a short while.
     @discardableResult
     func waitLoad(changedFrom old: String?, expect: String? = nil, timeout: TimeInterval) -> Bool {
+        if let expect {
+            if case .arrived = navigationOutcome(from: old, expected: expect, timeout: timeout) { return true }
+            return false
+        }
         let clock = ProcessInfo.processInfo
         let start = clock.systemUptime
         let deadline = start + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
         return BrowserCallBudget.withDeadline(deadline) {
-            while deadline - clock.systemUptime > 0.3 {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 do { try BrowserRequestContext.validateCurrent() } catch { return false }
                 if let here = try? location(),
                    here.readyState == "interactive" || here.readyState == "complete" {
                     let elapsed = clock.systemUptime - start
-                    if let expect {
-                        if BrowserRules.sameAddress(here.href, expect)
-                            || (elapsed > 4 && here.href != old && BrowserRules.isWebAddress(here.href)) { return true }
-                    } else if old == nil || here.href != old || elapsed > 1.5 {
+                    if old == nil || here.href != old || elapsed > 1.5 {
                         return true
                     }
                 }
@@ -1567,11 +2061,40 @@ final class BrowserPage {
         }
     }
 
+    /// Waits for `expected` after a navigation that began at `old`. Only `.arrived` confirms the address. An error
+    /// page or a load that ends on another origin is reported as it is, without waiting out the time limit.
+    func navigationOutcome(from old: String?, expected: String, timeout: TimeInterval) -> BrowserNavigationResult {
+        let clock = ProcessInfo.processInfo
+        let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
+        let startingDocument = try? documentIdentity()
+        return BrowserCallBudget.withDeadline(deadline) {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
+                do { try BrowserRequestContext.validateCurrent() } catch { return .timedOut }
+                if let here = try? location(),
+                   let stage = BrowserRules.navigationStage(expected: expected, from: old, href: here.href,
+                                                            readyState: here.readyState) {
+                    switch stage {
+                    case .arrived:
+                        let current = try? documentIdentity()
+                        let newDocument = current != nil && startingDocument != nil && current != startingDocument
+                        return .arrived(finalURL: here.href, newDocument: newDocument)
+                    case .redirected: return .redirected(finalURL: here.href)
+                    case .errorPage: return .errorPage(finalURL: here.href)
+                    }
+                }
+                let remaining = deadline - clock.systemUptime - 0.3
+                if remaining <= 0 { break }
+                Thread.sleep(forTimeInterval: min(0.12, remaining))
+            }
+            return .timedOut
+        }
+    }
+
     /// After a click on a link that leads elsewhere: when the address moves on within 1.5 s, waits for that page
     /// to load and returns it.
     func followNavigation(from old: String) -> BrowserLocation? {
         let deadline = Date().addingTimeInterval(1.5)
-        while Date() < deadline {
+        while !RequestCancellation.requested && Date() < deadline {
             if let here = try? location(), here.href != old {
                 waitLoad(changedFrom: old, timeout: 20)
                 settle()
@@ -1602,6 +2125,9 @@ final class BrowserPage {
 
     @discardableResult
     func settle(cap: Int = 800) -> BrowserChange {
+        // The network-idle and mutation counters exist only in the agent's own tabs. Elsewhere there is
+        // nothing to observe without changing the page, so no change is claimed.
+        guard ownsTab else { return .none }
         // Polled from here with quick synchronous reads. A promise that waits inside the page never settled in a
         // background tab (Chrome throttles its timers), so each wait hung until the 15 s command timeout.
         let clock = ProcessInfo.processInfo
@@ -1611,7 +2137,7 @@ final class BrowserPage {
         let deadline = start + min(quietLimit + 1, max(0, BrowserCallBudget.remaining()))
         let last: [String: Any]? = BrowserCallBudget.withDeadline(deadline) {
             var observed: [String: Any]?
-            while deadline - clock.systemUptime > 0.3 {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 let payload = try? cdp("Runtime.evaluate", ["returnByValue": true, "expression": Self.settleProbeJS])
                 guard let value = (payload?["result"] as? [String: Any])?["value"] as? [String: Any],
                       (value["ok"] as? Bool) == true else { break }
@@ -1658,16 +2184,51 @@ final class BrowserPage {
     """
 
     /// Waits for the text to appear on the page, or for a labelled element to exist. False when the time runs out.
+    func waitForControl(_ wait: ControlWait) throws -> String {
+        let startingDocument = wait.condition == .valueChanged ? try documentIdentity() : nil
+        if wait.condition == .valueChanged, startingDocument == nil {
+            throw ComputerUseError.stateUnavailable("Could not bind the value wait to the current document.")
+        }
+        return try wait.run { () -> ControlWait.Sample<Int> in
+            try BrowserRequestContext.validateCurrent()
+            if let startingDocument, try documentIdentity() != startingDocument {
+                throw ComputerUseError.stateUnavailable("The document changed during the value wait.")
+            }
+            let named = try queryNamedAny(wait.label).filter {
+                Self.normalize(Self.axValue($0["name"]) ?? "") == Self.normalize(wait.label)
+            }
+            guard !named.isEmpty else { return .absent }
+            guard wait.condition == .valueChanged else { return .present }
+            let matches = Self.namedCandidates(named)
+            guard Set(matches.map(\.backendNodeID)).count == 1, let node = matches.first,
+                  let value = try observedControlValue(node) else { return .unreadable }
+            return .value(node.backendNodeID, value)
+        }
+    }
+
+    private func observedControlValue(_ node: BrowserNode) throws -> String? {
+        try callOnNode(node, """
+        function(){
+          if(!this.isConnected||this.type==='password')return null;
+          if(this.type==='checkbox'||this.type==='radio')return String(this.checked);
+          if(typeof this.value==='string')return this.value;
+          if(this.isContentEditable)return this.innerText;
+          const value=this.getAttribute('aria-valuenow')??this.getAttribute('aria-checked');
+          return value===null?null:String(value);
+        }
+        """) as? String
+    }
+
     func waitFor(text: String?, label: String?, urlContains: String? = nil, controlCondition: ControlCondition? = nil, timeout: TimeInterval) -> Bool {
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining()))
         return BrowserCallBudget.withDeadline(deadline) {
-            while clock.systemUptime < deadline {
+            while !RequestCancellation.requested && clock.systemUptime < deadline {
                 do { try BrowserRequestContext.validateCurrent() } catch { return false }
                 if let urlContains {
                     if let place = try? location(),
                        place.readyState == "interactive" || place.readyState == "complete",
-                       place.href.localizedCaseInsensitiveContains(urlContains) { return true }
+                       BrowserRules.urlContains(place.href, urlContains) { return true }
                 } else if let text {
                     let remaining = deadline - clock.systemUptime
                     let milliseconds = Int(min(1.0, max(0, remaining - 0.05)) * 1000)
@@ -1733,15 +2294,20 @@ final class BrowserPage {
     // MARK: CDP plumbing
 
     /// Calls a JavaScript function with `this` set to the element. Returns the function's JSON value.
-    func callOnNode(_ node: BrowserNode, _ function: String, arguments: [Any] = [], feedback: String? = nil) throws -> Any? {
+    private func nodeObjectID(_ node: BrowserNode) throws -> String {
         let resolved = try cdp("DOM.resolveNode", ["backendNodeId": node.backendNodeID])
         guard let object = resolved["object"] as? [String: Any], let objectID = object["objectId"] as? String else {
             throw ComputerUseError.message("browser: \"\(node.name)\" is gone from the page; browser read again")
         }
+        return objectID
+    }
+
+    func callOnNode(_ node: BrowserNode, _ function: String, arguments: [Any] = [],
+                    objectArguments: [String] = [], feedback: String? = nil) throws -> Any? {
         let payload = try cdp("Runtime.callFunctionOn", [
-            "objectId": objectID,
+            "objectId": nodeObjectID(node),
             "functionDeclaration": function,
-            "arguments": arguments.map { ["value": $0] },
+            "arguments": arguments.map { ["value": $0] } + objectArguments.map { ["objectId": $0] },
             "returnByValue": true,
         ], feedback: feedback)
         if payload["exceptionDetails"] != nil {
@@ -1777,6 +2343,8 @@ final class BrowserPage {
     """
 
     private func guardForeignFrames() {
+        // Installing a page hook changes the user's page, so it happens only in a tab the agent opened.
+        guard ownsTab else { return }
         let key = domainKey("foreign-frame-guard")
         if BrowserPageMemory.shared.isEnabled(key) { return }
         let setup = Self.foreignFrameGuardJS + "\n;" + Self.pageStateJS
@@ -1802,27 +2370,21 @@ final class BrowserPage {
     }
 
     @discardableResult
-    private func cdp(_ method: String, _ params: [String: Any] = [:], feedback: String? = nil) throws -> [String: Any] {
+    func cdp(_ method: String, _ params: [String: Any] = [:], feedback: String? = nil) throws -> [String: Any] {
         if let indexedGeneration, indexedGeneration != bridge.referenceGeneration {
             throw Self.staleIndex
         }
         do {
             return try cdpOnce(method, params, feedback: feedback)
-        } catch let error as BrowserLinkDropped {
-            // The new link starts without what was set up on the old one (focus emulation, accessibility,
-            // the frame guard): forget that it was done, so it is done again.
+        } catch let error as BrowserCommandFailure {
+            let detail = BrowserReply.explain(error.text)
+            // The helper reports a failed command, but older helpers cannot
+            // distinguish an unacknowledged input from a rejected command.
+            guard !StrictBackground.enabled(), indexedGeneration == nil,
+                  Self.isRepeatSafe(method, params) else {
+                throw ComputerUseError.stateUnavailable("browser: \(detail)")
+            }
             if let tabID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID) }
-            if indexedGeneration != nil {
-                // Do not send any more commands using the old resolution, even if a caller catches this error.
-                indexedGeneration = -1
-                throw ComputerUseError.message("browser: the tab connection changed; browser read to check what happened before continuing")
-            }
-            // Retry only operations with known replay semantics.
-            guard Self.isRepeatSafe(method, params) else {
-                throw ComputerUseError.message(
-                    "browser: the tab connection dropped and the command may have taken effect. Read the tab before deciding whether to repeat it."
-                )
-            }
             for wait in [0.3, 0.8, 1.5] {
                 try BrowserRequestContext.validateCurrent()
                 guard BrowserCallBudget.remaining() > wait + 0.3 else { break }
@@ -1831,11 +2393,11 @@ final class BrowserPage {
                     let result = try cdpOnce(method, params, feedback: feedback)
                     restoreSetup()
                     return result
-                } catch is BrowserLinkDropped {
+                } catch is BrowserCommandFailure {
                     continue
                 }
             }
-            throw ComputerUseError.message("browser: \(BrowserReply.explain(error.text))")
+            throw ComputerUseError.stateUnavailable("browser: \(detail)")
         }
     }
 
@@ -1855,14 +2417,8 @@ final class BrowserPage {
         _ = try? cdp("Runtime.evaluate", ["expression": "1", "returnByValue": true])
     }
 
-    /// Chrome reported the tab as not attached (or detached mid-command).
-    private struct BrowserLinkDropped: Error { let text: String }
-
-    private static func linkDropped(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        return ["detached while handling", "debugger unattached", "debugger is not attached", "not attached to the tab",
-                "cannot access a chrome-extension"].contains { lower.contains($0) }
-    }
+    /// A structured error returned by the helper or Chrome.
+    private struct BrowserCommandFailure: Error { let text: String }
 
     /// Replay only known observations. A command with an uncertain delivery may already have changed the page.
     static func isRepeatSafe(_ method: String, _ params: [String: Any]) -> Bool {
@@ -1871,10 +2427,6 @@ final class BrowserPage {
              "DOM.getBoxModel", "DOM.resolveNode", "Page.captureScreenshot", "Page.getFrameTree",
              "Page.getNavigationHistory":
             return true
-        case "Input.dispatchMouseEvent":
-            return (params["type"] as? String) == "mouseMoved"
-                && (params["buttons"] as? Int ?? 0) == 0
-                && (params["button"] as? String ?? "none") == "none"
         case "Runtime.evaluate":
             guard let expression = params["expression"] as? String else { return false }
             return expression == "1" || expression == "performance.timeOrigin"
@@ -1907,7 +2459,7 @@ final class BrowserPage {
     private func cdpOnce(_ method: String, _ params: [String: Any], feedback: String?) throws -> [String: Any] {
         Self.trace("\(method) \((params["type"] as? String) ?? "")")
         do {
-            return try cdpSend(method, params, feedback: feedback)
+            return try TimingLog.measure("browser.cdp") { try cdpSend(method, params, feedback: feedback) }
         } catch {
             Self.trace("  FAILED \(method): \(String(describing: error).prefix(120))")
             throw error
@@ -1930,9 +2482,9 @@ final class BrowserPage {
         let commandWait = min(isQuery ? 2 : 10, transportWait - 0.5)
         arguments["timeout_ms"] = Int(commandWait * 1_000)
         let reply = try bridge.callTool("cdp", arguments: arguments, timeout: transportWait, referenceGeneration: indexedGeneration)
+        TimingLog.count("browser.cdp_reply_bytes", reply.text.utf8.count)
         if reply.isError {
-            if Self.linkDropped(reply.text) { throw BrowserLinkDropped(text: reply.text) }
-            throw ComputerUseError.message("browser: \(BrowserReply.explain(reply.text))")
+            throw BrowserCommandFailure(text: reply.text)
         }
         guard let data = reply.text.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -1945,8 +2497,7 @@ final class BrowserPage {
         let error = (object["error"] as? [String: Any]) ?? ((object["result"] as? [String: Any])?["error"] as? [String: Any])
         if let error {
             let message = (error["message"] as? String) ?? "error"
-            if Self.linkDropped(message) { throw BrowserLinkDropped(text: message) }
-            throw ComputerUseError.message("browser: \(BrowserReply.explain(message))")
+            throw BrowserCommandFailure(text: message)
         }
         return (object["result"] as? [String: Any]) ?? object
     }
@@ -2111,6 +2662,18 @@ enum BrowserRules {
         return spaces(actual).contains(spaces(typed))
     }
 
+    /// Note for an append whose result is not confirmed: `expected` is the field value the insert should have
+    /// produced, `actual` what the field reads back as. Nil only when the field is exactly that value.
+    static func appendNote(expected: String?, actual: String?) -> String? {
+        guard let expected else {
+            return "(could not confirm the field grew by the typed text; read the field before relying on it)"
+        }
+        guard let actual else {
+            return "(the field could not be read back after typing; read it before relying on it)"
+        }
+        return actual == expected ? nil : "(the field did not grow by exactly the typed text; read it before sending more)"
+    }
+
     /// Scroll words accepted for `direction`, or nil when the word is not one.
     static func scrollDirection(_ raw: String) -> String? {
         switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
@@ -2157,6 +2720,31 @@ enum BrowserRules {
     static func isWebAddress(_ address: String) -> Bool {
         guard let url = URLComponents(string: address), let scheme = url.scheme?.lowercased() else { return false }
         return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
+    }
+
+    /// `url_contains`: the part must appear in the host or the path. The scheme, query and fragment do not count, so
+    /// a page at /login?next=/cart does not match "/cart".
+    static func urlContains(_ address: String, _ part: String) -> Bool {
+        let wanted = part.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !wanted.isEmpty, let url = URLComponents(string: address), let host = url.host else { return false }
+        return (host + url.path).lowercased().contains(wanted)
+    }
+
+    /// Scheme, host and port of a web address, or nil when it is not one.
+    static func origin(_ address: String) -> String? {
+        guard isWebAddress(address), let url = URLComponents(string: address),
+              let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return nil }
+        return "\(scheme)://\(host):\(url.port ?? (scheme == "https" ? 443 : 80))"
+    }
+
+    /// Where a navigation that began at `old` stands against the requested address. Nil while it is still pending.
+    static func navigationStage(expected: String, from old: String?, href: String, readyState: String) -> NavigationStage? {
+        if href.hasPrefix("chrome-error://") || href.contains("net::ERR") { return .errorPage }
+        guard old == nil || href != old else { return nil }
+        guard readyState == "interactive" || readyState == "complete" else { return nil }
+        if sameAddress(href, expected) { return .arrived }
+        if origin(href) != origin(expected) { return .redirected }
+        return nil
     }
 
     /// Match the origin and the requested path boundary. Paths and query values are case-sensitive.
@@ -2363,10 +2951,18 @@ enum BrowserReply {
     }
 
     /// "12 Title — https://…" lines for a tab listing.
-    static func tabLines(in text: String, limit: Int) -> [String] {
+    static func tabURL(in text: String, id: Int) -> String? {
+        var found: String?
+        walk(json(text)) { object in
+            if object["id"] as? Int == id, let url = object["url"] as? String { found = url }
+        }
+        return found
+    }
+
+    static func tabLines(in text: String, limit: Int, include: (String) -> Bool = { _ in true }) -> [String] {
         var lines: [String] = []
         walk(json(text)) { object in
-            guard lines.count < limit, let id = object["id"] as? Int, let url = object["url"] as? String else { return }
+            guard lines.count < limit, let id = object["id"] as? Int, let url = object["url"] as? String, include(url) else { return }
             let title = (object["title"] as? String) ?? ""
             lines.append("\(id) \(title.isEmpty ? "" : title + " — ")\(url)")
         }
@@ -2419,6 +3015,14 @@ enum BrowserReply {
 }
 
 /// The document identity Chrome exposes for each frame in the tab's frame tree.
+struct BrowserEvidenceScope: Equatable {
+    let connection: UUID
+    let generation: Int
+    let tabID: Int
+    let document: BrowserDocumentIdentity
+    let url: String
+}
+
 struct BrowserDocumentIdentity: Equatable {
     private let loadersByFrame: [String: String]
 

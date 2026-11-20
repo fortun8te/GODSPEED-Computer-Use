@@ -3,8 +3,49 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class BatchEffectsTests: XCTestCase {
+    func testWaitTimeoutFromHugeOrNonFiniteSecondsIsClampedNotTrapped() throws {
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": 1e30]).timeoutMs, BatchEffects.Wait.maxTimeoutMs)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": -1e30]).timeoutMs, 100)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": 2]).timeoutMs, 2_000)
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": "nan"]))
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": "inf"]))
+    }
+
     private func state(_ rows: [String], title: String = "Settings") -> String {
         (["App=com.example (pid 1)", "Window: \"\(title)\", App: Example.", "[legend]"] + rows).joined(separator: "\n")
+    }
+
+    func testWaitPollsCheaplyAndTakesOneFullReadOnReadiness() {
+        var gate = BatchEffects.WaitReadGate(nextFullRead: 0.75)
+        var probes = 0
+        var fullReads = 0
+        for time in [0.0, 0.2, 0.4] {
+            if gate.shouldRead(at: time, probe: {
+                probes += 1
+                return time == 0.4
+            }) { fullReads += 1 }
+        }
+        XCTAssertEqual(probes, 3)
+        XCTAssertEqual(fullReads, 1)
+    }
+
+    func testWaitStillTakesFullReadOnUnknownOrAtFallbackDeadline() {
+        var gate = BatchEffects.WaitReadGate(nextFullRead: 0.75)
+        XCTAssertTrue(gate.shouldRead(at: 0.2) { nil })
+        XCTAssertFalse(gate.shouldRead(at: 0.5) { false })
+        XCTAssertTrue(gate.shouldRead(at: 0.95) { false })
+    }
+
+    func testReusesChangedWindowEvidenceOnlyWithCompleteMatchingScope() {
+        let head = "App=test.app (pid 42)\nWindow: \"Editor\", App: Test.\nWindow ID: 17\n"
+        let before = head + "1 text field Title = old"
+        let after = head + "1 text field Title = new"
+        XCTAssertEqual(BatchEffects.Watch.reusableSignature(before: before, after: after, id: 17)?.id, 17)
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: before, id: 17))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after, id: 18))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after.replacingOccurrences(of: "42", with: "43"), id: 17))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after + "\n2 sheet Save", id: 17))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after + "\n[Accessibility tree truncated: omitted]", id: 17))
     }
 
     func testCheckboxChangeReadsAsOldToNew() {
@@ -115,6 +156,39 @@ final class BatchEffectsTests: XCTestCase {
         let forty = Array(repeating: ["tool": "press_key", "key": "Down"] as [String: Any], count: 40)
         XCTAssertEqual(try BatchTool.parseSteps(forty, defaultApp: "Notes").count, 40)
         XCTAssertThrowsError(try BatchTool.parseSteps(forty + forty.prefix(1), defaultApp: "Notes"))
+    }
+
+    /// A 40-step element batch. The effect budget is spent after step 20, so no read refreshes the window
+    /// any more. The window changes after step 25. The identity check before each element step must stop
+    /// the batch at step 26, before it can act on the new window's element numbers.
+    func testElementStepsStopAtTheWindowChangeAfterTheEffectBudgetIsSpent() {
+        var budget = BatchEffects.ReadBudget()
+        let original = BatchEffects.WindowIdentity(id: 7, bounds: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let replacement = BatchEffects.WindowIdentity(id: 8, bounds: CGRect(x: 0, y: 0, width: 800, height: 600))
+        var executed = 0
+        var stoppedAt: Int?
+        for step in 1...40 {
+            if step == 20 { budget.record(seconds: 8, settleMs: 0, observed: true) }
+            let now = step > 25 ? replacement : original
+            if BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: budget.exhausted,
+                                                   start: original, now: { now }) {
+                stoppedAt = step
+                break
+            }
+            executed += 1
+        }
+        XCTAssertTrue(budget.exhausted)
+        XCTAssertEqual(stoppedAt, 26)
+        XCTAssertEqual(executed, 25)
+        // Same window, or effects off, or budget still open: nothing extra is decided here.
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { original }))
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: false, budgetExhausted: true, start: original, now: { replacement }))
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: false, start: original, now: { replacement }))
+        let dragged = BatchEffects.WindowIdentity(id: original.id, bounds: original.bounds.offsetBy(dx: 120, dy: 40))
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { dragged }),
+                       "moving the same window keeps its element numbers")
+        XCTAssertTrue(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { nil }),
+                      "a window that cannot be found is not confirmed")
     }
 }
 

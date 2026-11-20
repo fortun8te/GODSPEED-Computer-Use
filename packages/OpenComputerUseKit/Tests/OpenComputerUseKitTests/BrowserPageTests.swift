@@ -6,6 +6,104 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testClippedBrowserTextAndControlsCannotBeCompletionEvidence() {
+        let heading: [String: Any] = ["role": ["value": "heading"], "name": ["value": "Ready"]]
+        let clipped: [String: Any] = ["role": ["value": "heading"], "name": ["value": String(repeating: "x", count: 200)]]
+        XCTAssertTrue(BrowserPage.parseAX([heading]).isCompleteEvidence)
+        XCTAssertFalse(BrowserPage.parseAX([heading, clipped]).isCompleteEvidence)
+        XCTAssertFalse(BrowserPage.parseAX([heading], textBudget: 0).isCompleteEvidence)
+        let button: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
+        XCTAssertFalse(BrowserPage.parseAX([button], maxControls: 0).isCompleteEvidence)
+    }
+
+    func testExactLookupUsesOneQueryAndFallsBackOnNoCertainMatch() throws {
+        let save: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
+        let duplicate: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 43]
+        var queries = 0
+        var fullReads = 0
+        func fullTree() -> [[String: Any]] {
+            fullReads += 1
+            return [save, duplicate]
+        }
+        let targeted = try BrowserPage.exactControls(named: "Save", query: {
+            queries += 1
+            return [save, duplicate]
+        }, fallback: fullTree)
+        XCTAssertEqual(targeted.map(\.backendNodeID), [42, 43])
+        XCTAssertEqual(queries, 1)
+        XCTAssertEqual(fullReads, 0)
+
+        let fallback = try BrowserPage.exactControls(named: "Save", query: { [] }, fallback: fullTree)
+        XCTAssertEqual(fallback.map(\.backendNodeID), [42, 43])
+        XCTAssertEqual(fullReads, 1)
+    }
+
+    func testFindHintsSkipUnrelatedDuplicatesAndKeepIconOnlyControls() {
+        var parse = BrowserAXParse()
+        parse.controls = (1...24).map { BrowserNode(index: $0, role: "button", name: "Edit", value: "", backendNodeID: $0) }
+        parse.controls.append(.init(index: 25, role: "button", name: "Save", value: "", backendNodeID: 25))
+        parse.controls.append(.init(index: 26, role: "button", name: "", value: "", backendNodeID: 26))
+        XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "Save"), [25])
+        XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "trash").first, 25)
+    }
+
+    func testHintTransportSendsBothProbesBeforeWaitingForReplies() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        // The fake helper withholds both replies until both requests arrive,
+        // then sends them out of order.
+        let script = #"""
+        #!/bin/sh
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"[]"}]}}'
+        IFS= read -r first
+        IFS= read -r second
+        case "$first" in *DOM.resolveNode*) ;; *) exit 1 ;; esac
+        case "$second" in *DOM.resolveNode*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"result\":{\"object\":{\"objectId\":\"second\"}}}"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"result\":{\"object\":{\"objectId\":\"first\"}}}"}]}}'
+        IFS= read -r finalize
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "hint-pipeline-test", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("tabs", arguments: [:], timeout: 3)
+        let replies = try bridge.hintCommands(tab: ["tab_id": 12], commands: [
+            ("DOM.resolveNode", ["backendNodeId": 101]),
+            ("DOM.resolveNode", ["backendNodeId": 102]),
+        ], generation: bridge.referenceGeneration, deadline: TimingLog.now() + 2)
+        XCTAssertEqual(replies.compactMap { ($0?["object"] as? [String: Any])?["objectId"] as? String }, ["first", "second"])
+    }
+
+    func testHintProbesResolveTogetherAndShareOneRuntimeRead() {
+        var waves: [[String]] = []
+        let hints = BrowserPage.readHints(Array(1...24)) { commands in
+            waves.append(commands.map(\.0))
+            switch commands.first?.0 {
+            case "DOM.resolveNode":
+                return commands.map { _, params in
+                    ["object": ["objectId": "handle-\(params["backendNodeId"] as? Int ?? 0)"]]
+                }
+            case "Runtime.callFunctionOn":
+                XCTAssertEqual((commands[0].1["arguments"] as? [[String: String]])?.count, 24)
+                return [["result": ["value": (1...24).map { "hint-\($0)" }]]]
+            default:
+                return []
+            }
+        }
+        XCTAssertEqual(waves, [Array(repeating: "DOM.resolveNode", count: 24), ["Runtime.callFunctionOn"], ["Runtime.releaseObjectGroup"]])
+        XCTAssertEqual(hints.count, 24)
+        XCTAssertEqual(hints[24], "hint-24")
+    }
+
     func testRememberedBrowserControlsRequireTheOriginalHelperAndLoaders() throws {
         let memory = BrowserPageMemory()
         let first = BrowserBridge(sessionID: "test-first")
@@ -374,6 +472,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(BrowserRules.fieldMatches(actual: "", typed: "x", replaced: false))
     }
 
+    func testAppendIsConfirmedOnlyWhenTheFieldGrewByExactlyTheText() {
+        // The text already sat in the field: a dropped insert must not look like a success.
+        XCTAssertNotNil(BrowserRules.appendNote(expected: "a worldworld", actual: "a world"))
+        XCTAssertNil(BrowserRules.appendNote(expected: "a worldworld", actual: "a worldworld"))
+        // Without a known expected value nothing can be confirmed, so the reply must say so.
+        XCTAssertNotNil(BrowserRules.appendNote(expected: nil, actual: "hello"))
+        XCTAssertNotNil(BrowserRules.appendNote(expected: "hello!", actual: nil))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {
@@ -492,6 +599,26 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(alpha.sessionID == main.sessionID)
         let otherClient = ClientScope.with("alpha-lane1") { BrowserBridge.shared.sessionID }
         XCTAssertNotEqual(alpha.sessionID, otherClient)
+    }
+
+    func testPeekLaneCleansMultipleReadsTogetherAndStopsOnUnconfirmedCleanup() {
+        var nextIndex = 0
+        var cleaned = 0
+        var stored: [Int: BrowserPreviewPage] = [:]
+        ComputerUseToolDispatcher.runPeekLane(next: {
+            defer { nextIndex += 1 }
+            return nextIndex < 3 ? nextIndex : nil
+        }, read: { index in
+            XCTAssertEqual(cleaned, 0)
+            return (index == 1 ? "failed" : "read", "page \(index)")
+        }, cleanup: {
+            cleaned += 1
+            return false
+        }, store: { stored[$0] = $1 })
+        XCTAssertEqual(cleaned, 1)
+        XCTAssertEqual(stored.keys.sorted(), [0, 1])
+        XCTAssertEqual(stored[0]?.cleanupConfirmed, false)
+        XCTAssertEqual(stored[1]?.cleanupConfirmed, false)
     }
 
     func testRequestEnvironmentReachesEveryPeekLaneAndRestoresTheCaller() throws {
@@ -747,5 +874,130 @@ extension BrowserPageTests {
         XCTAssertFalse(BrowserPage.matchesUploadSelection([["wrong.txt", 4]], expected: expected))
         XCTAssertFalse(BrowserPage.matchesUploadSelection([["fixture.txt", 5]], expected: expected))
         XCTAssertFalse(BrowserPage.matchesUploadSelection(nil, expected: expected))
+    }
+}
+
+/// A stand-in OBU helper that records every CDP command it receives and answers each request. `open_tab`
+/// answers with `openTabID`, which makes that tab one the agent opened.
+enum RecordingBrowserHelper {
+    /// `replies`: a substring of a request line and the CDP reply (JSON text) to send when it matches.
+    static func make(directory: URL, openTabID: Int, replies: [(match: String, text: String)] = []) throws -> (helper: URL, log: URL) {
+        let log = directory.appendingPathComponent("requests.log")
+        let helper = directory.appendingPathComponent("obu")
+        let cases = replies.map { "*'\($0.match)'*) text='\($0.text)' ;;" }.joined(separator: "\n            ")
+        let script = #"""
+        #!/bin/sh
+        LOG='\#(log.path)'
+        touch "$LOG"
+        while IFS= read -r line; do
+          case "$line" in *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'; continue ;; esac
+          id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p')
+          [ -n "$id" ] || continue
+          printf '%s\n' "$line" >> "$LOG"
+          case "$line" in
+            *'"name":"open_tab"'*) text='{\"result\":{\"tab\":{\"id\":\#(openTabID)}}}' ;;
+            \#(cases)
+            *) text='{}' ;;
+          esac
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$text"
+        done
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        return (helper, log)
+    }
+}
+
+extension BrowserPageTests {
+    func testPageHooksStayOutOfTabsTheAgentDidNotOpen() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (helper, log) = try RecordingBrowserHelper.make(directory: directory, openTabID: 99)
+        let bridge = BrowserBridge(sessionID: "user-tab-hooks-\(UUID().uuidString)", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        // The tab is listed, not opened by the agent: it belongs to the user.
+        _ = try bridge.callTool("tabs", arguments: [:], timeout: 3)
+        BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
+        let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertFalse(sent.contains("Page.addScriptToEvaluateOnNewDocument"), "a user tab must not get page hooks")
+        XCTAssertFalse(sent.contains("__gs"), "a user tab must not get window.__gs")
+    }
+
+    func testPageHooksInstallInTheTabTheAgentOpened() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (helper, log) = try RecordingBrowserHelper.make(directory: directory, openTabID: 12)
+        let bridge = BrowserBridge(sessionID: "agent-tab-hooks-\(UUID().uuidString)", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
+        let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertTrue(sent.contains("Page.addScriptToEvaluateOnNewDocument"))
+    }
+
+    func testUrlContainsMatchesTheHostAndPathNotTheQuery() {
+        XCTAssertFalse(BrowserRules.urlContains("https://a.test/login?next=/cart", "/cart"))
+        XCTAssertFalse(BrowserRules.urlContains("https://a.test/login#cart", "cart"))
+        XCTAssertTrue(BrowserRules.urlContains("https://a.test/cart?x=1", "/cart"))
+        XCTAssertTrue(BrowserRules.urlContains("https://Shop.test/a", "shop.test"))
+        XCTAssertTrue(BrowserRules.urlContains("https://a.test/checkout/done", "a.test/checkout"))
+    }
+
+    func testNavigationStageNamesArrivalRedirectsAndErrorPagesOnly() {
+        let expected = "https://a.test/order/done"
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: expected,
+                                                    readyState: "complete"), .arrived)
+        // A page that is still loading, or the same address as before the click, is not a result yet.
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: expected,
+                                                  readyState: "loading"))
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/",
+                                                  readyState: "complete"))
+        // Still on the requested origin but not yet at the requested page: keep waiting.
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/cart",
+                                                  readyState: "complete"))
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://login.b.test/sso",
+                                                    readyState: "complete"), .redirected)
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "chrome-error://chromewebdata/",
+                                                    readyState: "complete"), .errorPage)
+    }
+
+    func testClickInsideAFrameNeedsTheIntendedElementAtThePoint() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let frameProbe = #"{\"result\":{\"result\":{\"value\":[\"frame\"]}}}"#
+        let box = #"{\"result\":{\"model\":{\"content\":[10,20,30,20,30,40,10,40]}}}"#
+        let object = #"{\"result\":{\"object\":{\"objectId\":\"handle\"}}}"#
+        func helper(hitting backendNodeID: Int) throws -> (BrowserBridge, () -> Void) {
+            let (helper, _) = try RecordingBrowserHelper.make(directory: directory, openTabID: 12, replies: [
+                (#""method":"Runtime.callFunctionOn""#, frameProbe),
+                (#""method":"DOM.getBoxModel""#, box),
+                (#""method":"DOM.resolveNode""#, object),
+                (#""method":"DOM.getNodeForLocation""#, #"{\"result\":{\"backendNodeId\":\#(backendNodeID)}}"#),
+            ])
+            let bridge = BrowserBridge(sessionID: "frame-click-\(UUID().uuidString)", launchEnvironment: [
+                "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+            ])
+            return (bridge, { bridge.shutdown() })
+        }
+        let control = BrowserNode(index: 4, role: "button", name: "Pay", value: "", backendNodeID: 101)
+        // Another element sits at the click point: the click must be refused, not reported as sent.
+        let (covered, stopCovered) = try helper(hitting: 777)
+        defer { stopCovered() }
+        _ = try covered.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        let page = BrowserPage(bridge: covered, tab: ["tab_id": 12])
+        XCTAssertThrowsError(try page.clickPoint(of: control))
+        // The intended control (or something inside it) is at the point: the click point is returned.
+        let (intended, stopIntended) = try helper(hitting: 101)
+        defer { stopIntended() }
+        _ = try intended.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        let point = try BrowserPage(bridge: intended, tab: ["tab_id": 12]).clickPoint(of: control)
+        XCTAssertEqual(point, CGPoint(x: 20, y: 30))
     }
 }

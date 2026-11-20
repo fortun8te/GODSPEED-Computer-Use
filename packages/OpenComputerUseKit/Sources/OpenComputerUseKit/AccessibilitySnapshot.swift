@@ -53,9 +53,9 @@ enum SnapshotMode {
 /// OPEN_COMPUTER_USE_BACKGROUND_ONLY=1: the user keeps working on this Mac. Nothing OCU does may
 /// bring an app or window in front of their work or take focus: no unhide, activate or raise to
 /// read or click, no foreground launch, no Raise action, no physical-pointer fallback.
-func backgroundOnlyMode(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-    let raw = environment["OPEN_COMPUTER_USE_BACKGROUND_ONLY"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "0"
-    return ["1", "true", "yes", "on"].contains(raw)
+func backgroundOnlyMode(environment: [String: String] = GodspeedSettings.environment) -> Bool {
+    StrictBackground.enabled(environment: environment)
+        || StrictBackground.enabledFlag(environment["OPEN_COMPUTER_USE_BACKGROUND_ONLY"])
 }
 
 let backgroundOnlyRaiseRefusedMessage = "Raise is refused in background-only mode (OPEN_COMPUTER_USE_BACKGROUND_ONLY=1): it would bring the window in front of the user's work. Clicks, set_value and keys work while the window stays behind."
@@ -115,8 +115,6 @@ let screenshotResultMaxDimension: CGFloat = 1280
 private let windowVisibilityRecoveryDelay: TimeInterval = 0.7
 private let axWebAreaRole = "AXWebArea"
 // A lazy web engine can need up to ~2 s after the accessibility flags before its tree exists.
-private let webAreaRewalkAttempts = 30
-private let webAreaRewalkInterval: TimeInterval = 0.1
 
 /// Layer-0 windows ordered above `windowID` on screen, excluding this process
 /// (the visual cursor overlay must not count as cover).
@@ -168,12 +166,11 @@ public struct AppSnapshot {
     /// shown at some point, so one this snapshot lacks belongs to an element that is gone. Nil: fixture or numbered per read.
     var numberingHighWater: Int? = nil
 
-    /// The capture and AX tree have a confirmed, shared native window identity.
-    public var observedWindowID: CGWindowID? {
-        guard let windowElement, let targetWindowID, targetWindowID != kCGNullWindowID,
-              SkyLightSPI.shared.windowID(for: windowElement) == targetWindowID else { return nil }
-        return targetWindowID
-    }
+    var nativeWindow: NativeWindowObservation? = nil
+    var elementRefs: NativeSnapshotRefs? = nil
+
+    /// The capture and AX tree shared an exact window ID at observation time.
+    public var observedWindowID: CGWindowID? { nativeWindow?.id }
 
     public var renderedText: String {
         renderedText(style: .fullState)
@@ -211,6 +208,15 @@ public enum SnapshotTextStyle {
 }
 
 enum SnapshotBuilder {
+    @TaskLocal static var publishesElementNumbers = true
+
+    /// Captures the observed window alone, with the same frame used by its AX context.
+    static func localWindowImage(_ context: TargetedAX.WindowContext) -> CGImage? {
+        guard let capture = WindowCapture.resolve(for: context.app.pid, exactWindowID: context.windowID),
+              capture.bounds == context.windowBounds, let image = capture.image else { return nil }
+        return image
+    }
+
     static func build(
         for app: RunningAppDescriptor,
         textLimit: SnapshotTextLimit = .defaults,
@@ -334,6 +340,12 @@ enum SnapshotBuilder {
         scopeFocusToWindow: Bool = false
     ) -> AppSnapshot {
         let windowBounds = windowCapture.bounds
+        let appIdentity = TargetedAppIdentity(app: app)
+        func bindWindow() -> NativeWindowObservation? {
+            guard !app.runningApplication.isTerminated,
+                  SkyLightSPI.shared.windowID(for: rootElement) == windowCapture.windowID else { return nil }
+            return NativeWindowObservation(id: windowCapture.windowID, app: appIdentity)
+        }
         // The image is already captured; encoding it is pure CPU work, so it runs beside the
         // tree walk instead of in front of it.
         let encoding = ScreenshotEncodingJob(
@@ -348,7 +360,7 @@ enum SnapshotBuilder {
                                screenshotData: screenshotData, mode: .accessibility, treeLines: [],
                                focusedSummary: nil, focusedElement: nil, selectedText: nil,
                                windowElement: rootElement, elements: [:], screenshotNote: screenshot.note,
-                               observation: observation)
+                               observation: observation, nativeWindow: bindWindow())
         }
         let appFocus = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         let focusedElement = appFocus.flatMap { element in
@@ -362,11 +374,14 @@ enum SnapshotBuilder {
             treeLimits: treeLimits
         )
 
-        let numbering = ElementNumbering.isEnabled ? ElementNumbering.forApp(pid: app.pid) : nil
+        let numbering = publishesElementNumbers && ElementNumbering.isEnabled ? ElementNumbering.forApp(pid: app.pid) : nil
         context.numbering = numbering
         numbering?.beginSnapshot()
         var renderer = TreeRenderer(context: context)
+        // Timed here so the shared profile learns this app's AX latency (the tree read is the AX work).
+        let walkStart = TimingLog.now()
         TimingLog.measure("snapshot.tree_walk") { AXSnapshotReadCache.withSnapshot { renderer.render(rootElement) } }
+        AppTiming.shared.record(app: AppTiming.key(pid: app.pid), axLatencyMs: (TimingLog.now() - walkStart) * 1000)
 
         // Pin the window's visible state (WindowServer occlusion notifications
         // off) so covering it or moving it to another Space later does not hide
@@ -379,14 +394,10 @@ enum SnapshotBuilder {
         var occlusionNote: String?
         if lazyWebAccessibility, !renderer.hasWebArea {
             if pinned {
-                for _ in 0..<webAreaRewalkAttempts {
-                    Thread.sleep(forTimeInterval: webAreaRewalkInterval)
+                refreshLazyWebArea(probe: { shallowWebAreaIsPresent(in: rootElement) }) {
                     numbering?.beginSnapshot()
                     renderer = TreeRenderer(context: context)
-                    AXSnapshotReadCache.withSnapshot { renderer.render(rootElement) }
-                    if renderer.hasWebArea {
-                        break
-                    }
+                    TimingLog.measure("snapshot.tree_walk") { AXSnapshotReadCache.withSnapshot { renderer.render(rootElement) } }
                 }
             } else {
                 var note = "Note: this window is covered or on another Space, so the app hides its web content and it is not in the tree. Bring the window into view once (covering it afterwards keeps working)."
@@ -397,10 +408,17 @@ enum SnapshotBuilder {
             }
         }
 
-        if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
-           !CFEqual(menuBar, rootElement)
-        {
-            AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+        // The menu bar is appended for display, but its elements belong to the app, not the window.
+        let refIndexes = observation.includeRefs ? renderer.records.values.compactMap { record -> Int? in
+            guard !record.isSyntheticText, record.element != nil, record.identity?.role != nil else { return nil }
+            return record.index
+        } : []
+        observation.readMenuBar {
+            if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute), !CFEqual(menuBar, rootElement) {
+                TimingLog.measure("snapshot.menu_tree_walk") {
+                    AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+                }
+            }
         }
 
         numbering?.endSnapshot(windowID: windowCapture.windowID)
@@ -410,6 +428,9 @@ enum SnapshotBuilder {
         }
         let screenshot = encoding.result()
         let screenshotData = screenshot.data
+        let nativeWindow = bindWindow()
+        let elementRefs = nativeWindow?.app.launchedAt != nil && !refIndexes.isEmpty
+            ? NativeSnapshotRefs(elementIndexes: refIndexes) : nil
 
         return AppSnapshot(
             app: app,
@@ -427,7 +448,9 @@ enum SnapshotBuilder {
             elements: renderer.records,
             screenshotNote: screenshot.note,
             observation: observation,
-            numberingHighWater: numbering?.highWater
+            numberingHighWater: numbering?.highWater,
+            nativeWindow: nativeWindow,
+            elementRefs: elementRefs
         )
     }
 
@@ -650,7 +673,7 @@ private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) -> Bo
     return manual == .success
 }
 
-private struct WindowCapture {
+struct WindowCapture {
     let windowID: CGWindowID
     let layer: Int
     let bounds: CGRect
@@ -779,7 +802,9 @@ private struct WindowCapture {
 
     func screenshotResult() -> ScreenshotEncodingResult {
         guard let image else { return ScreenshotEncodingResult(data: nil, note: nil) }
-        return encodeScreenshot(for: image, config: imageConfig)
+        return TimingLog.measure("snapshot.screenshot_encode") {
+            encodeScreenshot(for: image, config: imageConfig)
+        }
     }
 
 }
@@ -962,25 +987,19 @@ enum BlockingAsyncBridge {
     }
 
     private static func waitForSignal(_ semaphore: DispatchSemaphore, timeout: TimeInterval?) -> Bool {
-        let deadline = timeout.map { Date(timeIntervalSinceNow: $0) }
-
-        if Thread.isMainThread {
-            while semaphore.wait(timeout: .now()) == .timedOut {
-                if let deadline, Date() >= deadline {
-                    return false
-                }
-
+        let deadline = timeout.map { DispatchTime.now() + $0 }
+        while !RequestCancellation.requested {
+            let now = DispatchTime.now()
+            if let deadline, now >= deadline { return false }
+            if Thread.isMainThread {
+                if semaphore.wait(timeout: .now()) == .success { return true }
                 RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+            } else {
+                let next = now + .milliseconds(50)
+                if semaphore.wait(timeout: min(deadline ?? next, next)) == .success { return true }
             }
-            return true
         }
-
-        if let timeout {
-            return semaphore.wait(timeout: .now() + timeout) == .success
-        }
-
-        semaphore.wait()
-        return true
+        return false
     }
 }
 
@@ -2509,7 +2528,7 @@ func summaryMarkdownLinkText(text: String, url: String) -> String {
 /// On-screen rows of a collection, at most `OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS` (default 20).
 /// Without usable frames the first rows are kept, so nothing disappears entirely.
 private let maxCollectionRows: Int = {
-    let raw = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS"] ?? ""
+    let raw = RequestConfiguration.environment["OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS"] ?? ""
     return Int(raw).map { max(1, $0) } ?? 20
 }()
 
@@ -2600,7 +2619,9 @@ extension SnapshotBuilder {
     /// Mirrors the window-finding prologue of `build` without the tree walk or
     /// capture, so it never redirects input or steals focus. `windowID` selects a
     /// specific window; otherwise the app's current focused window is used.
-    static func resolveTargetWindow(for app: RunningAppDescriptor, windowID: CGWindowID? = nil) throws -> TargetedAX.WindowContext {
+    static func resolveTargetWindow(
+        for app: RunningAppDescriptor, windowID: CGWindowID? = nil, matchingRoot: AXUIElement? = nil
+    ) throws -> TargetedAX.WindowContext {
         if app.name == FixtureBridge.appName {
             throw ComputerUseError.message("targeted lookup is not supported for fixture apps")
         }
@@ -2611,7 +2632,8 @@ extension SnapshotBuilder {
 
         let appElement = AXUIElementCreateApplication(app.pid)
         AXUIElementSetMessagingTimeout(appElement, 0.1)
-        _ = enableBestEffortAccessibilityModes(appElement)
+        // Revalidation must keep the same AX tree.
+        if matchingRoot == nil { _ = enableBestEffortAccessibilityModes(appElement) }
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, 0.1)
         // This object changes the process-wide timeout, not just one AX reference.
@@ -2619,7 +2641,23 @@ extension SnapshotBuilder {
         let focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
 
         let rootWindow: AXUIElement
-        if let windowID, let named = windowElement(for: windowID, appElement: appElement) {
+        if let windowID, let named = selectNativeWindow(
+            listed: copyArray(appElement, attribute: kAXWindowsAttribute) ?? [],
+            focused: {
+                // AXWindows leaves sheets out. Check the focus sources that can
+                // supply the original observation when looking for the same root.
+                let appWindow = copyElement(appElement, attribute: kAXFocusedWindowAttribute)
+                guard let matchingRoot, let focusedApplication, pid(of: focusedApplication) == app.pid else {
+                    return appWindow
+                }
+                if let appWindow, CFEqual(appWindow, matchingRoot) { return appWindow }
+                return [copyElement(systemWide, attribute: kAXFocusedWindowAttribute),
+                        copyElement(focusedApplication, attribute: kAXFocusedWindowAttribute)]
+                    .compactMap { $0 }.first { CFEqual($0, matchingRoot) }
+            },
+            matchesID: { SkyLightSPI.shared.windowID(for: $0) == windowID },
+            matchesObservedRoot: matchingRoot.map { root in { CFEqual($0, root) } }
+        ) {
             rootWindow = named
         } else if let windowID {
             throw ComputerUseError.stateUnavailable("window_id \(windowID) is not a current window of \(app.bundleIdentifier ?? app.name).")
@@ -2645,6 +2683,17 @@ extension SnapshotBuilder {
             windowBounds: meta.bounds,
             focusedElement: focusedElement
         )
+    }
+
+    static func directFieldValue(_ label: String, in context: TargetedAX.WindowContext) -> String? {
+        let criteria = TargetedAX.Criteria(text: label, exact: true, role: nil, limit: 2, maxNodes: 120)
+        guard let scan = try? targetedSearch(criteria, in: context, timeout: 0.15), !scan.truncated,
+              scan.records.count == 1, let field = scan.records.first,
+              field.title?.caseInsensitiveCompare(label) == .orderedSame,
+              ComputerUseService.typingRoles.contains(SmartSteps.roleKey(field.role)),
+              let element = field.element, belongsToWindow(element, window: context.windowElement),
+              let value = field.value else { return nil }
+        return value
     }
 
     /// Current window bounds and element frame for a queried control, so an action
@@ -2691,11 +2740,47 @@ extension SnapshotBuilder {
         return false
     }
 
-    private static func windowElement(for windowID: CGWindowID, appElement: AXUIElement) -> AXUIElement? {
-        let isWindow = { SkyLightSPI.shared.windowID(for: $0) == windowID }
-        // AXWindows leaves sheets out; a sheet is found as the focused window.
-        return copyArray(appElement, attribute: kAXWindowsAttribute)?.first(where: isWindow)
-            ?? copyElement(appElement, attribute: kAXFocusedWindowAttribute).flatMap { isWindow($0) ? $0 : nil }
+    static func selectNativeWindow<Root>(
+        listed: [Root], focused: () -> Root?, matchesID: (Root) -> Bool, matchesObservedRoot: ((Root) -> Bool)?
+    ) -> Root? {
+        // Filter by both identities before choosing. A different AX object for
+        // the same native ID must not hide the observed object.
+        func matches(_ root: Root) -> Bool { matchesID(root) && matchesObservedRoot?(root) != false }
+        return listed.first(where: matches) ?? focused().flatMap { matches($0) ? $0 : nil }
+    }
+
+    static func refreshLazyWebArea(
+        timeout: TimeInterval = 3, probe: () -> Bool, render: () -> Void
+    ) {
+        TimingLog.measure("snapshot.web_area_readiness") {
+            _ = ReadinessPoll.first(timeout: timeout, interval: 0.1) { probe() ? true : nil }
+        }
+        guard !RequestCancellation.requested else { return }
+        // Read once on readiness or once at the deadline for diagnosis. A
+        // shallow miss says nothing about whether deep web content is present.
+        render()
+    }
+
+    private static func shallowWebAreaIsPresent(in root: AXUIElement) -> Bool {
+        let deadline = TimingLog.now() + 0.075
+        let result = try? boundedTargetedWalk(
+            root: AXSearchNode(element: root), maxNodes: 64, limit: 1, expired: { TimingLog.now() >= deadline },
+            inspect: { node in
+                let role = stringValue(of: node.element, attribute: kAXRoleAttribute)
+                return (role == axWebAreaRole, role.map {
+                    !largeContainerRoles.contains($0) && $0 != kAXMenuBarRole as String
+                } ?? false)
+            },
+            children: { node, remaining in
+                guard remaining > 0 else { return ([], true) }
+                var children: CFArray?
+                let size = min(remaining, 12)
+                let status = AXUIElementCopyAttributeValues(node.element, kAXChildrenAttribute as CFString, 0, size, &children)
+                guard status == .success, let children = children as? [AXUIElement] else { return ([], false) }
+                return (children.map { AXSearchNode(element: $0) }, children.count == size)
+            }
+        )
+        return result?.matches.isEmpty == false
     }
 
     // Attributes read for every visited node, in one batched IPC call. Position
@@ -2712,8 +2797,10 @@ extension SnapshotBuilder {
     ]
 
     /// Use one bounded traversal so every app has the same visibility and match rules.
-    static func targetedSearch(_ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext) throws -> TargetedAX.SearchResult {
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
+    static func targetedSearch(
+        _ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext, timeout: TimeInterval = 2
+    ) throws -> TargetedAX.SearchResult {
+        let deadline = TimingLog.now() + min(timeout, BrowserCallBudget.activeRemaining ?? timeout)
         let expired = { ProcessInfo.processInfo.systemUptime >= deadline }
         var scans: [AXSearchNode: NodeScan] = [:]
         var records: [AXSearchNode: ElementRecord] = [:]
@@ -2897,6 +2984,8 @@ extension SnapshotBuilder {
         AXUIElementSetMessagingTimeout(element, timeout)
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+        // A frozen-looking answer is an AX timeout; repeated ones mark the app unresponsive in the shared profile.
+        if appLooksFrozen(error) { AppTiming.shared.recordTimeout(app: AppTiming.key(pid: pid)) }
         return !appLooksFrozen(error)
     }
 

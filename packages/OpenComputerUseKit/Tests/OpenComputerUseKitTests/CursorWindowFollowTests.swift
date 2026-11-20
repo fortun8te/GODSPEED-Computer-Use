@@ -64,7 +64,8 @@ final class CursorWindowFollowTests: XCTestCase {
             XCTAssertEqual(actual.y, target.y, accuracy: 0.5)
             if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                 XCTAssertGreaterThan(samples.count, 5)
-                XCTAssertTrue(samples.allSatisfy { frame.contains($0) && $0.y >= target.y - 0.5 && $0.y <= start.y + 0.5 })
+                // Next to the display edge the move still arcs, but the planner keeps the whole arc on the display.
+                XCTAssertTrue(samples.allSatisfy { frame.contains($0) && $0.y >= target.y - 0.5 })
                 XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy { $1.x <= $0.x + 0.5 })
             }
         }

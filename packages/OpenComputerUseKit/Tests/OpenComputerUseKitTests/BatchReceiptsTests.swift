@@ -7,18 +7,43 @@ final class BatchReceiptsTests: XCTestCase {
         SmartSteps.Node(index: index, role: role, subrole: nil, name: name, frame: nil)
     }
 
-    func testFailureReceiptNotSent() {
-        XCTAssertEqual(BatchEffects.failureReceipt(ElementNumbering.goneMessage(index: "12")), .notSent)
-        XCTAssertEqual(BatchEffects.failureReceipt("element 4 is disabled, so nothing was sent. Wait."), .notSent)
-        XCTAssertEqual(BatchEffects.failureReceipt("Missing required argument: text"), .notSent)
-        XCTAssertEqual(BatchEffects.failureReceipt("no element labelled 'Save' in this window"), .notSent)
+    func testFailureReceiptUsesDeliveryState() {
+        XCTAssertEqual(BatchEffects.failureReceipt(.notSent), .notSent)
+        XCTAssertEqual(BatchEffects.failureReceipt(.outcomeUnknown), .outcomeUnknown)
+        XCTAssertNil(BatchEffects.failureReceipt(.acknowledged))
+        XCTAssertNil(BatchEffects.failureReceipt(.verified))
     }
 
-    func testFailureReceiptUnknownWinsOverNotSent() {
-        let message = clickMayHaveActedMessage(what: "AXPress", result: .cannotComplete)
-        XCTAssertEqual(BatchEffects.failureReceipt(message), .outcomeUnknown)
-        XCTAssertEqual(BatchEffects.failureReceipt("the app read timed out; nothing sent to it yet"), .outcomeUnknown)
-        XCTAssertNil(BatchEffects.failureReceipt("something odd happened"))
+    func testStaleAndAmbiguousErrorsUseTypesEvenWhenLabelsContainErrorWords() throws {
+        XCTAssertTrue(SmartSteps.isStale(ComputerUseError.staleTarget("read again")))
+        XCTAssertFalse(SmartSteps.isStale(ComputerUseError.message("no longer has the identity")))
+        XCTAssertFalse(SmartSteps.isNotFound(ComputerUseError.ambiguousTarget("no element labelled")))
+        XCTAssertTrue(SmartSteps.isNotFound(ComputerUseError.targetNotFound("read again")))
+        XCTAssertFalse(ElementNumbering.isGone(ComputerUseError.message(ElementNumbering.goneMessage(index: "1"))))
+    }
+
+    func testBatchStoppedForTimeIsAnErrorWithItsReceiptLines() throws {
+        // A deadline already past: the batch stops before step 1 and says so.
+        let result = try ComputerUseToolDispatcher().runBatch(arguments: [
+            "app": "NoSuchBatchTimeApp", "steps": [["tool": "click", "element_index": "1"]],
+        ], inheritedDeadline: ProcessInfo.processInfo.systemUptime - 1)
+        XCTAssertEqual(result.batchReceipt?.stop, .timeBudget)
+        XCTAssertTrue(result.textContent.contains("The action budget elapsed before step 1"), result.textContent)
+        XCTAssertTrue(result.isError, "a batch that did not complete is an error")
+    }
+
+    func testCancelAfterDeliveryNamesTheStepAsSent() {
+        let click = "3. click \"Save\""
+        XCTAssertEqual(BatchEffects.cancelledStepLine(number: 3, description: "click \"Save\"", delivery: .notSent),
+                       click + ": cancelled during step")
+        for delivered in [DeliveryState.acknowledged, .verified] {
+            let line = BatchEffects.cancelledStepLine(number: 3, description: "click \"Save\"", delivery: delivered)
+            XCTAssertTrue(line.hasPrefix(click + ": sent"), line)
+            XCTAssertFalse(line.contains("cancelled during step"), line)
+        }
+        let unknown = BatchEffects.cancelledStepLine(number: 3, description: "click \"Save\"", delivery: .outcomeUnknown)
+        XCTAssertTrue(unknown.hasPrefix(click + ": sent, outcome unknown"), unknown)
+        XCTAssertFalse(unknown.contains("cancelled during step"), unknown)
     }
 
     func testLineAppendsReceiptToFirstLineOnly() {
@@ -41,6 +66,16 @@ final class BatchReceiptsTests: XCTestCase {
         XCTAssertTrue(BatchEffects.advice(for: .notSent, stepNumber: 3).contains("Step 3 was not sent"))
     }
 
+    func testAcknowledgedReadbackFailureGuidesInspectionWithoutRetry() {
+        let receipt = TrajectoryLog.BatchReceipt(
+            totalSteps: 2, steps: [.init(failureCode: .timeout, deliveryState: .acknowledged)], stop: .stepFailure
+        )
+        XCTAssertEqual(receipt.recovery?["action"] as? String, "inspect_result")
+        XCTAssertEqual(receipt.recovery?["step"] as? Int, 1)
+        XCTAssertEqual(BatchEffects.advice(for: .acknowledged, stepNumber: 1),
+                       "Step 1 was sent. Inspect its result before continuing.")
+    }
+
     func testHealsToTheSingleRedrawnTwin() {
         let outcome = StaleHealing.resolve(index: "12", role: "button", label: "Save", nodes: [
             node(30, "AXButton", "Cancel"), node(31, "AXButton", "Save"), node(32, "AXStaticText", "Save"),
@@ -55,7 +90,7 @@ final class BatchReceiptsTests: XCTestCase {
         guard case .refuse(let message) = outcome else { return XCTFail("expected refusal") }
         XCTAssertTrue(message.hasPrefix("stale: element 12 (button \"Save\") is gone, nothing sent."))
         XCTAssertTrue(message.contains("2 controls match now: 31 button \"Save\", 40 button \"Save\""))
-        XCTAssertTrue(ElementNumbering.isGone(ComputerUseError.stateUnavailable(message)))
+        XCTAssertTrue(ElementNumbering.isGone(ComputerUseError.elementGone(message)))
     }
 
     func testNoMatchListsCloseNames() {
