@@ -66,9 +66,10 @@ final class FocusBorrowTests: XCTestCase {
     // MARK: - The setting
 
     func testSettingIsOnByDefaultAndZeroDisables() {
-        XCTAssertTrue(FocusBorrow.isEnabled(environment: [:]))
+        XCTAssertFalse(FocusBorrow.isEnabled(environment: [:]))
         XCTAssertTrue(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "1"]))
         XCTAssertTrue(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "yes"]))
+        XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "typo"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "0"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": " off "]))
     }
