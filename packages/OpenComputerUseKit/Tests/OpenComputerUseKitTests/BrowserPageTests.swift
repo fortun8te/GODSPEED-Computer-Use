@@ -621,6 +621,47 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(stored[1]?.cleanupConfirmed, false)
     }
 
+    func testPeekReceiptMarksPartialResultsAsErrorsAndListsRetries() {
+        let urls = ["https://a.test", "https://b.test"]
+        let oneFailed = [
+            BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: true),
+            BrowserPreviewPage(status: "failed", text: "could not load", cleanupConfirmed: true),
+        ]
+        let partial = ComputerUseToolDispatcher.peekReceipt(urls, pages: oneFailed)
+        XCTAssertTrue(partial.isError)
+        XCTAssertEqual(partial.read, 1)
+        XCTAssertEqual(partial.failed, 1)
+        XCTAssertEqual(partial.retryURLs, ["https://b.test"])
+        XCTAssertTrue(partial.line.contains("1 read"), partial.line)
+        XCTAssertTrue(partial.line.contains("1 failed"), partial.line)
+
+        let allFailed = [
+            BrowserPreviewPage(status: "failed", text: "x", cleanupConfirmed: true),
+            BrowserPreviewPage(status: "not_started", text: "y", cleanupConfirmed: nil),
+        ]
+        let none = ComputerUseToolDispatcher.peekReceipt(urls, pages: allFailed)
+        XCTAssertTrue(none.isError)
+        XCTAssertEqual(none.read, 0)
+        XCTAssertEqual(none.retryURLs, urls)
+
+        let unconfirmed = [
+            BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: false),
+            BrowserPreviewPage(status: "read", text: "b", cleanupConfirmed: false),
+        ]
+        let cleanup = ComputerUseToolDispatcher.peekReceipt(urls, pages: unconfirmed)
+        XCTAssertTrue(cleanup.isError)
+        XCTAssertEqual(cleanup.cleanupUnconfirmed, 2)
+        XCTAssertEqual(cleanup.retryURLs, [], "read pages are not retried; unconfirmed tabs are inspected first")
+
+        let complete = [
+            BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: true),
+            BrowserPreviewPage(status: "read", text: "b", cleanupConfirmed: true),
+        ]
+        let clean = ComputerUseToolDispatcher.peekReceipt(urls, pages: complete)
+        XCTAssertFalse(clean.isError)
+        XCTAssertEqual(clean.retryURLs, [])
+    }
+
     func testRequestEnvironmentReachesEveryPeekLaneAndRestoresTheCaller() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

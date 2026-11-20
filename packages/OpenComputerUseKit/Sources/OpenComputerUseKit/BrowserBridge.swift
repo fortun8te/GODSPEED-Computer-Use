@@ -1235,8 +1235,9 @@ extension ComputerUseToolDispatcher {
                 return url
             }
             let pages = Self.readPreviewPages(urls) { try Self.authorizeBrowserPage(policy, page: $0, afterDelivery: true) }
-            let content = Self.renderPreviewPages(urls, pages: pages)
-            return ToolCallResult(content: [.text(content)], isError: false,
+            let receipt = Self.peekReceipt(urls, pages: pages)
+            let content = Self.renderPreviewPages(urls, pages: pages) + "\n\n" + receipt.line
+            return ToolCallResult(content: [.text(content)], isError: receipt.isError,
                                   browserPreviewPages: zip(urls, pages).map { url, page in
                 var entry: [String: Any] = ["url": url, "status": page.status, "text": page.text]
                 entry["cleanup_confirmed"] = page.cleanupConfirmed
@@ -1531,6 +1532,38 @@ extension ComputerUseToolDispatcher {
         zip(urls, pages).map { url, page in
             "== \(url) [\(page.status)] ==\n\(page.text)"
         }.joined(separator: "\n\n")
+    }
+
+    /// FLOW-01: a peek with any failed, unstarted or unconfirmed page is a partial result. The reply must say so
+    /// (isError), list the reads to retry, and never let the page text stand in for completion.
+    struct PeekReceipt: Equatable {
+        let read: Int
+        let failed: Int
+        let notStarted: Int
+        let cleanupUnconfirmed: Int
+        /// Failed and unstarted reads only. Unconfirmed tabs are inspected before any replacement is opened.
+        let retryURLs: [String]
+
+        var isError: Bool { failed + notStarted + cleanupUnconfirmed > 0 }
+
+        var line: String {
+            var parts = ["\(read) read", "\(failed) failed", "\(notStarted) not started"]
+            if cleanupUnconfirmed > 0 { parts.append("\(cleanupUnconfirmed) cleanup unconfirmed (inspect those tabs before opening more)") }
+            var text = "peek: " + parts.joined(separator: ", ") + "."
+            if !retryURLs.isEmpty { text += " Retry: " + retryURLs.joined(separator: ", ") }
+            return text
+        }
+    }
+
+    static func peekReceipt(_ urls: [String], pages: [BrowserPreviewPage]) -> PeekReceipt {
+        let pairs = zip(urls, pages)
+        return PeekReceipt(
+            read: pages.filter { $0.status == "read" }.count,
+            failed: pages.filter { $0.status == "failed" }.count,
+            notStarted: pages.filter { $0.status == "not_started" }.count,
+            cleanupUnconfirmed: pages.filter { $0.cleanupConfirmed == false }.count,
+            retryURLs: pairs.filter { $0.1.status == "failed" || $0.1.status == "not_started" }.map { $0.0 }
+        )
     }
 
     private static func readPreviewPages(_ urls: [String], verifyPage: @Sendable (BrowserPage) throws -> Void = { _ in }) -> [BrowserPreviewPage] {
