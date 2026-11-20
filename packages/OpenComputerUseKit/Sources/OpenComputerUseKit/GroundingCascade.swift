@@ -122,6 +122,24 @@ enum GroundingCascade {
         return .act(id: top.id, provenance: .model, probability: topProbability, lead: lead)
     }
 
+    /// Step 5 crop: half the window's width and height, centred on the first vision point and kept inside the window.
+    /// Fractions of the window, top left origin. The crop is what the helper sees at about twice the scale.
+    static func zoomRect(around point: CGPoint) -> CGRect {
+        let size: CGFloat = 0.5
+        let x = min(max(point.x - size / 2, 0), 1 - size)
+        let y = min(max(point.y - size / 2, 0), 1 - size)
+        return CGRect(x: x, y: y, width: size, height: size)
+    }
+
+    /// Step 5. One locate on the zoomed crop around `point`; its answer maps back to window fractions. The
+    /// point is accepted only when `verify` (the hit-test name check) confirms it. Nil otherwise: no retry.
+    static func secondLook(at point: CGPoint, locate: (CGRect) -> CGPoint?, verify: (CGPoint) -> Bool) -> CGPoint? {
+        let rect = zoomRect(around: point)
+        guard let inside = locate(rect), (0...1).contains(inside.x), (0...1).contains(inside.y) else { return nil }
+        let mapped = CGPoint(x: rect.minX + inside.x * rect.width, y: rect.minY + inside.y * rect.height)
+        return verify(mapped) ? mapped : nil
+    }
+
     /// Levenshtein distance over characters. Inputs are short control names.
     static func editDistance(_ left: String, _ right: String) -> Int {
         let a = Array(left), b = Array(right)
