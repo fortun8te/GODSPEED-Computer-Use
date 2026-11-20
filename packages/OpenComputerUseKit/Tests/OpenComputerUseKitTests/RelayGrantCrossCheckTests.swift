@@ -64,7 +64,12 @@ final class RelayGrantCrossCheckTests: XCTestCase {
 
     func testGoVerifierAcceptsSwiftGrant() throws {
         let environment = ProcessInfo.processInfo.environment
-        let repo = URL(fileURLWithPath: environment["GODSPEED_BROWSER_REPO"] ?? "/Users/michael/Projects/godspeed-browser-agenttabs")
+        // The sibling godspeed-browser checkout by default; GODSPEED_BROWSER_REPO points elsewhere.
+        let sibling = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("godspeed-browser").path
+        let repo = URL(fileURLWithPath: environment["GODSPEED_BROWSER_REPO"] ?? sibling)
         guard FileManager.default.fileExists(atPath: repo.appendingPathComponent("internal/host/auth.go").path) else {
             throw XCTSkip("browser repo not found")
         }
