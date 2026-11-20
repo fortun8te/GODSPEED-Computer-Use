@@ -162,6 +162,20 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertFalse(controller.isBorrowed(pid: appA))
     }
 
+    func testReleaseDoesNotRestorePreviousAppWhileTheUserIsTyping() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+
+        let lease = controller.acquire(pid: appA)
+        XCTAssertTrue(lease.activated)
+        activator.typing = true
+        controller.release(lease)
+
+        XCTAssertEqual(activator.activations, [appA], "focus must not move away from the user's typing")
+        XCTAssertEqual(activator.front, appA)
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
     func testStillTypingAtTheEndOfTheWaitDoesNotTakeFocus() {
         let activator = FakeActivator(front: user, alive: [user, appA])
         activator.typing = true
