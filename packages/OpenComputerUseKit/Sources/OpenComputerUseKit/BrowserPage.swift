@@ -174,6 +174,11 @@ final class BrowserPage {
         "browser: the tab or document changed; browser read again before using an element number"
     )
 
+    /// True only for an enabled file input itself. A button that opens a chooser is not one (ACT-01).
+    func isFileInput(_ node: BrowserNode) -> Bool {
+        (try? callOnNode(node, "function(){return this.isConnected&&this.tagName==='INPUT'&&this.type==='file';}")) as? Bool == true
+    }
+
     /// The top document's loader ID from the same frame tree the verified click reads (ACT-02).
     func topFrameLoaderID() -> String? {
         guard let tree = try? cdp("Page.getFrameTree"), let frameTree = tree["frameTree"] as? [String: Any],
@@ -2976,6 +2981,14 @@ enum BrowserReply {
               let result = envelope["result"] as? [String: Any],
               let tab = result["tab"] as? [String: Any], let id = tab["id"] as? Int, id > 0 else { return nil }
         return id
+    }
+
+    /// ACT-01: the selected count from `upload_via_button`, only when Chrome verified the names and sizes.
+    static func uploadSelected(in text: String) -> Int? {
+        guard let object = json(text) as? [String: Any], object["error"] == nil else { return nil }
+        let body = (object["result"] as? [String: Any]) ?? object
+        guard body["verified"] as? Bool == true, let selected = body["selected"] as? Int, selected > 0 else { return nil }
+        return selected
     }
 
     /// ACT-02: `click_target`'s receipt. `openedTabID` is nil when Chrome could not verify a new tab.
