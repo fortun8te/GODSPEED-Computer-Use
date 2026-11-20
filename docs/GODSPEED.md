@@ -31,7 +31,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 
 | Tool | What it does |
 |---|---|
-| `batch` | Up to 20 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
+| `batch` | Up to 40 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
 | `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
 | `click`, `hover`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
@@ -125,7 +125,7 @@ Helpers (referee and vision):
 | `OPEN_COMPUTER_USE_REFEREE_DONE_HINTS` | off | Optional model hints. `done_when` controls verified completion. |
 | `OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS` | 1500 | Longest wait for a verdict. |
 | `OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE` | 0.6 | Below this, no hint. |
-| `OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE` | 0.85 | A `done` hint needs this. |
+| `OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE` | 0.86 | A `done` hint needs this. |
 | `OPEN_COMPUTER_USE_REFEREE_MAX_VIEW` | 1200 | Characters of state sent to the referee. |
 | `OPEN_COMPUTER_USE_VISION_URL` | unset (off) | Helper service base URL for `/locate`. |
 | `OPEN_COMPUTER_USE_VISION_TIMEOUT_MS` | 8000 | Longest wait for a vision answer. |
@@ -226,7 +226,7 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 - Native app input and browser writes are serialized. Eligible browser reads overlap across clients. Use `cua.peekPages(urls)` in the REPL to load up to three independent pages at once, with up to six URLs per call. Keep steps that share input or depend on each other's output in one ordered batch.
 - Set `OPEN_COMPUTER_USE_CURSOR_COLOR=auto` for stable per-client cursor colors. The active cursor shows which client is driving the shared Mac input.
 - Background delivery depends on the app. Dialogs, sheets and some key chords need focus borrowing.
-- A batch is at most 20 steps. `peek` takes at most 6 URLs with a shared 40-second browser budget. Idle preview workers pick up the next unread URL automatically. At most three preview loads run across the shared process. Preview helpers expire after a minute of inactivity. The REPL returns `pages` with a URL, status, text, and cleanup result for each page. Retry only failed or unstarted URLs. Results stay in the input order and report pages that could not be read.
+- A batch is at most 40 steps. `peek` takes at most 6 URLs with a shared 40-second browser budget. Idle preview workers pick up the next unread URL automatically. At most three preview loads run across the shared process. Preview helpers expire after a minute of inactivity. The REPL returns `pages` with a URL, status, text, and cleanup result for each page. Retry only failed or unstarted URLs. Results stay in the input order and report pages that could not be read.
 - The referee and vision are hints and fallbacks, off by default. Vision has been checked on one synthetic image, not on real apps.
 - Recipes match the exact goal text. They are stored only on this Mac (`~/.godspeed/recipes.json`).
 - The browser tool needs Chrome, the Open Browser Use extension, and the one-time setup step. It cannot use other browsers.
