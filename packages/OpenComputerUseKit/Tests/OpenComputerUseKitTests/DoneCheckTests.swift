@@ -271,6 +271,23 @@ final class DoneCheckTests: XCTestCase {
         ])
     }
 
+    func testEveryKeyInOneObjectIsACondition() throws {
+        // One object with several keys means all of them must hold (AND); none is silently dropped.
+        let file = "/tmp/godspeed-done-check-both.pdf"
+        XCTAssertEqual(
+            try DoneCheck.parse(["file_exists": file, "text": "Saved"]),
+            [.fileExists(file), .text("Saved")]
+        )
+        XCTAssertEqual(
+            try DoneCheck.parse(["field": "Name", "equals": "Ada", "since_start": "changed", "text": "Saved"]),
+            [.fieldChanged(label: "Name", equals: "Ada"), .text("Saved")]
+        )
+        XCTAssertEqual(
+            try DoneCheck.parse(["text": "Sent", "gone": "Loading"]),
+            [.text("Sent"), .gone("Loading")]
+        )
+    }
+
     func testExpandsTildeInFileExists() throws {
         let parsed = try DoneCheck.parse(["file_exists": "~/Desktop/out.pdf"])
         XCTAssertEqual(parsed, [.fileExists(NSString(string: "~/Desktop/out.pdf").expandingTildeInPath)])
