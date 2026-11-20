@@ -2,22 +2,16 @@ import CoreFoundation
 import Foundation
 import ImageIO
 
-/// Optional local vision fallback for `click` with a `label`: when no accessibility element matches
-/// (canvas apps, games, some web content), take one screenshot of the window, ask a small local
-/// vision model (LFM3-VL-2B through the helper service in ~/.ocu-referee, `POST /locate`) where the
-/// label is, and click there. Off unless `OPEN_COMPUTER_USE_VISION_URL` is set. A missing or slow
-/// service only means the original "no element labelled ..." error is returned.
-///
-/// Contract: request {"image_base64": str, "query": str}; reply {"found": bool, "x": 0-1, "y": 0-1,
-/// "ms": int}, where x and y are fractions of the image width and height.
+/// Optional grounding for an unambiguous labelled miss. The returned point is a suggestion.
 enum VisionFallback {
-    static let baseURL: URL? = {
-        guard let raw = GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
-              ["http", "https"].contains(scheme), let host = url.host, !host.isEmpty else { return nil }
+    static let baseURL = localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"])
+
+    static func localURL(_ raw: String?) -> URL? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              HelperAutoStarter.isLoopback(url) else { return nil }
         return url
-    }()
+    }
 
     /// Default 8 s: one answer takes about 2.3 s warm, more on the first call after the model unloaded.
     static let timeout: TimeInterval = {
@@ -27,6 +21,57 @@ enum VisionFallback {
     }()
 
     static var isEnabled: Bool { baseURL != nil }
+
+    enum Evidence: Equatable { case ocr, model }
+
+    struct Candidate {
+        let fraction: CGPoint
+        let evidence: Evidence
+    }
+
+    static func candidate(scan: (_ accurate: Bool) -> LocalOCR.Scan,
+                          locate: () -> CGPoint?) -> Candidate? {
+        for accurate in [false, true] {
+            switch scan(accurate) {
+            case .point(let point): return Candidate(fraction: point, evidence: .ocr)
+            case .ambiguous: return nil
+            case .missing: continue
+            }
+        }
+        return locate().map { Candidate(fraction: $0, evidence: .model) }
+    }
+
+    static func sameName(_ left: String, _ right: String) -> Bool {
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        let lhs = left.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let rhs = right.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return !lhs.isEmpty && lhs.compare(rhs, options: options) == .orderedSame
+    }
+
+    static func risky(_ label: String) -> Bool {
+        HandoffTool.isRisky(label: label) || MenuItemLookup.isDestructive(label)
+    }
+
+    static func allowsHit(candidate: Candidate, label: String, hitNames: [String]) -> Bool {
+        guard !risky(label), !hitNames.contains(where: risky) else { return false }
+        if hitNames.contains(where: { sameName($0, label) }) { return true }
+        // OCR can identify text drawn in an unnamed surface. A model point alone cannot identify it.
+        return candidate.evidence == .ocr && hitNames.isEmpty
+    }
+
+    /// Both OCR and the helper use top-left fractions. Scaling the whole crop preserves these fractions.
+    static func windowPoint(_ fraction: CGPoint, bounds: CGRect) -> CGPoint? {
+        guard (0..<1).contains(fraction.x), (0..<1).contains(fraction.y),
+              WindowCaptureGeometry.isValid(bounds) else { return nil }
+        return CGPoint(x: fraction.x * bounds.width, y: fraction.y * bounds.height)
+    }
+
+    static func sameCapture(_ original: CGImage, _ fresh: CGImage) -> Bool {
+        guard original.width == fresh.width, original.height == fresh.height,
+              original.bytesPerRow == fresh.bytesPerRow,
+              let left = original.dataProvider?.data, let right = fresh.dataProvider?.data else { return false }
+        return CFEqual(left, right)
+    }
 
     /// Where `query` is in the image, as fractions of its width and height, or nil.
     static func locate(imageBase64: String, query: String, remaining: TimeInterval? = nil) -> CGPoint? {

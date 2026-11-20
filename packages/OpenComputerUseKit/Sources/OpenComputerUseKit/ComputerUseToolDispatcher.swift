@@ -417,10 +417,13 @@ public final class ComputerUseToolDispatcher {
             do {
                 elementIndex = try labelledElementIndex(in: arguments, log: log) ?? optionalElementIndex(in: arguments)
             } catch let error as ComputerUseError {
-                // No accessibility element has that label: try finding it on screen, when vision is on.
-                // Several close matches are listed by the label healing, so vision never guesses between them.
-                if ComputerUseService.requiredWindowID == nil, !SmartSteps.isAmbiguous(error), VisionFallback.isEnabled, let label = labelArguments(in: arguments)?.first,
-                   let result = try visionClick(app: requireString("app", in: arguments), label: label, clickCount: clickCount, arguments: arguments) {
+                // Only a real label miss can use the local perception path.
+                if ComputerUseService.requiredWindowID == nil, SmartSteps.isNotFound(error),
+                   VisionFallback.isEnabled, clickCount == 1,
+                   (optionalString("mouse_button", in: arguments) ?? "left").lowercased() == "left",
+                   let label = labelArguments(in: arguments)?.first,
+                   let result = try service.visionClick(app: requireString("app", in: arguments), label: label,
+                                                       method: parseClickMethod(optionalString("click_method", in: arguments))) {
                     return result
                 }
                 throw error
@@ -654,37 +657,6 @@ public final class ComputerUseToolDispatcher {
     private func labelledElementIndex(in arguments: [String: Any], log: SmartLog) throws -> String? {
         guard optionalElementIndex(in: arguments) == nil, let labels = labelArguments(in: arguments) else { return nil }
         return String(try resolveLabelHealing(app: try requireString("app", in: arguments), labels: labels, log: log).index)
-    }
-
-    /// Clicks `label` where a local vision model finds it on a fresh screenshot of the window, or returns
-    /// nil (no screenshot, not found, service unavailable) so the caller reports the original miss.
-    private func visionClick(app: String, label: String, clickCount: Int, arguments: [String: Any]) throws -> ToolCallResult? {
-        guard (BrowserCallBudget.activeRemaining ?? .infinity) > 0 else { return nil }
-        let state = try service.getAppState(
-            app: app,
-            observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: true)
-        )
-        guard let image = state.content.first(where: { $0.dictionary["type"] as? String == "image" }),
-              let encoded = image.dictionary["data"] as? String,
-              let data = Data(base64Encoded: encoded),
-              let size = VisionFallback.pixelSize(of: data),
-              let fraction = VisionFallback.locate(imageBase64: encoded, query: label, remaining: BrowserCallBudget.activeRemaining),
-              (BrowserCallBudget.activeRemaining ?? .infinity) > 0
-        else { return nil }
-
-        let x = min(size.width - 1, (fraction.x * size.width).rounded())
-        let y = min(size.height - 1, (fraction.y * size.height).rounded())
-        let clicked = try service.click(
-            app: app,
-            elementIndex: nil,
-            x: x,
-            y: y,
-            clickCount: clickCount,
-            mouseButton: optionalString("mouse_button", in: arguments) ?? "left",
-            clickMethod: try parseClickMethod(optionalString("click_method", in: arguments))
-        )
-        let note = "No accessibility element is labelled '\(label)'; found it on screen and clicked at (\(Int(x)), \(Int(y))). Check the state to confirm."
-        return ToolCallResult(content: [.text(note)] + clicked.content, isError: clicked.isError)
     }
 
     /// An element named by `label`/`labels` (its visible name) or by `element_index`, for actions that need one.

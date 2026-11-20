@@ -895,6 +895,82 @@ public final class ComputerUseService {
         return LocalWindowImage.jpeg(crop)
     }
 
+    /// Ground a label in the same observed window, then verify it immediately before delivery.
+    func visionClick(app query: String, label: String, method: ClickMethod) throws -> ToolCallResult? {
+        guard method == .auto || method == .skyClick, !VisionFallback.risky(label),
+              label.contains(where: { $0.isLetter || $0.isNumber }),
+              (try? requireUsableComputerUseSession()) != nil,
+              let snapshot = snapshotsByApp[query.lowercased()], let id = snapshot.observedWindowID,
+              let window = snapshot.windowElement, let bounds = snapshot.windowBounds else { return nil }
+
+        func liveWindow() -> TargetedAX.WindowContext? {
+            guard (BrowserCallBudget.activeRemaining ?? .infinity) > 0,
+                  let app = try? AppDiscovery.resolveRunning(query), app.pid == snapshot.app.pid,
+                  app.runningApplication.launchDate == snapshot.app.runningApplication.launchDate,
+                  let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: id),
+                  CFEqual(window, context.windowElement), bounds == context.windowBounds else { return nil }
+            return context
+        }
+
+        let clock = ProcessInfo.processInfo
+        let deadline = clock.systemUptime + min(VisionFallback.timeout, BrowserCallBudget.activeRemaining ?? .infinity)
+        guard let context = liveWindow(), let original = SnapshotBuilder.localWindowImage(context),
+              let crop = LocalWindowImage.downscaled(original) else { return nil }
+        let candidate = VisionFallback.candidate(scan: { accurate in
+            guard clock.systemUptime < deadline else { return .missing }
+            return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
+        }, locate: {
+            guard clock.systemUptime < deadline, let jpeg = LocalWindowImage.jpeg(crop) else { return nil }
+            return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
+                                         remaining: deadline - clock.systemUptime)
+        })
+        guard let candidate, let point = VisionFallback.windowPoint(candidate.fraction, bounds: bounds),
+              clock.systemUptime < deadline, let live = liveWindow(),
+              let fresh = SnapshotBuilder.localWindowImage(live), VisionFallback.sameCapture(original, fresh),
+              let hit = try hitTestElement(at: point, in: snapshot)?.element,
+              SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
+              let names = visualHitNames(hit, window: live.windowElement),
+              VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names),
+              clock.systemUptime < deadline, liveWindow() != nil else { return nil }
+
+        let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
+        try InputSimulation.clickWithSkyLight(at: screenPoint, windowPoint: point, windowBounds: bounds,
+                                               windowID: id, clickCount: 1, pid: live.app.pid)
+        // Read back the same window. Delivery has already happened if this read fails.
+        let state = try? getAppState(app: query,
+            observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false), windowID: id)
+        return ToolCallResult(content: [.text(state == nil
+            ? "Clicked the verified on-screen target. Read the window to check the result."
+            : "Clicked the verified on-screen target.")] + (state?.content ?? []))
+    }
+
+    private func visualHitNames(_ leaf: AXUIElement, window: AXUIElement) -> [String]? {
+        var element = leaf
+        var names: [String] = []
+        var sawAction = false
+        for _ in 0..<32 {
+            if CFEqual(element, window) { return names }
+            var enabled: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled) == .success,
+               (enabled as? Bool) == false { return nil }
+            let role = stringValue(of: element, attribute: kAXRoleAttribute) ?? ""
+            var current = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+                .compactMap { stringValue(of: element, attribute: $0) }
+            if role == kAXStaticTextRole as String, let value = stringValue(of: element, attribute: kAXValueAttribute) {
+                current.append(value)
+            }
+            if current.contains(where: VisionFallback.risky) { return nil }
+            let actions = copyActions(for: element) ?? []
+            if !sawAction, CFEqual(element, leaf) || actions.contains(kAXPressAction as String) {
+                names.append(contentsOf: current.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            }
+            sawAction = sawAction || actions.contains(kAXPressAction as String)
+            guard let parent = copyParent(of: element) else { return nil }
+            element = parent
+        }
+        return nil
+    }
+
     public func click(
         app query: String,
         elementIndex: String?,
