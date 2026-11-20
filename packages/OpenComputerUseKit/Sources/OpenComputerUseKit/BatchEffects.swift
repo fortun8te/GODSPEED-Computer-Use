@@ -227,6 +227,11 @@ enum BatchEffects {
             return Watch(text: text, sig: sig, result: result)
         }
 
+        /// A read the monitor may treat as the app's full state: nothing hidden, absence checks supported.
+        static func isComplete(_ state: String) -> Bool {
+            DoneCheck.supportsAbsenceCheck(state) && !state.contains("the app hides its web content")
+        }
+
         static func reusableSignature(before: String, after: String, id: UInt32) -> WindowSig? {
             let head = before.split(separator: "\n", maxSplits: 3).prefix(3)
             guard head.count == 3, head.last == "Window ID: \(id)",

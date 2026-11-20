@@ -924,7 +924,7 @@ public final class ComputerUseService {
               let context = try? SnapshotBuilder.resolveTargetWindow(for: app) else {
             return "Settle skipped: no window to watch yet."
         }
-        let settled = WindowSettle.wait(timeout: TimeInterval(min(timeoutMs, 5000)) / 1000) {
+        let settled = WindowSettle.wait(timeout: TimeInterval(min(timeoutMs, 5000)) / 1000, pid: app.pid) {
             TimingLog.measure("get_app_state.settle_scan") { WindowSettle.busy(from: context.windowElement, requireComplete: true, read: WindowSettle.readAll) }
         }
         let waited = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
