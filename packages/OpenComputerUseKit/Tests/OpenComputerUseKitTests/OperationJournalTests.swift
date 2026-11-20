@@ -138,6 +138,44 @@ final class OperationJournalTests: XCTestCase {
         }
     }
 
+    func testRotationKeepsOnlyUnfinishedIntentsAndStaysBounded() throws {
+        try withJournal { base in
+            var journal = base
+            journal.rotateAboveBytes = 4_096
+            let open = try journal.begin(tool: "click", requestID: UUID(), app: "Notes")
+            for _ in 0..<60 {
+                _ = try journal.record(tool: "clipboard", requestID: UUID()) { .text("ok") }
+            }
+            let file = journal.directory.appendingPathComponent("operations.jsonl")
+            let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int)
+            XCTAssertLessThan(size, 4_096 + 1_024)
+            XCTAssertEqual(try journal.unfinishedIntents().map(\.operationID), [open.operationID])
+        }
+    }
+
+    func testRecoveryStreamsAJournalLargerThanOneChunk() throws {
+        try withJournal { journal in
+            try FileManager.default.createDirectory(at: journal.directory, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            var data = Data()
+            var unfinished: UUID?
+            for index in 0..<2_000 {
+                let operation = UUID()
+                let intent = OperationJournal.Entry(operationID: operation, requestID: UUID(), tool: "clipboard", app: nil,
+                                                    phase: .intent, state: .outcomeUnknown, time: Date())
+                data.append(contentsOf: [10] + (try encoder.encode(intent)) + [10])
+                if index == 1_234 { unfinished = operation; continue }
+                let outcome = OperationJournal.Entry(operationID: operation, requestID: intent.requestID, tool: "clipboard",
+                                                     app: nil, phase: .outcome, state: .acknowledged, time: Date())
+                data.append(contentsOf: [10] + (try encoder.encode(outcome)) + [10])
+            }
+            XCTAssertGreaterThan(data.count, 256 * 1024)
+            let file = journal.directory.appendingPathComponent("operations.jsonl")
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: data, attributes: [.posixPermissions: 0o600]))
+            XCTAssertEqual(try journal.unfinishedIntents().map(\.operationID), [try XCTUnwrap(unfinished)])
+        }
+    }
+
     func testJournalChildFixture() throws {
         guard let folder = ProcessInfo.processInfo.environment["GODSPEED_L6_JOURNAL_FIXTURE_DIRECTORY"] else {
             return

@@ -32,6 +32,8 @@ struct OperationJournal: Sendable {
 
     let directory: URL
     var onFlush: (@Sendable (Flush) -> Void)? = nil
+    /// Past this size, the next append rewrites the file with unfinished intents only.
+    var rotateAboveBytes: Int = 8 * 1024 * 1024
     private var file: URL { directory.appendingPathComponent("operations.jsonl") }
 
     static func withRecording<T>(_ journal: Self = shared, _ body: () throws -> T) rethrows -> T {
@@ -123,6 +125,7 @@ struct OperationJournal: Sendable {
     }
 
     /// An intent without an outcome stays unknown. Reading the file has no side effects.
+    /// The file is streamed in chunks, so recovery never holds the whole journal in memory.
     func recoveredEntries() throws -> [Entry] {
         let fd = open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else {
@@ -131,32 +134,89 @@ struct OperationJournal: Sendable {
         }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         try lock(fd, mode: LOCK_SH)
-        let data = try handle.readToEnd() ?? Data()
+        return try Self.latestEntries(handle).values.sorted { $0.time < $1.time }
+    }
+
+    /// The last entry per operation, read chunk by chunk. The caller holds the journal's lock.
+    private static func latestEntries(_ handle: FileHandle) throws -> [UUID: Entry] {
         let decoder = JSONDecoder()
         var entries: [UUID: Entry] = [:]
-        for line in data.split(separator: 10) {
+        func consume(_ line: Data) {
             // An interrupted append can leave a partial line. An earlier synced intent still stands.
-            if let entry = try? decoder.decode(Entry.self, from: Data(line)) {
-                entries[entry.operationID] = entry
+            if let entry = try? decoder.decode(Entry.self, from: line) { entries[entry.operationID] = entry }
+        }
+        var carry = Data()
+        while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            let parts = chunk.split(separator: 10, omittingEmptySubsequences: false)
+            for (index, part) in parts.enumerated() {
+                carry.append(contentsOf: part)
+                if index < parts.count - 1 {
+                    if !carry.isEmpty { consume(carry) }
+                    carry.removeAll(keepingCapacity: true)
+                }
             }
         }
-        return entries.values.sorted { $0.time < $1.time }
+        if !carry.isEmpty { consume(carry) }
+        return entries
     }
 
     private func append(_ entry: Entry) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        let created = !FileManager.default.fileExists(atPath: file.path)
-        let fd = open(file.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { throw posixError() }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        try lock(fd, mode: LOCK_EX)
         let json = try JSONEncoder().encode(entry)
+        var (handle, created) = try openLocked()
+        if try size(of: handle) > rotateAboveBytes {
+            try compact()
+            (handle, created) = try openLocked()
+        }
         // Start on a new line even when the last writer died mid-append.
         try handle.write(contentsOf: Data([10]) + json + Data([10]))
-        try flushToDisk(fd)
+        try flushToDisk(handle.fileDescriptor)
         // A new file is only durable once its directory entry is durable too.
         if created { try syncDirectory() }
+    }
+
+    /// Opens the journal exclusively. Rotation replaces the file, so an open handle to the old file is retried.
+    private func openLocked() throws -> (FileHandle, created: Bool) {
+        while true {
+            let existed = access(file.path, F_OK) == 0
+            let fd = open(file.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw posixError() }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            try lock(fd, mode: LOCK_EX)
+            var opened = stat()
+            var named = stat()
+            guard fstat(fd, &opened) == 0, stat(file.path, &named) == 0,
+                  opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else { continue }
+            return (handle, !existed)
+        }
+    }
+
+    private func size(of handle: FileHandle) throws -> Int {
+        var info = stat()
+        guard fstat(handle.fileDescriptor, &info) == 0 else { throw posixError() }
+        return Int(info.st_size)
+    }
+
+    /// Replaces the journal with its unfinished intents. Called with the journal locked.
+    /// The rename is atomic, so a crash leaves either the old file or the compacted one.
+    private func compact() throws {
+        let source = open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard source >= 0 else { throw posixError() }
+        let keep = try Self.latestEntries(FileHandle(fileDescriptor: source, closeOnDealloc: true))
+            .values.filter { $0.phase == .intent }.sorted { $0.time < $1.time }
+        let temporary = directory.appendingPathComponent("operations.jsonl.compacting")
+        unlink(temporary.path)
+        let fd = open(temporary.path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw posixError() }
+        defer { close(fd) }
+        let encoder = JSONEncoder()
+        var data = Data()
+        for entry in keep { data.append(contentsOf: [10] + (try encoder.encode(entry)) + [10]) }
+        try FileHandle(fileDescriptor: fd, closeOnDealloc: false).write(contentsOf: data)
+        try flushToDisk(fd)
+        guard rename(temporary.path, file.path) == 0 else { throw posixError() }
+        try syncDirectory()
     }
 
     /// macOS fsync does not flush the drive cache. F_FULLFSYNC does, so fsync is only the fallback.
