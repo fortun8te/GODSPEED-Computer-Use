@@ -174,6 +174,19 @@ final class BrowserPage {
         "browser: the tab or document changed; browser read again before using an element number"
     )
 
+    /// True only for an enabled file input itself. A button that opens a chooser is not one (ACT-01).
+    func isFileInput(_ node: BrowserNode) -> Bool {
+        (try? callOnNode(node, "function(){return this.isConnected&&this.tagName==='INPUT'&&this.type==='file';}")) as? Bool == true
+    }
+
+    /// The top document's loader ID from the same frame tree the verified click reads (ACT-02).
+    func topFrameLoaderID() -> String? {
+        guard let tree = try? cdp("Page.getFrameTree"), let frameTree = tree["frameTree"] as? [String: Any],
+              let frame = frameTree["frame"] as? [String: Any], let loader = frame["loaderId"] as? String,
+              !loader.isEmpty else { return nil }
+        return loader
+    }
+
     func documentIdentity() throws -> BrowserDocumentIdentity? {
         guard let frames = try cdp("Page.getFrameTree")["frameTree"] as? [String: Any] else { return nil }
         return BrowserDocumentIdentity(tree: frames)
@@ -710,7 +723,8 @@ final class BrowserPage {
             throw ComputerUseError.invalidArguments("browser: give a label (visible text) or an index from browser read")
         }
         let wanted = Self.normalize(label)
-        if let named = try? queryNamed(label), let hit = Self.pickNamed(named, wanted: wanted) {
+        let targeted = (try? queryNamed(label)) ?? []
+        if let hit = Self.pickNamed(targeted, wanted: wanted) {
             return hit
         }
         // A hint from the last read ("icon:trash", "trash", "in:Invoice 12") names an icon-only control.
@@ -727,6 +741,8 @@ final class BrowserPage {
                 return current
             }
         }
+        // PERF-01: the targeted query already names the exact-label candidates. Decide from them before any full read.
+        if let hit = try Self.decideFromTargeted(targeted, label: label) { return hit }
         let raw = try fullTree()
         let nodes = Self.parseAX(raw, controlBudget: Int.max, textBudget: 0, maxControls: .max).controls
         if let hit = try Self.pickFuzzy(nodes, label: label) { return hit }
@@ -858,6 +874,15 @@ final class BrowserPage {
 
     /// The one element whose name equals the label (clickable ones first). Several different elements with
     /// that name give nil: the full read then decides, and lists them with their numbers if they are distinct.
+    /// PERF-01: decides a label from the targeted AX query's exact-name candidates. Nil when none of them carries
+    /// the exact name, so the caller searches the whole page. Duplicates throw the same ambiguity message as a full read.
+    static func decideFromTargeted(_ targeted: [BrowserNode], label: String) throws -> BrowserNode? {
+        let wanted = normalize(label)
+        if let hit = pickNamed(targeted, wanted: wanted) { return hit }
+        guard targeted.contains(where: { normalize($0.name) == wanted }) else { return nil }
+        return try pickFuzzy(targeted, label: label)
+    }
+
     static func pickNamed(_ nodes: [BrowserNode], wanted: String) -> BrowserNode? {
         let exact = nodes.filter { normalize($0.name) == wanted }
         let clickable = exact.filter { clickableRoles.contains($0.role) }
@@ -1251,16 +1276,11 @@ final class BrowserPage {
         let (head, last) = keyEvents ? BrowserRules.splitForTyping(text) : (text, nil)
         let document = node != nil ? try? documentIdentity() : nil
         var expected = replace ? text : nil
-        // An append is confirmed only against the exact value the insert should produce, so the field is read
-        // before the text goes in (this also covers text that already appears in the field).
-        if !replace, let node, document != nil {
-            expected = (try? callOnNode(node, """
-                function (text) {
-                  if (!this.matches('input,textarea') || this.type === 'password' ||
-                      !Number.isInteger(this.selectionStart) || !Number.isInteger(this.selectionEnd)) return null;
-                  return this.value.slice(0,this.selectionStart) + text + this.value.slice(this.selectionEnd);
-                }
-                """, arguments: [text])) as? String
+        // An append is confirmed only against the exact value the insert should produce. The value and caret are
+        // captured before the text goes in, for the named field or the focused one (this covers text that already
+        // appears in the field, and a dropped repeat of it).
+        if !replace {
+            expected = appendExpectation(for: node, typed: text)
         }
         do {
             if !head.isEmpty { _ = try cdp("Input.insertText", ["text": head]) }
@@ -1301,13 +1321,46 @@ final class BrowserPage {
         if let actual, let expected, actual == expected {
             outcome.deliveryState = .verified
         }
-        if !replace, node != nil, outcome.note == nil,
+        if !replace, outcome.note == nil,
            let note = BrowserRules.appendNote(expected: expected, actual: actual) {
             outcome.note = note
         }
         if watchSuggestions { outcome.options = comboOptions() }
         return outcome
     }
+
+    /// Captures the value and caret of the named field (or the focused field) before an append is sent.
+    /// Nil for editors that do not expose a value and selection, so the append stays unverified.
+    private func appendExpectation(for node: BrowserNode?, typed: String) -> String? {
+        let captured: Any?
+        if let node {
+            captured = try? callOnNode(node, Self.appendFieldJS)
+        } else {
+            captured = try? evaluate(Self.appendFieldActiveJS)
+        }
+        guard let row = captured as? [Any], row.count == 3, let value = row[0] as? String,
+              let start = BrowserRules.number(row[1]).flatMap({ Int(exactly: $0) }),
+              let end = BrowserRules.number(row[2]).flatMap({ Int(exactly: $0) }) else { return nil }
+        return BrowserRules.appendExpectation(value: value, selectionStart: start, selectionEnd: end, typed: typed)
+    }
+
+    private static let appendFieldJS = """
+        function () {
+          if (!this.matches('input,textarea') || this.type === 'password' ||
+              !Number.isInteger(this.selectionStart) || !Number.isInteger(this.selectionEnd)) return null;
+          return [this.value, this.selectionStart, this.selectionEnd];
+        }
+        """
+
+    private static let appendFieldActiveJS = """
+        (() => {
+          let element = document.activeElement;
+          while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+          if (!element || !element.matches || !element.matches('input,textarea') || element.type === 'password' ||
+              !Number.isInteger(element.selectionStart) || !Number.isInteger(element.selectionEnd)) return null;
+          return [element.value, element.selectionStart, element.selectionEnd];
+        })()
+        """
 
     /// The last typed character as a real key event (keyDown carrying the text, then keyUp).
     private func sendTypedCharacter(_ character: Character) throws {
@@ -1667,6 +1720,23 @@ final class BrowserPage {
 
     enum ControlCondition: String {
         case visible, enabled, checked, unchecked
+        /// The accessibility tree names a control with the label, whether or not it is shown (explicit only).
+        case exists
+    }
+
+    /// ACT-04: a label is ready when exactly one control carries it and that control meets the condition.
+    /// Hidden or ambiguous matches are not ready. Accessibility existence counts only for `.exists`.
+    static func labelReady(matches: [BrowserNode], state: (visible: Bool, enabled: Bool, checked: String?)?,
+                           condition: ControlCondition) -> Bool {
+        if condition == .exists { return !matches.isEmpty }
+        guard Set(matches.map(\.backendNodeID)).count == 1, let state else { return false }
+        switch condition {
+        case .visible: return state.visible
+        case .enabled: return state.enabled
+        case .checked: return state.checked == "true"
+        case .unchecked: return state.checked == "false"
+        case .exists: return false
+        }
     }
 
     func controlState(_ node: BrowserNode) throws -> String {
@@ -2244,20 +2314,12 @@ final class BrowserPage {
                         return true
                     }
                 } else if let label {
-                    if let controlCondition {
-                        let matches = ((try? queryNamed(label)) ?? []).filter { Self.normalize($0.name) == Self.normalize(label) }
-                        if Set(matches.map(\.backendNodeID)).count == 1, let node = matches.first,
-                           let state = try? inspectControl(node) {
-                            switch controlCondition {
-                            case .visible: if state.visible { return true }
-                            case .enabled: if state.enabled { return true }
-                            case .checked: if state.checked == "true" { return true }
-                            case .unchecked: if state.checked == "false" { return true }
-                            }
-                        }
-                    } else if let named = try? queryNamedAny(label), !named.isEmpty {
-                        return true
-                    }
+                    // ACT-04: with no condition, a label waits for one visible control, not for AX existence.
+                    let condition = controlCondition ?? .visible
+                    let matches = ((try? queryNamed(label)) ?? []).filter { Self.normalize($0.name) == Self.normalize(label) }
+                    let state = Set(matches.map(\.backendNodeID)).count == 1 && condition != .exists
+                        ? matches.first.flatMap { try? inspectControl($0) } : nil
+                    if Self.labelReady(matches: matches, state: state, condition: condition) { return true }
                 }
                 Thread.sleep(forTimeInterval: min(0.25, max(0, deadline - clock.systemUptime)))
             }
@@ -2662,6 +2724,16 @@ enum BrowserRules {
         return spaces(actual).contains(spaces(typed))
     }
 
+    /// ACT-07: the value an append must produce, from the field's value and selection captured before the text is
+    /// sent. Offsets are UTF-16 units, as Chrome reports them. Nil when the selection does not fit the value.
+    static func appendExpectation(value: String, selectionStart: Int, selectionEnd: Int, typed: String) -> String? {
+        let units = Array(value.utf16)
+        guard selectionStart >= 0, selectionStart <= selectionEnd, selectionEnd <= units.count else { return nil }
+        let head = String(decoding: units[..<selectionStart], as: UTF16.self)
+        let tail = String(decoding: units[selectionEnd...], as: UTF16.self)
+        return head + typed + tail
+    }
+
     /// Note for an append whose result is not confirmed: `expected` is the field value the insert should have
     /// produced, `actual` what the field reads back as. Nil only when the field is exactly that value.
     static func appendNote(expected: String?, actual: String?) -> String? {
@@ -2930,6 +3002,35 @@ enum BrowserReply {
               let result = envelope["result"] as? [String: Any],
               let tab = result["tab"] as? [String: Any], let id = tab["id"] as? Int, id > 0 else { return nil }
         return id
+    }
+
+    /// A helper failure as one plain line: the message inside a JSON error envelope, else the text itself.
+    static func failureText(_ text: String) -> String {
+        let message = (json(text) as? [String: Any]).flatMap { BrowserPage.find("message", in: $0) as? String } ?? text
+        return explain(message)
+    }
+
+    /// ACT-01: the selected count from `upload_via_button`, only when Chrome verified the names and sizes.
+    static func uploadSelected(in text: String) -> Int? {
+        guard let object = json(text) as? [String: Any], object["error"] == nil else { return nil }
+        let body = (object["result"] as? [String: Any]) ?? object
+        guard body["verified"] as? Bool == true, let selected = body["selected"] as? Int, selected > 0 else { return nil }
+        return selected
+    }
+
+    /// ACT-02: `click_target`'s receipt. `openedTabID` is nil when Chrome could not verify a new tab.
+    static func clickedTab(in text: String) -> (clicked: Bool, openedTabID: Int?)? {
+        guard let object = json(text) as? [String: Any] else { return nil }
+        let body = (object["result"] as? [String: Any]) ?? object
+        guard let clicked = body["clicked"] as? Bool else { return nil }
+        let id = body["openedTabId"] as? Int
+        return (clicked, id.flatMap { $0 > 0 ? $0 : nil })
+    }
+
+    /// True when the helper does not know a tool at all (an older helper), so the caller takes its usual path.
+    static func isUnsupportedTool(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("unknown tool") || lower.contains("method not found")
     }
 
     /// Every object that has an id and a url or title: a tab listing entry.

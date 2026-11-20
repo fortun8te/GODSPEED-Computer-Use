@@ -1203,7 +1203,7 @@ extension ComputerUseToolDispatcher {
             if let raw = arguments["condition"] {
                 guard label != nil, wantedText == nil, urlPart == nil,
                       let name = raw as? String, let parsed = BrowserPage.ControlCondition(rawValue: name) else {
-                    throw ComputerUseError.invalidArguments("browser wait_for condition needs a label and one of visible, enabled, checked, unchecked")
+                    throw ComputerUseError.invalidArguments("browser wait_for condition needs a label and one of visible, enabled, checked, unchecked, exists")
                 }
                 condition = parsed
             } else {
@@ -1211,7 +1211,9 @@ extension ComputerUseToolDispatcher {
             }
             let seconds = Swift.min(30, Swift.max(1, Self.browserTabID(arguments["timeout"]) ?? 10))
             let what = urlPart.map { "URL containing \"\($0)\"" } ?? "\"\(wantedText ?? label ?? "")\""
-            let expected = condition.map { "\(what) is \($0.rawValue)" } ?? what
+            // A bare label waits for a visible control (ACT-04), and the timeout message says so.
+            let effective = condition ?? (wantedText == nil && urlPart == nil ? BrowserPage.ControlCondition.visible : nil)
+            let expected = effective.map { "\(what) is \($0.rawValue)" } ?? what
             let generation = bridge.referenceGeneration
             let before = Self.bindsBrowserWaitEvidence && wantedText != nil ? try? page.documentIdentity() : nil
             guard page.waitFor(text: wantedText, label: wantedText == nil ? label : nil,
@@ -1235,8 +1237,9 @@ extension ComputerUseToolDispatcher {
                 return url
             }
             let pages = Self.readPreviewPages(urls) { try Self.authorizeBrowserPage(policy, page: $0, afterDelivery: true) }
-            let content = Self.renderPreviewPages(urls, pages: pages)
-            return ToolCallResult(content: [.text(content)], isError: false,
+            let receipt = Self.peekReceipt(urls, pages: pages)
+            let content = Self.renderPreviewPages(urls, pages: pages) + "\n\n" + receipt.line
+            return ToolCallResult(content: [.text(content)], isError: receipt.isError,
                                   browserPreviewPages: zip(urls, pages).map { url, page in
                 var entry: [String: Any] = ["url": url, "status": page.status, "text": page.text]
                 entry["cleanup_confirmed"] = page.cleanupConfirmed
@@ -1403,8 +1406,17 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.invalidArguments("browser upload needs files: [\"/path/to/file\"]. Click the page's upload button in the same batch first.")
             }
             if label != nil || index != nil {
-                try page.setFiles(files, on: target())
-                return .text("Selected \(files.count) file(s) in the upload control.")
+                let node = try target()
+                if page.isFileInput(node) {
+                    try page.setFiles(files, on: node)
+                    return .text("Selected \(files.count) file(s) in the upload control.")
+                }
+                // ACT-01: an upload button arms its chooser and clicks once, in one helper call.
+                if let selected = try uploadThroughButton(node, files: files, page: page, bridge: bridge) {
+                    return .text("Selected \(selected) file(s) in the upload control.")
+                }
+                // An older helper: today's path, a click on the button, then the chooser wait below.
+                try page.click(node)
             }
             let chooser = try call("wait_file_chooser", timeout: 15)
             guard !chooser.isError else { return finish([chooser]) }
@@ -1446,6 +1458,46 @@ extension ComputerUseToolDispatcher {
         return mask
     }
 
+    /// ACT-01: selects files through an upload button with `upload_via_button`. Nil when this helper lacks the
+    /// command. The files count as selected only from Chrome's verified receipt.
+    private func uploadThroughButton(_ node: BrowserNode, files: [String], page: BrowserPage, bridge: BrowserBridge) throws -> Int? {
+        guard let tab = page.tab["tab_id"] as? Int, let loader = page.topFrameLoaderID() else { return nil }
+        let paths = files.map { ($0 as NSString).expandingTildeInPath }
+        guard paths.allSatisfy({ $0.hasPrefix("/") }) else {
+            throw ComputerUseError.invalidArguments("browser upload needs absolute file paths. Nothing was sent.")
+        }
+        let point = try page.clickPoint(of: node, beforeFirstAction: true)
+        let reply = try bridge.callTool("upload_via_button", arguments: [
+            "tab_id": tab, "backend_node_id": node.backendNodeID, "loader_id": loader,
+            "x": Double(point.x), "y": Double(point.y), "files": paths,
+        ], timeout: 20)
+        if reply.isError, BrowserReply.isUnsupportedTool(reply.text) { return nil }
+        guard !reply.isError, let selected = BrowserReply.uploadSelected(in: reply.text) else {
+            throw ComputerUseError.stateUnavailable("browser: \(BrowserReply.failureText(reply.text)). Inspect the upload control before retrying.")
+        }
+        return selected
+    }
+
+    /// ACT-02: one verified left click on a `_blank` link through `click_target`. Nil when the helper has no such
+    /// command, so the caller takes the open_tab path. The new tab is reported only as Chrome verified it.
+    private func clickNewTabLink(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge) throws -> ClickedNewTab? {
+        guard let tab = page.tab["tab_id"] as? Int, let loader = page.topFrameLoaderID() else { return nil }
+        let point = try page.clickPoint(of: node, beforeFirstAction: true)
+        let reply = try bridge.callTool("click_target", arguments: [
+            "tab_id": tab, "backend_node_id": node.backendNodeID, "loader_id": loader,
+            "x": Double(point.x), "y": Double(point.y), "expect_new_tab": true,
+        ], timeout: 20)
+        if reply.isError, BrowserReply.isUnsupportedTool(reply.text) { return nil }
+        guard !reply.isError, let clicked = BrowserReply.clickedTab(in: reply.text), clicked.clicked else {
+            throw ComputerUseError.stateUnavailable("browser: \(BrowserReply.failureText(reply.text)). Inspect the tab before repeating the click.")
+        }
+        return ClickedNewTab(openedTabID: clicked.openedTabID)
+    }
+
+    struct ClickedNewTab {
+        let openedTabID: Int?
+    }
+
     /// Clicks an element. A link is followed for a moment, so the reply says where it landed. A click that
     /// opens a new tab makes that tab the working tab, and the reply says so.
     private func clickAndWatch(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge,
@@ -1460,6 +1512,22 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.backgroundUnsupported("This link needs a new tab.")
             }
             try Self.authorizeBrowserAddresses(policy, addresses: [url])
+            // ACT-02: a real click on the verified link, so the site's own link behaviour runs. An older helper
+            // without click_target keeps the open_tab shortcut.
+            if let click = try clickNewTabLink(node, page: page, bridge: bridge) {
+                guard let newID = click.openedTabID else {
+                    throw ComputerUseError.stateUnavailable("browser: the link was clicked, but Chrome did not confirm the new tab. List tabs before repeating the click.")
+                }
+                BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: newID)
+                let destination = BrowserPage(bridge: bridge, tab: ["tab_id": newID])
+                guard destination.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
+                    try Self.authorizeBrowserPage(policy, page: destination, afterDelivery: true)
+                    throw ComputerUseError.stateUnavailable("browser: link opened tab \(newID), but the destination did not become ready. Inspect that tab before retrying.")
+                }
+                try Self.authorizeBrowserPage(policy, page: destination, afterDelivery: true)
+                bridge.currentTab = newID
+                return ("clicked \"\(node.name)\"; it opened a new tab (id \(newID)), and browser now works in that tab", newID)
+            }
             let opened = try bridge.callTool("open_tab", arguments: ["url": url], timeout: 20)
             guard !opened.isError, let newID = BrowserReply.createdTabID(in: opened.text) else {
                 throw ComputerUseError.stateUnavailable("browser: the background link may have opened. List tabs before repeating the click.")
@@ -1531,6 +1599,38 @@ extension ComputerUseToolDispatcher {
         zip(urls, pages).map { url, page in
             "== \(url) [\(page.status)] ==\n\(page.text)"
         }.joined(separator: "\n\n")
+    }
+
+    /// FLOW-01: a peek with any failed, unstarted or unconfirmed page is a partial result. The reply must say so
+    /// (isError), list the reads to retry, and never let the page text stand in for completion.
+    struct PeekReceipt: Equatable {
+        let read: Int
+        let failed: Int
+        let notStarted: Int
+        let cleanupUnconfirmed: Int
+        /// Failed and unstarted reads only. Unconfirmed tabs are inspected before any replacement is opened.
+        let retryURLs: [String]
+
+        var isError: Bool { failed + notStarted + cleanupUnconfirmed > 0 }
+
+        var line: String {
+            var parts = ["\(read) read", "\(failed) failed", "\(notStarted) not started"]
+            if cleanupUnconfirmed > 0 { parts.append("\(cleanupUnconfirmed) cleanup unconfirmed (inspect those tabs before opening more)") }
+            var text = "peek: " + parts.joined(separator: ", ") + "."
+            if !retryURLs.isEmpty { text += " Retry: " + retryURLs.joined(separator: ", ") }
+            return text
+        }
+    }
+
+    static func peekReceipt(_ urls: [String], pages: [BrowserPreviewPage]) -> PeekReceipt {
+        let pairs = zip(urls, pages)
+        return PeekReceipt(
+            read: pages.filter { $0.status == "read" }.count,
+            failed: pages.filter { $0.status == "failed" }.count,
+            notStarted: pages.filter { $0.status == "not_started" }.count,
+            cleanupUnconfirmed: pages.filter { $0.cleanupConfirmed == false }.count,
+            retryURLs: pairs.filter { $0.1.status == "failed" || $0.1.status == "not_started" }.map { $0.0 }
+        )
     }
 
     private static func readPreviewPages(_ urls: [String], verifyPage: @Sendable (BrowserPage) throws -> Void = { _ in }) -> [BrowserPreviewPage] {
