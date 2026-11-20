@@ -1078,7 +1078,7 @@ final class BrowserPage {
     /// hit-test). Says so when something else lies on top of every probed point (a banner, a dialog, a
     /// stretched link). For frames, use the browser's box geometry. In the main document
     /// a missing hit test is a refusal, since an unverified box could target another control.
-    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
+    func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
         if let placement {
             return try precisePoint(of: node, placement: placement)
         }
@@ -1114,7 +1114,14 @@ final class BrowserPage {
         }
         if kind == "frame" {
             reveal(node)
-            return try center(of: node)
+            let point = try center(of: node)
+            // The page's own hit test at the point decides. An overlay or a stale frame that is there instead is
+            // refused before any input is sent.
+            guard frameHitIsIntended(node, at: point) else {
+                let message = "browser: another element is at the click point inside the frame, so no click was sent. Reveal the control and read the tab again."
+                throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
+            }
+            return point
         }
         let message = "browser: could not confirm an unobstructed click point.\(delivery) Reveal the control and read the tab again."
         throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
@@ -1150,6 +1157,20 @@ final class BrowserPage {
 
     private func reveal(_ node: BrowserNode) {
         _ = try? cdp("DOM.scrollIntoViewIfNeeded", ["backendNodeId": node.backendNodeID])
+    }
+
+    /// Chrome's hit test at a point of the main page: true when the element there is the control or sits inside it.
+    /// Any failure to answer is false, so an unverified click is never sent.
+    private func frameHitIsIntended(_ node: BrowserNode, at point: CGPoint) -> Bool {
+        guard let hit = try? cdp("DOM.getNodeForLocation", [
+            "x": Int(point.x), "y": Int(point.y), "includeUserAgentShadowDOM": true,
+        ]), let hitID = hit["backendNodeId"] as? Int else { return false }
+        if hitID == node.backendNodeID { return true }
+        guard let resolved = try? cdp("DOM.resolveNode", ["backendNodeId": hitID]),
+              let hitObject = (resolved["object"] as? [String: Any])?["objectId"] as? String else { return false }
+        // Runs in the control's own frame: a descendant of the control counts as the control.
+        return (try? callOnNode(node, "function(hit){return this===hit||this.contains(hit);}",
+                                objectArguments: [hitObject])) as? Bool == true
     }
 
     private func center(of node: BrowserNode) throws -> CGPoint {
