@@ -6,6 +6,16 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testClippedBrowserTextAndControlsCannotBeCompletionEvidence() {
+        let heading: [String: Any] = ["role": ["value": "heading"], "name": ["value": "Ready"]]
+        let clipped: [String: Any] = ["role": ["value": "heading"], "name": ["value": String(repeating: "x", count: 200)]]
+        XCTAssertTrue(BrowserPage.parseAX([heading]).isCompleteEvidence)
+        XCTAssertFalse(BrowserPage.parseAX([heading, clipped]).isCompleteEvidence)
+        XCTAssertFalse(BrowserPage.parseAX([heading], textBudget: 0).isCompleteEvidence)
+        let button: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
+        XCTAssertFalse(BrowserPage.parseAX([button], maxControls: 0).isCompleteEvidence)
+    }
+
     func testExactLookupUsesOneQueryAndFallsBackOnNoCertainMatch() throws {
         let save: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
         let duplicate: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 43]

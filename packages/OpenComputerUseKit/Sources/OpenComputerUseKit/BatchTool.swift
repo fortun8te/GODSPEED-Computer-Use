@@ -1088,10 +1088,14 @@ extension ComputerUseToolDispatcher {
                 }
             }
         }
+        var browserTextChecks: [DoneCheck.Condition] = []
         var observation = trailingObservation
         if !unconfirmedOpen, earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool == "browser" {
             if unconfirmedFinalClick, let condition = doneConditions.first {
-                _ = waitForBrowserEvidence(condition)
+                if waitForBrowserEvidence(condition),
+                   case .text(let text) = condition, !DoneCheck.isPlainNumber(text) {
+                    browserTextChecks.append(condition)
+                }
             }
             observation = browserObservation("read")
         }
@@ -1212,13 +1216,17 @@ extension ComputerUseToolDispatcher {
                         }
                         return pageURL()
                     },
-                    supportsAbsence: lastAttemptedStep?.tool != "browser"
+                    supportsAbsence: lastAttemptedStep?.tool != "browser",
+                    directlyVerified: observation?.browserObservationURL?.isEmpty == false ? browserTextChecks : []
                 ))
             }
             var doneResult = earlyCompletion ?? TimingLog.measure("batch.final_check", checkConditions)
             if (!failed || ambiguousFinalClick), finalClickChecksPage, case .missing(let unmet) = doneResult,
                let pending = doneConditions.first(where: { unmet.contains($0.summary) }),
                waitForBrowserEvidence(pending) {
+                if case .text(let text) = pending, !DoneCheck.isPlainNumber(text) {
+                    browserTextChecks.append(pending)
+                }
                 observation = browserObservation("read")
                 doneResult = checkConditions()
             }

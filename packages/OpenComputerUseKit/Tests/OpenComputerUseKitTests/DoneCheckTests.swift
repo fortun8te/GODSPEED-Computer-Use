@@ -28,6 +28,13 @@ final class DoneCheckTests: XCTestCase {
 
     // MARK: - Parsing
 
+    func testDirectBrowserEvidenceDoesNotVerifyOtherConditions() {
+        let wanted: [DoneCheck.Condition] = [.text("Sent"), .text("Receipt")]
+        let evidence = DoneCheck.Evidence(screenText: nil, pageURL: { "https://example.test" },
+                                          directlyVerified: [.text("Sent")])
+        XCTAssertEqual(DoneCheck.check(wanted, evidence: evidence), .missing(unmet: [wanted[1].summary]))
+    }
+
     func testDirectCompletionReadsFileAndExactFieldWithoutScreenState() {
         let conditions: [DoneCheck.Condition] = [.fileExists("/test/file"), .field(label: "Title", equals: "Ready")]
         var files: [String] = []
