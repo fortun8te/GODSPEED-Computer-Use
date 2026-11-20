@@ -107,6 +107,7 @@ class MiningTests(unittest.TestCase):
         self.assertEqual(candidate["params"], {"to": "", "amount": ""})
         self.assertFalse(candidate["verified"])
         self.assertEqual(candidate["done_when"], [])
+        self.assertEqual(candidate["reason"], "done_when missing")
         self.assertFalse(candidate["requiresConfirmation"])
         self.assertEqual(dropped, {})
 
@@ -163,6 +164,88 @@ class MiningTests(unittest.TestCase):
         self.assertTrue(candidates[0]["requiresConfirmation"])
         self.assertTrue(candidates[0]["steps"][1]["requiresConfirmation"])
         self.assertNotIn("requiresConfirmation", candidates[0]["steps"][0])
+
+    def identified(self, goal, run, conditions, window=None, done="verified"):
+        """A batch whose episode row carries done_when, its result and the window, as BatchTool.learn writes them."""
+        rows = batch(goal, run=run, done=done)
+        window = window or {"app": "com.apple.Notes", "title": "Window: \"Draft - Notes\", App: Notes."}
+        for row in rows:
+            row["window"] = window
+        rows[-1].update({"done_when": conditions, "done": "verified" if done == "verified" else "unmet"})
+        return rows
+
+    def test_shared_done_when_and_window_emit_a_verified_candidate(self):
+        conditions = [{"text": "Message sent"}, {"field": "Status", "equals": "Paid"}]
+        rows = []
+        for index, goal in enumerate(["Charge bob@x.com 7777", "Charge ann@y.org 1200", "Charge cy@z.net 45"]):
+            rows += self.identified(goal, f"run-{index}", conditions)
+        candidates, dropped = self.mine(rows)
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertTrue(candidate["verified"])
+        self.assertEqual(candidate["status"], "verified")
+        self.assertIsNone(candidate["reason"])
+        self.assertEqual(candidate["done_when"], conditions)
+        self.assertFalse(candidate["done_when_missing"])
+        self.assertEqual(candidate["window"], {"app": "com.apple.Notes", "title": "Window: \"Draft - Notes\", App: Notes."})
+        self.assertEqual(candidate["champion"], False)
+        self.assertEqual(dropped, {})
+
+    def test_different_done_when_leaves_candidate_unverified(self):
+        rows = []
+        for index, text in enumerate(["Message sent", "Message sent", "Saved"]):
+            rows += self.identified(f"Charge bob@x.com 7777", f"run-{index}", [{"text": text}])
+        candidate = self.mine(rows)[0][0]
+        self.assertFalse(candidate["verified"])
+        self.assertEqual(candidate["status"], "unverified")
+        self.assertEqual(candidate["reason"], "done_when differs")
+        self.assertEqual(candidate["done_when"], [])
+        self.assertIsNone(candidate["window"])
+
+    def test_different_window_leaves_candidate_unverified(self):
+        rows = []
+        for index, title in enumerate(["Draft - Notes", "Draft - Notes", "Other - Notes"]):
+            window = {"app": "com.apple.Notes", "title": f"Window: \"{title}\", App: Notes."}
+            rows += self.identified("Charge bob@x.com 7777", f"run-{index}", [{"text": "Message sent"}], window=window)
+        candidate = self.mine(rows)[0][0]
+        self.assertFalse(candidate["verified"])
+        self.assertEqual(candidate["reason"], "window differs")
+        self.assertEqual(candidate["done_when"], [])
+        self.assertIsNone(candidate["window"])
+
+    def test_rows_without_identity_stay_unverified_with_a_reason(self):
+        rows = []
+        for index in range(3):
+            rows += batch("Charge bob@x.com 7777", run=f"old-{index}")
+        candidate = self.mine(rows)[0][0]
+        self.assertFalse(candidate["verified"])
+        self.assertEqual(candidate["reason"], "done_when missing")
+        self.assertTrue(candidate["done_when_missing"])
+        windowless = []
+        for index in range(3):
+            run_rows = self.identified("Charge bob@x.com 7777", f"nowin-{index}", [{"text": "Sent"}])
+            for row in run_rows:
+                row.pop("window", None)
+            windowless += run_rows
+        self.assertEqual(self.mine(windowless)[0][0]["reason"], "window missing")
+
+    def test_placeholder_done_when_is_not_verified(self):
+        rows = []
+        for index, address in enumerate(["bob@x.com", "ann@y.org", "cy@z.net"]):
+            rows += self.identified("Charge bob@x.com 7777", f"slot-{index}", [{"text": f"Sent to {address}"}])
+        candidate = self.mine(rows)[0][0]
+        self.assertEqual(candidate["done_when"], [])
+        self.assertEqual(candidate["reason"], "done_when has slots")
+        self.assertFalse(candidate["verified"])
+
+    def test_secure_done_when_excludes_the_episode(self):
+        rows = []
+        for index in range(3):
+            rows += self.identified("Charge bob@x.com 7777", f"sec-{index}", [{"field": "Password", "equals": "hunter2"}])
+        candidates, dropped = self.mine(rows)
+        self.assertEqual(candidates, [])
+        self.assertEqual(dropped, {"secure_or_redacted": 3})
+        self.assertNotIn("hunter2", json.dumps(dropped))
 
     def test_output_path_must_stay_outside_live_folders(self):
         with self.assertRaises(ValueError):
