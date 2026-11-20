@@ -128,6 +128,7 @@ public enum ToolDefinitions {
                     ),
                     "label": stringProperty(description: "Visible text of the target, e.g. \"Sign in\""),
                     "find": stringProperty(description: "read: only controls and text that mention these words"),
+                    "find_exact": stringProperty(description: "read: look up controls by exact accessible name without reading the whole page. Returns labels. Omit find."),
                     "full": ["type": "boolean", "default": false, "description": "read: list about four times as much"],
                     "diff": ["type": "boolean", "default": false, "description": "read: return a shorter change summary when the same tab, document, snapshot mode and control references are still valid."],
                     "if_changed": ["type": "boolean", "default": false, "description": "screenshot: omit the image when it exactly matches the last capture of this tab and URL."],
