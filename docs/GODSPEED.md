@@ -289,6 +289,14 @@ When many moves are queued before the next frame, Godspeed keeps the latest pend
 
 Vercel's agent-desktop scopes references to the observed window and keeps cursor travel out of the window interaction lock. [Snapshot guide](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/apps/docs/content/docs/snapshots-and-refs.mdx) · [Cursor delivery](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/crates/core/src/cursor_overlay/submit.rs)
 
+## Teach by example
+
+Use `teach` with `action: "start"`, an `app` and a one-sentence `goal`, then do the task yourself in that app. `stop` turns what you did into a recipe of labelled steps (never pixels or element numbers). Typed text becomes a slot, such as a recipient or a path, with your text as the example. `status` shows what has been recorded so far.
+
+Only the target app is watched, and only while recording. Recording ends after 10 minutes or when the app quits. Text is kept only when it was typed into a confirmed plain text field of that app. Password and secret fields, secure input and anything that can't be confirmed are never recorded, and the clipboard is never read. A taught recipe starts unverified and replays on its own only after one run passes a `done_when` check.
+
+Teaching needs macOS Input Monitoring for GODSPEED, in addition to Accessibility. Without it, `start` says so and records nothing.
+
 ## Native window and element identity
 
 To inspect a known native window directly, pass its ID to `get_app_state`. This read does not move the window or use app-wide settle. For an exact native action target, take a fresh app observation and use its reported `Window ID` as `window_id` on a supported action or a single-app batch. Godspeed checks the same accessibility window it read, even if macOS lists another object for that window ID. If the window, its bounds or the required focus changes, Godspeed stops. Refresh the observation before trying again. In the JavaScript REPL, use `app.batch(steps, { windowId, doneWhen })` to execute a sequence and check the final state in one call. The reply includes a `receipt` with each step's status, the number of steps left and the completion verdict. Acknowledged actions and verified outcomes are reported separately.

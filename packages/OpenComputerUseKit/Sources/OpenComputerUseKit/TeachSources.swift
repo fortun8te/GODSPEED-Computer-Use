@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 
@@ -75,6 +76,34 @@ enum TeachLive {
             if let text = string(element, attribute), !text.trimmingCharacters(in: .whitespaces).isEmpty { return text }
         }
         return ""
+    }
+
+    /// Words in a field's label or description that mark a secret, in the languages Michael uses.
+    static let secretFieldWords = ["password", "passcode", "passphrase", "pin", "wachtwoord", "pincode", "toegangscode",
+                                   "passwort", "kennwort", "mot de passe", "contraseña", "secret", "token", "otp",
+                                   "2fa", "verification code", "verificatiecode", "security code", "cvv", "cvc"]
+
+    /// Whether one keystroke may be recorded as text: secure input is off, the focused element belongs to the
+    /// target app, is a plain text-entry control, and is not a password or secret field. Anything that can't be
+    /// confirmed is dropped, so a missed focus change can never leak what was typed into a password field.
+    static func keystrokeMayBeRecorded(targetPID: pid_t) -> Bool {
+        if IsSecureEventInputEnabled() { return false }
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.05)
+        guard let focused = elementAttribute(system, kAXFocusedUIElementAttribute as String),
+              pid(of: focused) == targetPID else { return false }
+        return focusedFieldMayBeRecorded(role: string(focused, kAXRoleAttribute as String),
+                                         subrole: string(focused, kAXSubroleAttribute as String),
+                                         label: label(of: focused),
+                                         description: string(focused, kAXDescriptionAttribute as String))
+    }
+
+    /// The pure part of `keystrokeMayBeRecorded`, for tests.
+    static func focusedFieldMayBeRecorded(role: String?, subrole: String?, label: String, description: String?) -> Bool {
+        guard let role, ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role) else { return false }
+        if role == "AXSecureTextField" || isSecureTextField(subrole: subrole) { return false }
+        let text = (label + " " + (description ?? "")).lowercased()
+        return !secretFieldWords.contains { text.contains($0) }
     }
 
     /// Role, label and parent label of an element. Secure fields are flagged so their text is never kept.
@@ -243,6 +272,8 @@ final class LiveTeachSource: TeachInputSource {
             // Key presses belong to whichever app is frontmost; the recorder keeps only the target's.
             guard let text = TeachLive.typedText(of: event) else { return }
             let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+            // Privacy: only text typed into a confirmed, non-secret field of the target app is ever recorded.
+            guard frontmost == pid, TeachLive.keystrokeMayBeRecorded(targetPID: pid) else { return }
             deliver(TeachInput(pid: frontmost, event: .typed(text)))
         } else if type == .leftMouseDown {
             let point = event.location
