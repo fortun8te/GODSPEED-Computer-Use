@@ -448,7 +448,8 @@ public final class ComputerUseToolDispatcher {
         if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check() }
         switch name {
         case BatchTool.name:
-            return try runBatch(arguments: arguments)
+            // The goal and step number go into each journaled intent, so a restart notice can name them.
+            return try OperationJournal.withBatchGoal(arguments["goal"] as? String ?? "") { try runBatch(arguments: arguments) }
         case HandoffTool.name:
             return try runHandoff(arguments: arguments)
         case "browser":
