@@ -2475,11 +2475,29 @@ public final class ComputerUseService {
            try AppleEventsGate.send("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
             return .text("pressed File > Save (saved \(path))")
         }
+        // Learned shortcut (AdaptiveLearning): an item whose key equivalent an earlier press confirmed is pressed by that
+        // chord, with no key event. The chord must still name the same item; any doubt falls through to the menu.
+        let joined = titles.joined(separator: " > ")
+        let learning = AdaptiveLearning.shared
+        let appKey = AdaptiveLearning.appKey(for: app)
+        if case .shortcut(let chord) = learning.shortcuts.route(app: appKey, path: joined, strict: StrictBackground.enabled()),
+           let last = titles.last,
+           SkyKeyboardDispatcher.menuItemTitle(forKey: chord, pid: app.pid).map({ AdaptiveLearning.sameTitle($0, last) }) == true,
+           case .pressed(let disabled) = try SkyKeyboardDispatcher.pressMenuKeyEquivalent(chord, pid: app.pid) {
+            return .text("pressed \(joined)" + (disabled ? " (the closed menu listed it as disabled; check the state to see whether it ran)" : ""))
+        }
         SkyKeyboardDispatcher.lastPressReportedDisabled = false
-        try SkyKeyboardDispatcher.pressMenuItem(path: titles, pid: app.pid)
+        let keyEquivalent = try SkyKeyboardDispatcher.pressMenuItem(path: titles, pid: app.pid)
         let note = SkyKeyboardDispatcher.lastPressReportedDisabled
             ? " (the closed menu listed it as disabled; check the state to see whether it ran)" : ""
-        return .text("pressed \(titles.joined(separator: " > "))\(note)")
+        // Only a press that did not report disabled confirms the shortcut; the next press of this path may use it.
+        if let keyEquivalent, !SkyKeyboardDispatcher.lastPressReportedDisabled, let last = titles.last {
+            learning.shortcuts.parse(app: appKey, items: [.init(path: joined, title: last,
+                commandCharacter: keyEquivalent.commandCharacter, modifierMask: keyEquivalent.modifierMask)])
+            learning.shortcuts.confirm(app: appKey, path: joined)
+            learning.saveShortcuts()
+        }
+        return .text("pressed \(joined)\(note)")
     }
 
     private func requireAutoKeyMethodForFixture(_ keyMethod: KeyMethod) throws {

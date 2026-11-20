@@ -485,7 +485,9 @@ enum SkyKeyboardDispatcher {
     /// `press_menu`: press the item at `path` (["Format", "Font", "Show Fonts"]) through
     /// AXPress, with no key or pointer event, so the app can stay in the background. Each
     /// title is looked up among the items of the menu named before it; a miss lists them.
-    static func pressMenuItem(path: [String], pid: pid_t) throws {
+    /// Returns the item's key equivalent as AX reports it (read before the press), so press_menu can learn it.
+    @discardableResult
+    static func pressMenuItem(path: [String], pid: pid_t) throws -> (commandCharacter: String, modifierMask: Int)? {
         let application = AXUIElementCreateApplication(pid)
         var menuBar: CFTypeRef?
         let read = AXUIElementCopyAttributeValue(application, kAXMenuBarAttribute as CFString, &menuBar)
@@ -521,6 +523,9 @@ enum SkyKeyboardDispatcher {
         // background app can report "disabled" for an item that works (File > Save after typing).
         // Pressing a really disabled item does nothing, so press anyway and say what the menu reported.
         let reportedDisabled = (copyValue(item, kAXEnabledAttribute) as? NSNumber)?.boolValue == false
+        let keyEquivalent = (copyValue(item, "AXMenuItemCmdChar") as? String).map {
+            (commandCharacter: $0, modifierMask: (copyValue(item, "AXMenuItemCmdModifiers") as? NSNumber)?.intValue ?? 0)
+        }
 
         try requireUsableComputerUseSession()
         if let error = menuPressError(AXUIElementPerformAction(item, kAXPressAction as CFString), path: joined) {
@@ -528,6 +533,7 @@ enum SkyKeyboardDispatcher {
         }
         Thread.sleep(forTimeInterval: 0.1)
         if reportedDisabled { lastPressReportedDisabled = true }
+        return keyEquivalent
     }
 
     /// Set when the last press_menu item had reported itself disabled before it was pressed.
