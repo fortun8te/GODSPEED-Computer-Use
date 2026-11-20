@@ -837,11 +837,12 @@ extension ComputerUseToolDispatcher {
 
             // Bring the app forward for the whole batch (foreground: true), or from the first step that opens
             // a dialog or editor on. The borrow stays until the batch's final read (see FocusBorrowSession).
+            // Checked actions never request a focus borrow.
             if validatedHandoffRecipe == nil, !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
+               !ActionOptions.usesStrictRoute(step.tool, step.arguments),
                let app = step.arguments["app"] as? String, !app.isEmpty,
                let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
-               foreground || (!ActionOptions.usesStrictRoute(step.tool, step.arguments)
-                              && (stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app))) {
+               foreground || stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) {
                 if !focus.ensure(pid: pid) {
                     lines.append("Could not bring \(app) to the front; the steps below ran in the background.")
                 }
