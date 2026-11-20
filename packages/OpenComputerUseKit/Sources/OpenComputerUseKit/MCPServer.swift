@@ -137,6 +137,7 @@ public final class StdioMCPServer {
     public func endSession() {
         trajectory.sessionEnded()
         service.clearQueryIndexes()
+        service.clearSnapshotRefs()
         BrowserBridge.endClientTurn()
         // The cursor is deliberately left alone here. One `ocu call` is one session, so
         // resetting it made every step of a batch start a new cursor from scratch. The

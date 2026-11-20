@@ -51,22 +51,34 @@ public final class ComputerUseToolDispatcher {
         let arguments = ArgumentNormalizer.normalize(
             tool: name, arguments: rawArguments, lastApp: RecentAppMemory.shared.current
         )
+        let ref = try NativeSnapshotRefs.argument(in: arguments, tool: name)
         if let problem = ArgumentNormalizer.problem(tool: name, arguments: arguments) {
             throw ComputerUseError.notSent(problem)
         }
-        if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name,
-           name != HandoffTool.name {
+        let hasWindowPin = arguments["window_id"] != nil && name != "query" && name != "get_app_state"
+            && name != BatchTool.name && name != HandoffTool.name
+        if ref != nil || hasWindowPin {
             guard ArgumentNormalizer.windowBoundTools.contains(name) else {
                 throw ComputerUseError.invalidArguments("\(name) cannot be bound to a native window")
             }
             let app = try requireString("app", in: arguments)
-            guard let windowID = try validatedQueryWindowID(arguments["window_id"]) else {
+            let requestedWindow = try validatedQueryWindowID(arguments["window_id"])
+            let target = try ref.map { try service.resolveElementRef($0, app: app) }
+            if let target, let requestedWindow, target.windowID != requestedWindow {
+                throw ComputerUseError.windowChanged(requestedWindow)
+            }
+            guard let windowID = target?.windowID ?? requestedWindow else {
                 throw ComputerUseError.invalidArguments("window_id is required for a bound action")
             }
-            // Routes that guess a replacement target or borrow focus are outside a bound action.
+            // Ref actions take the same direct route as pinned actions. Smart
+            // retries, label healing and focus borrowing cannot change the target.
+            var boundArguments = arguments
+            if let target { boundArguments["element_index"] = String(target.index) }
             let result = try autoreleasepool {
                 try ComputerUseService.$requiredWindowID.withValue(windowID) {
-                    try dispatchTool(name: name, arguments: arguments, log: log)
+                    try ComputerUseService.$requiredRefGeneration.withValue(target?.generation) {
+                        try dispatchTool(name: name, arguments: boundArguments, log: log)
+                    }
                 }
             }
             RecentAppMemory.shared.remember(app)
@@ -398,7 +410,8 @@ public final class ComputerUseToolDispatcher {
                     includeAX: try strictObservationBool("include_ax", in: arguments),
                     includeScreenshot: try strictObservationBool(
                         "include_screenshot", in: arguments, default: LeanDefaults.includeScreenshot
-                    )
+                    ),
+                    includeRefs: try strictObservationBool("include_refs", in: arguments, default: false)
                 ),
                 settleMs: try optionalSettleMs(in: arguments),
                 compact: try strictObservationBool("compact", in: arguments, default: false),
@@ -522,6 +535,12 @@ public final class ComputerUseToolDispatcher {
         default:
             throw ComputerUseError.unsupportedTool(name)
         }
+    }
+
+    /// The batch can check its result in the ref's window without an app-wide read.
+    func observedNativeRefWindow(in arguments: [String: Any]) -> UInt32? {
+        guard let ref = arguments["ref"] as? String, let app = arguments["app"] as? String else { return nil }
+        return try? service.resolveElementRef(ref, app: app).windowID
     }
 
     public func callToolAsResult(name: String, arguments: [String: Any]) -> ToolCallResult {

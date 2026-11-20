@@ -168,12 +168,11 @@ public struct AppSnapshot {
     /// shown at some point, so one this snapshot lacks belongs to an element that is gone. Nil: fixture or numbered per read.
     var numberingHighWater: Int? = nil
 
-    /// The capture and AX tree have a confirmed, shared native window identity.
-    public var observedWindowID: CGWindowID? {
-        guard let windowElement, let targetWindowID, targetWindowID != kCGNullWindowID,
-              SkyLightSPI.shared.windowID(for: windowElement) == targetWindowID else { return nil }
-        return targetWindowID
-    }
+    var nativeWindow: NativeWindowObservation? = nil
+    var elementRefs: NativeSnapshotRefs? = nil
+
+    /// The capture and AX tree shared an exact window ID at observation time.
+    public var observedWindowID: CGWindowID? { nativeWindow?.id }
 
     public var renderedText: String {
         renderedText(style: .fullState)
@@ -336,6 +335,12 @@ enum SnapshotBuilder {
         scopeFocusToWindow: Bool = false
     ) -> AppSnapshot {
         let windowBounds = windowCapture.bounds
+        let appIdentity = TargetedAppIdentity(app: app)
+        func bindWindow() -> NativeWindowObservation? {
+            guard !app.runningApplication.isTerminated,
+                  SkyLightSPI.shared.windowID(for: rootElement) == windowCapture.windowID else { return nil }
+            return NativeWindowObservation(id: windowCapture.windowID, app: appIdentity)
+        }
         // The image is already captured; encoding it is pure CPU work, so it runs beside the
         // tree walk instead of in front of it.
         let encoding = ScreenshotEncodingJob(
@@ -350,7 +355,7 @@ enum SnapshotBuilder {
                                screenshotData: screenshotData, mode: .accessibility, treeLines: [],
                                focusedSummary: nil, focusedElement: nil, selectedText: nil,
                                windowElement: rootElement, elements: [:], screenshotNote: screenshot.note,
-                               observation: observation)
+                               observation: observation, nativeWindow: bindWindow())
         }
         let appFocus = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         let focusedElement = appFocus.flatMap { element in
@@ -399,6 +404,11 @@ enum SnapshotBuilder {
             }
         }
 
+        // The menu bar is appended for display, but its elements belong to the app, not the window.
+        let refIndexes = observation.includeRefs ? renderer.records.values.compactMap { record -> Int? in
+            guard !record.isSyntheticText, record.element != nil, record.identity?.role != nil else { return nil }
+            return record.index
+        } : []
         if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
            !CFEqual(menuBar, rootElement)
         {
@@ -412,6 +422,9 @@ enum SnapshotBuilder {
         }
         let screenshot = encoding.result()
         let screenshotData = screenshot.data
+        let nativeWindow = bindWindow()
+        let elementRefs = nativeWindow?.app.launchedAt != nil && !refIndexes.isEmpty
+            ? NativeSnapshotRefs(elementIndexes: refIndexes) : nil
 
         return AppSnapshot(
             app: app,
@@ -429,7 +442,9 @@ enum SnapshotBuilder {
             elements: renderer.records,
             screenshotNote: screenshot.note,
             observation: observation,
-            numberingHighWater: numbering?.highWater
+            numberingHighWater: numbering?.highWater,
+            nativeWindow: nativeWindow,
+            elementRefs: elementRefs
         )
     }
 
@@ -2602,7 +2617,9 @@ extension SnapshotBuilder {
     /// Mirrors the window-finding prologue of `build` without the tree walk or
     /// capture, so it never redirects input or steals focus. `windowID` selects a
     /// specific window; otherwise the app's current focused window is used.
-    static func resolveTargetWindow(for app: RunningAppDescriptor, windowID: CGWindowID? = nil) throws -> TargetedAX.WindowContext {
+    static func resolveTargetWindow(
+        for app: RunningAppDescriptor, windowID: CGWindowID? = nil, matchingRoot: AXUIElement? = nil
+    ) throws -> TargetedAX.WindowContext {
         if app.name == FixtureBridge.appName {
             throw ComputerUseError.message("targeted lookup is not supported for fixture apps")
         }
@@ -2613,7 +2630,8 @@ extension SnapshotBuilder {
 
         let appElement = AXUIElementCreateApplication(app.pid)
         AXUIElementSetMessagingTimeout(appElement, 0.1)
-        _ = enableBestEffortAccessibilityModes(appElement)
+        // Revalidation must keep the same AX tree.
+        if matchingRoot == nil { _ = enableBestEffortAccessibilityModes(appElement) }
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, 0.1)
         // This object changes the process-wide timeout, not just one AX reference.
@@ -2621,7 +2639,23 @@ extension SnapshotBuilder {
         let focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
 
         let rootWindow: AXUIElement
-        if let windowID, let named = windowElement(for: windowID, appElement: appElement) {
+        if let windowID, let named = selectNativeWindow(
+            listed: copyArray(appElement, attribute: kAXWindowsAttribute) ?? [],
+            focused: {
+                // AXWindows leaves sheets out. Check the focus sources that can
+                // supply the original observation when looking for the same root.
+                let appWindow = copyElement(appElement, attribute: kAXFocusedWindowAttribute)
+                guard let matchingRoot, let focusedApplication, pid(of: focusedApplication) == app.pid else {
+                    return appWindow
+                }
+                if let appWindow, CFEqual(appWindow, matchingRoot) { return appWindow }
+                return [copyElement(systemWide, attribute: kAXFocusedWindowAttribute),
+                        copyElement(focusedApplication, attribute: kAXFocusedWindowAttribute)]
+                    .compactMap { $0 }.first { CFEqual($0, matchingRoot) }
+            },
+            matchesID: { SkyLightSPI.shared.windowID(for: $0) == windowID },
+            matchesObservedRoot: matchingRoot.map { root in { CFEqual($0, root) } }
+        ) {
             rootWindow = named
         } else if let windowID {
             throw ComputerUseError.stateUnavailable("window_id \(windowID) is not a current window of \(app.bundleIdentifier ?? app.name).")
@@ -2693,11 +2727,13 @@ extension SnapshotBuilder {
         return false
     }
 
-    private static func windowElement(for windowID: CGWindowID, appElement: AXUIElement) -> AXUIElement? {
-        let isWindow = { SkyLightSPI.shared.windowID(for: $0) == windowID }
-        // AXWindows leaves sheets out; a sheet is found as the focused window.
-        return copyArray(appElement, attribute: kAXWindowsAttribute)?.first(where: isWindow)
-            ?? copyElement(appElement, attribute: kAXFocusedWindowAttribute).flatMap { isWindow($0) ? $0 : nil }
+    static func selectNativeWindow<Root>(
+        listed: [Root], focused: () -> Root?, matchesID: (Root) -> Bool, matchesObservedRoot: ((Root) -> Bool)?
+    ) -> Root? {
+        // Filter by both identities before choosing. A different AX object for
+        // the same native ID must not hide the observed object.
+        func matches(_ root: Root) -> Bool { matchesID(root) && matchesObservedRoot?(root) != false }
+        return listed.first(where: matches) ?? focused().flatMap { matches($0) ? $0 : nil }
     }
 
     // Attributes read for every visited node, in one batched IPC call. Position

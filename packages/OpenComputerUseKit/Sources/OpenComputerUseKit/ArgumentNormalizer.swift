@@ -19,7 +19,7 @@ enum ArgumentNormalizer {
         "set_value", "select_text",
     ]
 
-    /// Tools that act on one accessibility element, by `element_index` or `label`.
+    /// Tools that act on one accessibility element, by `ref`, `element_index` or `label`.
     static let elementTools: Set<String> = ["click", "hover", "perform_secondary_action", "scroll", "set_value", "select_text"]
 
     /// Spellings for `app` on every app tool and on batch.
@@ -118,8 +118,8 @@ enum ArgumentNormalizer {
 
     private static let appNeed = Need(keys: ["app"], text: "\"app\" (the app name)")
     private static let elementNeed = Need(
-        keys: ["label", "labels", "element_index"],
-        text: "\"label\" (its visible name) or \"element_index\""
+        keys: ["label", "labels", "element_index", "ref"],
+        text: "\"label\" (its visible name), \"element_index\", or \"ref\""
     )
 
     /// What each tool needs before it can run. Each entry needs at least one of its keys.
@@ -129,8 +129,8 @@ enum ArgumentNormalizer {
         "list_apps": [],
         "query": [appNeed, Need(keys: ["text", "role"], text: "\"text\" or \"role\"")],
         "click": [appNeed, Need(
-            keys: ["label", "labels", "element_index", "x"],
-            text: "\"label\" (its visible name), \"element_index\", or \"x\" and \"y\""
+            keys: ["label", "labels", "element_index", "ref", "x"],
+            text: "\"label\" (its visible name), \"element_index\", \"ref\", or \"x\" and \"y\""
         )],
         "drag": [
             appNeed,
@@ -195,7 +195,8 @@ enum ArgumentNormalizer {
         }
         if tool == "click" { applyClickFlags(&args) }
         // select_text with only the words to select means the document's text: the window's one text area.
-        if tool == "select_text", !["label", "labels", "element_index"].contains(where: { isPresent(args[$0], allowsEmpty: false) }) {
+        if tool == "select_text", args["ref"] == nil,
+           !["label", "labels", "element_index"].contains(where: { isPresent(args[$0], allowsEmpty: false) }) {
             args["label"] = "text entry area"
         }
         if elementTools.contains(tool) || tool == "browser", let list = args["label"] as? [Any] {
