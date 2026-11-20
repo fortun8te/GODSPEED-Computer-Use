@@ -838,13 +838,23 @@ extension ComputerUseToolDispatcher {
         let implicit = explicit == nil && !tabless.contains(action) ? try bridge.resolveImplicitTab() : nil
         if let id = explicit ?? implicit?.id { tab["tab_id"] = id }
         return try BrowserBridge.$implicitTabGeneration.withValue(implicit?.generation) {
-            let result = try browserAction(action, arguments: arguments, bridge: bridge, tab: tab, policy: policy)
-            // A page can navigate while a read, wait or action is in flight.
-            if !result.isError, tab["tab_id"] != nil, action != "close_tab",
-               !Self.browserOpenActions.contains(action), !Self.browserPreviewActions.contains(action),
-               !Self.browserListActions.contains(action) {
+            func recheckOrigin() throws {
+                guard tab["tab_id"] != nil, action != "close_tab",
+                      !Self.browserOpenActions.contains(action), !Self.browserPreviewActions.contains(action),
+                      !Self.browserListActions.contains(action) else { return }
                 try Self.authorizeBrowserPage(policy, page: BrowserPage(bridge: bridge, tab: tab), afterDelivery: true)
             }
+            let result: ToolCallResult
+            do {
+                result = try browserAction(action, arguments: arguments, bridge: bridge, tab: tab, policy: policy)
+            } catch {
+                // A failed action may already have sent input, so its destination is checked too.
+                // A policy refusal found here takes precedence over the original error.
+                if Self.browserActionMayDeliverInput(action) { try recheckOrigin() }
+                throw error
+            }
+            // A page can navigate while a read, wait or action is in flight, including when the action reports an error.
+            if !result.isError || Self.browserActionMayDeliverInput(action) { try recheckOrigin() }
             return result
         }
     }
@@ -1015,6 +1025,9 @@ extension ComputerUseToolDispatcher {
             let destination = try hasControl
                 ? page.resolveExact(label: destinationLabel, index: destinationIndex, allowPassive: true) : nil
             let point = x.flatMap { x in y.map { CGPoint(x: x, y: $0) } }
+            // The drop target gets the same effect and risk check as a click, before any input is sent.
+            try authorizeBrowserEffect(policy, action: "drag", arguments: ["label": destinationLabel ?? ""], page: page,
+                                       node: destination, point: destination == nil ? point : nil)
             try page.drag(from: source, to: destination, point: point, modifiers: modifiers,
                           steps: options.steps ?? 5, hold: options.hold)
             if let verified = try options.verifiedDrop({ try page.waitForControl($0) }) {
