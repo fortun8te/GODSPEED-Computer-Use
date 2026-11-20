@@ -58,7 +58,6 @@ final class TeachModeTests: XCTestCase {
             resolveApp: { name in
                 name.caseInsensitiveCompare("Mail") == .orderedSame ? TeachMode.AppTarget(pid: self.mailPID, name: "Mail") : nil
             },
-            readWindow: { _ in nil },
             now: { [unowned self] in self.clock },
             scheduleTimer: false
         )

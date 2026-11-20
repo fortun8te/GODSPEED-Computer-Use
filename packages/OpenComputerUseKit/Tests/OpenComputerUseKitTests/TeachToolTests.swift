@@ -14,7 +14,6 @@ final class TeachToolTests: XCTestCase {
             store: BatchRecipes(fileURL: folder.appendingPathComponent("recipes.json")),
             makeSource: { nil },
             resolveApp: { _ in TeachMode.AppTarget(pid: 1, name: "Mail") },
-            readWindow: { _ in nil },
             now: { Date() },
             scheduleTimer: false
         )

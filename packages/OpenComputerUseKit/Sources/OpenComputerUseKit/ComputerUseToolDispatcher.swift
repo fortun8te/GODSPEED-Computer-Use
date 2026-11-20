@@ -456,7 +456,10 @@ public final class ComputerUseToolDispatcher {
         case SmartSteps.openName:
             return try SmartSteps.open(arguments: arguments, browser: { try self.callTool(name: "browser", arguments: $0) })
         case TeachMode.toolName:
-            return try teach.run(arguments: arguments)
+            // The window is read with get_app_state, so a saved recipe is tied to the window it was recorded in.
+            return try teach.run(arguments: arguments, readState: { app in
+                (try? self.callTool(name: "get_app_state", arguments: ["app": app])).map { BatchTool.stateText(of: $0) }
+            })
         case "clipboard":
             let clipboard = PrivateClipboard.current
             switch try requireString("action", in: arguments).lowercased() {

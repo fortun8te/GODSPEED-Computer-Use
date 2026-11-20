@@ -13,9 +13,8 @@ protocol TeachInputSource: AnyObject {
 final class TeachMode: @unchecked Sendable {  // every mutable field is guarded by `lock`
     static let shared = TeachMode(
         store: .shared,
-        makeSource: { nil },
-        resolveApp: { _ in nil },
-        readWindow: { _ in nil },
+        makeSource: { LiveTeachSource() },
+        resolveApp: TeachLive.runningApp(named:),
         now: { Date() }
     )
 
@@ -31,7 +30,6 @@ final class TeachMode: @unchecked Sendable {  // every mutable field is guarded 
     private let store: BatchRecipes
     private let makeSource: () -> TeachInputSource?
     private let resolveApp: (String) -> AppTarget?
-    private let readWindow: (String) -> BatchRecipes.Window?
     private let now: () -> Date
     private let scheduleTimer: Bool
     private var recorder: TeachRecorder?
@@ -40,18 +38,17 @@ final class TeachMode: @unchecked Sendable {  // every mutable field is guarded 
     private var lastOutcome: String?
 
     init(store: BatchRecipes, makeSource: @escaping () -> TeachInputSource?,
-         resolveApp: @escaping (String) -> AppTarget?, readWindow: @escaping (String) -> BatchRecipes.Window?,
+         resolveApp: @escaping (String) -> AppTarget?,
          now: @escaping () -> Date, scheduleTimer: Bool = true) {
         self.store = store
         self.makeSource = makeSource
         self.resolveApp = resolveApp
-        self.readWindow = readWindow
         self.now = now
         self.scheduleTimer = scheduleTimer
     }
 
     /// Starts recording. The reply says recording is on.
-    func start(app: String, goal: String) throws -> String {
+    func start(app: String, goal: String, readState: (String) -> String? = { _ in nil }) throws -> String {
         let appName = app.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !appName.isEmpty, !trimmedGoal.isEmpty else {
@@ -64,7 +61,7 @@ final class TeachMode: @unchecked Sendable {  // every mutable field is guarded 
         }
         guard let target = resolveApp(appName) else { throw ComputerUseError.appNotFound(appName) }
         let started = TeachRecorder(app: target.name, goal: trimmedGoal, pid: target.pid,
-                                    window: readWindow(target.name), startedAt: now())
+                                    window: BatchRecipes.Window(state: readState(target.name)), startedAt: now())
         guard let live = makeSource(), live.start(pid: target.pid, deliver: { [weak self] in self?.receive($0) }) else {
             throw ComputerUseError.permissionDenied("Teach mode could not watch \(target.name). Check Accessibility and Input Monitoring for Godspeed.")
         }
@@ -104,10 +101,10 @@ final class TeachMode: @unchecked Sendable {  // every mutable field is guarded 
     }
 
     /// The `teach` tool: action start (app, goal), stop or status.
-    func run(arguments: [String: Any]) throws -> ToolCallResult {
+    func run(arguments: [String: Any], readState: (String) -> String? = { _ in nil }) throws -> ToolCallResult {
         switch ((arguments["action"] as? String) ?? "").lowercased() {
         case "start":
-            return .text(try start(app: (arguments["app"] as? String) ?? "", goal: (arguments["goal"] as? String) ?? ""))
+            return .text(try start(app: (arguments["app"] as? String) ?? "", goal: (arguments["goal"] as? String) ?? "", readState: readState))
         case "stop":
             return .text(stop())
         case "status":
