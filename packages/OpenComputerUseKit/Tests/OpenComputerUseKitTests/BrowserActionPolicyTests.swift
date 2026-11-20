@@ -51,4 +51,25 @@ final class BrowserActionPolicyTests: XCTestCase {
             guard case ComputerUseError.actionDenied = error else { return XCTFail("\(error)") }
         }
     }
+
+    /// The user's own Chrome tabs are listed only when the browser app passes the same policy as other browser actions.
+    func testUserChromeTabsNeedBrowserAppAuthorization() throws {
+        let own = (text: #"{"result":[{"id":3,"url":"https://a.test","title":"Agent tab"}]}"#, isError: false)
+        let userTabs = #"{"result":[{"id":9,"url":"https://bank.test","title":"Bank"}]}"#
+        let denied = try JSONDecoder().decode(ActionPolicy.self, from: Data(#"{"apps":{"com.google.Chrome":"deny"}}"#.utf8))
+        var asked = false
+        let refused = try ComputerUseToolDispatcher.tabListingText(policy: denied, own: own, userTabs: {
+            asked = true
+            return (text: userTabs, isError: false)
+        })
+        XCTAssertFalse(asked, "user tabs must not be read when the browser app is denied")
+        XCTAssertTrue(refused.contains("Agent tab"))
+        XCTAssertFalse(refused.contains("Bank"))
+
+        let open = try JSONDecoder().decode(ActionPolicy.self, from: Data("{}".utf8))
+        let listed = try ComputerUseToolDispatcher.tabListingText(policy: open, own: own, userTabs: {
+            (text: userTabs, isError: false)
+        })
+        XCTAssertTrue(listed.contains("Bank"))
+    }
 }
