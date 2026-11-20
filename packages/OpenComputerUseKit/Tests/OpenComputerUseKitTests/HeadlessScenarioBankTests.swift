@@ -63,6 +63,31 @@ final class HeadlessScenarioBankTests: XCTestCase {
         }
     }
 
+    func testPinnedFirstClickKeepsObservedRoot() throws {
+        // AXFocusedWindow supplied the observation. AXWindows can expose a different
+        // accessibility object for the same native ID, ahead of that very same root.
+        try run("pinned_first_click") { seed in
+            struct Root {
+                let windowID: UInt32
+                let object: Int
+            }
+            let observed = Root(windowID: 18855 + UInt32(seed), object: 1)
+            let otherObject = Root(windowID: observed.windowID, object: 2)
+            let otherWindow = Root(windowID: observed.windowID + 1, object: 1)
+            let matchingRootIsLive = seed.isMultiple(of: 2)
+            let live = SnapshotBuilder.selectNativeWindow(
+                listed: [otherWindow, otherObject], focused: { matchingRootIsLive ? observed : nil },
+                matchesID: { $0.windowID == observed.windowID },
+                matchesObservedRoot: { $0.object == observed.object }
+            )
+            return (
+                ["window_id": String(observed.windowID), "original_root_present": String(matchingRootIsLive)],
+                matchingRootIsLive ? "1" : "refused",
+                live.map { String($0.object) } ?? "refused"
+            )
+        }
+    }
+
     func testFormExpansion() throws {
         try run("forms") { seed in
             let value = "Answer \(seed)"

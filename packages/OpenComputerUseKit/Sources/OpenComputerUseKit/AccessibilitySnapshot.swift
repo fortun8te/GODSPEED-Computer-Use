@@ -2600,7 +2600,9 @@ extension SnapshotBuilder {
     /// Mirrors the window-finding prologue of `build` without the tree walk or
     /// capture, so it never redirects input or steals focus. `windowID` selects a
     /// specific window; otherwise the app's current focused window is used.
-    static func resolveTargetWindow(for app: RunningAppDescriptor, windowID: CGWindowID? = nil) throws -> TargetedAX.WindowContext {
+    static func resolveTargetWindow(
+        for app: RunningAppDescriptor, windowID: CGWindowID? = nil, matchingRoot: AXUIElement? = nil
+    ) throws -> TargetedAX.WindowContext {
         if app.name == FixtureBridge.appName {
             throw ComputerUseError.message("targeted lookup is not supported for fixture apps")
         }
@@ -2611,7 +2613,8 @@ extension SnapshotBuilder {
 
         let appElement = AXUIElementCreateApplication(app.pid)
         AXUIElementSetMessagingTimeout(appElement, 0.1)
-        _ = enableBestEffortAccessibilityModes(appElement)
+        // Revalidation must keep the same AX tree.
+        if matchingRoot == nil { _ = enableBestEffortAccessibilityModes(appElement) }
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, 0.1)
         // This object changes the process-wide timeout, not just one AX reference.
@@ -2619,7 +2622,23 @@ extension SnapshotBuilder {
         let focusedApplication = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute)
 
         let rootWindow: AXUIElement
-        if let windowID, let named = windowElement(for: windowID, appElement: appElement) {
+        if let windowID, let named = selectNativeWindow(
+            listed: copyArray(appElement, attribute: kAXWindowsAttribute) ?? [],
+            focused: {
+                // AXWindows leaves sheets out. Check the focus sources that can
+                // supply the original observation when looking for the same root.
+                let appWindow = copyElement(appElement, attribute: kAXFocusedWindowAttribute)
+                guard let matchingRoot, let focusedApplication, pid(of: focusedApplication) == app.pid else {
+                    return appWindow
+                }
+                if let appWindow, CFEqual(appWindow, matchingRoot) { return appWindow }
+                return [copyElement(systemWide, attribute: kAXFocusedWindowAttribute),
+                        copyElement(focusedApplication, attribute: kAXFocusedWindowAttribute)]
+                    .compactMap { $0 }.first { CFEqual($0, matchingRoot) }
+            },
+            matchesID: { SkyLightSPI.shared.windowID(for: $0) == windowID },
+            matchesObservedRoot: matchingRoot.map { root in { CFEqual($0, root) } }
+        ) {
             rootWindow = named
         } else if let windowID {
             throw ComputerUseError.stateUnavailable("window_id \(windowID) is not a current window of \(app.bundleIdentifier ?? app.name).")
@@ -2691,11 +2710,13 @@ extension SnapshotBuilder {
         return false
     }
 
-    private static func windowElement(for windowID: CGWindowID, appElement: AXUIElement) -> AXUIElement? {
-        let isWindow = { SkyLightSPI.shared.windowID(for: $0) == windowID }
-        // AXWindows leaves sheets out; a sheet is found as the focused window.
-        return copyArray(appElement, attribute: kAXWindowsAttribute)?.first(where: isWindow)
-            ?? copyElement(appElement, attribute: kAXFocusedWindowAttribute).flatMap { isWindow($0) ? $0 : nil }
+    static func selectNativeWindow<Root>(
+        listed: [Root], focused: () -> Root?, matchesID: (Root) -> Bool, matchesObservedRoot: ((Root) -> Bool)?
+    ) -> Root? {
+        // Filter by both identities before choosing. A different AX object for
+        // the same native ID must not hide the observed object.
+        func matches(_ root: Root) -> Bool { matchesID(root) && matchesObservedRoot?(root) != false }
+        return listed.first(where: matches) ?? focused().flatMap { matches($0) ? $0 : nil }
     }
 
     // Attributes read for every visited node, in one batched IPC call. Position
