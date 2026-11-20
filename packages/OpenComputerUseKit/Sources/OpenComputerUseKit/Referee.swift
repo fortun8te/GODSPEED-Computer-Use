@@ -212,6 +212,7 @@ enum HelperHTTP {
     }
 
     private static func send(_ request: URLRequest, timeout: TimeInterval) -> Data? {
+        guard !RequestCancellation.requested else { return nil }
         let box = ReplyBox()
         let done = DispatchSemaphore(value: 0)
         let task = URLSession.shared.dataTask(with: request) { data, response, _ in
@@ -220,11 +221,14 @@ enum HelperHTTP {
             box.set(data)
         }
         task.resume()
-        if done.wait(timeout: .now() + timeout + 0.05) == .timedOut {
-            task.cancel()
-            return nil
+        let deadline = DispatchTime.now() + timeout + 0.05
+        while !RequestCancellation.requested, DispatchTime.now() < deadline {
+            if done.wait(timeout: min(deadline, .now() + .milliseconds(50))) == .success {
+                return RequestCancellation.requested ? nil : box.get()
+            }
         }
-        return box.get()
+        task.cancel()
+        return nil
     }
 }
 

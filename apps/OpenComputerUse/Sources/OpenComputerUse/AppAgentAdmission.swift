@@ -1,4 +1,5 @@
 import Foundation
+import OpenComputerUseKit
 
 /// Coordinates request threads in the app agent. Callers must classify requests
 /// before entering and keep any protected work inside the admitted closure.
@@ -52,10 +53,11 @@ final class AppAgentAdmission: @unchecked Sendable {
             queuedReaders.append((ticket, client))
             while exclusive || (!queuedWriters.isEmpty && !readerTurnDue)
                     || readers.count >= readerLimit || nextReader() != ticket {
-                guard condition.wait(until: deadline) else {
+                guard wait(until: deadline) else {
                     queuedReaders.removeAll { $0.ticket == ticket }
                     condition.broadcast()
                     condition.unlock()
+                    try RequestCancellation.check()
                     throw Timeout()
                 }
             }
@@ -70,6 +72,7 @@ final class AppAgentAdmission: @unchecked Sendable {
                 condition.broadcast()
                 condition.unlock()
             }
+            try RequestCancellation.check()
             return try body()
         }
 
@@ -77,10 +80,11 @@ final class AppAgentAdmission: @unchecked Sendable {
         condition.lock()
         queuedWriters.append(ticket)
         while exclusive || !readers.isEmpty || queuedWriters.first != ticket || readerTurnDue {
-            guard condition.wait(until: deadline) else {
+            guard wait(until: deadline) else {
                 queuedWriters.removeAll { $0 == ticket }
                 condition.broadcast()
                 condition.unlock()
+                try RequestCancellation.check()
                 throw Timeout()
             }
         }
@@ -94,6 +98,13 @@ final class AppAgentAdmission: @unchecked Sendable {
             condition.broadcast()
             condition.unlock()
         }
+        try RequestCancellation.check()
         return try body()
+    }
+
+    private func wait(until deadline: Date) -> Bool {
+        guard !RequestCancellation.requested, Date() < deadline else { return false }
+        _ = condition.wait(until: min(deadline, Date().addingTimeInterval(0.05)))
+        return !RequestCancellation.requested && Date() < deadline
     }
 }

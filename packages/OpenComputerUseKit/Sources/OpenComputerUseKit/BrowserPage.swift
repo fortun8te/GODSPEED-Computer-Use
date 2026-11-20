@@ -1512,7 +1512,7 @@ final class BrowserPage {
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(20, max(0, BrowserCallBudget.remaining()))
         let observed: BrowserLocation? = try BrowserCallBudget.withDeadline(deadline) {
-            while deadline - clock.systemUptime > 0.3 {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 try BrowserRequestContext.validateCurrent()
                 if (try? reachedTarget()) == true, let place = try? location(),
                    place.readyState == "interactive" || place.readyState == "complete" {
@@ -1547,7 +1547,7 @@ final class BrowserPage {
         let start = clock.systemUptime
         let deadline = start + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
         return BrowserCallBudget.withDeadline(deadline) {
-            while deadline - clock.systemUptime > 0.3 {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 do { try BrowserRequestContext.validateCurrent() } catch { return false }
                 if let here = try? location(),
                    here.readyState == "interactive" || here.readyState == "complete" {
@@ -1571,7 +1571,7 @@ final class BrowserPage {
     /// to load and returns it.
     func followNavigation(from old: String) -> BrowserLocation? {
         let deadline = Date().addingTimeInterval(1.5)
-        while Date() < deadline {
+        while !RequestCancellation.requested && Date() < deadline {
             if let here = try? location(), here.href != old {
                 waitLoad(changedFrom: old, timeout: 20)
                 settle()
@@ -1611,7 +1611,7 @@ final class BrowserPage {
         let deadline = start + min(quietLimit + 1, max(0, BrowserCallBudget.remaining()))
         let last: [String: Any]? = BrowserCallBudget.withDeadline(deadline) {
             var observed: [String: Any]?
-            while deadline - clock.systemUptime > 0.3 {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 let payload = try? cdp("Runtime.evaluate", ["returnByValue": true, "expression": Self.settleProbeJS])
                 guard let value = (payload?["result"] as? [String: Any])?["value"] as? [String: Any],
                       (value["ok"] as? Bool) == true else { break }
@@ -1662,7 +1662,7 @@ final class BrowserPage {
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining()))
         return BrowserCallBudget.withDeadline(deadline) {
-            while clock.systemUptime < deadline {
+            while !RequestCancellation.requested && clock.systemUptime < deadline {
                 do { try BrowserRequestContext.validateCurrent() } catch { return false }
                 if let urlContains {
                     if let place = try? location(),

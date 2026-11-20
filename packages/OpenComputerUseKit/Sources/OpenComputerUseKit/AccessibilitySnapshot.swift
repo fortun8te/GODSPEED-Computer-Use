@@ -380,6 +380,7 @@ enum SnapshotBuilder {
         if lazyWebAccessibility, !renderer.hasWebArea {
             if pinned {
                 for _ in 0..<webAreaRewalkAttempts {
+                    if RequestCancellation.requested { break }
                     Thread.sleep(forTimeInterval: webAreaRewalkInterval)
                     numbering?.beginSnapshot()
                     renderer = TreeRenderer(context: context)
@@ -962,25 +963,19 @@ enum BlockingAsyncBridge {
     }
 
     private static func waitForSignal(_ semaphore: DispatchSemaphore, timeout: TimeInterval?) -> Bool {
-        let deadline = timeout.map { Date(timeIntervalSinceNow: $0) }
-
-        if Thread.isMainThread {
-            while semaphore.wait(timeout: .now()) == .timedOut {
-                if let deadline, Date() >= deadline {
-                    return false
-                }
-
+        let deadline = timeout.map { DispatchTime.now() + $0 }
+        while !RequestCancellation.requested {
+            let now = DispatchTime.now()
+            if let deadline, now >= deadline { return false }
+            if Thread.isMainThread {
+                if semaphore.wait(timeout: .now()) == .success { return true }
                 RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+            } else {
+                let next = now + .milliseconds(50)
+                if semaphore.wait(timeout: min(deadline ?? next, next)) == .success { return true }
             }
-            return true
         }
-
-        if let timeout {
-            return semaphore.wait(timeout: .now() + timeout) == .success
-        }
-
-        semaphore.wait()
-        return true
+        return false
     }
 }
 

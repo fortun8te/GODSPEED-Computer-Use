@@ -29,16 +29,19 @@ public final class StdioMCPServer {
 
     public func run() throws {
         defer { endSession() }
-        while let line = readLine(strippingNewline: true) {
-            guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                continue
+        let requests = MCPRequestStream()
+        Thread.detachNewThread {
+            while let line = readLine(strippingNewline: true) {
+                autoreleasepool { requests.receive(line, rpcLine: line) }
             }
-
-            // This thread's autorelease pool never drains on its own: each response's encoded
-            // bytes (a screenshot's base64 among them) stayed alive for the whole session.
+            requests.disconnect()
+        }
+        while let request = requests.next() {
             autoreleasepool {
-                if let response = handle(line: line) {
-                    FileHandle.standardOutput.write((response + "\n").data(using: .utf8)!)
+                RequestCancellation.$current.withValue(request.cancellation) {
+                    if let response = handle(line: request.line) {
+                        FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                    }
                 }
             }
         }
@@ -73,7 +76,7 @@ public final class StdioMCPServer {
                         "instructions": computerUseServerInstructions,
                     ]
                 )
-            case "notifications/initialized":
+            case "notifications/initialized", "notifications/cancelled":
                 return nil
             case "notifications/turn-ended":
                 endSession()

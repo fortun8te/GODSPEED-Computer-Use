@@ -33,6 +33,7 @@ final class LockedUseConnection: @unchecked Sendable {
     deinit { if clientSocket >= 0 { Darwin.close(clientSocket) } }
 
     func perform<T>(_ body: () throws -> T) throws -> T {
+        try RequestCancellation.check()
         let session = LockedUseSession.current()
         guard session.state != .unavailable else {
             throw ComputerUseError.stateUnavailable("No completed GUI session for the current console user is available. Sign in normally before using Godspeed.")
@@ -146,6 +147,7 @@ final class LockedUseConnection: @unchecked Sendable {
             startPolling()
             let deadline = startupDeadline
             while ProcessInfo.processInfo.systemUptime < deadline {
+                try RequestCancellation.check()
                 let status = try connection.request(.init(operation: .status, leaseID: lease, session: .current()))
                 receive(status)
                 if status.result == .active { recoveryDeadline.cancel(); return }

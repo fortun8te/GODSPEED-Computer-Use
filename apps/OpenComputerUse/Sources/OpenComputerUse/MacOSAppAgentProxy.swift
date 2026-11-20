@@ -171,8 +171,23 @@ enum MacOSAppAgentProxy {
         var client = initialClient
         var environment = proxiedEnvironment(mcpSession: UUID())
         var canIdentifyClient = environment[cursorNameEnvironmentKey] == nil
-        while let line = readLine(strippingNewline: true) {
-            guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let requests = MCPRequestStream()
+        Thread.detachNewThread {
+            while let line = readLine(strippingNewline: true) {
+                autoreleasepool { requests.receive(line, rpcLine: line) }
+            }
+            requests.disconnect()
+        }
+        while let request = requests.next() {
+            let line = request.line
+            if request.cancellation.isCancelled {
+                if let id = jsonRPCRequestID(line),
+                   let reply = try? JSONSerialization.data(withJSONObject: [
+                       "jsonrpc": "2.0", "id": id,
+                       "error": ["code": -32000, "message": "Request cancelled before dispatch. No steps ran."],
+                   ]) {
+                    FileHandle.standardOutput.write(reply + Data([10]))
+                }
                 continue
             }
             if canIdentifyClient {
@@ -187,7 +202,7 @@ enum MacOSAppAgentProxy {
                         "kind": "mcp",
                         "line": line,
                         "environment": environment,
-                    ])
+                    ], cancellation: request.cancellation, rpcID: jsonRPCRequestID(line))
 
                     if let responseLine = response["response"] as? String {
                         FileHandle.standardOutput.write(Data((responseLine + "\n").utf8))
@@ -530,27 +545,29 @@ private final class AppAgentConnection: @unchecked Sendable {
     }
 
     func run() {
-        guard let file = fdopen(fileDescriptor, "r+") else {
+        // A dedicated reader can observe cancellation and EOF even during a long dispatch.
+        // Use independent streams so stdio's FILE lock cannot block replies behind reads.
+        let outputFD = dup(fileDescriptor)
+        guard outputFD >= 0, let output = fdopen(outputFD, "w") else {
+            if outputFD >= 0 { close(outputFD) }
             close(fileDescriptor)
             return
         }
-        let monitorQueue = DispatchQueue(label: "ocu.client-disconnect")
-        let monitor = DispatchSource.makeTimerSource(queue: monitorQueue)
-        // Polls only while a request runs (rescheduled below): between requests the blocking
-        // read sees the hang-up itself, and an idle client cost 10 wakeups a second.
-        monitor.schedule(deadline: .distantFuture)
-        monitor.setEventHandler { [self] in
-            var byte: UInt8 = 0
-            let count = recv(fileDescriptor, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
-            if count == 0 || count < 0 && ![EAGAIN, EWOULDBLOCK, EINTR].contains(errno) {
-                lockedUse.end(disconnecting: true)
-                monitor.cancel()
-            }
+        guard let input = fdopen(fileDescriptor, "r") else {
+            fclose(output)
+            close(fileDescriptor)
+            return
         }
-        monitor.resume()
-        defer {
-            monitor.cancel(); monitorQueue.sync {}
+        _ = fcntl(fileDescriptor, F_SETFD, FD_CLOEXEC)
+        _ = fcntl(outputFD, F_SETFD, FD_CLOEXEC)
+        let requests = MCPRequestStream()
+        // The pointer belongs to the reader until EOF. The worker only writes.
+        let source = AppAgentLineSource(file: input)
+        Thread.detachNewThread { [self] in
+            source.read(into: requests)
             lockedUse.end(disconnecting: true)
+        }
+        defer {
             if let probe = keychainProbe { keychainProbe = nil; LockedUseDeferredCleanup.shared.retainIfNeeded(probe) }
             server?.flushTrajectory()
             // An explicitly shared identity must not detach browser tabs while
@@ -564,18 +581,15 @@ private final class AppAgentConnection: @unchecked Sendable {
                     }
                 }
             }
-            fclose(file)
+            fclose(output)
         }
 
-        while let line = readAgentLine(file) {
-            // A pool per request: this thread's own drains only when the client disconnects.
+        while let request = requests.next() {
             autoreleasepool {
-                monitor.schedule(deadline: .now(), repeating: .milliseconds(100))
-                let response = handle(requestLine: line)
-                writeAgentLine(response, to: file)
-                // A slow reader can also block the response write. Keep disconnect
-                // monitoring active until the whole exchange has finished.
-                monitor.schedule(deadline: .distantFuture)
+                let response = RequestCancellation.$current.withValue(request.cancellation) {
+                    handle(requestLine: request.line)
+                }
+                writeAgentLine(response, to: output)
             }
         }
     }
@@ -898,9 +912,12 @@ struct AppAgentResponseTimeout: LocalizedError {
 
 private final class AppAgentSocketClient: @unchecked Sendable {
     private let file: UnsafeMutablePointer<FILE>
+    private let descriptor: Int32
 
     private init(file: UnsafeMutablePointer<FILE>) {
         self.file = file
+        descriptor = fileno(file)
+        _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
     }
 
     deinit {
@@ -961,14 +978,28 @@ private final class AppAgentSocketClient: @unchecked Sendable {
     /// Set once a request timed out: the late reply would otherwise be read as the answer to the next request.
     private var timedOut = false
 
-    func request(_ object: [String: Any]) throws -> [String: Any] {
+    func request(
+        _ object: [String: Any], cancellation: RequestCancellation? = nil, rpcID: Any? = nil
+    ) throws -> [String: Any] {
         if timedOut { throw AppAgentResponseTimeout() }
         let data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
         guard let line = String(data: data, encoding: .utf8) else {
             throw ComputerUseError.message("Failed to encode app-agent request.")
         }
 
+        // Only the worker writes normal requests. The reader can send one
+        // cancellation after this line is flushed, while the worker awaits its reply.
         writeAgentLine(line, to: file)
+        let cancel = Self.cancellationEnvelope(id: rpcID)
+        cancellation?.onCancel { [self] disconnected in
+            if disconnected {
+                shutdown(descriptor, SHUT_RDWR)
+            } else if let cancel {
+                let count = cancel.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+                if count != cancel.count { shutdown(descriptor, SHUT_RDWR) }
+            }
+        }
+        defer { cancellation?.onCancel(nil) }
 
         let responseLine = readAgentLine(file)
         // A read that hit the timeout returns what arrived so far (possibly a partial line): check it before using it.
@@ -988,6 +1019,17 @@ private final class AppAgentSocketClient: @unchecked Sendable {
         }
 
         return response
+    }
+
+    private static func cancellationEnvelope(id: Any?) -> Data? {
+        guard let id,
+              let rpc = try? JSONSerialization.data(withJSONObject: [
+                  "jsonrpc": "2.0", "method": "notifications/cancelled", "params": ["requestId": id],
+              ]),
+              let envelope = try? JSONSerialization.data(withJSONObject: [
+                  "kind": "mcp", "line": String(decoding: rpc, as: UTF8.self),
+              ]) else { return nil }
+        return envelope + Data([10])
     }
 
     func waitForDisconnect() -> Bool {
@@ -1039,6 +1081,24 @@ private final class AppAgentSocketClient: @unchecked Sendable {
             .appendingPathComponent("MacOS", isDirectory: true)
             .appendingPathComponent(executableName)
             .standardizedFileURL
+    }
+}
+
+private final class AppAgentLineSource: @unchecked Sendable {
+    private let file: UnsafeMutablePointer<FILE>
+
+    init(file: UnsafeMutablePointer<FILE>) { self.file = file }
+
+    func read(into requests: MCPRequestStream) {
+        defer { fclose(file) }
+        while let line = readAgentLine(file) {
+            autoreleasepool {
+                let envelope = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                let rpc = envelope?["kind"] as? String == "mcp" ? envelope?["line"] as? String : nil
+                requests.receive(line, rpcLine: rpc)
+            }
+        }
+        requests.disconnect()
     }
 }
 
