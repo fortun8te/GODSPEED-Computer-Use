@@ -535,6 +535,10 @@ public final class ComputerUseToolDispatcher {
             }
             return try service.typeText(app: app, text: text, keyMethod: keyMethod)
         case "press_key":
+            if let hold = try ActionOptions.duration("hold_ms", in: arguments, maxMs: 1000) {
+                return try service.holdKey(app: requireString("app", in: arguments), key: requireString("key", in: arguments),
+                    method: parseKeyMethod(optionalString("key_method", in: arguments)), hold: hold)
+            }
             return try service.pressKey(
                 app: requireString("app", in: arguments),
                 key: requireString("key", in: arguments),

@@ -96,6 +96,33 @@ final class ActionHardeningTests: XCTestCase {
         })
     }
 
+    func testHeldKeysReleaseOnceOnSuccessOrUncertainPress() throws {
+        var events: [String] = []
+        try BrowserPage.deliverHeldKey(hold: 0.2, pause: { events.append("hold \($0)") },
+                                       press: { events.append("down") }, release: { events.append("up") })
+        XCTAssertEqual(events, ["down", "hold 0.2", "up"])
+        events.removeAll()
+        XCTAssertThrowsError(try BrowserPage.deliverHeldKey(hold: 0.2, pause: { _ in XCTFail("Unexpected hold") },
+            press: { events.append("down"); throw ComputerUseError.stateUnavailable("Uncertain press.") },
+            release: { events.append("up") }))
+        XCTAssertEqual(events, ["down", "up"])
+        XCTAssertTrue(ActionOptions.usesStrictRoute("press_key", ["hold_ms": 200]))
+    }
+
+    func testNativeHeldKeyReleasesItsModifiersWhenFocusChanges() throws {
+        let chord = try KeyPressParser.parse("shift+Down", layout: { _ in nil })
+        var events: [CGEvent] = []
+        var maySend = true
+        XCTAssertThrowsError(try InputSimulation.deliverHeldKey(chord, hold: 0.2, validate: {
+            if !maySend { throw ComputerUseError.stateUnavailable("Window changed.") }
+        }, post: { events.append($0) }, release: { events.append($0) }, pause: { _ in maySend = false }))
+        XCTAssertEqual(Array(events.dropFirst().dropLast()).map(\.type), [.keyDown, .keyUp])
+        XCTAssertTrue(events.dropLast().allSatisfy { $0.flags.contains(.maskShift) })
+        XCTAssertFalse(events.last?.flags.contains(.maskShift) ?? true)
+        XCTAssertEqual(events.map { $0.getIntegerValueField(.keyboardEventKeycode) },
+                       [chord.modifiers[0].keyCode, chord.keyCode, chord.keyCode, chord.modifiers[0].keyCode].map(Int64.init))
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

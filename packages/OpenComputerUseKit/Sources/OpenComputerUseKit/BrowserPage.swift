@@ -1156,26 +1156,26 @@ final class BrowserPage {
     """
 
     /// Presses a key or key combination ("Enter", "Cmd+A", "ctrl+shift+z"): keyDown then keyUp.
-    func pressKey(_ raw: String) throws {
+    func pressKey(_ raw: String, hold: TimeInterval? = nil) throws {
         guard let combo = BrowserKeyCombo.parse(raw) else {
             throw ComputerUseError.invalidArguments(
                 "browser: key \"\(raw)\" is not known; use Enter, Tab, Escape, Backspace, Delete, Space, arrows, Home, End, PageUp/PageDown, or a letter or digit with Cmd, Ctrl, Alt or Shift (e.g. Cmd+A)"
             )
         }
         restoreSetup()
-        try send(combo)
+        try send(combo, hold: hold)
     }
 
     /// A key press followed by the one change line (Enter often submits or navigates).
-    func pressKeyAndWatch(_ raw: String) throws -> BrowserChange {
-        guard BrowserKeyCombo.parse(raw) != nil else { try pressKey(raw); return .none }
+    func pressKeyAndWatch(_ raw: String, hold: TimeInterval? = nil) throws -> BrowserChange {
+        guard BrowserKeyCombo.parse(raw) != nil else { try pressKey(raw, hold: hold); return .none }
         restoreSetup()
         markBaseline()
-        try pressKey(raw)
+        try pressKey(raw, hold: hold)
         return settle()
     }
 
-    private func send(_ combo: BrowserKeyCombo) throws {
+    private func send(_ combo: BrowserKeyCombo, hold: TimeInterval? = nil) throws {
         var down: [String: Any] = [
             "type": "keyDown", "key": combo.key,
             "windowsVirtualKeyCode": combo.virtualKey, "modifiers": combo.modifiers,
@@ -1187,8 +1187,31 @@ final class BrowserPage {
         if !combo.code.isEmpty { down["code"] = combo.code; up["code"] = combo.code }
         if let text = combo.text { down["text"] = text }
         if !combo.commands.isEmpty { down["commands"] = combo.commands }
-        _ = try cdp("Input.dispatchKeyEvent", down)
-        _ = try cdp("Input.dispatchKeyEvent", up)
+        if let hold {
+            try Self.deliverHeldKey(hold: hold, press: { _ = try cdp("Input.dispatchKeyEvent", down) },
+                                   release: { _ = try cdp("Input.dispatchKeyEvent", up) })
+        } else {
+            _ = try cdp("Input.dispatchKeyEvent", down)
+            _ = try cdp("Input.dispatchKeyEvent", up)
+        }
+    }
+
+    static func deliverHeldKey(hold: TimeInterval, pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+                               press: () throws -> Void, release: () throws -> Void) throws {
+        try ActionOptions.requireTime(for: hold + 3)
+        let deadline = BrowserCallBudget.deadline(after: BrowserCallBudget.remaining())
+        do {
+            try BrowserCallBudget.withDeadline(deadline - 1.5, press)
+        } catch {
+            try? BrowserCallBudget.withDeadline(deadline, release)
+            throw ComputerUseError.stateUnavailable("The held key may have reached the tab. Inspect it before repeating.")
+        }
+        if hold > 0 { pause(hold) }
+        do {
+            try BrowserCallBudget.withDeadline(deadline, release)
+        } catch {
+            throw ComputerUseError.stateUnavailable("Chrome did not confirm key release. Inspect the tab before repeating.")
+        }
     }
 
     /// Verify and select within the target's own document or shadow root.

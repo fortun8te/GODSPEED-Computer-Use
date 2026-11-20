@@ -8,6 +8,7 @@ enum ActionOptions {
         switch tool {
         case "scroll_into_view", "wait_for": return true
         case "drag": return DragOptions.isRequested(args)
+        case "press_key": return args["hold_ms"] != nil
         case "hover": return args["dwell_ms"] != nil
         case "select_text": return TextRangeRequest.isRequested(args)
         case "scroll": return ScrollChunks.isRequested(args)
