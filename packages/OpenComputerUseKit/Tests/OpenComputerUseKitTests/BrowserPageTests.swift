@@ -481,6 +481,24 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNotNil(BrowserRules.appendNote(expected: "hello!", actual: nil))
     }
 
+    func testAppendExpectationInsertsAtTheCapturedSelectionInUTF16Offsets() {
+        // A nonterminal caret: the text lands between the captured offsets, not at the end.
+        XCTAssertEqual(BrowserRules.appendExpectation(value: "abcd", selectionStart: 2, selectionEnd: 2, typed: "X"), "abXcd")
+        // A selection is replaced, and offsets count UTF-16 units (the emoji takes two).
+        XCTAssertEqual(BrowserRules.appendExpectation(value: "a\u{1F600}bc", selectionStart: 3, selectionEnd: 4, typed: "X"), "a\u{1F600}Xc")
+        XCTAssertNil(BrowserRules.appendExpectation(value: "ab", selectionStart: 3, selectionEnd: 3, typed: "X"))
+        XCTAssertNil(BrowserRules.appendExpectation(value: "ab", selectionStart: 2, selectionEnd: 1, typed: "X"))
+    }
+
+    func testDroppedDuplicateAppendIsNotConfirmedEvenWhenTheTextAlreadySits() throws {
+        // First append landed: the field reads "hellox". A second, identical append was dropped.
+        let expected = try XCTUnwrap(BrowserRules.appendExpectation(value: "hellox", selectionStart: 6, selectionEnd: 6, typed: "x"))
+        XCTAssertEqual(expected, "helloxx")
+        XCTAssertTrue(BrowserRules.fieldMatches(actual: "hellox", typed: "x", replaced: false), "the loose check alone would accept it")
+        XCTAssertNotNil(BrowserRules.appendNote(expected: expected, actual: "hellox"))
+        XCTAssertNil(BrowserRules.appendNote(expected: expected, actual: "helloxx"))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {
