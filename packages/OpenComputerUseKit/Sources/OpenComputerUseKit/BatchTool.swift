@@ -693,6 +693,11 @@ extension ComputerUseToolDispatcher {
         func markStepObservation(_ observation: BatchEffects.Receipt) {
             receipt.steps[receipt.steps.count - 1].observation = observation
         }
+        // Per-click outcome for the step receipt (ClickVerifier). Never triggers a retry.
+        func markStepVerdict(_ verdict: ClickVerifier.Verdict?) {
+            guard let verdict, !receipt.steps.isEmpty else { return }
+            receipt.steps[receipt.steps.count - 1].verification = verdict
+        }
         var failed = false
         var lastApp = defaultApp
         var changedSomething = false
@@ -745,7 +750,7 @@ extension ComputerUseToolDispatcher {
         /// effect reads run, and checked before element steps once they stop.
         var boundIdentity: BatchEffects.WindowIdentity?
         var goneReported = Set<Int>()
-        var pendingLastEffect: (app: String, before: String, position: Int, line: Int, tool: String)?
+        var pendingLastEffect: (app: String, before: String, position: Int, line: Int, tool: String, target: String)?
         var failedNumber = 0
         func windowID(_ app: String) -> UInt32? {
             (try? AppDiscovery.resolveRunning(app)).flatMap { ElementNumbering.forApp(pid: $0.pid).currentWindowID }
@@ -774,11 +779,27 @@ extension ComputerUseToolDispatcher {
         /// Effect and window lines for a step that took `before` to `after`; follows a dialog, remembers a move.
         /// `noEffect` is true when the step should have changed something and nothing visible did: the step
         /// line then ends with "no effect seen" instead of a separate "no visible change" line.
-        func effectLines(before: String, after: String, sig: BatchEffects.WindowSig, tool: String) -> (lines: [String], noEffect: Bool) {
+        /// Click-like steps are judged by ClickVerifier instead: "no effect" needs complete, same-window reads.
+        func effectLines(before: String, after: String, sig: BatchEffects.WindowSig, tool: String, target: String = "")
+            -> (lines: [String], noEffect: Bool, verdict: ClickVerifier.Verdict?) {
             var raw = BatchEffects.effectLines(before: before, after: after, reportedGone: &goneReported)
-            let noEffect = BatchEffects.sawNoChange(raw) && BatchEffects.expectsVisibleChange(tool: tool)
+            var noEffect = BatchEffects.sawNoChange(raw) && BatchEffects.expectsVisibleChange(tool: tool)
+            var verdict: ClickVerifier.Verdict?
+            if ClickVerifier.applies(tool: tool) {
+                let windowChanged = boundWindow.map { BatchEffects.compare(bound: $0, now: sig) != .same } ?? false
+                let judged = ClickVerifier.verdict(
+                    before: before, after: after, beforeWindowID: boundWindow?.id, afterWindowID: sig.id,
+                    windowChanged: windowChanged, effectLines: raw,
+                    events: SemanticChanges.events(before: before, after: after))
+                verdict = judged
+                noEffect = judged == .noEffectSeen
+                if BatchEffects.sawNoChange(raw) { raw = [] }
+            }
             if noEffect { raw = [] }
             var result = raw.map { "   " + $0 }
+            if noEffect, ClickVerifier.applies(tool: tool) {
+                result.append("   " + ClickVerifier.noEffectLine(tool: tool, target: target))
+            }
             if let bound = boundWindow {
                 switch BatchEffects.compare(bound: bound, now: sig) {
                 case .same:
@@ -792,7 +813,7 @@ extension ComputerUseToolDispatcher {
                     result.append("   windows: now \"\(title)\", not the window this batch started in")
                 }
             }
-            return (result, noEffect)
+            return (result, noEffect, verdict)
         }
 
         // These private baseline reads leave the caller's window and element references in place.
@@ -1083,16 +1104,18 @@ extension ComputerUseToolDispatcher {
             // What this step changed. The last step is judged against the final read below.
             if effectsOn, !effectBudget.exhausted, isMutating, let app = stepApp, watchApp == app, let before = watchState {
                 if isLastStep {
-                    pendingLastEffect = (app, before, lines.count, stepLineIndex, step.tool)
+                    pendingLastEffect = (app, before, lines.count, stepLineIndex, step.tool, ClickVerifier.target(arguments: step.arguments))
                 } else if let read = BatchEffects.Watch.afterAction(
                     snapshot: stepLog.afterActionSnapshot, before: before, tool: step.tool,
                     fallback: { readWatch(app, settleMs: 600) }
                 ) {
-                    let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool)
+                    let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool,
+                                             target: ClickVerifier.target(arguments: step.arguments))
                     if effect.noEffect {
                         lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen)
                         markStepObservation(.noEffectSeen)
                     }
+                    markStepVerdict(effect.verdict)
                     lines += effect.lines
                     watchState = read.text
                 } else {
@@ -1293,11 +1316,12 @@ extension ComputerUseToolDispatcher {
         if let pending = pendingLastEffect, !failed {
             if let observation, !observation.isError, let text = LeanOutput.stateText(of: observation) {
                 let sig = BatchEffects.windowSig(state: text, id: windowID(pending.app))
-                let effect = effectLines(before: pending.before, after: text, sig: sig, tool: pending.tool)
+                let effect = effectLines(before: pending.before, after: text, sig: sig, tool: pending.tool, target: pending.target)
                 if effect.noEffect, pending.line < lines.count {
                     lines[pending.line] = BatchEffects.line(lines[pending.line], receipt: .noEffectSeen)
                     markStepObservation(.noEffectSeen)
                 }
+                markStepVerdict(effect.verdict)
                 lines.insert(contentsOf: effect.lines, at: min(pending.position, lines.count))
             } else if pending.line < lines.count {
                 lines[pending.line] = BatchEffects.line(lines[pending.line], receipt: .outcomeUnknown)
