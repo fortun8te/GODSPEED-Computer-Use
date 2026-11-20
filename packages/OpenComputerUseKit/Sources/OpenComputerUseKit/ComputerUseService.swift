@@ -1351,6 +1351,38 @@ public final class ComputerUseService {
         return .text(try outcome.reply(label: chunks.untilVisible))
     }
 
+    func waitForControl(app query: String, wait: ControlWait) throws -> ToolCallResult {
+        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+        guard let id = snapshot.targetWindowID, let window = snapshot.windowElement else {
+            throw ComputerUseError.backgroundUnsupported("This wait requires an observed native window.")
+        }
+        let reply = try wait.run { () -> ControlWait.Sample<AXWaitIdentity> in
+            try requireUsableComputerUseSession()
+            let context = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(context.windowElement, window) else {
+                throw ComputerUseError.stateUnavailable("The observed window changed during the wait.")
+            }
+            let search = try SnapshotBuilder.targetedSearch(
+                .init(text: wait.label, exact: true, role: nil, limit: 10, maxNodes: 1000), in: context
+            )
+            if search.records.isEmpty {
+                return search.truncated ? .unreadable : .absent
+            }
+            guard wait.condition == .valueChanged else { return .present }
+            guard !search.truncated, search.records.count == 1, let record = search.records.first,
+                  let element = record.element, let value = nativeObservedValue(element) else {
+                return .unreadable
+            }
+            return .value(AXWaitIdentity(element: element), value)
+        }
+        return .text(reply)
+    }
+
+    private struct AXWaitIdentity: Equatable {
+        let element: AXUIElement
+        static func == (lhs: Self, rhs: Self) -> Bool { CFEqual(lhs.element, rhs.element) }
+    }
+
     func scrollIntoView(app query: String, elementIndex: String) throws -> ToolCallResult {
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)

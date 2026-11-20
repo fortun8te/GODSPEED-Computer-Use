@@ -266,3 +266,9 @@ Use `anchor` with `center`, `left`, `right`, `top` or `bottom` on a control. Opt
 Click with `modifiers` such as `["cmd"]` to toggle an item, or `["shift"]` to extend a selection from an item you have already selected. The app defines which ranges it supports. Use `click_count: 2` or `3` on a left click. In a Mac app, supply the control for a triple click. Read back selected rows or text to confirm the result.
 
 Use `mouse_button: "right"` to open a context menu. Read the resulting state, then click the menu item if the app or website exposes it. Chrome's own context menu requires its native window. Web pages can expose their own menu inside the tab.
+
+## Wait for a control
+
+Use `wait_for` with a label, a timeout of 1 to 30 seconds, and `condition` set to `appears`, `disappears` or `value_changed`. Use the same step names in Mac and web batches. The label is checked in the window or tab's accessibility tree. An incomplete read cannot confirm absence.
+
+For `value_changed`, give `from_value` to compare against a value you read before the previous action. Without it, the wait starts from the first value it reads. Secure fields are excluded. Set a separate completion check if a specific value matters.

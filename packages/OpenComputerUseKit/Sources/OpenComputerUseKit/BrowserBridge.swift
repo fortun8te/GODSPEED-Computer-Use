@@ -910,6 +910,7 @@ extension ComputerUseToolDispatcher {
             return .text(try page.history(action))
 
         case "wait_for":
+            if let wait = try ControlWait(arguments) { return .text(try page.waitForControl(wait)) }
             let text = (arguments["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let wantedText = text.flatMap { $0.isEmpty ? nil : $0 }
             let urlPart = (arguments["url_contains"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -10,13 +10,13 @@ enum ArgumentNormalizer {
 
     /// Tools that act on one app window; they take `app`.
     static let appTools: Set<String> = [
-        "get_app_state", "query", "click", "hover", "perform_secondary_action", "scroll", "scroll_into_view", "drag",
+        "get_app_state", "query", "wait_for", "click", "hover", "perform_secondary_action", "scroll", "scroll_into_view", "drag",
         "type_text", "press_key", "press_menu", "set_value", "select_text",
     ]
 
     static let windowBoundTools: Set<String> = [
         "click", "hover", "perform_secondary_action", "scroll", "scroll_into_view", "drag", "type_text", "press_key",
-        "set_value", "select_text",
+        "set_value", "select_text", "wait_for",
     ]
 
     /// Tools that act on one accessibility element, by `element_index` or `label`.
@@ -149,6 +149,7 @@ enum ArgumentNormalizer {
             Need(keys: ["direction"], text: "\"direction\" (up, down, left or right)"),
             elementNeed,
         ],
+        "wait_for": [appNeed, Need(keys: ["label"], text: "an exact label"), Need(keys: ["condition"], text: "a wait condition")],
         "hover": [appNeed, elementNeed],
         "scroll_into_view": [appNeed, elementNeed],
         "select_text": [appNeed, Need(keys: ["text"], text: "\"text\", exactly as shown"), elementNeed],
