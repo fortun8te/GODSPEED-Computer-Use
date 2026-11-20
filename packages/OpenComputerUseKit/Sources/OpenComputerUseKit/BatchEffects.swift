@@ -191,7 +191,9 @@ enum BatchEffects {
                                        now: () -> WindowIdentity?) -> Bool {
         guard effectsOn, budgetExhausted, let start else { return false }
         guard let current = now() else { return true }
-        return current != start
+        // Element numbers belong to the window, not its position: a window the user moved or resized is
+        // still the same window. A different window id means the numbers no longer apply.
+        return current.id != start.id
     }
 
     /// The step line when cancellation arrives during a step. A step whose input went out says so.

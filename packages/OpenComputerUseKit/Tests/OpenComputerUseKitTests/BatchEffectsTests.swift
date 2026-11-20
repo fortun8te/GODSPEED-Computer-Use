@@ -184,6 +184,9 @@ final class BatchEffectsTests: XCTestCase {
         XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { original }))
         XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: false, budgetExhausted: true, start: original, now: { replacement }))
         XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: false, start: original, now: { replacement }))
+        let dragged = BatchEffects.WindowIdentity(id: original.id, bounds: original.bounds.offsetBy(dx: 120, dy: 40))
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { dragged }),
+                       "moving the same window keeps its element numbers")
         XCTAssertTrue(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { nil }),
                       "a window that cannot be found is not confirmed")
     }
