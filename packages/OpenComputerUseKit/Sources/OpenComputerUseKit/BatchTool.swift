@@ -110,6 +110,11 @@ enum BatchTool {
     /// Whether the state this agent last saw for `app` had a sheet or dialog open. Steps in a dialog need the
     /// app in front (keys and typing do not reach a background sheet), so the batch borrows focus for them.
     /// The app's front window, read from the window list only (one query, no accessibility tree).
+    /// Pid of the running app a step names, for AX change tracking. Nil when it cannot be resolved.
+    static func runningPid(_ app: String) -> pid_t? {
+        (try? AppDiscovery.resolveRunning(app))?.pid
+    }
+
     static func windowIdentity(app: String) -> BatchEffects.WindowIdentity? {
         guard let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
               let window = WindowCapture.resolve(for: pid, titleHint: nil, capture: false) else { return nil }
@@ -762,6 +767,9 @@ extension ComputerUseToolDispatcher {
             var readArguments: [String: Any] = ["app": app, "include_screenshot": NSNumber(value: false)]
             if let pinnedWindow = pinnedWindow ?? replayed?.window?.id, app == defaultApp { readArguments["window_id"] = pinnedWindow }
             if settleMs > 0 { readArguments["settle_ms"] = settleMs }
+            // Track the app so a notification after this read marks it dirty for a later quiet-read check.
+            let readPid = BatchTool.runningPid(app)
+            let readToken = readPid.map { AXChangeMonitor.shared.track($0) }
             let read = TimingLog.measure(optionalEffect ? "batch.effect_read" : "batch.wait_read") {
                 callToolAsResult(name: "get_app_state", arguments: readArguments)
             }
@@ -772,6 +780,10 @@ extension ComputerUseToolDispatcher {
                 if effectBudget.exhausted {
                     lines.append("   (optional effect checks paused for the rest of this batch)")
                 }
+            }
+            if let readPid, let readToken {
+                AXChangeMonitor.shared.finishRead(pid: readPid, startedAt: readToken,
+                                                  complete: text.map(BatchEffects.Watch.isComplete) ?? false)
             }
             guard let text else { return nil }
             return .init(text: text, sig: BatchEffects.windowSig(state: text, id: windowID(app)), result: read)
@@ -874,7 +886,10 @@ extension ComputerUseToolDispatcher {
                 let fallbackInterval = BatchEffects.WaitReadGate.fallbackInterval
                 let firstFullRead = limit <= fallbackInterval ? waitStart : waitStart + fallbackInterval
                 var readGate = BatchEffects.WaitReadGate(nextFullRead: firstFullRead)
+                // A notification for this app ends the poll sleep early. Without one, the sleep is unchanged.
+                let waitPid = BatchTool.runningPid(app)
                 while !RequestCancellation.requested, clock.systemUptime - waitStart < limit {
+                    let waitToken = waitPid.map { AXChangeMonitor.shared.track($0) }
                     let shouldRead = readGate.shouldRead(at: clock.systemUptime) {
                         TimingLog.measure("batch.wait_readiness") {
                             BatchEffects.waitMayBeReady(wait.kind, app: app, windowID: replayed?.window?.id ?? pinnedWindow)
@@ -899,7 +914,11 @@ extension ComputerUseToolDispatcher {
                     if waitReadRefusal != nil { break }
                     let remaining = limit - (clock.systemUptime - waitStart)
                     if remaining <= 0 { break }
-                    Thread.sleep(forTimeInterval: min(0.2, remaining))
+                    if let waitPid, let waitToken {
+                        AXChangeMonitor.shared.awaitChange(pid: waitPid, since: waitToken, upTo: min(0.2, remaining))
+                    } else {
+                        Thread.sleep(forTimeInterval: min(0.2, remaining))
+                    }
                 }
                 if RequestCancellation.requested {
                     receipt.steps.append(.init(failureCode: .cancelled, observation: .notSent, deliveryState: .notSent))
@@ -1014,6 +1033,9 @@ extension ComputerUseToolDispatcher {
             let deferValueRead = step.tool == "set_value"
                 && ((isLastStep && wantsScreenshot) || (!effectsOn && nextReadsSameApp))
             let dispatchStarted = clock.systemUptime
+            // Observe the app before a mutating step, so its notifications are not missed.
+            let actionPid = isMutating ? stepApp.flatMap(BatchTool.runningPid) : nil
+            if let actionPid { AXChangeMonitor.shared.track(actionPid) }
             let result = BrowserCallBudget.withDeadline(actionDeadline) {
                 Self.$defersBrowserNavigationObservation.withValue(defersNavigationRead) {
                     Self.$clipsBrowserStepObservation.withValue(step.tool == "browser" && !isLastStep) {
@@ -1101,27 +1123,42 @@ extension ComputerUseToolDispatcher {
             }
             lines += stepNotes
 
+            // A notification within the grace window confirms the app reports changes; silence marks it polled.
+            if let actionPid { AXChangeMonitor.shared.noteAction(actionPid) }
             // What this step changed. The last step is judged against the final read below.
             if effectsOn, !effectBudget.exhausted, isMutating, let app = stepApp, watchApp == app, let before = watchState {
                 if isLastStep {
                     pendingLastEffect = (app, before, lines.count, stepLineIndex, step.tool, ClickVerifier.target(arguments: step.arguments))
-                } else if let read = BatchEffects.Watch.afterAction(
-                    snapshot: stepLog.afterActionSnapshot, before: before, tool: step.tool,
-                    fallback: { readWatch(app, settleMs: 600) }
-                ) {
-                    let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool,
-                                             target: ClickVerifier.target(arguments: step.arguments))
-                    if effect.noEffect {
-                        lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen)
-                        markStepObservation(.noEffectSeen)
-                    }
-                    markStepVerdict(effect.verdict)
-                    lines += effect.lines
-                    watchState = read.text
                 } else {
-                    // The step ran, but the check read failed or timed out, so its result is not known.
-                    lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .outcomeUnknown)
-                    markStepObservation(.outcomeUnknown)
+                    var quietSkip = false
+                    let check = BatchEffects.Watch.afterAction(
+                        snapshot: stepLog.afterActionSnapshot, before: before, tool: step.tool,
+                        fallback: {
+                            // Nothing reported since a complete read: reuse that read. No change is claimed either way.
+                            if let pid = BatchTool.runningPid(app),
+                               AXChangeMonitor.shared.mayReuseQuietRead(pid: pid, purpose: .effectCheck) {
+                                quietSkip = true
+                                return nil
+                            }
+                            return readWatch(app, settleMs: 600)
+                        })
+                    if let read = check {
+                        let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool,
+                                                 target: ClickVerifier.target(arguments: step.arguments))
+                        if effect.noEffect {
+                            lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen)
+                            markStepObservation(.noEffectSeen)
+                        }
+                        markStepVerdict(effect.verdict)
+                        lines += effect.lines
+                        watchState = read.text
+                    } else if quietSkip {
+                        TimingLog.count("batch.effect_read_skipped", 1)
+                    } else {
+                        // The step ran, but the check read failed or timed out, so its result is not known.
+                        lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .outcomeUnknown)
+                        markStepObservation(.outcomeUnknown)
+                    }
                 }
             } else if step.tool == "get_app_state", effectsOn, let app = stepApp, let text = LeanOutput.stateText(of: result) {
                 // An explicit read: the model now knows this window, so it is the one to stay in.
