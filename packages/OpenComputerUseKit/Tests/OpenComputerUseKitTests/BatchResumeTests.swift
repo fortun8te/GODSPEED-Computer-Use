@@ -118,4 +118,62 @@ final class BatchResumeTests: XCTestCase {
             XCTAssertThrowsError(try BatchResume.consume("../etc/passwd", now: start))
         }
     }
+
+    private func dispatcher() -> ComputerUseToolDispatcher { ComputerUseToolDispatcher(service: ComputerUseService()) }
+
+    /// Unknown and expired tokens are refused before any step is sent, and the stored token survives a refusal.
+    func testUnknownAndExpiredTokensAreRefusedBeforeAnyStepRuns() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": UUID().uuidString])) { error in
+                XCTAssertTrue(error.localizedDescription.contains("RESUME_NOT_FOUND"), "\(error)")
+            }
+            let old = Date().addingTimeInterval(-25 * 60 * 60)
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: clicks(3), receipt: receipt([.acknowledged], stop: .timeBudget, total: 3),
+                goal: "", doneWhen: nil, app: nil, windowID: nil, processID: nil, now: old))
+            try BatchResume.save(record, now: old)
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": record.id])) { error in
+                XCTAssertTrue(error.localizedDescription.contains("RESUME_EXPIRED"), "\(error)")
+            }
+        }
+    }
+
+    /// The app's process is gone, so the pinned window cannot be the same one: refused as WINDOW_CHANGED.
+    func testResumeRefusesWhenTheAppProcessChanged() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: clicks(3), receipt: receipt([.acknowledged], stop: .windowChanged, total: 3),
+                goal: "", doneWhen: nil, app: "OpenComputerUseNoSuchApp", windowID: 42, processID: 999_999))
+            try BatchResume.save(record)
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": record.id])) { error in
+                XCTAssertTrue(error.localizedDescription.contains("WINDOW_CHANGED"), "\(error)")
+            }
+            XCTAssertNoThrow(try BatchResume.load(record.id), "a refused resume keeps its token")
+        }
+    }
+
+    /// A batch whose first step cannot reach its app stops before sending anything. Its reply carries a token
+    /// for all three steps.
+    func testStoppedBatchReplyCarriesAResumeToken() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            let reply = try dispatcher().runBatch(arguments: [
+                "app": "OpenComputerUseNoSuchApp", "goal": "Send the report",
+                "steps": [["tool": "click", "label": "A"], ["tool": "click", "label": "B"], ["tool": "click", "label": "C"]],
+            ])
+            XCTAssertTrue(reply.isError, reply.textContent)
+            let regex = try NSRegularExpression(pattern: "Resume ([0-9A-F-]{36})")
+            let text = reply.textContent
+            let match = try XCTUnwrap(regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)))
+            let token = String(text[Range(match.range(at: 1), in: text)!])
+            let record = try BatchResume.load(token)
+            XCTAssertEqual(record.pending.map(\.number), [1, 2, 3], text)
+            XCTAssertEqual(record.goal, "Send the report")
+        }
+    }
 }
