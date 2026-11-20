@@ -41,6 +41,26 @@ extension ComputerUseToolDispatcher {
         }
     }
 
+    /// Text for the `tabs` action. The session's own tabs are listed by origin. The user's Chrome tabs are
+    /// read only after the browser app passes the same policy as other browser actions, and each row
+    /// still needs its origin allowed. A refused or unreadable user list is omitted, not guessed.
+    static func tabListingText(policy: ActionPolicy, own: (text: String, isError: Bool),
+                               userTabs: () throws -> (text: String, isError: Bool)) throws -> String {
+        func allowed(_ url: String) -> Bool { (try? authorizeBrowserAddresses(policy, addresses: [url])) != nil }
+        var lines = ["Tabs in this session (browser use_tab with tab_id):"]
+        let mine = BrowserReply.tabLines(in: own.text, limit: 30, include: allowed)
+        lines += mine.isEmpty ? [own.isError ? BatchTool.firstLine(own.text) : "(none)"] : mine
+        if (try? policy.authorize(bundleIDs: [ActionPolicy.browserBundleID])) != nil,
+           let theirs = try? userTabs(), !theirs.isError {
+            let user = BrowserReply.tabLines(in: theirs.text, limit: 15, include: allowed)
+            if !user.isEmpty {
+                lines.append("Your Chrome tabs (read only; use_tab can take one):")
+                lines += user
+            }
+        }
+        return BatchTool.clipped(lines.joined(separator: "\n"), limit: 3_000)
+    }
+
     static func authorizeBrowserPage(_ policy: ActionPolicy, page: BrowserPage, afterDelivery: Bool = false) throws {
         guard policy.checksOrigins else { return }
         do {

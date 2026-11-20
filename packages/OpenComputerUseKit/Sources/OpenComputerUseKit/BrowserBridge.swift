@@ -1265,17 +1265,9 @@ extension ComputerUseToolDispatcher {
 
         case "tabs", "list":
             let mine = try bridge.callTool("tabs", arguments: [:], timeout: 10)
-            var lines = ["Tabs in this session (browser use_tab with tab_id):"]
-            let own = BrowserReply.tabLines(in: mine.text, limit: 30, include: includeTab)
-            lines += own.isEmpty ? [mine.isError ? BatchTool.firstLine(mine.text) : "(none)"] : own
-            if let theirs = try? bridge.callTool("user_tabs", arguments: [:], timeout: 10), !theirs.isError {
-                let user = BrowserReply.tabLines(in: theirs.text, limit: 15, include: includeTab)
-                if !user.isEmpty {
-                    lines.append("Your Chrome tabs (read only; use_tab can take one):")
-                    lines += user
-                }
-            }
-            return .text(BatchTool.clipped(lines.joined(separator: "\n"), limit: 3_000))
+            return .text(try Self.tabListingText(policy: policy, own: mine, userTabs: {
+                try bridge.callTool("user_tabs", arguments: [:], timeout: 10)
+            }))
 
         case "use_tab", "claim", "claim_tab", "switch":
             // Only the id the model named: the current tab is not "claimed" by a call that named none.
