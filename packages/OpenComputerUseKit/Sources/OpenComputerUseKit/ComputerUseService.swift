@@ -1186,12 +1186,21 @@ public final class ComputerUseService {
     }
 
     public func hover(app query: String, elementIndex: String) throws -> ToolCallResult {
-        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        try hover(app: query, elementIndex: elementIndex, dwell: nil)
+    }
+
+    func hover(app query: String, elementIndex: String, dwell: TimeInterval?) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex,
+                                             recoveryPolicy: dwell == nil ? .allowActivation : .readOnly)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
         guard snapshot.mode != .fixture, let windowID = snapshot.targetWindowID,
               let bounds = snapshot.windowBounds,
               let point = try globalPoint(for: record, snapshot: snapshot) else {
             throw ComputerUseError.stateUnavailable("Hover requires an element with a frame inside the observed Mac window.")
+        }
+        if let dwell, let local = localCenter(for: record) {
+            try validatePointerTarget(record, index: elementIndex, point: local, snapshot: snapshot)
+            try ActionOptions.requireTime(for: dwell + 0.1)
         }
         let location = inputEventPoint(fromScreenStatePoint: point)
         try BackgroundDragDispatcher.hover(target: BackgroundDragTarget(
@@ -1200,9 +1209,15 @@ public final class ComputerUseService {
         let visualTarget = visualCursorTarget(for: record, snapshot: snapshot)
         moveVisualCursor(to: visualTarget)
         settleVisualCursor(at: visualTarget)
-        pauseBeforeReadBack(0.1, windowID: windowID)
-        let state = try actionResult(for: query)
-        return ToolCallResult(content: [.text("Hover event delivered. Check the app state for the expected effect.")] + state.content,
+        if let dwell, dwell > 0 {
+            Thread.sleep(forTimeInterval: dwell)
+        } else {
+            pauseBeforeReadBack(0.1, windowID: windowID)
+        }
+        let state = try actionResult(for: query, recoveryPolicy: dwell == nil ? .allowActivation : .readOnly)
+        let note = dwell.map { "Hovered for \(Int(($0 * 1000).rounded())) ms. Check the resulting state." }
+            ?? "Hover event delivered. Check the app state for the expected effect."
+        return ToolCallResult(content: [.text(note)] + state.content,
                               isError: state.isError)
     }
 
@@ -2150,7 +2165,25 @@ public final class ComputerUseService {
         suffix: String?,
         selection: TextSelectionMode
     ) throws -> ToolCallResult {
-        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        try selectText(app: query, elementIndex: elementIndex, text: text, prefix: prefix, suffix: suffix,
+                       selection: selection, range: nil)
+    }
+
+    func selectText(app query: String, elementIndex: String, text: String, prefix: String?, suffix: String?,
+                    selection: TextSelectionMode, range: TextRangeRequest?) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex,
+                                             recoveryPolicy: range == nil ? .allowActivation : .readOnly)
+        func resolve(in value: String) throws -> TextSelectionTarget {
+            if let range { return try TextSelectionResolver.resolve(value: value, start: range.start, length: range.length) }
+            return try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
+                                            selection: selection, elementIndex: elementIndex)
+        }
+        func verified(_ target: TextSelectionTarget) throws -> ToolCallResult {
+            let result = try actionResult(for: query, recoveryPolicy: .readOnly)
+            guard range != nil else { return result }
+            let note = "Selected range \(target.location), length \(target.length)."
+            return ToolCallResult(content: [.text(note)] + result.content, isError: result.isError)
+        }
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
 
         if snapshot.mode == .fixture {
@@ -2159,20 +2192,20 @@ public final class ComputerUseService {
                   let value = state.elements.first(where: { $0.identifier == identifier })?.value else {
                 throw ComputerUseError.invalidArguments("fixture select_text requires a readable input element")
             }
-            let target = try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
-                                                 selection: selection, elementIndex: elementIndex)
+            let target = try resolve(in: value)
             let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
             moveVisualCursor(to: cursorTarget)
             defer { settleVisualCursor(at: cursorTarget) }
             try FixtureBridge.post(FixtureCommand(kind: "select_text", identifier: identifier, value: text,
-                                                 selection: selection.rawValue, prefix: prefix, suffix: suffix))
+                                                 selection: selection.rawValue, prefix: prefix, suffix: suffix,
+                                                 rangeStart: range?.start, rangeLength: range?.length))
             let deadline = Date().addingTimeInterval(1)
             while Date() < deadline {
                 if let applied = try FixtureBridge.readState(), applied.focusedIdentifier == identifier,
                    applied.selectedRangeLocation == target.location, applied.selectedRangeLength == target.length,
                    let current = applied.elements.first(where: { $0.identifier == identifier })?.value,
                    current.utf16.elementsEqual(value.utf16) {
-                    return try actionResult(for: query, recoveryPolicy: .readOnly)
+                    return try verified(target)
                 }
                 Thread.sleep(forTimeInterval: 0.01)
             }
@@ -2183,11 +2216,11 @@ public final class ComputerUseService {
         guard let element = record.element else {
             throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
         }
-        guard let value = stringValue(of: element, attribute: kAXValueAttribute) else {
+        guard !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)),
+              let value = stringValue(of: element, attribute: kAXValueAttribute) else {
             throw ComputerUseError.message(selectTextUnreadableValueErrorMessage(elementIndex: elementIndex))
         }
-        let target = try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
-                                             selection: selection, elementIndex: elementIndex)
+        let target = try resolve(in: value)
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &settable) == .success,
               settable.boolValue else {
@@ -2203,7 +2236,7 @@ public final class ComputerUseService {
             writeRange: { try AccessibilityTextSelection.writeRange($0, to: element) },
             readRange: { AccessibilityTextSelection.readRange(of: element) }
         )
-        return try actionResult(for: query, recoveryPolicy: .readOnly)
+        return try verified(target)
     }
 
     private func resolveTextSelection(value: String, text: String, prefix: String?, suffix: String?,

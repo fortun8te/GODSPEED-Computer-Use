@@ -462,6 +462,10 @@ public final class ComputerUseToolDispatcher {
                 action: requireString("action", in: arguments)
             )
         case "hover":
+            if let dwell = try ActionOptions.duration("dwell_ms", in: arguments, maxMs: 2000) {
+                let app = try requireString("app", in: arguments)
+                return try service.hover(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments), dwell: dwell)
+            }
             return try service.hover(
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
@@ -561,6 +565,12 @@ public final class ComputerUseToolDispatcher {
                 value: requireString("value", in: arguments, allowEmpty: true)
             )
         case "select_text":
+            // Explicit ranges need a named or observed control and verify the resulting AX range.
+            if let range = try TextRangeRequest(arguments) {
+                let app = try requireString("app", in: arguments)
+                return try service.selectText(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments),
+                    text: "", prefix: nil, suffix: nil, selection: .text, range: range)
+            }
             return try service.selectText(
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log),
@@ -652,7 +662,7 @@ public final class ComputerUseToolDispatcher {
         throw ComputerUseError.invalidArguments("path must be a string or an array of menu titles")
     }
 
-    private func selectionString(_ key: String, in arguments: [String: Any]) throws -> String? {
+    func selectionString(_ key: String, in arguments: [String: Any]) throws -> String? {
         guard let value = arguments[key] else { return nil }
         guard let string = value as? String else {
             throw ComputerUseError.invalidArguments("\(key) must be a string")
@@ -660,7 +670,7 @@ public final class ComputerUseToolDispatcher {
         return string
     }
 
-    private func parseSelectionMode(_ raw: String?) throws -> TextSelectionMode {
+    func parseSelectionMode(_ raw: String?) throws -> TextSelectionMode {
         guard let raw else { return .text }
 
         guard let mode = TextSelectionMode(rawValue: raw) else {

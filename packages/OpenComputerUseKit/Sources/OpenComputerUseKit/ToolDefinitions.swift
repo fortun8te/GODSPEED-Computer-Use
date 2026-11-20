@@ -124,7 +124,7 @@ public enum ToolDefinitions {
                 properties: [
                     "action": stringProperty(
                         description: "What to do",
-                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "check", "uncheck", "scroll", "scroll_into_view", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
+                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "select_text", "check", "uncheck", "scroll", "scroll_into_view", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
                     ),
                     "label": stringProperty(description: "Visible text of the target, e.g. \"Sign in\""),
                     "find": stringProperty(description: "read: only controls and text that mention these words"),
@@ -141,6 +141,7 @@ public enum ToolDefinitions {
                     "offset_y": numberProperty(description: "Click offset down from the anchor."),
                     "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
                                   "description": "click or drag: optional modifier keys."],
+                    "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
                     "hold_ms": integerProperty(description: "Drag hold before moving, up to 1000 ms."),
                     "drag_steps": integerProperty(description: "Drag movement steps, 2 to 30."),
                     "to_x": numberProperty(description: "Drag destination viewport X from screenshot."),
@@ -148,6 +149,11 @@ public enum ToolDefinitions {
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
                     "to_index": integerProperty(description: "drag: destination element number from read"),
                     "text": stringProperty(description: "type: text to enter. wait_for: text to wait for"),
+                    "start": integerProperty(description: "select_text start in UTF-16 units."),
+                    "length": integerProperty(description: "select_text length in UTF-16 units."),
+                    "prefix": stringProperty(description: "Text immediately before a repeated selection."),
+                    "suffix": stringProperty(description: "Text immediately after a repeated selection."),
+                    "selection": stringProperty(description: "Select text or place the cursor.", enumValues: TextSelectionMode.allCases.map(\.rawValue)),
                     "replace": ["type": "boolean", "default": false, "description": "type: true replaces the field's value"],
                     "option": stringProperty(description: "select: option text or value, e.g. Canada"),
                     "direction": stringProperty(description: "scroll: default down", enumValues: ["up", "down", "left", "right", "top", "bottom"]),
@@ -397,7 +403,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "select_text",
-            description: "Use to select text inside a text element, or place the cursor before or after it; not to replace a field's value (use set_value). text must match the accessibility tree exactly. If not unique, add prefix or suffix. Give label (or element_index).",
+            description: "Use to select text in a field by exact text or UTF-16 range. Add prefix or suffix for repeated text.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -405,6 +411,8 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Text element identifier"),
+                    "start": integerProperty(description: "Start in UTF-16 units."),
+                    "length": integerProperty(description: "Length in UTF-16 units. Zero places the cursor."),
                     "text": stringProperty(description: "Target text as shown in the accessibility tree"),
                     "prefix": stringProperty(description: "Optional text immediately before the target, used to disambiguate repeated matches"),
                     "suffix": stringProperty(description: "Optional text immediately after the target, used to disambiguate repeated matches"),
@@ -413,7 +421,7 @@ public enum ToolDefinitions {
                         enumValues: TextSelectionMode.allCases.map(\.rawValue)
                     ),
                 ],
-                required: ["app", "text"]
+                required: ["app"]
             )
         ),
         ToolDefinition(
@@ -433,7 +441,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "hover",
-            description: "Use hover over an observed Mac control to reveal a tooltip or hover state. Deliver to its window without moving the user's pointer. Check the returned state. For Chrome use browser hover.",
+            description: "Use to hover over a control and read its tooltip or hover state. Set dwell_ms for delayed menus.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -441,6 +449,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
+                    "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
                 ],
                 required: ["app"]
             )

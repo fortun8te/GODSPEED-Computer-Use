@@ -152,7 +152,7 @@ enum ArgumentNormalizer {
         "wait_for": [appNeed, Need(keys: ["label"], text: "an exact label"), Need(keys: ["condition"], text: "a wait condition")],
         "hover": [appNeed, elementNeed],
         "scroll_into_view": [appNeed, elementNeed],
-        "select_text": [appNeed, Need(keys: ["text"], text: "\"text\", exactly as shown"), elementNeed],
+        "select_text": [appNeed, Need(keys: ["text", "start", "length"], text: "text or a UTF-16 range"), elementNeed],
         "perform_secondary_action": [
             appNeed,
             Need(keys: ["action"], text: "\"action\", e.g. \"AXShowMenu\""),
@@ -195,7 +195,7 @@ enum ArgumentNormalizer {
         }
         if tool == "click" { applyClickFlags(&args) }
         // select_text with only the words to select means the document's text: the window's one text area.
-        if tool == "select_text", !["label", "labels", "element_index"].contains(where: { isPresent(args[$0], allowsEmpty: false) }) {
+        if tool == "select_text", !TextRangeRequest.isRequested(args), !["label", "labels", "element_index"].contains(where: { isPresent(args[$0], allowsEmpty: false) }) {
             args["label"] = "text entry area"
         }
         if elementTools.contains(tool) || tool == "browser", let list = args["label"] as? [Any] {

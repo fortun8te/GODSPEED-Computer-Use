@@ -114,7 +114,7 @@ enum BackgroundDragDispatcher {
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
-            throw ComputerUseError.stateUnavailable("Hover cannot address this window on this Mac.")
+            throw ComputerUseError.backgroundUnsupported("This Mac cannot address hover to the target window.")
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
