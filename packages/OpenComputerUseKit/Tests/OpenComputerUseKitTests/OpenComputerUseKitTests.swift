@@ -2900,13 +2900,13 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(positivePose.tipPosition.y, restingTipPosition.y, accuracy: 0.0001)
         XCTAssertGreaterThan(positivePose.angleOffset, 0)
         XCTAssertLessThanOrEqual(abs(positivePose.angleOffset), visualCursorIdleRotationAmplitude() + 0.0001)
-        XCTAssertGreaterThan(abs(positivePose.angleOffset), 0.08)
+        XCTAssertGreaterThan(abs(positivePose.angleOffset), visualCursorIdleRotationAmplitude() * 0.85)
 
         XCTAssertEqual(negativePose.tipPosition.x, restingTipPosition.x, accuracy: 0.0001)
         XCTAssertEqual(negativePose.tipPosition.y, restingTipPosition.y, accuracy: 0.0001)
         XCTAssertLessThan(negativePose.angleOffset, 0)
         XCTAssertLessThanOrEqual(abs(negativePose.angleOffset), visualCursorIdleRotationAmplitude() + 0.0001)
-        XCTAssertGreaterThan(abs(negativePose.angleOffset), 0.08)
+        XCTAssertGreaterThan(abs(negativePose.angleOffset), visualCursorIdleRotationAmplitude() * 0.85)
     }
 
     private func makeSnapshot(treeLines: [String], focusedSummary: String?, selectedText: String? = nil) -> AppSnapshot {

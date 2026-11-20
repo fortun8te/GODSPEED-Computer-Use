@@ -30,17 +30,17 @@ final class CursorGlideShapeTests: XCTestCase {
             }
             XCTAssertEqual(glide.point(at: glide.duration).x, end.x, accuracy: 0.01)
             XCTAssertEqual(glide.point(at: glide.duration).y, end.y, accuracy: 0.01)
-            XCTAssertLessThanOrEqual(glide.duration, 0.3)
+            XCTAssertLessThanOrEqual(glide.duration, 0.45)
         }
     }
 
     func testShortHopsScootWithALightTiltThatReturnsToZero() {
         let glide = CursorGlide(
-            start: CGPoint(x: 100, y: 100), end: CGPoint(x: 180, y: 100), startVelocity: .zero,
+            start: CGPoint(x: 100, y: 100), end: CGPoint(x: 140, y: 100), startVelocity: .zero,
             startForward: restForward(), restForward: restForward(), bounds: nil, planned: true,
             startTime: 0, speed: 1, queuedBehind: 0
         )
-        guard case let .straight(tilt) = glide.shape else { return XCTFail("an 80 px hop scoots") }
+        guard case let .straight(tilt) = glide.shape else { return XCTFail("a 40 px hop scoots") }
         XCTAssertGreaterThan(abs(tilt), 0.1)
         XCTAssertLessThanOrEqual(abs(tilt), 1 / 3)
         XCTAssertEqual(glide.tilt(at: glide.duration), 0, accuracy: 1e-6)

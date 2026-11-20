@@ -240,6 +240,15 @@ A batch stops on uncertain delivery. A completion check can still report what ch
 
 The visible cursor is feedback. Godspeed resolves and checks the target independently, keeps each agent's window anchor separate, and plays cursor motion on the display clock. If a path crosses a gap with no screen, it reappears beside the next target. The app never needs to move your physical pointer with the default background settings.
 
+How the cursor moves:
+
+- A move starts and lands with no jolt. It speeds up quickly, peaks a little before the middle and settles gently onto the target, like a hand aiming a mouse. The speed follows the path's real length, so curves don't speed up or slow down.
+- Moves take about 0.15 s for a short hop and up to about 0.45 s across a screen. `cursor_speed` scales this.
+- Hops under 48 pt travel straight. Longer moves bend into a shallow arc that grows with distance, so there is no sudden change of style. The arc stays on the display, also next to its edges and the menu bar.
+- The arrow leans up to about 11° into a move, the same way for short and long moves. It is upright again when it lands. At rest it only breathes by about 2°.
+- When a target window moves mid-flight, the cursor bends toward the new spot without a corner. Across offset displays it banks through the shared edges, over any number of displays. A display behind a real gap makes it reappear there instead.
+- The name tag sits beside the arrow, just right of its tip. Next to a display's right or bottom edge it moves to the other side.
+
 When many moves are queued before the next frame, Godspeed keeps the latest pending move for each agent. It preserves clicks and gestures in order. Each cursor can finish and fade on its own while other agents keep working.
 
 Vercel's agent-desktop scopes references to the observed window and keeps cursor travel out of the window interaction lock. [Snapshot guide](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/apps/docs/content/docs/snapshots-and-refs.mdx) · [Cursor delivery](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/crates/core/src/cursor_overlay/submit.rs)

@@ -111,6 +111,16 @@ enum SoftwareCursorGlyphMetrics {
     static let pointerArtworkRotation = targetNeutralHeading - proceduralContourNeutralHeading
 }
 
+/// The cursor window: the 126 pt glyph art in the middle, with room on both sides for the name tag, which sits
+/// beside the arrow (to its right, or to its left next to the right edge of a display).
+enum SoftwareCursorPanelMetrics {
+    static let sideRoom: CGFloat = 132
+    static let glyphRect = CGRect(origin: CGPoint(x: sideRoom, y: 0), size: SoftwareCursorGlyphMetrics.windowSize)
+    static let size = CGSize(width: SoftwareCursorGlyphMetrics.windowSize.width + 2 * sideRoom,
+                             height: SoftwareCursorGlyphMetrics.windowSize.height)
+    static let tipAnchor = CGPoint(x: SoftwareCursorGlyphMetrics.tipAnchor.x + sideRoom, y: SoftwareCursorGlyphMetrics.tipAnchor.y)
+}
+
 /// A cursor colour chosen in PURE (Settings > GODSPEED), as "#RRGGBB".
 struct CursorColor: Equatable, Sendable {
     let red: CGFloat
