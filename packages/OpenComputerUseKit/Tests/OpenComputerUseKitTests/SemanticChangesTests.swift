@@ -96,6 +96,69 @@ final class SemanticChangesTests: XCTestCase {
         XCTAssertEqual(SemanticChanges.events(before: before, after: after), ["Shipping: Oslo → Bergen"])
     }
 
+    func testApiKeyLabelHidesValuesThatLookLikeKeys() {
+        let before = state(rows: [(0, "window Settings"), (1, "text field API Key = sk-live-1")])
+        let after = state(rows: [(0, "window Settings"), (1, "text field API Key = sk-live-2")])
+        let events = SemanticChanges.events(before: before, after: after)
+        XCTAssertEqual(events, ["API Key changed"])
+        XCTAssertFalse(events.joined().contains("sk-live"))
+    }
+
+    func testDutchPasswordLabelHidesValues() {
+        let before = state(rows: [(0, "window Inloggen"), (1, "text field Wachtwoord = hunter2")])
+        let after = state(rows: [(0, "window Inloggen"), (1, "text field Wachtwoord = hunter3")])
+        let events = SemanticChanges.events(before: before, after: after)
+        XCTAssertEqual(events, ["Wachtwoord changed"])
+        XCTAssertFalse(events.joined().contains("hunter"))
+    }
+
+    func testSecretLabelsInOtherLanguagesHideValues() {
+        // Labels in German, French, Spanish and more Dutch, with and without diacritics.
+        let labels = ["Passwort", "Kennwort", "Mot de passe", "Contraseña", "Contrasena", "Toegangscode", "Verificatiecode"]
+        for label in labels {
+            let before = state(rows: [(0, "window Login"), (1, "text field \(label) = first-value")])
+            let after = state(rows: [(0, "window Login"), (1, "text field \(label) = second-value")])
+            XCTAssertEqual(SemanticChanges.events(before: before, after: after), ["\(label) changed"], "label: \(label)")
+        }
+    }
+
+    func testTokenLookingValueIsHiddenUnderInnocentLabel() {
+        // 21 mixed letters and digits, under a label that names nothing secret.
+        let before = state(rows: [(0, "window Notes"), (1, "text field Comment = a8f3k2m9p0q7w4e1r6t5y")])
+        let after = state(rows: [(0, "window Notes"), (1, "text field Comment = b1c2d3e4f5g6h7i8j9k0l")])
+        let events = SemanticChanges.events(before: before, after: after)
+        XCTAssertEqual(events, ["Comment changed"])
+        XCTAssertFalse(events.joined().contains("a8f3"))
+    }
+
+    func testKnownKeyPrefixIsHiddenUnderInnocentLabel() {
+        let before = state(rows: [(0, "window Notes"), (1, "text field Note = hello")])
+        let after = state(rows: [(0, "window Notes"), (1, "text field Note = ghp_example1")])
+        XCTAssertEqual(SemanticChanges.events(before: before, after: after), ["Note changed"])
+    }
+
+    func testCardNumberLabelHidesValues() {
+        let before = state(rows: [(0, "window Payment"), (1, "text field Card number = 4111 1111 1111 1111")])
+        let after = state(rows: [(0, "window Payment"), (1, "text field Card number = 4111 1111 1111 1112")])
+        let events = SemanticChanges.events(before: before, after: after)
+        XCTAssertEqual(events, ["Card number changed"])
+        XCTAssertFalse(events.joined().contains("4111"))
+    }
+
+    func testCardNumberUnderInnocentLabelIsHiddenOnlyWhenItPassesLuhn() {
+        // 4111 1111 1111 1111 passes Luhn and is hidden. 4111 1111 1111 1112 fails it and is shown.
+        let before = state(rows: [(0, "window Form"), (1, "text field Reference = 4111 1111 1111 1111")])
+        let after = state(rows: [(0, "window Form"), (1, "text field Reference = 4111 1111 1111 1112")])
+        XCTAssertEqual(SemanticChanges.events(before: before, after: after), ["Reference changed"])
+
+        let plainBefore = state(rows: [(0, "window Form"), (1, "text field Reference = 4111 1111 1111 1110")])
+        let plainAfter = state(rows: [(0, "window Form"), (1, "text field Reference = 4111 1111 1111 1112")])
+        XCTAssertEqual(
+            SemanticChanges.events(before: plainBefore, after: plainAfter),
+            ["Reference: 4111 1111 1111 1110 → 4111 1111 1111 1112"]
+        )
+    }
+
     // MARK: - Toggles, selection and buttons
 
     func testCheckBoxTurningOn() {
