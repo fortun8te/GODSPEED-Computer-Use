@@ -8,6 +8,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 from collections import Counter
 from pathlib import Path
 import statistics
@@ -777,6 +778,52 @@ def export_learning(source, destination):
         handle.write(jsonl(out).decode())
     return {"labels": dict(counts), "skipped": skipped, "written": len(out)}
 
+
+SECURE_MARKERS = ("password", "passcode", "wachtwoord", "secure")
+REDACTED = "[redacted]"
+TYPING_TOOLS = {"type_text": "text", "set_value": "value"}
+
+
+def words(text):
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def secure_text(text):
+    """True for secure-field markers and for values the scrubber already redacted. Matching is loose on purpose."""
+    lower = (text or "").lower()
+    return REDACTED in lower or any(marker in lower for marker in SECURE_MARKERS)
+
+
+def learning_episodes(folder):
+    """Group LearningLog step rows into episodes. BatchTool.learn writes an episode row after its steps, so each
+    episode row closes the steps before it. Steps left open by a crash (a new batch starts before the old one closed)
+    are counted as incomplete and dropped."""
+    if not folder.is_dir():
+        raise ValueError("Learning folder not found")
+    episodes, dropped = [], Counter()
+    for file in sorted(folder.glob("learning-*.jsonl")):
+        pending = []
+        for line in file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid learning row")
+            if not isinstance(row, dict):
+                raise ValueError("Invalid learning row")
+            if row.get("kind") == "step":
+                if pending and (row.get("n") == 1 or pending[-1].get("run_id") != row.get("run_id")):
+                    dropped["incomplete"] += 1
+                    pending = []
+                pending.append(row)
+            elif row.get("kind") == "episode":
+                episodes.append({"file": file.name, "run_id": row.get("run_id"), "ts": row.get("ts"),
+                                 "goal": row.get("goal") or "", "app": row.get("app") or "", "steps": pending})
+                pending = []
+        if pending:
+            dropped["incomplete"] += 1
+    return episodes, dropped
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
