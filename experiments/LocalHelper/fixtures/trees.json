@@ -1,0 +1,950 @@
+{
+  "prefixes": {
+    "mail": "Window: \"Inbox\", App: Mail.\n0 standard window message list\n\t1 row Newsletter 1\n\t2 row Newsletter 2\n\t3 row Newsletter 3\n\t4 row Newsletter 4\n\t5 row Newsletter 5\n\t6 row Newsletter 6\n\t7 row Newsletter 7\n\t8 row Newsletter 8\n\t9 row Newsletter 9\n\t10 row Newsletter 10\n\t11 row Newsletter 11\n\t12 row Newsletter 12\n\t13 row Newsletter 13\n\t14 row Newsletter 14\n\t15 row Newsletter 15\n\t16 row Newsletter 16\n\t17 row Newsletter 17\n\t18 row Newsletter 18\n\t19 row Newsletter 19\n\t20 row Newsletter 20\n\t21 row Newsletter 21\n\t22 row Newsletter 22\n\t23 row Newsletter 23\n\t24 row Newsletter 24\n\t25 row Newsletter 25\n\t26 row Newsletter 26\n\t27 row Newsletter 27\n\t28 row Newsletter 28\n\t29 row Newsletter 29\n\t30 row Newsletter 30\n\t31 row Newsletter 31\n\t32 row Newsletter 32\n\t33 row Newsletter 33\n\t34 row Newsletter 34\n\t35 row Newsletter 35\n\t36 row Newsletter 36\n\t37 row Newsletter 37\n\t38 row Newsletter 38\n\t39 row Newsletter 39\n\t40 row Newsletter 40\n\t41 row Newsletter 41\n\t42 row Newsletter 42\n\t43 row Newsletter 43\n\t44 row Newsletter 44\n\t45 row Newsletter 45\n\t46 row Newsletter 46\n\t47 row Newsletter 47\n\t48 row Newsletter 48\n\t49 row Newsletter 49\n\t50 row Newsletter 50\n\t51 row Newsletter 51\n\t52 row Newsletter 52\n\t53 row Newsletter 53\n\t54 row Newsletter 54\n\t55 row Newsletter 55\n\t56 row Newsletter 56",
+    "calculator": "Window: \"Calculator\", App: Fixture.\n0 standard window calculation history\n\t1 button History entry 1\n\t2 button History entry 2\n\t3 button History entry 3\n\t4 button History entry 4\n\t5 button History entry 5\n\t6 button History entry 6\n\t7 button History entry 7\n\t8 button History entry 8\n\t9 button History entry 9\n\t10 button History entry 10\n\t11 button History entry 11\n\t12 button History entry 12\n\t13 button History entry 13\n\t14 button History entry 14\n\t15 button History entry 15\n\t16 button History entry 16\n\t17 button History entry 17\n\t18 button History entry 18\n\t19 button History entry 19\n\t20 button History entry 20\n\t21 button History entry 21\n\t22 button History entry 22\n\t23 button History entry 23\n\t24 button History entry 24\n\t25 button History entry 25\n\t26 button History entry 26\n\t27 button History entry 27\n\t28 button History entry 28\n\t29 button History entry 29\n\t30 button History entry 30\n\t31 button History entry 31\n\t32 button History entry 32\n\t33 button History entry 33\n\t34 button History entry 34\n\t35 button History entry 35\n\t36 button History entry 36\n\t37 button History entry 37\n\t38 button History entry 38\n\t39 button History entry 39\n\t40 button History entry 40\n\t41 button History entry 41\n\t42 button History entry 42\n\t43 button History entry 43\n\t44 button History entry 44\n\t45 button History entry 45\n\t46 button History entry 46\n\t47 button History entry 47\n\t48 button History entry 48\n\t49 button History entry 49\n\t50 button History entry 50\n\t51 button History entry 51\n\t52 button History entry 52\n\t53 button History entry 53\n\t54 button History entry 54\n\t55 button History entry 55\n\t56 button History entry 56",
+    "finder": "Window: \"Transfers\", App: Finder.\n0 standard window file list\n\t1 row Archive-1.mov\n\t2 row Archive-2.mov\n\t3 row Archive-3.mov\n\t4 row Archive-4.mov\n\t5 row Archive-5.mov\n\t6 row Archive-6.mov\n\t7 row Archive-7.mov\n\t8 row Archive-8.mov\n\t9 row Archive-9.mov\n\t10 row Archive-10.mov\n\t11 row Archive-11.mov\n\t12 row Archive-12.mov\n\t13 row Archive-13.mov\n\t14 row Archive-14.mov\n\t15 row Archive-15.mov\n\t16 row Archive-16.mov\n\t17 row Archive-17.mov\n\t18 row Archive-18.mov\n\t19 row Archive-19.mov\n\t20 row Archive-20.mov\n\t21 row Archive-21.mov\n\t22 row Archive-22.mov\n\t23 row Archive-23.mov\n\t24 row Archive-24.mov\n\t25 row Archive-25.mov\n\t26 row Archive-26.mov\n\t27 row Archive-27.mov\n\t28 row Archive-28.mov\n\t29 row Archive-29.mov\n\t30 row Archive-30.mov\n\t31 row Archive-31.mov\n\t32 row Archive-32.mov\n\t33 row Archive-33.mov\n\t34 row Archive-34.mov\n\t35 row Archive-35.mov\n\t36 row Archive-36.mov\n\t37 row Archive-37.mov\n\t38 row Archive-38.mov\n\t39 row Archive-39.mov\n\t40 row Archive-40.mov\n\t41 row Archive-41.mov\n\t42 row Archive-42.mov\n\t43 row Archive-43.mov\n\t44 row Archive-44.mov\n\t45 row Archive-45.mov\n\t46 row Archive-46.mov\n\t47 row Archive-47.mov\n\t48 row Archive-48.mov\n\t49 row Archive-49.mov\n\t50 row Archive-50.mov\n\t51 row Archive-51.mov\n\t52 row Archive-52.mov\n\t53 row Archive-53.mov\n\t54 row Archive-54.mov\n\t55 row Archive-55.mov\n\t56 row Archive-56.mov",
+    "settings": "Window: \"Accessibility\", App: System Settings.\n0 standard window settings sidebar\n\t1 group Setting 1\n\t2 group Setting 2\n\t3 group Setting 3\n\t4 group Setting 4\n\t5 group Setting 5\n\t6 group Setting 6\n\t7 group Setting 7\n\t8 group Setting 8\n\t9 group Setting 9\n\t10 group Setting 10\n\t11 group Setting 11\n\t12 group Setting 12\n\t13 group Setting 13\n\t14 group Setting 14\n\t15 group Setting 15\n\t16 group Setting 16\n\t17 group Setting 17\n\t18 group Setting 18\n\t19 group Setting 19\n\t20 group Setting 20\n\t21 group Setting 21\n\t22 group Setting 22\n\t23 group Setting 23\n\t24 group Setting 24\n\t25 group Setting 25\n\t26 group Setting 26\n\t27 group Setting 27\n\t28 group Setting 28\n\t29 group Setting 29\n\t30 group Setting 30\n\t31 group Setting 31\n\t32 group Setting 32\n\t33 group Setting 33\n\t34 group Setting 34\n\t35 group Setting 35\n\t36 group Setting 36\n\t37 group Setting 37\n\t38 group Setting 38\n\t39 group Setting 39\n\t40 group Setting 40\n\t41 group Setting 41\n\t42 group Setting 42\n\t43 group Setting 43\n\t44 group Setting 44\n\t45 group Setting 45\n\t46 group Setting 46\n\t47 group Setting 47\n\t48 group Setting 48\n\t49 group Setting 49\n\t50 group Setting 50\n\t51 group Setting 51\n\t52 group Setting 52\n\t53 group Setting 53\n\t54 group Setting 54\n\t55 group Setting 55\n\t56 group Setting 56",
+    "web": "Page: Library (https://example.invalid/library)\nControls:\n1 link Related resource 1\n2 link Related resource 2\n3 link Related resource 3\n4 link Related resource 4\n5 link Related resource 5\n6 link Related resource 6\n7 link Related resource 7\n8 link Related resource 8\n9 link Related resource 9\n10 link Related resource 10\n11 link Related resource 11\n12 link Related resource 12\n13 link Related resource 13\n14 link Related resource 14\n15 link Related resource 15\n16 link Related resource 16\n17 link Related resource 17\n18 link Related resource 18\n19 link Related resource 19\n20 link Related resource 20\n21 link Related resource 21\n22 link Related resource 22\n23 link Related resource 23\n24 link Related resource 24\n25 link Related resource 25\n26 link Related resource 26\n27 link Related resource 27\n28 link Related resource 28\n29 link Related resource 29\n30 link Related resource 30\n31 link Related resource 31\n32 link Related resource 32\n33 link Related resource 33\n34 link Related resource 34\n35 link Related resource 35\n36 link Related resource 36\n37 link Related resource 37\n38 link Related resource 38\n39 link Related resource 39\n40 link Related resource 40\n41 link Related resource 41\n42 link Related resource 42\n43 link Related resource 43\n44 link Related resource 44\n45 link Related resource 45\n46 link Related resource 46\n47 link Related resource 47\n48 link Related resource 48\n49 link Related resource 49\n50 link Related resource 50\n51 link Related resource 51\n52 link Related resource 52\n53 link Related resource 53\n54 link Related resource 54\n55 link Related resource 55\n56 link Related resource 56",
+    "form": "Window: \"Intake\", App: Fixture.\n0 standard window form history\n\t1 text field Old answer 1 = Blank\n\t2 text field Old answer 2 = Blank\n\t3 text field Old answer 3 = Blank\n\t4 text field Old answer 4 = Blank\n\t5 text field Old answer 5 = Blank\n\t6 text field Old answer 6 = Blank\n\t7 text field Old answer 7 = Blank\n\t8 text field Old answer 8 = Blank\n\t9 text field Old answer 9 = Blank\n\t10 text field Old answer 10 = Blank\n\t11 text field Old answer 11 = Blank\n\t12 text field Old answer 12 = Blank\n\t13 text field Old answer 13 = Blank\n\t14 text field Old answer 14 = Blank\n\t15 text field Old answer 15 = Blank\n\t16 text field Old answer 16 = Blank\n\t17 text field Old answer 17 = Blank\n\t18 text field Old answer 18 = Blank\n\t19 text field Old answer 19 = Blank\n\t20 text field Old answer 20 = Blank\n\t21 text field Old answer 21 = Blank\n\t22 text field Old answer 22 = Blank\n\t23 text field Old answer 23 = Blank\n\t24 text field Old answer 24 = Blank\n\t25 text field Old answer 25 = Blank\n\t26 text field Old answer 26 = Blank\n\t27 text field Old answer 27 = Blank\n\t28 text field Old answer 28 = Blank\n\t29 text field Old answer 29 = Blank\n\t30 text field Old answer 30 = Blank\n\t31 text field Old answer 31 = Blank\n\t32 text field Old answer 32 = Blank\n\t33 text field Old answer 33 = Blank\n\t34 text field Old answer 34 = Blank\n\t35 text field Old answer 35 = Blank\n\t36 text field Old answer 36 = Blank\n\t37 text field Old answer 37 = Blank\n\t38 text field Old answer 38 = Blank\n\t39 text field Old answer 39 = Blank\n\t40 text field Old answer 40 = Blank\n\t41 text field Old answer 41 = Blank\n\t42 text field Old answer 42 = Blank\n\t43 text field Old answer 43 = Blank\n\t44 text field Old answer 44 = Blank\n\t45 text field Old answer 45 = Blank\n\t46 text field Old answer 46 = Blank\n\t47 text field Old answer 47 = Blank\n\t48 text field Old answer 48 = Blank\n\t49 text field Old answer 49 = Blank\n\t50 text field Old answer 50 = Blank\n\t51 text field Old answer 51 = Blank\n\t52 text field Old answer 52 = Blank\n\t53 text field Old answer 53 = Blank\n\t54 text field Old answer 54 = Blank\n\t55 text field Old answer 55 = Blank\n\t56 text field Old answer 56 = Blank"
+  },
+  "cases": [
+    {
+      "id": "mail-choose-left",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Use Preview in Cedar conversation",
+      "doneWhen": "Use Preview in Cedar conversation is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "a",
+      "fixture": "mail",
+      "tail": "\t57 group Cedar conversation\n\t\t58 button Preview\n\t\t59 static text Cedar conversation selected\n\t60 group Archive conversation\n\t\t61 button Preview\n\t\t62 static text Archive conversation selected"
+    },
+    {
+      "id": "mail-choose-right",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Use Preview in Archive conversation",
+      "doneWhen": "Use Preview in Archive conversation is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "mail",
+      "tail": "\t57 group Cedar conversation\n\t\t58 button Preview\n\t\t59 static text Cedar conversation selected\n\t60 group Archive conversation\n\t\t61 button Preview\n\t\t62 static text Archive conversation selected"
+    },
+    {
+      "id": "mail-choose-reverse",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Use Preview in Cedar conversation",
+      "doneWhen": "Use Preview in Cedar conversation is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "mail",
+      "tail": "\t57 group Archive conversation\n\t\t58 button Preview\n\t\t59 static text Archive conversation selected\n\t60 group Cedar conversation\n\t\t61 button Preview\n\t\t62 static text Cedar conversation selected"
+    },
+    {
+      "id": "mail-choose-missing",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Show account history for mail",
+      "doneWhen": "Show account history for mail is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        }
+      ],
+      "expected": "none",
+      "fixture": "mail",
+      "tail": "\t57 group Cedar conversation\n\t\t58 button Preview\n\t\t59 static text Cedar conversation selected\n\t60 group Archive conversation\n\t\t61 button Preview\n\t\t62 static text Archive conversation selected"
+    },
+    {
+      "id": "mail-decide-done",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Open the Cedar conversation preview",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Use the requested control",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "mail",
+      "tail": "\t57 group Status\n\t\t58 static text Cedar conversation preview opened"
+    },
+    {
+      "id": "mail-decide-look_again",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Open the Cedar conversation preview",
+      "doneWhen": "",
+      "expected": "look_again",
+      "step": "Start the action",
+      "result": "waiting for the window",
+      "failures": 0,
+      "fixture": "mail",
+      "tail": "\t57 group Status\n\t\t58 static text Preview is still loading"
+    },
+    {
+      "id": "mail-decide-act",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Open the Cedar conversation preview",
+      "doneWhen": "",
+      "expected": "act",
+      "step": "Select the requested item",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "mail",
+      "tail": "\t57 group Status\n\t\t58 static text Mailbox is available"
+    },
+    {
+      "id": "mail-decide-stuck",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Open the Cedar conversation preview",
+      "doneWhen": "",
+      "expected": "stuck",
+      "step": "Try the same control again",
+      "result": "No effect after repeated attempts",
+      "failures": 3,
+      "fixture": "mail",
+      "tail": "\t57 group Status\n\t\t58 static text Mailbox is available"
+    },
+    {
+      "id": "calculator-choose-left",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Use Show Result in Current calculation",
+      "doneWhen": "Use Show Result in Current calculation is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Result\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Result\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "a",
+      "fixture": "calculator",
+      "tail": "\t57 group Current calculation\n\t\t58 button Show Result\n\t\t59 static text Current calculation selected\n\t60 group Saved calculation\n\t\t61 button Show Result\n\t\t62 static text Saved calculation selected"
+    },
+    {
+      "id": "calculator-choose-right",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Use Show Result in Saved calculation",
+      "doneWhen": "Use Show Result in Saved calculation is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Result\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Result\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "calculator",
+      "tail": "\t57 group Current calculation\n\t\t58 button Show Result\n\t\t59 static text Current calculation selected\n\t60 group Saved calculation\n\t\t61 button Show Result\n\t\t62 static text Saved calculation selected"
+    },
+    {
+      "id": "calculator-choose-reverse",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Use Show Result in Current calculation",
+      "doneWhen": "Use Show Result in Current calculation is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Result\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Result\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "calculator",
+      "tail": "\t57 group Saved calculation\n\t\t58 button Show Result\n\t\t59 static text Saved calculation selected\n\t60 group Current calculation\n\t\t61 button Show Result\n\t\t62 static text Current calculation selected"
+    },
+    {
+      "id": "calculator-choose-missing",
+      "split": "dev",
+      "route": "choose",
+      "goal": "Show account history for calculator",
+      "doneWhen": "Show account history for calculator is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Result\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Result\" (#61)",
+          "index": 61
+        }
+      ],
+      "expected": "none",
+      "fixture": "calculator",
+      "tail": "\t57 group Current calculation\n\t\t58 button Show Result\n\t\t59 static text Current calculation selected\n\t60 group Saved calculation\n\t\t61 button Show Result\n\t\t62 static text Saved calculation selected"
+    },
+    {
+      "id": "calculator-decide-done",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Calculate and show Result 42",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Use the requested control",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "calculator",
+      "tail": "\t57 group Status\n\t\t58 static text Result = 42"
+    },
+    {
+      "id": "calculator-decide-look_again",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Calculate and show Result 42",
+      "doneWhen": "",
+      "expected": "look_again",
+      "step": "Start the action",
+      "result": "waiting for the window",
+      "failures": 0,
+      "fixture": "calculator",
+      "tail": "\t57 group Status\n\t\t58 static text Result = calculating"
+    },
+    {
+      "id": "calculator-decide-act",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Calculate and show Result 42",
+      "doneWhen": "",
+      "expected": "act",
+      "step": "Select the requested item",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "calculator",
+      "tail": "\t57 group Status\n\t\t58 static text Result = 12"
+    },
+    {
+      "id": "calculator-decide-stuck",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Calculate and show Result 42",
+      "doneWhen": "",
+      "expected": "stuck",
+      "step": "Try the same control again",
+      "result": "No effect after repeated attempts",
+      "failures": 3,
+      "fixture": "calculator",
+      "tail": "\t57 group Status\n\t\t58 static text Result = 12"
+    },
+    {
+      "id": "finder-choose-left",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Quick Look in Reports folder",
+      "doneWhen": "Use Quick Look in Reports folder is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Quick Look\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Quick Look\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "a",
+      "fixture": "finder",
+      "tail": "\t57 group Reports folder\n\t\t58 button Quick Look\n\t\t59 static text Reports folder selected\n\t60 group Screenshots folder\n\t\t61 button Quick Look\n\t\t62 static text Screenshots folder selected"
+    },
+    {
+      "id": "finder-choose-right",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Quick Look in Screenshots folder",
+      "doneWhen": "Use Quick Look in Screenshots folder is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Quick Look\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Quick Look\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "finder",
+      "tail": "\t57 group Reports folder\n\t\t58 button Quick Look\n\t\t59 static text Reports folder selected\n\t60 group Screenshots folder\n\t\t61 button Quick Look\n\t\t62 static text Screenshots folder selected"
+    },
+    {
+      "id": "finder-choose-reverse",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Quick Look in Reports folder",
+      "doneWhen": "Use Quick Look in Reports folder is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Quick Look\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Quick Look\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "finder",
+      "tail": "\t57 group Screenshots folder\n\t\t58 button Quick Look\n\t\t59 static text Screenshots folder selected\n\t60 group Reports folder\n\t\t61 button Quick Look\n\t\t62 static text Reports folder selected"
+    },
+    {
+      "id": "finder-choose-missing",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Show account history for finder",
+      "doneWhen": "Show account history for finder is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Quick Look\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Quick Look\" (#61)",
+          "index": 61
+        }
+      ],
+      "expected": "none",
+      "fixture": "finder",
+      "tail": "\t57 group Reports folder\n\t\t58 button Quick Look\n\t\t59 static text Reports folder selected\n\t60 group Screenshots folder\n\t\t61 button Quick Look\n\t\t62 static text Screenshots folder selected"
+    },
+    {
+      "id": "finder-decide-done",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Copy Quarterly.pdf to Reports",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Use the requested control",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "finder",
+      "tail": "\t57 group Status\n\t\t58 static text Quarterly.pdf copied to Reports"
+    },
+    {
+      "id": "finder-decide-look_again",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Copy Quarterly.pdf to Reports",
+      "doneWhen": "",
+      "expected": "look_again",
+      "step": "Start the action",
+      "result": "waiting for the window",
+      "failures": 0,
+      "fixture": "finder",
+      "tail": "\t57 group Status\n\t\t58 static text Quarterly.pdf copy in progress"
+    },
+    {
+      "id": "finder-decide-act",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Copy Quarterly.pdf to Reports",
+      "doneWhen": "",
+      "expected": "act",
+      "step": "Select the requested item",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "finder",
+      "tail": "\t57 group Status\n\t\t58 static text Quarterly.pdf copy failed"
+    },
+    {
+      "id": "finder-decide-stuck",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Copy Quarterly.pdf to Reports",
+      "doneWhen": "",
+      "expected": "stuck",
+      "step": "Try the same control again",
+      "result": "No effect after repeated attempts",
+      "failures": 3,
+      "fixture": "finder",
+      "tail": "\t57 group Status\n\t\t58 static text Quarterly.pdf copy failed"
+    },
+    {
+      "id": "settings-choose-left",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Show Details in Hearing options",
+      "doneWhen": "Use Show Details in Hearing options is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Details\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Details\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "a",
+      "fixture": "settings",
+      "tail": "\t57 group Hearing options\n\t\t58 button Show Details\n\t\t59 static text Hearing options selected\n\t60 group Display options\n\t\t61 button Show Details\n\t\t62 static text Display options selected"
+    },
+    {
+      "id": "settings-choose-right",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Show Details in Display options",
+      "doneWhen": "Use Show Details in Display options is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Details\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Details\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "settings",
+      "tail": "\t57 group Hearing options\n\t\t58 button Show Details\n\t\t59 static text Hearing options selected\n\t60 group Display options\n\t\t61 button Show Details\n\t\t62 static text Display options selected"
+    },
+    {
+      "id": "settings-choose-reverse",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Show Details in Hearing options",
+      "doneWhen": "Use Show Details in Hearing options is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Details\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Details\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "settings",
+      "tail": "\t57 group Display options\n\t\t58 button Show Details\n\t\t59 static text Display options selected\n\t60 group Hearing options\n\t\t61 button Show Details\n\t\t62 static text Hearing options selected"
+    },
+    {
+      "id": "settings-choose-missing",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Show account history for settings",
+      "doneWhen": "Show account history for settings is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Show Details\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Show Details\" (#61)",
+          "index": 61
+        }
+      ],
+      "expected": "none",
+      "fixture": "settings",
+      "tail": "\t57 group Hearing options\n\t\t58 button Show Details\n\t\t59 static text Hearing options selected\n\t60 group Display options\n\t\t61 button Show Details\n\t\t62 static text Display options selected"
+    },
+    {
+      "id": "settings-decide-done",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Turn on Live Captions",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Use the requested control",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "settings",
+      "tail": "\t57 group Status\n\t\t58 static text Live Captions = On"
+    },
+    {
+      "id": "settings-decide-look_again",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Turn on Live Captions",
+      "doneWhen": "",
+      "expected": "look_again",
+      "step": "Start the action",
+      "result": "waiting for the window",
+      "failures": 0,
+      "fixture": "settings",
+      "tail": "\t57 group Status\n\t\t58 static text Live Captions settings loading"
+    },
+    {
+      "id": "settings-decide-act",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Turn on Live Captions",
+      "doneWhen": "",
+      "expected": "act",
+      "step": "Select the requested item",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "settings",
+      "tail": "\t57 group Status\n\t\t58 static text Live Captions = Off"
+    },
+    {
+      "id": "settings-decide-stuck",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Turn on Live Captions",
+      "doneWhen": "",
+      "expected": "stuck",
+      "step": "Try the same control again",
+      "result": "No effect after repeated attempts",
+      "failures": 3,
+      "fixture": "settings",
+      "tail": "\t57 group Status\n\t\t58 static text Live Captions = Off"
+    },
+    {
+      "id": "web-choose-left",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Preview in Saved reports",
+      "doneWhen": "Use Preview in Saved reports is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "a",
+      "fixture": "web",
+      "tail": "\t57 group Saved reports\n\t\t58 button Preview\n\t\t59 static text Saved reports selected\n\t60 group Recent reports\n\t\t61 button Preview\n\t\t62 static text Recent reports selected"
+    },
+    {
+      "id": "web-choose-right",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Preview in Recent reports",
+      "doneWhen": "Use Preview in Recent reports is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "web",
+      "tail": "\t57 group Saved reports\n\t\t58 button Preview\n\t\t59 static text Saved reports selected\n\t60 group Recent reports\n\t\t61 button Preview\n\t\t62 static text Recent reports selected"
+    },
+    {
+      "id": "web-choose-reverse",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Preview in Saved reports",
+      "doneWhen": "Use Preview in Saved reports is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "web",
+      "tail": "\t57 group Recent reports\n\t\t58 button Preview\n\t\t59 static text Recent reports selected\n\t60 group Saved reports\n\t\t61 button Preview\n\t\t62 static text Saved reports selected"
+    },
+    {
+      "id": "web-choose-missing",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Show account history for web",
+      "doneWhen": "Show account history for web is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Preview\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Preview\" (#61)",
+          "index": 61
+        }
+      ],
+      "expected": "none",
+      "fixture": "web",
+      "tail": "\t57 group Saved reports\n\t\t58 button Preview\n\t\t59 static text Saved reports selected\n\t60 group Recent reports\n\t\t61 button Preview\n\t\t62 static text Recent reports selected"
+    },
+    {
+      "id": "web-decide-done",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Export Annual report.pdf",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Use the requested control",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "web",
+      "tail": "Text:\nExport completed: Annual report.pdf"
+    },
+    {
+      "id": "web-decide-look_again",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Export Annual report.pdf",
+      "doneWhen": "",
+      "expected": "look_again",
+      "step": "Start the action",
+      "result": "waiting for the window",
+      "failures": 0,
+      "fixture": "web",
+      "tail": "Text:\nPreparing export: Annual report.pdf"
+    },
+    {
+      "id": "web-decide-act",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Export Annual report.pdf",
+      "doneWhen": "",
+      "expected": "act",
+      "step": "Select the requested item",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "web",
+      "tail": "Text:\nAnnual report.pdf selected"
+    },
+    {
+      "id": "web-decide-stuck",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Export Annual report.pdf",
+      "doneWhen": "",
+      "expected": "stuck",
+      "step": "Try the same control again",
+      "result": "No effect after repeated attempts",
+      "failures": 3,
+      "fixture": "web",
+      "tail": "Text:\nAnnual report.pdf selected"
+    },
+    {
+      "id": "form-choose-left",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Look up Postcode in Mailing address",
+      "doneWhen": "Use Look up Postcode in Mailing address is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Look up Postcode\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Look up Postcode\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "a",
+      "fixture": "form",
+      "tail": "\t57 group Mailing address\n\t\t58 button Look up Postcode\n\t\t59 static text Mailing address selected\n\t60 group Billing address\n\t\t61 button Look up Postcode\n\t\t62 static text Billing address selected"
+    },
+    {
+      "id": "form-choose-right",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Look up Postcode in Billing address",
+      "doneWhen": "Use Look up Postcode in Billing address is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Look up Postcode\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Look up Postcode\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "form",
+      "tail": "\t57 group Mailing address\n\t\t58 button Look up Postcode\n\t\t59 static text Mailing address selected\n\t60 group Billing address\n\t\t61 button Look up Postcode\n\t\t62 static text Billing address selected"
+    },
+    {
+      "id": "form-choose-reverse",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Use Look up Postcode in Mailing address",
+      "doneWhen": "Use Look up Postcode in Mailing address is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Look up Postcode\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Look up Postcode\" (#61)",
+          "index": 61
+        },
+        {
+          "id": "c",
+          "text": "scroll down"
+        }
+      ],
+      "expected": "b",
+      "fixture": "form",
+      "tail": "\t57 group Billing address\n\t\t58 button Look up Postcode\n\t\t59 static text Billing address selected\n\t60 group Mailing address\n\t\t61 button Look up Postcode\n\t\t62 static text Mailing address selected"
+    },
+    {
+      "id": "form-choose-missing",
+      "split": "heldout",
+      "route": "choose",
+      "goal": "Show account history for form",
+      "doneWhen": "Show account history for form is visible",
+      "options": [
+        {
+          "id": "a",
+          "text": "click \"Look up Postcode\" (#58)",
+          "index": 58
+        },
+        {
+          "id": "b",
+          "text": "click \"Look up Postcode\" (#61)",
+          "index": 61
+        }
+      ],
+      "expected": "none",
+      "fixture": "form",
+      "tail": "\t57 group Mailing address\n\t\t58 button Look up Postcode\n\t\t59 static text Mailing address selected\n\t60 group Billing address\n\t\t61 button Look up Postcode\n\t\t62 static text Billing address selected"
+    },
+    {
+      "id": "form-decide-done",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Fill in Postcode 4021 AB",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Use the requested control",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "form",
+      "tail": "\t57 group Status\n\t\t58 static text Postcode = 4021 AB"
+    },
+    {
+      "id": "form-decide-look_again",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Fill in Postcode 4021 AB",
+      "doneWhen": "",
+      "expected": "look_again",
+      "step": "Start the action",
+      "result": "waiting for the window",
+      "failures": 0,
+      "fixture": "form",
+      "tail": "\t57 group Status\n\t\t58 static text Postcode lookup is still loading"
+    },
+    {
+      "id": "form-decide-act",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Fill in Postcode 4021 AB",
+      "doneWhen": "",
+      "expected": "act",
+      "step": "Select the requested item",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "form",
+      "tail": "\t57 group Status\n\t\t58 static text Postcode ="
+    },
+    {
+      "id": "form-decide-stuck",
+      "split": "heldout",
+      "route": "decide",
+      "goal": "Fill in Postcode 4021 AB",
+      "doneWhen": "",
+      "expected": "stuck",
+      "step": "Try the same control again",
+      "result": "No effect after repeated attempts",
+      "failures": 3,
+      "fixture": "form",
+      "tail": "\t57 group Status\n\t\t58 static text Postcode ="
+    },
+    {
+      "id": "mail-decide-done-alternate",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Open the Cedar conversation preview",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Wait for the result",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "mail",
+      "tail": "\t57 dialog Action result\n\t\t58 static text Preview: Cedar conversation"
+    },
+    {
+      "id": "calculator-decide-done-alternate",
+      "split": "dev",
+      "route": "decide",
+      "goal": "Calculate and show Result 42",
+      "doneWhen": "",
+      "expected": "done",
+      "step": "Wait for the result",
+      "result": "ok",
+      "failures": 0,
+      "fixture": "calculator",
+      "tail": "\t57 dialog Action result\n\t\t58 static text Result = 42"
+    }
+  ]
+}
