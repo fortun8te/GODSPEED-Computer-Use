@@ -327,6 +327,16 @@ enum HandoffTool {
         return !candidate.risky && !tried.contains(candidate.key) ? candidate : nil
     }
 
+    /// True when every condition was missing on `before` and is met on `after`: the goal became true during the handoff.
+    static func becameTrue(_ conditions: [DoneCheck.Condition], before: String, after: String) -> Bool {
+        !conditions.isEmpty && conditions.allSatisfy { condition in
+            guard case .missing = check([condition], screen: before), case .weak = check([condition], screen: after) else {
+                return false
+            }
+            return true
+        }
+    }
+
     static func check(_ conditions: [DoneCheck.Condition], screen: String) -> DoneCheck.Result {
         let evidence = DoneCheck.Evidence(screenText: screen, pageURL: { nil })
         var controls: [Control]?
@@ -449,7 +459,8 @@ enum HandoffTool {
     }
 
     struct Outcome {
-        enum Kind { case done, stuck, escalate, budget, failed, cancelled }
+        /// `notVerified`: the goal was already on screen as weak evidence. Nothing ran; the caller decides.
+        enum Kind { case done, notVerified, stuck, escalate, budget, failed, cancelled }
         let kind: Kind
         let reason: String
         let steps: [String]
@@ -468,6 +479,7 @@ enum HandoffTool {
             switch kind {
             case .done:
                 lines.append(deliveryState == .verified ? "Done: \(reason)" : "Weak evidence: \(reason)")
+            case .notVerified: lines.append("Not verified: \(reason)")
             case .stuck: lines.append("Stuck: \(reason)")
             case .escalate: lines.append("Needs you: \(reason)")
             case .budget: lines.append("Stopped: \(reason)")
@@ -566,11 +578,20 @@ enum HandoffTool {
         let doneSummary = request.doneWhen.map(\.summary).joined(separator: "; ")
         var lastUnmet: [String] = []
         var deliveryState: DeliveryState = .notSent
-        func matched(_ state: String) -> [String]? {
+        // A weak match (present in the state, no proof it changed) never completes the handoff by itself.
+        var weakMatch: [String]?
+        /// `start` is the state the handoff began from: a weak match that was false there and is true now is verified.
+        func matched(_ state: String, since start: String? = nil) -> [String]? {
+            weakMatch = nil
             switch deps.check(state) {
-            case .verified(let met), .weak(let met):
+            case .verified(let met):
                 lastUnmet = []
                 return met
+            case .weak(let met):
+                lastUnmet = []
+                if let start, HandoffTool.becameTrue(request.doneWhen, before: start, after: state) { return met }
+                weakMatch = met
+                return nil
             case .missing(let unmet):
                 lastUnmet = unmet
                 return nil
@@ -606,6 +627,9 @@ enum HandoffTool {
         if let met = matched(state) {
             return Outcome(kind: .done, reason: "already true (\(met.joined(separator: "; ")))", steps: [], changes: nil, options: [])
         }
+        if let weak = weakMatch {
+            return finish(.notVerified, "already satisfied (weak evidence: \(weak.joined(separator: "; ")))", initial: initial, latest: state)
+        }
 
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: initial, latest: state)
@@ -621,7 +645,7 @@ enum HandoffTool {
             }
             if case .blocked(let reason) = replayed { return finish(.escalate, reason, initial: initial, latest: state) }
             if case .alreadySatisfied(let evidence) = replayed {
-                return finish(.done, evidence, initial: initial, latest: state)
+                return finish(.notVerified, evidence, initial: initial, latest: state)
             }
             steps.append("replayed the saved recipe")
             if replayed == .verified {
@@ -640,7 +664,7 @@ enum HandoffTool {
             if replayed == .uncertain {
                 return finish(.escalate, "the saved recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: state)
             }
-            if let met = matched(state) {
+            if let met = matched(state, since: initial) {
                 return finish(.done, met.joined(separator: ", "), initial: initial, latest: state)
             }
             steps[steps.count - 1] = "the saved recipe did not finish; continued by hand"
@@ -731,7 +755,7 @@ enum HandoffTool {
                     if RequestCancellation.requested { return cancelled() }
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
-                if let met = matched(next) {
+                if let met = matched(next, since: initial) {
                     return finish(.done, met.joined(separator: "; "), initial: initial, latest: next)
                 }
                 let unchanged = AXStateDiff.diff(previous: state, current: next) == AXStateDiff.noChangesMessage

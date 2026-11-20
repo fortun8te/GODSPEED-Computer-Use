@@ -673,7 +673,7 @@ private func enableBestEffortAccessibilityModes(_ appElement: AXUIElement) -> Bo
     return manual == .success
 }
 
-private struct WindowCapture {
+struct WindowCapture {
     let windowID: CGWindowID
     let layer: Int
     let bounds: CGRect

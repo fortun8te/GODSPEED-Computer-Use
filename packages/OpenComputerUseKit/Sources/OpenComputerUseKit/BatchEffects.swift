@@ -179,6 +179,34 @@ enum BatchEffects {
         WindowSig(id: id, title: windowTitle(in: state), dialog: dialog(in: state))
     }
 
+    /// A window's number and frame, read from the window list (no accessibility tree).
+    struct WindowIdentity: Equatable {
+        let id: UInt32
+        let bounds: CGRect
+    }
+
+    /// Whether an element-number or ref step must stop because its window is no longer the one the batch started
+    /// in. Only checked once the effect budget is spent: the optional reads that track the window have stopped by then.
+    static func elementStepMovedWindow(effectsOn: Bool, budgetExhausted: Bool, start: WindowIdentity?,
+                                       now: () -> WindowIdentity?) -> Bool {
+        guard effectsOn, budgetExhausted, let start else { return false }
+        guard let current = now() else { return true }
+        return current != start
+    }
+
+    /// The step line when cancellation arrives during a step. A step whose input went out says so.
+    static func cancelledStepLine(number: Int, description: String, delivery: DeliveryState) -> String {
+        let head = "\(number). \(description): "
+        switch delivery {
+        case .notSent:
+            return head + "cancelled during step"
+        case .acknowledged, .verified:
+            return head + "sent, cancelled after delivery (\(delivery.rawValue))"
+        case .outcomeUnknown:
+            return head + "sent, outcome unknown after cancellation. Inspect before retrying."
+        }
+    }
+
     struct Watch {
         let text: String
         let sig: WindowSig

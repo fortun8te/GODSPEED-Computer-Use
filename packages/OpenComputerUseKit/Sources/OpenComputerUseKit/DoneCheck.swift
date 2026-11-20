@@ -111,7 +111,8 @@ enum DoneCheck {
         guard entries.count <= 8 else {
             throw ComputerUseError.invalidArguments("done_when allows at most 8 conditions")
         }
-        return try entries.map { entry in
+        // Every recognized key in an object is its own condition (all must hold); none is dropped.
+        return try entries.flatMap { entry -> [Condition] in
             guard var object = entry as? [String: Any] else {
                 throw ComputerUseError.invalidArguments(
                     "done_when entries are objects like {\"text\": \"Message sent\"} or {\"file_exists\": \"~/x.pdf\"}"
@@ -120,40 +121,47 @@ enum DoneCheck {
             for (alias, key) in Self.keyAliases where object[key] == nil {
                 if let value = object[alias] { object[key] = value }
             }
+            var conditions: [Condition] = []
+            // `since_start` turns `field` + `equals` into a transition check, so the field is not a plain match too.
+            var fieldIsTransition = false
             if let mode = object["since_start"] {
                 guard mode as? String == "changed", let label = object["field"] as? String, !label.isEmpty,
                       let value = object["equals"], !(value is NSNull) else {
                     throw ComputerUseError.invalidArguments("done_when since_start: changed needs field and equals")
                 }
-                return .fieldChanged(label: label, equals: "\(value)")
+                conditions.append(.fieldChanged(label: label, equals: "\(value)"))
+                fieldIsTransition = true
             }
-            if let text = object["appeared"] as? String, !text.isEmpty { return .appeared(text) }
-            if let text = object["disappeared"] as? String, !text.isEmpty { return .disappeared(text) }
-            if let url = object["url_changed"] as? String, !url.isEmpty { return .urlChanged(url) }
+            if let text = object["appeared"] as? String, !text.isEmpty { conditions.append(.appeared(text)) }
+            if let text = object["disappeared"] as? String, !text.isEmpty { conditions.append(.disappeared(text)) }
+            if let url = object["url_changed"] as? String, !url.isEmpty { conditions.append(.urlChanged(url)) }
             if let path = object["file_changed"] as? String, !path.isEmpty {
-                return .fileChanged((path as NSString).expandingTildeInPath)
+                conditions.append(.fileChanged((path as NSString).expandingTildeInPath))
             }
             if let path = object["file_exists"] as? String, !path.isEmpty {
-                return .fileExists((path as NSString).expandingTildeInPath)
+                conditions.append(.fileExists((path as NSString).expandingTildeInPath))
             }
             if let text = object["text"] as? String, !text.isEmpty {
-                return .text(text)
+                conditions.append(.text(text))
             }
-            if let label = object["field"] as? String, !label.isEmpty {
+            if !fieldIsTransition, let label = object["field"] as? String, !label.isEmpty {
                 guard let value = object["equals"], !(value is NSNull) else {
                     throw ComputerUseError.invalidArguments("done_when field '\(label)' needs an equals value")
                 }
-                return .field(label: label, equals: "\(value)")
+                conditions.append(.field(label: label, equals: "\(value)"))
             }
             if let part = object["url_contains"] as? String, !part.isEmpty {
-                return .urlContains(part)
+                conditions.append(.urlContains(part))
             }
             if let label = object["gone"] as? String, !label.isEmpty {
-                return .gone(label)
+                conditions.append(.gone(label))
             }
-            throw ComputerUseError.invalidArguments(
-                "done_when entry needs one of: file_changed, appeared, disappeared, url_changed, file_exists, text, field + equals, url_contains, gone"
-            )
+            guard !conditions.isEmpty else {
+                throw ComputerUseError.invalidArguments(
+                    "done_when entry needs one of: file_changed, appeared, disappeared, url_changed, file_exists, text, field + equals, url_contains, gone"
+                )
+            }
+            return conditions
         }
     }
 
