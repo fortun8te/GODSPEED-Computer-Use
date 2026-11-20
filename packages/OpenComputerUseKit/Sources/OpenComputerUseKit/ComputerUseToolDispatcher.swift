@@ -210,8 +210,18 @@ public final class ComputerUseToolDispatcher {
                 log.note("'\(label)' is a menu item; pressed \(path.joined(separator: " > ")).")
                 return pressed
             }
+            // A failed native step (AdaptiveLearning): a learned recovery hint for this kind of failure is named on one
+            // more line. Refusals never reach here, and send/pay/delete-type steps are never recorded (FailureSignatures).
+            if !StrictBackground.enabled(), let failure = error as? ComputerUseError,
+               let app = arguments["app"] as? String, !app.isEmpty {
+                let bundle = (try? AppDiscovery.resolveRunning(app))?.bundleIdentifier ?? app
+                let signature = FailureSignature.forStep(tool: name, arguments: arguments, error: failure, appBundleID: bundle)
+                throw AdaptiveLearning.shared.hints.recordFailure(signature, error: failure)
+            }
             throw error
         }
+        // The step went through: a hint that this step followed is credited (AdaptiveLearning).
+        if !result.isError, !StrictBackground.enabled() { AdaptiveLearning.shared.hints.recordSuccess() }
         // Opening an app comes with its state, so the model needs no separate read before acting.
         if name == "open", !result.isError, let app = arguments["app"] as? String, !app.isEmpty,
            arguments["path"] == nil, arguments["url"] == nil,
