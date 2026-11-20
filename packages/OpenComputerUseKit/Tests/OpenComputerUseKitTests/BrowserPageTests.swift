@@ -871,9 +871,11 @@ extension BrowserPageTests {
 /// A stand-in OBU helper that records every CDP command it receives and answers each request. `open_tab`
 /// answers with `openTabID`, which makes that tab one the agent opened.
 enum RecordingBrowserHelper {
-    static func make(directory: URL, openTabID: Int) throws -> (helper: URL, log: URL) {
+    /// `replies`: a substring of a request line and the CDP reply (JSON text) to send when it matches.
+    static func make(directory: URL, openTabID: Int, replies: [(match: String, text: String)] = []) throws -> (helper: URL, log: URL) {
         let log = directory.appendingPathComponent("requests.log")
         let helper = directory.appendingPathComponent("obu")
+        let cases = replies.map { "*'\($0.match)'*) text='\($0.text)' ;;" }.joined(separator: "\n            ")
         let script = #"""
         #!/bin/sh
         LOG='\#(log.path)'
@@ -885,6 +887,7 @@ enum RecordingBrowserHelper {
           printf '%s\n' "$line" >> "$LOG"
           case "$line" in
             *'"name":"open_tab"'*) text='{\"result\":{\"tab\":{\"id\":\#(openTabID)}}}' ;;
+            \#(cases)
             *) text='{}' ;;
           esac
           printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$text"
@@ -927,5 +930,39 @@ extension BrowserPageTests {
         BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
         let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
         XCTAssertTrue(sent.contains("Page.addScriptToEvaluateOnNewDocument"))
+    }
+
+    func testClickInsideAFrameNeedsTheIntendedElementAtThePoint() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let frameProbe = #"{\"result\":{\"result\":{\"value\":[\"frame\"]}}}"#
+        let box = #"{\"result\":{\"model\":{\"content\":[10,20,30,20,30,40,10,40]}}}"#
+        let object = #"{\"result\":{\"object\":{\"objectId\":\"handle\"}}}"#
+        func helper(hitting backendNodeID: Int) throws -> (BrowserBridge, () -> Void) {
+            let (helper, _) = try RecordingBrowserHelper.make(directory: directory, openTabID: 12, replies: [
+                (#""method":"Runtime.callFunctionOn""#, frameProbe),
+                (#""method":"DOM.getBoxModel""#, box),
+                (#""method":"DOM.resolveNode""#, object),
+                (#""method":"DOM.getNodeForLocation""#, #"{\"result\":{\"backendNodeId\":\#(backendNodeID)}}"#),
+            ])
+            let bridge = BrowserBridge(sessionID: "frame-click-\(UUID().uuidString)", launchEnvironment: [
+                "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+            ])
+            return (bridge, { bridge.shutdown() })
+        }
+        let control = BrowserNode(index: 4, role: "button", name: "Pay", value: "", backendNodeID: 101)
+        // Another element sits at the click point: the click must be refused, not reported as sent.
+        let (covered, stopCovered) = try helper(hitting: 777)
+        defer { stopCovered() }
+        _ = try covered.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        let page = BrowserPage(bridge: covered, tab: ["tab_id": 12])
+        XCTAssertThrowsError(try page.clickPoint(of: control))
+        // The intended control (or something inside it) is at the point: the click point is returned.
+        let (intended, stopIntended) = try helper(hitting: 101)
+        defer { stopIntended() }
+        _ = try intended.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        let point = try BrowserPage(bridge: intended, tab: ["tab_id": 12]).clickPoint(of: control)
+        XCTAssertEqual(point, CGPoint(x: 20, y: 30))
     }
 }
