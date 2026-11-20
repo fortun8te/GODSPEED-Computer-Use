@@ -268,6 +268,20 @@ final class ActionPolicyTests: XCTestCase {
         XCTAssertFalse(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": "a\nb"], bundleID: "com.apple.TextEdit", target: nil).contains(.send))
     }
 
+    func testClassificationReadsElementsWithoutRecoveringAWindow() {
+        var policies: [SnapshotRecoveryPolicy] = []
+        let record = ActionPolicy.classificationRecord(index: "5") { policy in
+            policies.append(policy)
+            throw ComputerUseError.stateUnavailable("the app has no window")
+        }
+        XCTAssertNil(record)
+        XCTAssertEqual(policies, [.readOnly], "classification must not unhide, activate or open a window")
+        XCTAssertNil(ActionPolicy.classificationRecord(index: "not-a-number") { _ in
+            XCTFail("a non-numeric index must not read the app")
+            throw ComputerUseError.stateUnavailable("unused")
+        })
+    }
+
     func testDragIsATargetedToolAndItsDropTargetCarriesRisk() {
         XCTAssertTrue(ActionPolicy.nativeTargetTools.contains("drag"))
         // A pixel drop has no readable destination, so it is treated like an opaque click.

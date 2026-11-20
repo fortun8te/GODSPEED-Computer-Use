@@ -39,6 +39,13 @@ extension ActionPolicy {
         return [id]
     }
 
+    /// The element an action would target, read for classification only. Classification runs before
+    /// authorization, so it must never unhide, activate, raise or open a window to find that element.
+    static func classificationRecord(index: String, readSnapshot: (SnapshotRecoveryPolicy) throws -> AppSnapshot) -> ElementRecord? {
+        guard let parsed = Int(index), let snapshot = try? readSnapshot(.readOnly) else { return nil }
+        return snapshot.elements[parsed]
+    }
+
     static let nativeTargetTools: Set<String> = ["click", "set_value", "type_text", "press_key", "perform_secondary_action", "drag"]
 
     /// A drag's risk comes from where it drops. The destination arguments name that element.
@@ -63,13 +70,27 @@ extension ComputerUseService {
         if let labels {
             record = try? resolveLabel(app: app, labels: labels)
         } else if let index {
-            record = policyElement(app: app, index: index)
+            record = policyRecord(app: app, index: index)
         } else {
             record = nil
         }
         guard let record else { return nil }
         return ActionPolicy.Target(title: record.title, identifier: record.identifier, role: record.role,
                                    secureField: isSecurePolicyField(record))
+    }
+}
+
+extension ComputerUseService {
+    /// Targeted (registry) indexes never recover a window, so they keep their own lookup. Any other index is read
+    /// with a read-only recovery policy instead of the default that may activate the app.
+    func policyRecord(app: String, index: String) -> ElementRecord? {
+        if ComputerUseService.requiredRefGeneration == nil, let parsed = Int(index),
+           parsed > TargetedElementRegistry<Int>.indexBase {
+            return policyElement(app: app, index: index)
+        }
+        return ActionPolicy.classificationRecord(index: index) { policy in
+            try currentSnapshot(for: app, needScreenshot: false, recoveryPolicy: policy)
+        }
     }
 }
 
