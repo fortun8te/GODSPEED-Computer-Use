@@ -22,12 +22,16 @@ struct OperationJournal: Sendable {
         let requestID = UUID()
     }
 
+    /// The durability steps taken for each append, in order. Tests observe them through `onFlush`.
+    enum Flush: Sendable, Equatable { case fullSync, fsync, directory }
+
     @TaskLocal private static var recording: Recording?
 
     static let shared = OperationJournal(directory: FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".godspeed/journal", isDirectory: true))
 
     let directory: URL
+    var onFlush: (@Sendable (Flush) -> Void)? = nil
     private var file: URL { directory.appendingPathComponent("operations.jsonl") }
 
     static func withRecording<T>(_ journal: Self = shared, _ body: () throws -> T) rethrows -> T {
@@ -142,6 +146,7 @@ struct OperationJournal: Sendable {
     private func append(_ entry: Entry) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        let created = !FileManager.default.fileExists(atPath: file.path)
         let fd = open(file.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw posixError() }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -149,6 +154,26 @@ struct OperationJournal: Sendable {
         let json = try JSONEncoder().encode(entry)
         // Start on a new line even when the last writer died mid-append.
         try handle.write(contentsOf: Data([10]) + json + Data([10]))
+        try flushToDisk(fd)
+        // A new file is only durable once its directory entry is durable too.
+        if created { try syncDirectory() }
+    }
+
+    /// macOS fsync does not flush the drive cache. F_FULLFSYNC does, so fsync is only the fallback.
+    private func flushToDisk(_ fd: Int32) throws {
+        onFlush?(.fullSync)
+        if fcntl(fd, F_FULLFSYNC) == 0 { return }
+        onFlush?(.fsync)
+        while fsync(fd) != 0 {
+            if errno != EINTR { throw posixError() }
+        }
+    }
+
+    private func syncDirectory() throws {
+        let fd = open(directory.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw posixError() }
+        defer { close(fd) }
+        onFlush?(.directory)
         while fsync(fd) != 0 {
             if errno != EINTR { throw posixError() }
         }
