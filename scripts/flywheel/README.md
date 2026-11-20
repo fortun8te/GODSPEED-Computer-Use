@@ -117,3 +117,14 @@ Undo with the saved plist. Verify that health reports the original path again.
   curl --fail --silent http://127.0.0.1:8765/health
 )
 ```
+
+## Calibrate and pick rows to label
+
+Both commands read probability JSONL only and load no model. They write new files and refuse to overwrite.
+
+```sh
+python3 -I scripts/flywheel/flywheel.py calibrate validation-probs.jsonl --params calibration.json [--isotonic]
+python3 -I scripts/flywheel/flywheel.py select-for-labeling --pool pool-probs.jsonl [--other-probs second-probs.jsonl] --n 40 --out next-labels.jsonl
+```
+
+Validation rows are `{"id", "gold", "probs", "question"}`; `question` defaults to `default` and gets its own temperature. The done threshold is the highest calibrated P(done) any non-done row received, so false done is zero on that file. The report is in-sample, so check it on a separate file before trusting it. Pool rows are `{"id", "family", "probs"}`. Selection ranks by uncertainty (margin and entropy), adds model disagreement when a second file is given, and keeps every family at or below 40 percent of the picks. Output rows carry a `reason`. The current eval writes reports, not probability files, so these inputs must be produced separately.
