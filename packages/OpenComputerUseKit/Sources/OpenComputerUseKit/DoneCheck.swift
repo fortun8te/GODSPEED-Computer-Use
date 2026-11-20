@@ -157,16 +157,20 @@ enum DoneCheck {
         }
     }
 
-    /// A final-state match is weak evidence. Every check needs a transition to verify completion.
+    /// A final-state match is weak evidence unless it became true during the batch (see
+    /// BatchCompletion.confirmsTransition). Transition checks verify directly.
     static func check(_ conditions: [Condition], evidence: Evidence, baseline: BatchCompletion? = nil,
                       after: BatchCompletion.Observation? = nil) -> Result {
         var met: [String] = []
         var unmet: [String] = []
+        // Strong when every met check either is a transition check or became true during the batch.
+        var allStrong = true
         var fetchedURL: String?
         var didFetchURL = false
         for condition in conditions {
             if !condition.requiresBaseline, evidence.directlyVerified.contains(condition) {
                 met.append(condition.summary)
+                if baseline?.confirmsTransition(condition, after: after) != true { allStrong = false }
                 continue
             }
             let ok: Bool
@@ -190,10 +194,17 @@ enum DoneCheck {
             case .appeared, .disappeared, .fieldChanged, .urlChanged, .fileChanged:
                 ok = baseline?.meets(condition, after: after) == true
             }
-            if ok { met.append(condition.summary) } else { unmet.append(condition.summary) }
+            if ok {
+                met.append(condition.summary)
+                if !condition.requiresBaseline, baseline?.confirmsTransition(condition, after: after) != true {
+                    allStrong = false
+                }
+            } else {
+                unmet.append(condition.summary)
+            }
         }
         if !unmet.isEmpty { return .missing(unmet: unmet) }
-        return conditions.allSatisfy(\.requiresBaseline) ? .verified(met: met) : .weak(met: met)
+        return allStrong ? .verified(met: met) : .weak(met: met)
     }
 
     /// The one line the batch reply adds: "Done: verified (...)" or "Not done yet: (...)".
