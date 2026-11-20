@@ -82,8 +82,9 @@ public struct ToolCallResult: @unchecked Sendable {
         var metadata: [String: Any] = [:]
         for (key, value) in deliveryState.metadata { metadata["godspeed/\(key)"] = value }
         metadata["godspeed/preview_pages"] = browserPreviewPages
-        if let failureCode, failureCode == .staleRef || failureCode == .windowChanged {
-            metadata["godspeed/error_code"] = failureCode.rawValue
+        let code = batchReceipt?.failureCode ?? failureCode
+        if let code, code == .staleRef || code == .windowChanged || code.isActionRefusal {
+            metadata["godspeed/error_code"] = code.rawValue
         }
         if let receipt = batchReceipt {
             var batch: [String: Any] = [

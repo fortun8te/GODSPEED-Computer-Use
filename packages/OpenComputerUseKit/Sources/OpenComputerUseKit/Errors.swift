@@ -18,6 +18,9 @@ public enum ComputerUseError: Error, LocalizedError {
     case acknowledged(String)
     case staleRef
     case windowChanged(UInt32)
+    case backgroundUnsupported(String)
+    case approvalRequired(String)
+    case actionDenied(String)
 
     public var errorDescription: String? {
         switch self {
@@ -31,6 +34,12 @@ public enum ComputerUseError: Error, LocalizedError {
             return "appNotFound(\"\(app)\")"
         case .permissionDenied(let message):
             return message
+        case .backgroundUnsupported(let message):
+            return "BACKGROUND_UNSUPPORTED: \(message)"
+        case .approvalRequired(let message):
+            return "APPROVAL_REQUIRED: \(message)"
+        case .actionDenied(let message):
+            return "ACTION_DENIED: \(message)"
         case .stateUnavailable(let message), .notSent(let message), .staleTarget(let message),
              .elementGone(let message), .timedOut(let message, _), .acknowledged(let message):
             return message
@@ -50,7 +59,7 @@ public enum ComputerUseError: Error, LocalizedError {
         switch self {
         case .unsupportedTool, .invalidArguments, .appNotFound, .permissionDenied, .notSent,
              .targetNotFound, .ambiguousTarget, .staleTarget, .elementGone,
-             .staleRef, .windowChanged:  // L1: refused before any input was sent
+             .staleRef, .windowChanged, .backgroundUnsupported, .approvalRequired, .actionDenied:  // refused before any input
             return .notSent
         case .timedOut(_, let delivery):
             return delivery

@@ -284,6 +284,12 @@ export function parseListApps(text) {
   }).filter(app => app.id);
 }
 
+function strictBackgroundArgs({ strictBackground } = {}) {
+  if (strictBackground === undefined) return {};
+  if (typeof strictBackground !== "boolean") throw new Error("strictBackground must be a boolean");
+  return { strict_background: strictBackground };
+}
+
 function optionsToSnapshotArgs(options = {}) {
   const args = optionsToWindowArgs(options);
   if (options.textLimit !== undefined) args.text_limit = options.textLimit;
@@ -312,12 +318,14 @@ function optionsToSnapshotArgs(options = {}) {
   return args;
 }
 
-function optionsToWindowArgs({ windowId } = {}) {
-  if (windowId === undefined) return {};
+function optionsToWindowArgs(options = {}) {
+  const args = strictBackgroundArgs(options);
+  const { windowId } = options;
+  if (windowId === undefined) return args;
   if (!Number.isSafeInteger(windowId) || windowId < 1 || windowId > 0xffffffff) {
     throw new Error("windowId must be a positive integer up to 4294967295");
   }
-  return { window_id: windowId };
+  return { ...args, window_id: windowId };
 }
 
 function elementTargetArgs(target) {
@@ -384,7 +392,9 @@ export function createCuaApi(native, activeOutput) {
     const text = toolResultText(result);
     await emitText(text, options);
     await emitImages(toolResultImages(result), options);
-    return { text, isError: result?.isError === true, receipt: result?._meta?.["godspeed/batch"] ?? null };
+    const reply = { text, isError: result?.isError === true, receipt: result?._meta?.["godspeed/batch"] ?? null };
+    if (result?._meta?.["godspeed/error_code"]) reply.errorCode = result._meta["godspeed/error_code"];
+    return reply;
   }
   function appBinding(app) {
     return Object.freeze({
@@ -394,7 +404,7 @@ export function createCuaApi(native, activeOutput) {
       async query(options = {}) {
         if (!isPlainObject(options)) throw new Error("app.query expects an options object");
         for (const key of Object.keys(options)) {
-          if (!["text", "role", "exact", "limit", "maxNodes", "windowId"].includes(key)) throw new Error(`Unknown query option: ${key}`);
+          if (!["text", "role", "exact", "limit", "maxNodes", "windowId", "strictBackground"].includes(key)) throw new Error(`Unknown query option: ${key}`);
         }
         for (const key of ["text", "role"]) {
           if (options[key] !== undefined && (typeof options[key] !== "string" || options[key].length > 1000)) throw new Error(`${key} must be a string of at most 1000 UTF-16 code units`);
@@ -405,7 +415,7 @@ export function createCuaApi(native, activeOutput) {
           if (options[key] !== undefined && (!Number.isSafeInteger(options[key]) || options[key] < 1 || (key === "windowId" && options[key] > 0xffffffff))) throw new Error(`${key} must be a positive integer${key === "windowId" ? " up to 4294967295" : ""}`);
         }
         const result = await call("query", { app, text: options.text, role: options.role, exact: options.exact,
-                                             limit: options.limit, max_nodes: options.maxNodes, window_id: options.windowId });
+                                             limit: options.limit, max_nodes: options.maxNodes, window_id: options.windowId, ...strictBackgroundArgs(options) });
         const response = JSON.parse(toolResultText(result));
         if (!isPlainObject(response) || !Array.isArray(response.matches) || typeof response.truncated !== "boolean" || typeof response.stop_reason !== "string") throw new Error("Invalid query response");
         return response;
@@ -447,15 +457,17 @@ export function createCuaApi(native, activeOutput) {
         });
       },
       async pressKey(key, options = {}) { await call("press_key", { app, key, ...optionsToKeyArgs(options) }); },
-      async pressMenu(path) {
+      async pressMenu(path, options = {}) {
         if (typeof path !== "string" || !path.trim()) throw new Error("pressMenu requires a menu path such as \"File > Save As…\"");
-        await call("press_menu", { app, path });
+        await call("press_menu", { app, path, ...strictBackgroundArgs(options) });
       },
-      async scroll(target, direction, pages = 1) {
+      async scroll(target, direction, pages = 1, options = {}) {
         if (Array.isArray(target)) throw new Error("coordinate scroll is not supported by this Open Computer Use runtime");
-        await call("scroll", { app, ...elementTargetArgs(target), direction, pages });
+        await call("scroll", { app, ...elementTargetArgs(target), direction, pages, ...strictBackgroundArgs(options) });
       },
-      async setValue(target, value) { await call("set_value", { app, ...elementTargetArgs(target), value }); },
+      async setValue(target, value, options = {}) {
+        await call("set_value", { app, ...elementTargetArgs(target), value, ...strictBackgroundArgs(options) });
+      },
       async selectText(target, text, options = {}) {
         const targetArgs = elementTargetArgs(target);
         if (!targetArgs.ref) {
@@ -465,7 +477,7 @@ export function createCuaApi(native, activeOutput) {
         if (typeof text !== "string" || !text.length) throw new Error("selectText requires non-empty text");
         if (!isPlainObject(options)) throw new Error("selectText expects an options object");
         for (const key of Object.keys(options)) {
-          if (!["prefix", "suffix", "selection"].includes(key)) throw new Error(`Unknown selectText option: ${key}`);
+          if (!["prefix", "suffix", "selection", "strictBackground"].includes(key)) throw new Error(`Unknown selectText option: ${key}`);
         }
         for (const key of ["prefix", "suffix"]) {
           if (options[key] !== undefined && typeof options[key] !== "string") throw new Error(`${key} must be a string`);
@@ -474,21 +486,25 @@ export function createCuaApi(native, activeOutput) {
           throw new Error("selection must be text, cursor_before or cursor_after");
         }
         await call("select_text", { app, ...targetArgs, text,
-          prefix: options.prefix, suffix: options.suffix, selection: options.selection });
+          prefix: options.prefix, suffix: options.suffix, selection: options.selection, ...strictBackgroundArgs(options) });
       },
       async typeText(text, options = {}) { await call("type_text", { app, text, ...optionsToKeyArgs(options) }); },
-      async performSecondaryAction(target, action) { await call("perform_secondary_action", { app, ...elementTargetArgs(target), action }); },
+      async performSecondaryAction(target, action, options = {}) {
+        await call("perform_secondary_action", { app, ...elementTargetArgs(target), action, ...strictBackgroundArgs(options) });
+      },
     });
   }
   const api = {
     async browser(action, args = {}, options = {}) {
       if (typeof action !== "string" || !action.trim()) throw new Error("browser requires an action name");
       if (!isPlainObject(args) || !isPlainObject(options)) throw new Error("browser expects argument and output objects");
-      const result = await native.request("tools/call", { name: "browser", arguments: { ...args, action } });
+      const result = await native.request("tools/call", { name: "browser", arguments: { ...args, ...strictBackgroundArgs(options), action } });
       const text = toolResultText(result);
       await emitText(text, options);
       await emitImages(toolResultImages(result), options);
-      return { text, isError: result?.isError === true, pages: result?._meta?.["godspeed/preview_pages"] ?? [] };
+      const reply = { text, isError: result?.isError === true, pages: result?._meta?.["godspeed/preview_pages"] ?? [] };
+      if (result?._meta?.["godspeed/error_code"]) reply.errorCode = result._meta["godspeed/error_code"];
+      return reply;
     },
     async clipboard(action, text) {
       if (!["read", "write", "clear"].includes(action)) throw new Error("clipboard expects read, write, or clear");
@@ -504,7 +520,7 @@ export function createCuaApi(native, activeOutput) {
         throw new Error("peekPages expects one to six nonempty browser addresses");
       }
       if (!isPlainObject(options)) throw new Error("peekPages expects an options object");
-      const result = await call("browser", { action: "peek", urls });
+      const result = await call("browser", { action: "peek", urls, ...strictBackgroundArgs(options) });
       const text = toolResultText(result);
       await emitText(text, options);
       return { text, pages: result?._meta?.["godspeed/preview_pages"] ?? [] };

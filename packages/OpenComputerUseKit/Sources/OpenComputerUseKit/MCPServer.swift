@@ -16,13 +16,20 @@ public final class StdioMCPServer {
     /// Per-connection record of top-level tool calls.
     private let trajectory: TrajectoryLog
 
-    public init(
+    public convenience init(
         service: ComputerUseService = ComputerUseService(),
         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
         trajectoryEnvironment: [String: String]? = nil
     ) {
-        self.service = service
-        self.dispatcher = ComputerUseToolDispatcher(service: service)
+        self.init(dispatcher: ComputerUseToolDispatcher(service: service), backgroundStateReset: backgroundStateReset,
+                  trajectoryEnvironment: trajectoryEnvironment)
+    }
+
+    init(dispatcher: ComputerUseToolDispatcher,
+         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
+         trajectoryEnvironment: [String: String]? = nil) {
+        self.service = dispatcher.service
+        self.dispatcher = dispatcher
         self.backgroundStateReset = backgroundStateReset
         self.trajectory = TrajectoryLog(environment: trajectoryEnvironment ?? GodspeedSettings.environment)
     }

@@ -14,7 +14,8 @@ import Foundation
 ///       "find_on_screen": false,           -> OPEN_COMPUTER_USE_VISION_URL = helper_url
 ///       "helper_url": "http://127.0.0.1:8765",
 ///       "recipes": true,                   -> OPEN_COMPUTER_USE_RECIPES
-///       "browser": true                    -> OPEN_COMPUTER_USE_BROWSER
+///       "browser": true,                   -> OPEN_COMPUTER_USE_BROWSER
+///       "strict_background": true          -> OPEN_COMPUTER_USE_STRICT_BACKGROUND
 ///     }
 ///
 /// The file is checked for changes as requests read settings.
@@ -63,6 +64,7 @@ enum GodspeedSettings {
         if (settings["find_on_screen"] as? Bool) == true { variables["OPEN_COMPUTER_USE_VISION_URL"] = helper }
         if let value = flag("cursor_lens") { variables["OPEN_COMPUTER_USE_CURSOR_LENS"] = value }
         if let value = flag("recipes") { variables["OPEN_COMPUTER_USE_RECIPES"] = value }
+        if let value = flag("strict_background") { variables["OPEN_COMPUTER_USE_STRICT_BACKGROUND"] = value }
         if let value = flag("browser") { variables["OPEN_COMPUTER_USE_BROWSER"] = value }
         return variables
     }
