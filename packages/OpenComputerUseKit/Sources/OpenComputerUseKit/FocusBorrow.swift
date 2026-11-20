@@ -199,13 +199,24 @@ final class FocusBorrowController: @unchecked Sendable {
         case .handOver(let pid):
             if activator.isAlive(pid: pid) { _ = activator.activate(pid: pid) }
         case .restore(let previous):
-            // Restore only if this app is still the one in front: otherwise the user moved on by themselves.
-            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid {
+            // Restore only if this app is still the one in front (otherwise the user moved on by themselves), and
+            // only once the user has paused: taking focus mid-sentence would send their keys to the other app.
+            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid, awaitTypingPause() {
                 _ = activator.activate(pid: previous)
             }
         }
         // An app that was hidden before the borrow is hidden again once nothing borrows it.
         if !isBorrowed(pid: lease.pid) { activator.restoreVisibility(pid: lease.pid) }
+    }
+
+    /// Polls for a typing pause for up to `timeout` seconds. False when the user is still typing at the end.
+    private func awaitTypingPause(timeout: TimeInterval = 1.5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if activator.waitForTypingPause() { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        return activator.waitForTypingPause()
     }
 
     func isBorrowed(pid: pid_t) -> Bool {

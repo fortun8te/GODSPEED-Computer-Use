@@ -325,6 +325,13 @@ enum BatchEffects {
         let kind: Kind
         let timeoutMs: Int
 
+        /// Whole milliseconds for a number a model sent. Clamped to 0...maxTimeoutMs before the Int conversion,
+        /// which traps on huge values; non-finite input is rejected.
+        static func milliseconds(_ value: Double, perUnit: Double = 1) throws -> Int {
+            guard value.isFinite else { throw ComputerUseError.invalidArguments("wait time must be a finite number") }
+            return Int(min(max(value * perUnit, 0), Double(maxTimeoutMs)))
+        }
+
         /// Seconds this wait may poll, limited by its own timeout and the batch's remaining time.
         func pollSeconds(elapsedInBatch: TimeInterval, budget: TimeInterval) -> TimeInterval {
             min(Double(timeoutMs) / 1000, max(budget - elapsedInBatch, 0))
@@ -356,7 +363,7 @@ enum BatchEffects {
                 let seconds = ["timeout_s", "timeout_seconds", "timeout"].lazy.compactMap { key -> Double? in
                     (arguments[key] as? NSNumber)?.doubleValue ?? Double((arguments[key] as? String) ?? "")
                 }.first
-                if let seconds { arguments["timeout_ms"] = seconds <= 60 ? Int(seconds * 1000) : Int(seconds) }
+                if let seconds { arguments["timeout_ms"] = try Self.milliseconds(seconds, perUnit: seconds <= 60 ? 1000 : 1) }
             }
             func text(_ key: String) -> String? {
                 (arguments[key] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }

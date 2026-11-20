@@ -368,6 +368,12 @@ enum InputSimulation {
         }
     }
 
+    /// Global mouse events that must wait until the user is hands-off (releases are exempt).
+    static func needsHandsOff(_ type: CGEventType) -> Bool {
+        type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown || type == .mouseMoved
+            || type == .leftMouseDragged
+    }
+
     private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, flags: CGEventFlags? = nil) throws {
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
@@ -377,9 +383,9 @@ enum InputSimulation {
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         applyDragMotionFields(to: event, delta: delta, eventNumber: eventNumber)
         if let flags { event.flags = flags }
-        // A press or move through the global stream lands wherever the user is working: only when they are
+        // A press, move or drag through the global stream lands wherever the user is working: only when they are
         // hands-off. A release always goes out, so no button stays held.
-        if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown || type == .mouseMoved {
+        if needsHandsOff(type) {
             try requireUserHandsOff()
         }
         event.post(tap: .cghidEventTap)
