@@ -52,20 +52,35 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
 - **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
 
-### Works only with focus borrowing
+### Strict background mode
 
-Focus borrowing brings one app to the front for a moment, then gives focus back to the app that had it. The pointer does not move. It is used only where background delivery cannot work:
+Set `"strict_background": true` in `~/.godspeed/settings.json`, or pass `strict_background: true` on a tool call. In the JavaScript REPL, use `strictBackground: true` in the options. Batch and handoff steps inherit the restriction.
 
-- Dialogs and editors: Save, Export, Rename, New Folder, Print, Duplicate, Move To, and any menu title ending in `…`.
-- Typing into a sheet that a shortcut just opened (for example after ⌘S).
-- Key chords and activation-based clicks, and typing into a field a shortcut just opened, while `OPEN_COMPUTER_USE_BACKGROUND_ONLY=1`.
-- Any batch sent with `foreground: true` (the whole batch runs with the app in front).
+Godspeed uses routes that avoid app activation, temporary key focus, and physical pointer movement. Native reads require an app that is already running. Native clicks use accessibility elements. If the route needs keys, a pixel click, a window move, or a new browser tab, Godspeed returns `BACKGROUND_UNSUPPORTED`. Browser actions in strict mode require an already connected helper.
 
-Set `OPEN_COMPUTER_USE_FOCUS_BORROW=0` to turn it off. Steps then run in the background only.
+Focus borrowing is off by default. When explicitly enabled with `OPEN_COMPUTER_USE_FOCUS_BORROW=1`, it can bring an app forward for a dialog or a batch sent with `foreground: true`. Strict background mode and `OPEN_COMPUTER_USE_BACKGROUND_ONLY=1` both disable focus borrowing. Strict mode also refuses routes that temporarily make a background window key.
+
+### Local action policy
+
+Godspeed reads `~/.godspeed/action-policy.json` for each action, including steps expanded from a batch, handoff, or recipe. Use bundle IDs for apps and full HTTP(S) origins for websites. Scheme and port matter. Each rule accepts `allow`, `ask`, or `deny`. A refusal takes precedence over an allow. With no rules, existing tool behavior applies.
+
+```json
+{
+  "apps": { "com.apple.mail": "ask" },
+  "origins": { "https://shop.example": "deny" },
+  "risks": { "purchase": "ask", "credential_entry": "deny" }
+}
+```
+
+The risk keys are `send`, `submit`, `purchase`, `delete`, `credential_entry`, `file_overwrite`, and `system_settings`. Godspeed checks context such as secure fields, form controls, key shortcuts, and save operations. An opaque native action can match several risk rules. With site restrictions enabled, use the browser tool for Chrome so it can check the tab and known destinations.
+
+An `ask` rule stops with `APPROVAL_REQUIRED`. A `deny` rule stops with `ACTION_DENIED`. Only the local policy file controls permission. Page text and tool arguments cannot grant it. MCP returns the code in `_meta["godspeed/error_code"]`. The REPL exposes it as `error.code` on native exceptions and `errorCode` on batch and browser replies.
+
+Chrome can follow its own redirects during navigation. Godspeed checks the resulting origin before returning page content or accepting another action. The policy governs Godspeed calls. Chrome still handles network requests and page scripts.
 
 ## Settings
 
-Two places, one rule: **an environment variable that is set always wins**. Otherwise the value from `~/.godspeed/settings.json` is used, and otherwise the default. The file is re-read when it changes. Cursor settings apply on the next action. The others are read once per process, so they apply from the next start. PURE's Settings > GODSPEED writes the file.
+Two places, one rule: **an environment variable that is set always wins**. Otherwise the value from `~/.godspeed/settings.json` is used, and otherwise the default. The file is re-read when it changes. Cursor and strict background settings apply on the next call. Settings read once per process apply on the next start. PURE's Settings > GODSPEED writes the file.
 
 ### `~/.godspeed/settings.json`
 
@@ -98,7 +113,8 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 | `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | on | Stop waiting when the window stops changing. |
 | `OPEN_COMPUTER_USE_BACKGROUND_ONLY` | off | Never raise or activate an app. Opt-in for when the user keeps working. |
 | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` | off | Allow moving the real pointer. Off means never. |
-| `OPEN_COMPUTER_USE_FOCUS_BORROW` | on | Focus borrowing (see above). |
+| `OPEN_COMPUTER_USE_FOCUS_BORROW` | off | Allow focus borrowing when background-only and strict modes are off. |
+| `OPEN_COMPUTER_USE_STRICT_BACKGROUND` | off | Require strict background delivery (settings key `strict_background`). |
 | `OPEN_COMPUTER_USE_RECIPES` | on | Saved recipes (settings key `recipes`). |
 | `OPEN_COMPUTER_USE_VIRTUAL_DISPLAY_ENABLED` | off | Adds `window_placement` to `get_app_state`. |
 | `OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE` | none | Separate socket for tests (`godspeed-agent-<hash>.sock`). |
@@ -225,7 +241,7 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 - macOS only. The app is built for the native arch. `obu` is built for arm64.
 - Native app input and browser writes are serialized. Eligible browser reads overlap across clients. Use `cua.peekPages(urls)` in the REPL to load up to three independent pages at once, with up to six URLs per call. Keep steps that share input or depend on each other's output in one ordered batch.
 - Set `OPEN_COMPUTER_USE_CURSOR_COLOR=auto` for stable per-client cursor colors. The active cursor shows which client is driving the shared Mac input.
-- Background delivery depends on the app. Dialogs, sheets and some key chords need focus borrowing.
+- Background delivery depends on the app. Some dialogs, sheets and key chords require foreground input.
 - A batch is at most 20 steps. `peek` takes at most 6 URLs with a shared 40-second browser budget. Idle preview workers pick up the next unread URL automatically. At most three preview loads run across the shared process. Preview helpers expire after a minute of inactivity. The REPL returns `pages` with a URL, status, text, and cleanup result for each page. Retry only failed or unstarted URLs. Results stay in the input order and report pages that could not be read.
 - The referee and vision are hints and fallbacks, off by default. Vision has been checked on one synthetic image, not on real apps.
 - Recipes match the exact goal text. They are stored only on this Mac (`~/.godspeed/recipes.json`).
