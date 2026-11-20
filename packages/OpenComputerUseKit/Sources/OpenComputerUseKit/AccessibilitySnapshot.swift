@@ -378,7 +378,10 @@ enum SnapshotBuilder {
         context.numbering = numbering
         numbering?.beginSnapshot()
         var renderer = TreeRenderer(context: context)
+        // Timed here so the shared profile learns this app's AX latency (the tree read is the AX work).
+        let walkStart = TimingLog.now()
         TimingLog.measure("snapshot.tree_walk") { AXSnapshotReadCache.withSnapshot { renderer.render(rootElement) } }
+        AppTiming.shared.record(app: AppTiming.key(pid: app.pid), axLatencyMs: (TimingLog.now() - walkStart) * 1000)
 
         // Pin the window's visible state (WindowServer occlusion notifications
         // off) so covering it or moving it to another Space later does not hide
@@ -2981,6 +2984,8 @@ extension SnapshotBuilder {
         AXUIElementSetMessagingTimeout(element, timeout)
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+        // A frozen-looking answer is an AX timeout; repeated ones mark the app unresponsive in the shared profile.
+        if appLooksFrozen(error) { AppTiming.shared.recordTimeout(app: AppTiming.key(pid: pid)) }
         return !appLooksFrozen(error)
     }
 

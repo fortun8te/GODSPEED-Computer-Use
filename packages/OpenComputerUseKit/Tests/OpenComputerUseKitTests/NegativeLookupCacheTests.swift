@@ -90,6 +90,45 @@ final class NegativeLookupCacheTests: XCTestCase {
         XCTAssertFalse(cache.isKnownMiss(key: key(app: "com.example.two"), generation: 1, now: 0))
     }
 
+    /// The label search as resolveLabel runs it. A repeat at the same generation skips the fresh read; a new
+    /// generation searches again and can find the control.
+    func testRepeatedMissSkipsFreshReadAndNewGenerationSearchesAgain() {
+        struct Snapshot { let window: Int; let names: [String] }
+        let cache = NegativeLookupCache(ttl: 2)
+        var generation = 1
+        var fresh = Snapshot(window: 7, names: ["Cancel"])
+        var freshReads = 0
+        let keyFor: (Snapshot) -> NegativeLookupCache.Key = {
+            NegativeLookupCache.Key(app: "com.example.app", windowID: $0.window, label: "Save", role: "")
+        }
+        let find: (Snapshot) throws -> String? = { $0.names.contains("Save") ? "Save" : nil }
+        func run(now: TimeInterval) throws -> (hit: String?, freshRead: Bool) {
+            let outcome = try cache.searchTwoStep(
+                keyFor: keyFor, cached: Snapshot(window: 7, names: ["Cancel"]),
+                generation: { generation }, now: { now }, find: find,
+                readFresh: { freshReads += 1; return fresh })
+            return (outcome.hit, outcome.freshRead)
+        }
+
+        XCTAssertNoThrow(try {
+            let first = try run(now: 10)
+            XCTAssertNil(first.hit)
+            XCTAssertTrue(first.freshRead, "the first miss does the fresh read")
+            XCTAssertEqual(freshReads, 1)
+
+            let second = try run(now: 10.5)
+            XCTAssertFalse(second.freshRead, "a repeat of the miss on the same generation skips the fresh read")
+            XCTAssertEqual(freshReads, 1)
+
+            generation = 2
+            fresh = Snapshot(window: 7, names: ["Save", "Cancel"])
+            let third = try run(now: 10.6)
+            XCTAssertTrue(third.freshRead, "a new generation searches again")
+            XCTAssertEqual(third.hit, "Save")
+            XCTAssertEqual(freshReads, 2)
+        }())
+    }
+
     func testConcurrentRecordLookupAndInvalidateStayBounded() {
         let cache = NegativeLookupCache(ttl: 2, capacity: 16)
         DispatchQueue.concurrentPerform(iterations: 8) { worker in
