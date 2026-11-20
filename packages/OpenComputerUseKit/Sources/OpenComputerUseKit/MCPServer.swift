@@ -118,23 +118,8 @@ public final class StdioMCPServer {
 
                 return try encodeJSONRPCError(id: id, code: -32601, message: "Method not found: \(method ?? "")")
             }
-        } catch let error as ComputerUseError {
-            let result = ToolCallResult.text(error.errorDescription ?? String(describing: error), isError: error.toolResultIsError)
-            return try? encodeJSONRPCResult(id: id, result: result.asDictionary)
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            return try? encodeJSONRPCResult(
-                id: id,
-                result: [
-                    "content": [
-                        [
-                            "type": "text",
-                            "text": message,
-                        ],
-                    ],
-                    "isError": true,
-                ]
-            )
+            return try? encodeJSONRPCResult(id: id, result: ToolCallResult.failure(error).asDictionary)
         }
     }
 

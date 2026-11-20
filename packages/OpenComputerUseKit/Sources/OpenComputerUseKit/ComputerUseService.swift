@@ -589,7 +589,9 @@ func clickActionRan(_ result: AXError, action: String) throws -> Bool {
     case .actionUnsupported, .illegalArgument, .notImplemented, .invalidUIElement:
         return false
     case .failure, .cannotComplete, .attributeUnsupported, .noValue:
-        throw ComputerUseError.message(clickMayHaveActedMessage(what: action, result: result))
+        let message = clickMayHaveActedMessage(what: action, result: result)
+        if result == .cannotComplete { throw ComputerUseError.timedOut(message, delivery: .outcomeUnknown) }
+        throw ComputerUseError.message(message)
     default:
         throw ComputerUseError.message("AXUIElementPerformAction(\(action)) failed with \(result.rawValue)")
     }
@@ -603,7 +605,9 @@ func clickAttributeWasSet(_ result: AXError, attribute: String) throws -> Bool {
     case .attributeUnsupported, .actionUnsupported, .illegalArgument, .noValue, .notImplemented, .invalidUIElement:
         return false
     case .failure, .cannotComplete:
-        throw ComputerUseError.message(clickMayHaveActedMessage(what: "setting \(attribute)", result: result))
+        let message = clickMayHaveActedMessage(what: "setting \(attribute)", result: result)
+        if result == .cannotComplete { throw ComputerUseError.timedOut(message, delivery: .outcomeUnknown) }
+        throw ComputerUseError.message(message)
     default:
         throw ComputerUseError.message("AXUIElementSetAttributeValue(\(attribute)) failed with \(result.rawValue)")
     }
@@ -772,7 +776,11 @@ public final class ComputerUseService {
             return .text("ok")
         }
 
-        return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
+        do {
+            return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
+        } catch {
+            throw ComputerUseError.acknowledged("Input was sent. Read the app to check its effect. \(SmartSteps.messageText(error))")
+        }
     }
 
     public func listApps() -> ToolCallResult {
@@ -1342,7 +1350,7 @@ public final class ComputerUseService {
                 pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                 return try actionResult(for: query)
             }
-            throw ComputerUseError.stateUnavailable(focusedElementUnreadableMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
+            throw ComputerUseError.notSent(focusedElementUnreadableMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
         }
         if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
             pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
@@ -1360,7 +1368,7 @@ public final class ComputerUseService {
                 return try withAutoFocusNote(deliverText(app: query, text: text, keyMethod: keyMethod, snapshot: snapshot, autoFocused: true))
             }
             guard try typeOnKeypad(text, snapshot: snapshot, focused: focused) else {
-                throw ComputerUseError.stateUnavailable(
+                throw ComputerUseError.notSent(
                     "type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element."
                         + FocusBorrow.retryHint(pid: snapshot.app.pid))
             }
@@ -1567,7 +1575,7 @@ public final class ComputerUseService {
         let normalized = Self.canonicalKey(key)
         if PrivateClipboard.Action(key: key) == nil,
            NSRunningApplication(processIdentifier: snapshot.app.pid)?.bundleIdentifier == "com.apple.finder",
-           let message = FinderClipboard.handle(key: normalized) {
+           let message = try FinderClipboard.handle(key: normalized) {
             return insertingNote(message, into: try actionResult(for: query))
         }
         func isText(_ element: AXUIElement) -> Bool {
@@ -1595,7 +1603,7 @@ public final class ComputerUseService {
         if normalized == "cmd+s", let bundle = NSRunningApplication(processIdentifier: snapshot.app.pid)?.bundleIdentifier,
            ["com.apple.TextEdit", "com.apple.Preview", "com.apple.iWork.Pages", "com.apple.iWork.Numbers", "com.apple.iWork.Keynote"].contains(bundle),
            let path = AppleEventsGate.run("tell application id \"\(bundle)\" to get path of document 1", bundle: bundle)?.stringValue, !path.isEmpty,
-           AppleEventsGate.run("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
+           try AppleEventsGate.send("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
             return insertingNote("Saved \(path).", into: try actionResult(for: query))
         }
         return nil
@@ -1616,7 +1624,7 @@ public final class ComputerUseService {
             default: key = nil
             }
             if let key {
-                guard let message = FinderClipboard.handle(key: key) else {
+                guard let message = try FinderClipboard.handle(key: key) else {
                     throw ComputerUseError.stateUnavailable("Finder could not complete the private clipboard action. Check the selection or destination before retrying.")
                 }
                 return .text(message)
@@ -1759,8 +1767,7 @@ public final class ComputerUseService {
                 "duplicate": "tell application id \"com.apple.finder\" to set made to duplicate (get selection)\nreturn count of made",
                 "move to trash": "tell application id \"com.apple.finder\" to set gone to delete (get selection)\nreturn count of gone",
             ][last]
-            if let script, let done = AppleEventsGate.run(script, bundle: "com.apple.finder") {
-                _ = done
+            if let script, try AppleEventsGate.send(script, bundle: "com.apple.finder") != nil {
                 return .text("pressed \(titles.joined(separator: " > ")) (done through Finder on the selected items)")
             }
         }
@@ -1769,7 +1776,7 @@ public final class ComputerUseService {
            let bundle = NSRunningApplication(processIdentifier: app.pid)?.bundleIdentifier,
            ["com.apple.TextEdit", "com.apple.Preview", "com.apple.iWork.Pages", "com.apple.iWork.Numbers", "com.apple.iWork.Keynote"].contains(bundle),
            let path = AppleEventsGate.run("tell application id \"\(bundle)\" to get path of document 1", bundle: bundle)?.stringValue, !path.isEmpty,
-           AppleEventsGate.run("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
+           try AppleEventsGate.send("tell application id \"\(bundle)\" to save document 1", bundle: bundle) != nil {
             return .text("pressed File > Save (saved \(path))")
         }
         SkyKeyboardDispatcher.lastPressReportedDisabled = false
@@ -1831,13 +1838,16 @@ public final class ComputerUseService {
         let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
         moveVisualCursor(to: cursorTarget)
 
+        var delivery: DeliveryState = .notSent
         do {
             try requireUsableComputerUseSession()
+            delivery = .outcomeUnknown
             let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
             guard result == .success else {
                 throw ComputerUseError.message("AXUIElementSetAttributeValue failed with \(result.rawValue)")
             }
 
+            delivery = .acknowledged
             try requireUsableComputerUseSession()
             // A password field's value is never read back: AppKit answers "" whatever it holds, so the check failed a
             // write that had worked and invited sending it again.
@@ -1847,14 +1857,17 @@ public final class ComputerUseService {
                     var actual: CFTypeRef?
                     return AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &actual) == .success ? actual : nil
                 }, validate: { try requireUsableComputerUseSession() })
+                delivery = .verified
             }
         } catch {
             settleVisualCursor(at: cursorTarget)
+            if delivery == .acknowledged { throw ComputerUseError.acknowledged(SmartSteps.messageText(error)) }
             throw error
         }
 
         settleVisualCursor(at: cursorTarget)
-        return try actionResult(for: query)
+        let result = try actionResult(for: query)
+        return result.replacingContent(result.content, deliveryState: delivery)
     }
 
     public func selectText(
@@ -2036,7 +2049,7 @@ public final class ComputerUseService {
     }
 
     private func windowBindingError(_ id: CGWindowID) -> ComputerUseError {
-        .stateUnavailable("Observed window \(id) changed or is unavailable. Read its state or query it again before acting.")
+        .notSent("Observed window \(id) changed or is unavailable. Read its state or query it again before acting.")
     }
 
     private func requireBoundFocusedWindow(in snapshot: AppSnapshot) throws {
@@ -2165,7 +2178,7 @@ public final class ComputerUseService {
             }
             guard distinct.count > 1 else { return distinct.first }
             let listed = distinct.prefix(6).map { "\($0.index) \(roleKey($0.role)) \(names($0).first ?? "")" }.joined(separator: ", ")
-            throw ComputerUseError.invalidArguments(
+            throw ComputerUseError.ambiguousTarget(
                 "'\(labels[0])' \(SmartSteps.ambiguousPhrase) (\(distinct.count)): \(listed). Pick one with element_index."
             )
         }
@@ -2260,7 +2273,7 @@ public final class ComputerUseService {
         let shown = avail.isEmpty
             ? "none with a name; use element_index from the state, or query to find text"
             : avail.prefix(60).joined(separator: ", ")
-        throw ComputerUseError.invalidArguments("no element labelled '\(labels[0])'. Clickable labels now: \(shown)")
+        throw ComputerUseError.targetNotFound("no element labelled '\(labels[0])'. Clickable labels now: \(shown)")
     }
 
     static func isToggleRole(_ role: String?) -> Bool {
@@ -2327,7 +2340,7 @@ public final class ComputerUseService {
             // Numbers are stable across reads: one that was handed out before but is not shown now is gone.
             if let parsedIndex = Int(index), parsedIndex >= 0, let high = snapshot.numberingHighWater, parsedIndex < high {
                 let known = ElementNumbering.forApp(pid: snapshot.app.pid).remembered(parsedIndex)
-                throw ComputerUseError.stateUnavailable(ElementNumbering.goneMessage(index: index, role: known?.role, label: known?.label))
+                throw ComputerUseError.elementGone(ElementNumbering.goneMessage(index: index, role: known?.role, label: known?.label))
             }
             throw ComputerUseError.invalidArguments("unknown element_index '\(index)'")
         }
@@ -2346,7 +2359,7 @@ public final class ComputerUseService {
         let now = try ElementIdentity.read(element)
         // An element that cannot be read at all has left the app: say so plainly (the number is never reused).
         if now == nil, snapshot.numberingHighWater != nil, Self.elementIsGone(element) {
-            throw ComputerUseError.stateUnavailable(ElementNumbering.goneMessage(
+            throw ComputerUseError.elementGone(ElementNumbering.goneMessage(
                 index: index, role: SmartSteps.roleKey(record.role), label: SmartSteps.name(of: record)
             ))
         }
@@ -2367,7 +2380,7 @@ public final class ComputerUseService {
         var enabled: CFTypeRef?
         _ = AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled)
         if let refusal = disabledControlRefusal(enabled: enabled as? Bool, role: record.role, elementIndex: elementIndex) {
-            throw ComputerUseError.message(refusal)
+            throw ComputerUseError.notSent(refusal)
         }
     }
 

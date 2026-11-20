@@ -38,32 +38,12 @@ enum BatchEffects {
         case outcomeUnknown = "outcome unknown"
     }
 
-    /// Phrases of errors that prove nothing was sent.
-    private static let notSentPhrases = [
-        "nothing sent", "nothing was sent", "no text was sent", "missing required argument", "invalidarguments",
-        "unknown element_index", "no element labelled", "matches several controls", "is disabled",
-        "appnotfound", "unsupportedtool", "stale:", "no longer has the identity", "permissiondenied",
-    ]
-    /// Phrases of errors raised after input may already have reached the app.
-    private static let unknownPhrases = [
-        "may have acted", "may have run", "did not answer", "did not respond", "timed out", "timeout",
-        "not responding", "outcome unknown", "a repeat could act twice",
-        "may have taken effect", "may have created a tab", "background link may have opened",
-        "navigation was sent", "navigation was not confirmed", "requested page did not become ready", "destination did not become ready",
-        "could not confirm tab", "was claimed, but", "click ran and multiple tabs appeared",
-        "drag was interrupted after starting", "helper returned an unreadable reply",
-    ]
-
-    /// The receipt for a failed step's message, or nil when it is a plain failure. Unknown wins over not sent:
-    /// a message that says the input may have gone out is never reported as safe to resend.
-    static func failureReceipt(_ message: String) -> Receipt? {
-        let text = message.lowercased()
-        if unknownPhrases.contains(where: { text.contains($0) }) { return .outcomeUnknown }
-        if notSentPhrases.contains(where: { text.contains($0) }) { return .notSent }
-        // The argument checker's own corrective line ("click needs a label or element_index. Example: ..."). A bare
-        // "needs" elsewhere proves nothing: the message may come from after the input went out.
-        if text.contains(" needs "), text.contains("example:") { return .notSent }
-        return nil
+    static func failureReceipt(_ delivery: DeliveryState) -> Receipt? {
+        switch delivery {
+        case .notSent: return .notSent
+        case .outcomeUnknown: return .outcomeUnknown
+        case .acknowledged, .verified: return nil
+        }
     }
 
     /// Tools whose success normally changes something the tree shows (scroll, drag and text selection may not).
@@ -85,12 +65,14 @@ enum BatchEffects {
     }
 
     /// The closing advice after a failed step.
-    static func advice(for receipt: Receipt?, stepNumber: Int) -> String {
-        switch receipt {
+    static func advice(for delivery: DeliveryState, stepNumber: Int) -> String {
+        switch delivery {
         case .notSent:
             return "Step \(stepNumber) was not sent. Fix it using the state below and continue from that step."
-        case .outcomeUnknown, .noEffectSeen, nil:
+        case .outcomeUnknown:
             return "Check whether step \(stepNumber) took effect before retrying. Resume at the first unfinished step."
+        case .acknowledged, .verified:
+            return "Step \(stepNumber) was sent. Inspect its result before continuing."
         }
     }
 

@@ -196,11 +196,8 @@ enum MacOSAppAgentProxy {
                     // Answer this request with an error, then continue on a fresh connection: the late reply
                     // on the old one must not be read as the answer to the next request.
                     if let id = jsonRPCRequestID(line) {
-                        let reply: [String: Any] = [
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": ["code": -32000, "message": timeout.errorDescription ?? "timed out"],
-                        ]
+                        let reply = Self.mcpFailureReply(id: id, message: timeout.errorDescription ?? "timed out",
+                                                         delivery: .outcomeUnknown)
                         if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
                             FileHandle.standardOutput.write(data + Data("\n".utf8))
                         }
@@ -227,6 +224,10 @@ enum MacOSAppAgentProxy {
         case "opencode": return "OpenCode"
         default: return nil
         }
+    }
+
+    static func mcpFailureReply(id: Any, message: String, delivery: DeliveryState) -> [String: Any] {
+        ["jsonrpc": "2.0", "id": id, "error": ["code": -32000, "message": message, "data": delivery.metadata]]
     }
 
     /// The `id` of a JSON-RPC request line; nil for a notification (no id, no reply expected).
@@ -749,8 +750,9 @@ private final class AppAgentConnection: @unchecked Sendable {
                        let params = rpc["params"] as? [String: Any], let tool = params["name"] as? String {
                         server?.recordAdmissionTimeout(tool: tool, elapsedMs: admissionMs())
                     }
-                    let failure: [String: Any] = ["jsonrpc": "2.0", "id": id,
-                        "error": ["code": -32000, "message": message]]
+                    let failure = MacOSAppAgentProxy.mcpFailureReply(
+                        id: id, message: message, delivery: error is AppAgentAdmission.Timeout ? .notSent : .outcomeUnknown
+                    )
                     if let data = try? JSONSerialization.data(withJSONObject: failure) {
                         return ["response": String(decoding: data, as: UTF8.self)]
                     }

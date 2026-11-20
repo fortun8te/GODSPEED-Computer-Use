@@ -315,7 +315,7 @@ enum SkyKeyboardDispatcher {
         try requireUsableComputerUseSession()
         let result = AXUIElementPerformAction(found.item, kAXPressAction as CFString)
         if let error = menuPressError(result, path: key) {
-            throw found.reportedDisabled ? ComputerUseError.message("\(key) is disabled.") : error
+            throw error
         }
         Thread.sleep(forTimeInterval: 0.1)
     }
@@ -490,7 +490,7 @@ enum SkyKeyboardDispatcher {
         var menuBar: CFTypeRef?
         let read = AXUIElementCopyAttributeValue(application, kAXMenuBarAttribute as CFString, &menuBar)
         guard read == .success, let menuBar else {
-            throw read == .cannotComplete ? appNotAnswering : ComputerUseError.stateUnavailable("The app has no menu bar.")
+            throw read == .cannotComplete ? appNotAnswering : ComputerUseError.notSent("The app has no menu bar.")
         }
         var item = menuBar as! AXUIElement
         for (depth, title) in path.enumerated() {
@@ -502,7 +502,7 @@ enum SkyKeyboardDispatcher {
                 let place = depth > 0 ? path[..<depth].joined(separator: " > ")
                     : path.count == 1 ? "any menu (a toggled item, like Make Plain Text vs Make Rich Text, shows only its current title)"
                     : "the menu bar"
-                throw ComputerUseError.message(
+                throw ComputerUseError.notSent(
                     "No menu item '\(title)' in \(place). Items: \(menuItemTitles(in: menu).joined(separator: ", "))"
                 )
             }
@@ -512,7 +512,7 @@ enum SkyKeyboardDispatcher {
         let joined = path.joined(separator: " > ")
         // Pressing a menu title or a submenu would open it on screen instead of running a command.
         if firstMenuItem(in: item, levels: 2, where: isMenuItem) != nil {
-            throw ComputerUseError.message(
+            throw ComputerUseError.notSent(
                 "\(joined) opens a menu. Add one of its items: \(menuItemTitles(in: item).joined(separator: ", "))"
             )
         }
@@ -524,7 +524,7 @@ enum SkyKeyboardDispatcher {
 
         try requireUsableComputerUseSession()
         if let error = menuPressError(AXUIElementPerformAction(item, kAXPressAction as CFString), path: joined) {
-            throw reportedDisabled ? ComputerUseError.message("\(joined) is disabled.") : error
+            throw error
         }
         Thread.sleep(forTimeInterval: 0.1)
         if reportedDisabled { lastPressReportedDisabled = true }
@@ -535,8 +535,9 @@ enum SkyKeyboardDispatcher {
 
     /// A busy app answers reads with kAXErrorCannotComplete, which would otherwise read as a
     /// missing menu bar or item.
-    private static let appNotAnswering = ComputerUseError.stateUnavailable(
-        "The app did not answer accessibility in time (it may be busy or showing a dialog), so nothing was pressed. Try again once it responds."
+    private static let appNotAnswering = ComputerUseError.timedOut(
+        "The app did not answer accessibility in time (it may be busy or showing a dialog), so nothing was pressed. Try again once it responds.",
+        delivery: .notSent
     )
 
     private static func requireAnswering(_ menu: AXUIElement) throws {

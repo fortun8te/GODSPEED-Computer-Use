@@ -228,7 +228,7 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(app.acts, ["type \"Ann\" into \"Name\"", "click \"Save\""])
         XCTAssertEqual(outcome.steps.count, 2)
         XCTAssertEqual(app.chooseCalls, 2, "ambiguous steps have one local scoring request each")
-        XCTAssertTrue(outcome.reply().hasPrefix("Done:"))
+        XCTAssertTrue(outcome.reply().hasPrefix("Weak evidence:"))
         XCTAssertTrue(outcome.reply().contains("Changes:"))
     }
 
@@ -296,9 +296,12 @@ final class HandoffToolTests: XCTestCase {
         var deps = app.deps(choose: pick(["type"]))
         deps.act = { candidate, _ in
             app.acts.append(candidate.text)
+            app.saved = true
             return HandoffTool.ActResult(ok: false, message: "transport interrupted")
         }
-        XCTAssertEqual(HandoffTool.run(request(), deps).kind, .escalate)
+        let outcome = HandoffTool.run(request(), deps)
+        XCTAssertEqual(outcome.kind, .escalate)
+        XCTAssertEqual(outcome.deliveryState, .outcomeUnknown)
         XCTAssertEqual(app.acts.count, 1)
         XCTAssertEqual(app.reads, 2)
         XCTAssertEqual(app.chooseCalls, 1)

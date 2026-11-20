@@ -31,7 +31,7 @@ struct ElementIdentity: Equatable {
 
     static func validate(index: String, recorded: ElementIdentity, now: ElementIdentity?) throws {
         guard recorded.role != nil, now == recorded else {
-            throw ComputerUseError.stateUnavailable(
+            throw ComputerUseError.staleTarget(
                 "element \(index) no longer has the identity the snapshot showed, or could not be checked; call get_app_state again (nothing was sent)"
             )
         }
