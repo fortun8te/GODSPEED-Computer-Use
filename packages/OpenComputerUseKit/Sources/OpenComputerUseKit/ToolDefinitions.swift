@@ -101,13 +101,14 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: HandoffTool.name,
-            description: "Use for a bounded native Mac subtask with a checkable finish. Give app, goal and done_when. Handoff reuses a recipe or chooses labeled controls. It stops at risky actions or uncertainty and reports what it found.",
+            description: "Use for a bounded Mac subtask. Exact field checks can run without a model. For ambiguous actions, handoff uses the local checker and stops on risk or uncertainty.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "app": stringProperty(description: "App name"),
+                    "window_id": observedWindowIDProperty(),
                     "goal": stringProperty(description: "One bounded subtask, one sentence"),
-                    "done_when": ["type": ["object", "array"], "description": "Required. {\"text\": \"Saved\"}, {\"field\": \"Name\", \"equals\": \"Ann\"}, {\"gone\": \"Loading\"}, {\"file_exists\": \"~/x.pdf\"}, {\"url_contains\": \"/thanks\"}; one object or a list."],
+                    "done_when": ["type": ["object", "array"], "description": "Required. Check text, exact field and value, a missing label, or a file. Supply one check or a list."],
                     "values": ["type": "object", "description": "Text to type, field name to text: {\"Name\": \"Ann\"}", "additionalProperties": ["type": "string"]],
                     "max_steps": ["type": "integer", "default": 15, "maximum": 30],
                     "time_budget_s": ["type": "number", "default": 60, "maximum": 300],

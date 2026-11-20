@@ -166,8 +166,8 @@ final class RecipeSafetyTests: XCTestCase {
     }
 
     func testRiskyRecipeIsNotReplayedUnattended() {
-        XCTAssertTrue(HandoffTool.recipeIsRisky([["tool": "click", "label": "Delete contact"]]))
-        XCTAssertFalse(HandoffTool.recipeIsRisky([["tool": "click", "label": "Save"]]))
+        XCTAssertFalse(HandoffTool.isSafeRecipeStep(.init(tool: "click", arguments: ["label": "Delete contact"]), app: "Notes"))
+        XCTAssertTrue(HandoffTool.isSafeRecipeStep(.init(tool: "click", arguments: ["label": "Save"]), app: "Notes"))
     }
 
     func testReplayIsNotRunWhenGoalAlreadyTrue() {
@@ -176,7 +176,7 @@ final class RecipeSafetyTests: XCTestCase {
             readState: { "App=x\nWindow: \"w\"\n\t1 static text Saved" }, act: { _, _ in .init(ok: true, message: "") },
             choose: { _, _, _, _, _ in nil }, looksStuck: { _, _, _ in false },
             check: { DoneCheck.check([.text("Saved")], evidence: .init(screenText: $0, pageURL: { nil })) },
-            replay: { replayed = true; return true }, now: { 0 })
+            replay: { _ in replayed = true; return .verified }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "g", doneWhen: [.text("Saved")], values: [], maxSteps: 3, timeBudget: 30), deps)
         XCTAssertEqual(outcome.kind, .done)
         XCTAssertFalse(replayed)
@@ -188,7 +188,7 @@ final class RecipeSafetyTests: XCTestCase {
             choose: { _, _, _, _, options in Dictionary(uniqueKeysWithValues: options.map { ($0.id, 0.4) }).merging(["none": 0.1]) { a, _ in a } },
             looksStuck: { _, _, _ in false },
             check: { DoneCheck.check([.text("42")], evidence: .init(screenText: $0, pageURL: { nil })) },
-            replay: { nil }, now: { 0 })
+            replay: { _ in nil }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "add numbers", doneWhen: [.text("42")], values: [], maxSteps: 3, timeBudget: 30), deps)
         XCTAssertEqual(outcome.kind, .escalate)
         let reply = outcome.reply()

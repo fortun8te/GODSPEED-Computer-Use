@@ -307,9 +307,10 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
             queue: .main
         ) { _ in
             Task { @MainActor in
-                // Any host's finished turn arrives here. With two agents at work, window pins and parked
-                // windows still belong to the other one, so only the cursor is cleared.
-                if ClientScope.activeCount() <= 1 { resetOpenComputerUseBackgroundWindowState() }
+                // This legacy notification is unscoped. Let cursors reach their own idle deadlines
+                // when several clients are active, so one turn cannot hide another client's work.
+                guard ClientScope.activeCount() <= 1 else { return }
+                resetOpenComputerUseBackgroundWindowState()
                 resetOpenComputerUseVisualCursor()
             }
         }
