@@ -1296,17 +1296,27 @@ extension ComputerUseToolDispatcher {
                 ClientScope.withScope(scope) {
                     BrowserCallBudget.withDeadline(deadline) {
                         let bridge = bridges[lane]
-                        // A fast lane can pick up the next URL while a slow or failed lane is occupied.
-                        while BrowserCallBudget.remaining() > 4, let index = results.takeNextIndex() {
-                            let permits = BrowserBridge.previewPermits
-                            let wait = max(0, BrowserCallBudget.remaining() - 4)
-                            guard permits.wait(timeout: .now() + wait) == .success else { break }
-                            defer { permits.signal() }
-                            guard BrowserCallBudget.remaining() > 4 else { break }
-                            let result = peek(urls[index], bridge: bridge, deadline: deadline - 3)
-                            results.set(index, result)
-                            if result.cleanupConfirmed != true { break }
-                        }
+                        let permits = BrowserBridge.previewPermits
+                        let wait = max(0, BrowserCallBudget.remaining() - 4)
+                        guard permits.wait(timeout: .now() + wait) == .success else { return }
+                        defer { permits.signal() }
+                        var tab: PeekTab?
+                        runPeekLane(next: {
+                            BrowserCallBudget.remaining() > 4 ? results.takeNextIndex() : nil
+                        }, read: { index in
+                            peek(urls[index], bridge: bridge, tab: &tab, deadline: deadline - 3)
+                        }, cleanup: {
+                            defer { tab = nil }
+                            if let tab {
+                                // A live lane owns this exact tab. A dropped
+                                // generation requires the lane's scoped cleanup.
+                                if tab.generation == bridge.referenceGeneration {
+                                    return (try? bridge.closeOpenedTab(tab.id)) != nil
+                                }
+                            }
+                            let cleanup = try? bridge.callTool("finalize_tabs", arguments: [:], timeout: 3)
+                            return cleanup?.isError == false
+                        }, store: results.set)
                     }
                 }
             }
@@ -1314,32 +1324,77 @@ extension ComputerUseToolDispatcher {
         return urls.indices.map(results.get)
     }
 
+    struct PeekTab {
+        let id: Int
+        let generation: Int
+    }
+
+    // Keep completed pages until cleanup can be included in their receipts.
+    // A failed navigation ends reuse. The lane can continue after cleanup.
+    static func runPeekLane(
+        next: () -> Int?, read: (Int) -> (status: String, text: String),
+        cleanup: () -> Bool, store: (Int, BrowserPreviewPage) -> Void
+    ) {
+        var pending: [(index: Int, status: String, text: String)] = []
+        func finish() -> Bool {
+            guard !pending.isEmpty else { return true }
+            let clean = cleanup()
+            for page in pending {
+                let text = page.text + (clean ? "" : "\nTemporary tab cleanup could not be confirmed.")
+                store(page.index, .init(status: page.status, text: text, cleanupConfirmed: clean))
+            }
+            pending.removeAll()
+            return clean
+        }
+        while let index = next() {
+            let outcome = read(index)
+            pending.append((index, outcome.status, outcome.text))
+            if outcome.status != "read", !finish() { return }
+        }
+        _ = finish()
+    }
+
     private static func peek(
-        _ url: String, bridge: BrowserBridge, deadline: TimeInterval
-    ) -> BrowserPreviewPage {
-        let outcome: (status: String, text: String)
+        _ url: String, bridge: BrowserBridge, tab: inout PeekTab?, deadline: TimeInterval
+    ) -> (status: String, text: String) {
         do {
-            outcome = try BrowserCallBudget.withDeadline(deadline) {
-                let opened = try bridge.callTool("open_tab", arguments: ["url": url], timeout: 15)
-                if opened.isError { return ("failed", "could not open: \(BatchTool.firstLine(opened.text))") }
-                if let error = BrowserReply.navigationError(in: opened.text) { return ("failed", "could not load: \(error)") }
-                guard let tabID = BrowserReply.openedTabID(in: opened.text) else {
-                    return ("failed", "the browser did not identify the tab it opened")
+            return try BrowserCallBudget.withDeadline(deadline) {
+                let page: BrowserPage
+                var before: String?
+                if let current = tab {
+                    page = BrowserPage(bridge: bridge, tab: ["tab_id": current.id], remember: false,
+                                       referenceGeneration: current.generation)
+                    before = try page.location().href
+                    let moved = try bridge.callTool("navigate", arguments: ["tab_id": current.id, "url": url],
+                                                    timeout: 15, referenceGeneration: current.generation)
+                    if let error = BrowserReply.navigationError(in: moved.text) ?? (moved.isError ? BatchTool.firstLine(moved.text) : nil) {
+                        return ("failed", "could not load: \(error)")
+                    }
+                } else {
+                    let opened = try bridge.callTool("open_tab", arguments: ["url": url], timeout: 15)
+                    if opened.isError { return ("failed", "could not open: \(BatchTool.firstLine(opened.text))") }
+                    if let id = BrowserReply.createdTabID(in: opened.text) {
+                        tab = PeekTab(id: id, generation: bridge.referenceGeneration)
+                    }
+                    if let error = BrowserReply.navigationError(in: opened.text) { return ("failed", "could not load: \(error)") }
+                    guard let current = tab, BrowserReply.openedTabID(in: opened.text) == current.id else {
+                        return ("failed", "the browser did not identify the tab it opened")
+                    }
+                    page = BrowserPage(bridge: bridge, tab: ["tab_id": current.id], remember: false,
+                                       referenceGeneration: current.generation)
                 }
-                let page = BrowserPage(bridge: bridge, tab: ["tab_id": tabID], remember: false)
-                guard page.waitLoad(changedFrom: nil, expect: url, timeout: 10) else {
+                guard page.waitLoad(changedFrom: before, expect: url, timeout: 10) else {
                     return ("failed", "the page did not finish loading")
                 }
-                return ("read", BatchTool.clipped(try page.read(), limit: 2_500))
+                let text = try page.read()
+                guard tab?.generation == bridge.referenceGeneration else {
+                    return ("failed", "the preview tab connection changed during the read")
+                }
+                return ("read", BatchTool.clipped(text, limit: 2_500))
             }
         } catch {
-            outcome = ("failed", (error as? LocalizedError)?.errorDescription ?? String(describing: error))
+            return ("failed", (error as? LocalizedError)?.errorDescription ?? String(describing: error))
         }
-        let cleanup = try? bridge.callTool("finalize_tabs", arguments: [:], timeout: 3)
-        guard let cleanup, !cleanup.isError else {
-            return BrowserPreviewPage(status: outcome.status, text: outcome.text + "\nTemporary tab cleanup could not be confirmed.", cleanupConfirmed: false)
-        }
-        return BrowserPreviewPage(status: outcome.status, text: outcome.text, cleanupConfirmed: true)
     }
 
     static func browserLabel(_ arguments: [String: Any]) -> String? {
