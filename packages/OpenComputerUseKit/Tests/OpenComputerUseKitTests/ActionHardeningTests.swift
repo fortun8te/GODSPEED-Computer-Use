@@ -260,4 +260,12 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertTrue(InputSimulation.needsHandsOff(.leftMouseDragged), "a drag moves the real pointer too")
         XCTAssertFalse(InputSimulation.needsHandsOff(.leftMouseUp), "a release always goes out so no button stays held")
     }
+
+    func testBatchToolWaitSecondsAreClampedBeforeTheMillisecondConversion() throws {
+        let huge = try BatchTool.parseSteps([["tool": "wait", "seconds": 1e16]], defaultApp: "Fixture")
+        XCTAssertEqual(huge.first?.arguments["timeout_ms"] as? Int, BatchEffects.Wait.maxTimeoutMs)
+        let normal = try BatchTool.parseSteps([["tool": "wait", "seconds": 2]], defaultApp: "Fixture")
+        XCTAssertEqual(normal.first?.arguments["timeout_ms"] as? Int, 2_000)
+        XCTAssertThrowsError(try BatchTool.parseSteps([["tool": "wait", "seconds": Double.nan]], defaultApp: "Fixture"))
+    }
 }
