@@ -39,7 +39,7 @@ enum Referee {
         finiteSetting("OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE", fallback: 0.86, range: 0...1)
     }()
 
-    /// The state text sent is cut to this many characters. Default 1200: longer views were slower and
+    /// The helper gets at most this many characters of state. Default 1200: longer views were slower and
     /// less accurate in the d1-2B measurements (~270 ms at 1,000 characters, ~1.1 s at 6,000).
     static let maxViewCharacters: Int = {
         max(0, environment("OPEN_COMPUTER_USE_REFEREE_MAX_VIEW").flatMap(Int.init) ?? 1_200)

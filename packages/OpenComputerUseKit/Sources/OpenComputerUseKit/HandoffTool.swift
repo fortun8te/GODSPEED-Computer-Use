@@ -591,7 +591,10 @@ enum HandoffTool {
             } else {
                 if !options.isEmpty {
                     let history = steps.suffix(4).joined(separator: "\n")
-                    probabilities = deps.choose(request.goal, doneSummary, history, RefereeSummary.screen(from: state),
+                    let targets = options.compactMap { Int($0.arguments["element_index"] as? String ?? "") }
+                    let view = RefereeView.build(state: state, goal: request.goal, doneWhen: doneSummary,
+                                                 optionIndexes: targets, limit: Referee.maxViewCharacters)
+                    probabilities = deps.choose(request.goal, doneSummary, history, view,
                                                 options.map { ($0.id, $0.text) })
                 }
                 decision = decide(candidates: options, probabilities: probabilities)
@@ -656,7 +659,9 @@ enum HandoffTool {
                     let summary = RefereeSummary.build(
                         goal: request.goal, steps: steps.map { ($0, "ok") }, repeatedFailures: failures,
                         screenChanged: false, dialogOpen: RefereeSummary.dialogOpen(in: state),
-                        changes: nil, screen: RefereeSummary.screen(from: state), maxCharacters: Referee.maxViewCharacters
+                        changes: nil, screen: RefereeView.build(state: state, goal: request.goal, doneWhen: doneSummary,
+                                                                        limit: Referee.maxViewCharacters / 2),
+                        maxCharacters: Referee.maxViewCharacters
                     )
                     if deps.looksStuck(request.goal, choice.text, summary) {
                         return finish(.stuck, "the checker model says no progress is being made", initial: initial, latest: state)
