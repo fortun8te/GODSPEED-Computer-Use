@@ -47,6 +47,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Fill**: `{"tool": "fill", "fields": {"To": "sam@x.com"}, "submit": "Send"}` becomes one `set_value` per field and a click. Add `"web": true` for a page.
 - **Goal**: `goal` is one sentence. The reply may add a `Check:` line (done, stuck, or still loading) from the referee. Treat it as a hint.
 - **Recipes**: send `remember: true` with a goal that reached it. Later, send only `goal` to replay the saved steps and their completion checks. Changed recipe values need a fresh check. Keep secrets out of completion conditions because saved recipes store them locally. Steps with element numbers or coordinates are never saved. A recipe that fails twice in a row is dropped.
+- **Action readback**. The dialog check reuses the action’s window read when available. An unchanged read can trigger a fresh check for a delayed result.
 - **Change-only replies**: the final read is compared with what the model last saw for that app. Only changed lines are sent. If an element's number moved, the full state is sent instead. If nothing changed, the reply says so.
 - **Condensed trees**: long rows are collapsed, text is cut at 160 characters, and container noise is dropped. Every element number the model can act on stays the same.
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
