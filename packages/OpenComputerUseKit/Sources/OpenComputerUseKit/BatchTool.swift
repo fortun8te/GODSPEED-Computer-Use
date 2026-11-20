@@ -401,11 +401,11 @@ enum LeanDefaults {
     /// get_app_state returns a screenshot only when asked (`include_screenshot: true`): the numbered
     /// element list is usually enough and a screenshot costs far more tokens.
     /// `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT=1` restores a screenshot on every read.
-    static let includeScreenshot: Bool = {
+    static var includeScreenshot: Bool {
         let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "0"
         return ["1", "true", "yes", "on"].contains(value)
-    }()
+    }
 
     /// How long a batch's final look waits while the window shows a busy sign (spinner, page loading).
     /// A window showing none is read at once.

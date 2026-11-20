@@ -729,7 +729,7 @@ public final class ComputerUseService {
     private var invalidatedSnapshotAliases: Set<String> = []
     // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
     // for the duration of each request.
-    private var actionReadBack: Bool { actionReadBackEnabled(environment: ProcessInfo.processInfo.environment) }
+    private var actionReadBack: Bool { actionReadBackEnabled(environment: RequestConfiguration.environment) }
 
     // Targeted-lookup registry. `query` stores each match here keyed by a high,
     // monotonic element index; the existing element actions resolve that index to
@@ -905,7 +905,7 @@ public final class ComputerUseService {
         try validateClickMethod(
             clickMethod,
             hasElementIndex: elementIndex != nil,
-            environment: ProcessInfo.processInfo.environment
+            environment: RequestConfiguration.environment
         )
         try validateSkyClickArguments(
             method: clickMethod,
@@ -1221,7 +1221,7 @@ public final class ComputerUseService {
         }
         let flags = try dragModifierFlags(modifiers)
         let deliveryPath: DragDeliveryPath = Self.requiredWindowID == nil
-            ? dragDeliveryPath(environment: ProcessInfo.processInfo.environment)
+            ? dragDeliveryPath(environment: RequestConfiguration.environment)
             : .appPost
         let recoveryPolicy = dragActionSnapshotRecoveryPolicy(for: deliveryPath)
         let snapshot = try currentSnapshot(for: query, recoveryPolicy: recoveryPolicy)
@@ -3016,7 +3016,7 @@ public final class ComputerUseService {
             let rangeWritable = isSettable(element: element, attribute: kAXSelectedTextRangeAttribute)
             let originalValue = stringValue(of: element, attribute: kAXValueAttribute)
             let currentSelection = selectedRange(of: element)
-            if inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) {
+            if inputFallbackDebugEnabled(environment: RequestConfiguration.environment) {
                 fputs("[open-computer-use] type_text value_writable=\(valueWritable) range_writable=\(rangeWritable) value_readable=\(originalValue != nil) selection_readable=\(currentSelection != nil)\n", stderr)
             }
             guard valueWritable, rangeWritable, let original = originalValue, let selection = currentSelection else { return false }
@@ -3489,7 +3489,7 @@ public final class ComputerUseService {
     }
 
     private func debugInputFallback(tool: String, targetDescription: String, snapshot: AppSnapshot) {
-        guard inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) else {
+        guard inputFallbackDebugEnabled(environment: RequestConfiguration.environment) else {
             return
         }
 
@@ -3501,7 +3501,7 @@ public final class ComputerUseService {
     }
 
     private func debugClickDecision(_ message: String) {
-        guard inputFallbackDebugEnabled(environment: ProcessInfo.processInfo.environment) else {
+        guard inputFallbackDebugEnabled(environment: RequestConfiguration.environment) else {
             return
         }
 
@@ -3546,7 +3546,7 @@ public final class ComputerUseService {
     ) throws {
         let eventPoint = inputEventPoint(fromScreenStatePoint: point)
 
-        if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
+        if globalPointerFallbacksEnabled(environment: RequestConfiguration.environment) {
             debugInputFallback(
                 tool: "scroll",
                 targetDescription: targetDescription,
@@ -3599,7 +3599,7 @@ public final class ComputerUseService {
     ) throws {
         let eventPoint = inputEventPoint(fromScreenStatePoint: point)
 
-        if globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) {
+        if globalPointerFallbacksEnabled(environment: RequestConfiguration.environment) {
             debugInputFallback(
                 tool: "click",
                 targetDescription: targetDescription,
@@ -3619,7 +3619,7 @@ public final class ComputerUseService {
             )
             return
         } catch {
-            guard globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) else {
+            guard globalPointerFallbacksEnabled(environment: RequestConfiguration.environment) else {
                 throw ComputerUseError.message(
                     "click could not be handled through accessibility, and global pointer fallback is disabled. Set OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 to allow physical-pointer fallback for this process."
                 )
@@ -3663,7 +3663,7 @@ public final class ComputerUseService {
                 pid: snapshot.app.pid
             )
         case .global:
-            guard globalPointerFallbacksEnabled(environment: ProcessInfo.processInfo.environment) else {
+            guard globalPointerFallbacksEnabled(environment: RequestConfiguration.environment) else {
                 throw ComputerUseError.message(
                     "click_method 'global' requires OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS=1 because it may move the system pointer and change foreground focus"
                 )
