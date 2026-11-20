@@ -42,6 +42,21 @@ enum VisionFallback {
         return locate().map { Candidate(fraction: $0, evidence: .model) }
     }
 
+    /// Learning row for one grounding attempt, found or not (see visionClick). The crop is saved only when
+    /// images are on, and the PNG is encoded only then. Nothing is written unless LearningLog is enabled.
+    /// `secure` is true when the window or the target is a password or secure field: the row is kept, the image is not.
+    static func recordLocate(query: String, crop: CGImage, candidate: Candidate?, verified: Bool, secure: Bool,
+                             log: LearningLog) {
+        guard log.isEnabled else { return }
+        let image = log.imagesEnabled && !secure ? LocalWindowImage.png(crop).flatMap { log.saveImage($0) } : nil
+        log.append(LearningLocateRow(
+            query: query, crop_width: Double(crop.width), crop_height: Double(crop.height),
+            point: candidate.map { [Double($0.fraction.x), Double($0.fraction.y)] },
+            verified: verified, image: image,
+            evidence: candidate.map { $0.evidence == .ocr ? "ocr" : "model" }
+        ))
+    }
+
     static func sameName(_ left: String, _ right: String) -> Bool {
         let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
         let lhs = left.split(whereSeparator: \.isWhitespace).joined(separator: " ")
