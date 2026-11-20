@@ -31,6 +31,11 @@ final class AppAgentAdmission: @unchecked Sendable {
         var errorDescription: String? { "The app agent is busy. Try again." }
     }
 
+    /// Thrown when the desktop gate cannot be re-acquired after an inference wait. The request is cancelled.
+    struct AdmissionLost: LocalizedError {
+        var errorDescription: String? { "Desktop admission was lost mid-request. Inspect the steps that already ran before repeating them." }
+    }
+
     static let shared = AppAgentAdmission()
     static let connectionLimit = 32
     static let queueLimit = 32
@@ -130,9 +135,15 @@ final class AppAgentAdmission: @unchecked Sendable {
                 let result = work()
                 // The caller can only continue with its prior observations if
                 // no other admission intervened and it still owns the gate.
-                guard let after = try? acquire(ticket, timeout: 2), after == before &+ 1 else {
+                // Losing the gate stops the request: a typed cancellation, never a silent nil.
+                let after: UInt64
+                do { after = try acquire(ticket, timeout: 2) } catch {
                     token.cancel()
-                    return nil
+                    throw AdmissionLost()
+                }
+                guard after == before &+ 1 else {
+                    token.cancel()
+                    throw AdmissionLost()
                 }
                 return result
             }, operation: body)
