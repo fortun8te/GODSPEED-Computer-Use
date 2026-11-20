@@ -962,6 +962,15 @@ public final class ComputerUseService {
         let deadline = clock.systemUptime + min(VisionFallback.timeout, BrowserCallBudget.activeRemaining ?? .infinity)
         guard let context = liveWindow(), let original = SnapshotBuilder.localWindowImage(context),
               let crop = LocalWindowImage.downscaled(original) else { return nil }
+        // Learning row for this attempt, written on every exit below (see VisionFallback.recordLocate).
+        var located: VisionFallback.Candidate?
+        var verified = false
+        // Password and secure fields keep their row but never their crop image.
+        var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
+        defer {
+            VisionFallback.recordLocate(query: label, crop: crop, candidate: located, verified: verified,
+                                        secure: secure, log: LearningLog.shared)
+        }
         let candidate = VisionFallback.candidate(scan: { accurate in
             guard clock.systemUptime < deadline else { return .missing }
             return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
@@ -970,14 +979,17 @@ public final class ComputerUseService {
             return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
                                          remaining: deadline - clock.systemUptime)
         })
+        located = candidate
         guard let candidate, let point = VisionFallback.windowPoint(candidate.fraction, bounds: bounds),
               clock.systemUptime < deadline, let live = liveWindow(),
               let fresh = SnapshotBuilder.localWindowImage(live), VisionFallback.sameCapture(original, fresh),
-              let hit = try hitTestElement(at: point, in: snapshot)?.element,
-              SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
+              let hit = try hitTestElement(at: point, in: snapshot)?.element else { return nil }
+        if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) { secure = true }
+        guard SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
               let names = visualHitNames(hit, window: live.windowElement),
               VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names),
               clock.systemUptime < deadline, liveWindow() != nil else { return nil }
+        verified = true
 
         let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
         try RequestCancellation.check()  // L6: a cancelled request sends nothing
