@@ -175,6 +175,12 @@ final class ActionPolicyTests: XCTestCase {
                 {executionContextId: 3}
               when 'Runtime.evaluate'
                 exit 4 unless args.dig('params', 'contextId') == 3
+                {result: {objectId: 'focused-control'}}
+              when 'DOM.describeNode'
+                exit 6 unless args.dig('params', 'objectId') == 'focused-control'
+                {node: {nodeId: 7}}
+              when 'Runtime.callFunctionOn'
+                exit 7 unless args.dig('params', 'objectId') == 'focused-control'
                 {result: {value: {secure: false, submits: true, destination: 'https://locked.test/submit'}}}
               else
                 exit 5

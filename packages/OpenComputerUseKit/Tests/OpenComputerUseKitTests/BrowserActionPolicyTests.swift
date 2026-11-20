@@ -26,4 +26,29 @@ final class BrowserActionPolicyTests: XCTestCase {
             XCTAssertFalse(ComputerUseToolDispatcher.browserActionMayDeliverInput(action), action)
         }
     }
+
+    /// Enter in an iframe form or typing into an iframe password field must be classified in that frame.
+    func testKeyboardPolicyFollowsFocusIntoNestedFrames() throws {
+        var entered: [String] = []
+        let focused = try BrowserPage.focusedPolicyElement(start: "main", focus: { document in
+            switch document {
+            case "main": return .frameOwner(objectID: "outer-iframe")
+            case "outer": return .frameOwner(objectID: "inner-iframe")
+            default: return .element(objectID: "password-field")
+            }
+        }, enter: { owner in
+            entered.append(owner)
+            return owner == "outer-iframe" ? "outer" : "inner"
+        })
+        XCTAssertEqual(focused, "password-field")
+        XCTAssertEqual(entered, ["outer-iframe", "inner-iframe"])
+    }
+
+    func testKeyboardPolicyFailsClosedWhenFocusedFrameCannotBeEntered() {
+        XCTAssertThrowsError(try BrowserPage.focusedPolicyElement(start: "main", focus: { _ in
+            .frameOwner(objectID: "self-referencing-iframe")
+        }, enter: { _ in "main" })) { error in
+            guard case ComputerUseError.actionDenied = error else { return XCTFail("\(error)") }
+        }
+    }
 }
