@@ -211,6 +211,13 @@ public enum SnapshotTextStyle {
 }
 
 enum SnapshotBuilder {
+    /// Captures the observed window alone, with the same frame used by its AX context.
+    static func localWindowImage(_ context: TargetedAX.WindowContext) -> CGImage? {
+        guard let capture = WindowCapture.resolve(for: context.app.pid, exactWindowID: context.windowID),
+              capture.bounds == context.windowBounds, let image = capture.image else { return nil }
+        return image
+    }
+
     static func build(
         for app: RunningAppDescriptor,
         textLimit: SnapshotTextLimit = .defaults,

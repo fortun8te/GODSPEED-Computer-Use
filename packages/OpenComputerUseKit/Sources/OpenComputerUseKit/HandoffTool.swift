@@ -481,14 +481,19 @@ enum HandoffTool {
         }
     }
 
+    struct DecisionView {
+        let state: String
+        let text: String
+    }
+
     /// Everything the loop touches outside itself, so tests can run it with fakes.
     struct Dependencies {
         var readState: () -> String?
         /// Runs one candidate in the window it was selected from.
         var act: (Candidate, _ state: String) -> ActResult
-        var choose: (_ goal: String, _ doneWhen: String, _ history: String, _ screen: String, _ options: [(id: String, text: String)]) -> [String: Double]?
+        var choose: (_ goal: String, _ doneWhen: String, _ history: String, _ screen: DecisionView, _ options: [(id: String, text: String)]) -> [String: Double]?
         /// The checker model's stuck verdict for a short summary.
-        var looksStuck: (_ goal: String, _ lastStep: String, _ summary: String) -> Bool
+        var looksStuck: (_ goal: String, _ lastStep: String, _ summary: DecisionView) -> Bool
         var check: (_ state: String) -> DoneCheck.Result
         /// Replay is based on this handoff's original window.
         var replay: (String) -> Replay?
@@ -594,7 +599,7 @@ enum HandoffTool {
                     let targets = options.compactMap { Int($0.arguments["element_index"] as? String ?? "") }
                     let view = RefereeView.build(state: state, goal: request.goal, doneWhen: doneSummary,
                                                  optionIndexes: targets, limit: Referee.maxViewCharacters)
-                    probabilities = deps.choose(request.goal, doneSummary, history, view,
+                    probabilities = deps.choose(request.goal, doneSummary, history, DecisionView(state: state, text: view),
                                                 options.map { ($0.id, $0.text) })
                 }
                 decision = decide(candidates: options, probabilities: probabilities)
@@ -663,7 +668,7 @@ enum HandoffTool {
                                                                         limit: Referee.maxViewCharacters / 2),
                         maxCharacters: Referee.maxViewCharacters
                     )
-                    if deps.looksStuck(request.goal, choice.text, summary) {
+                    if deps.looksStuck(request.goal, choice.text, DecisionView(state: state, text: summary)) {
                         return finish(.stuck, "the checker model says no progress is being made", initial: initial, latest: state)
                     }
                 }
@@ -719,13 +724,19 @@ extension ComputerUseToolDispatcher {
                     }
                 )
             },
-            choose: { goal, doneWhen, history, screen, options in
-                Referee.choose(goal: goal, doneWhen: doneWhen, history: history, screen: screen,
-                               options: options, remaining: deadline - clock.systemUptime)
+            choose: { [self] goal, doneWhen, history, screen, options in
+                let picture = Referee.picture(url: Referee.handoffURL, state: screen.state, remaining: deadline - clock.systemUptime) {
+                    localDecisionImage(app: app, state: screen.state)
+                }
+                return Referee.choose(goal: goal, doneWhen: doneWhen, history: history, screen: screen.text,
+                                      options: options, imageBase64: picture, remaining: deadline - clock.systemUptime)
             },
-            looksStuck: { goal, lastStep, summary in
-                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary,
-                                                   remaining: deadline - clock.systemUptime) else { return false }
+            looksStuck: { [self] goal, lastStep, summary in
+                let picture = Referee.picture(url: Referee.baseURL, state: summary.state, remaining: deadline - clock.systemUptime) {
+                    localDecisionImage(app: app, state: summary.state)
+                }
+                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary.text,
+                                                   imageBase64: picture, remaining: deadline - clock.systemUptime) else { return false }
                 return verdict.label == "stuck" && verdict.confidence >= Referee.minimumConfidence
             },
             check: { state in

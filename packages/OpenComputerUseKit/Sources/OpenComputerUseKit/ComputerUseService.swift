@@ -880,6 +880,21 @@ public final class ComputerUseService {
             : "Not settled: the window still showed a busy sign after \(waited) ms; this is its state at that point."
     }
 
+    /// Local decision hints can see a window only when it still matches the native observation.
+    func localDecisionImage(app query: String, state: String) -> Data? {
+        guard (try? requireUsableComputerUseSession()) != nil,
+              let id = HandoffTool.observedWindowID(in: state),
+              let snapshot = snapshotsByApp[query.lowercased()], snapshot.observedWindowID == id,
+              let window = snapshot.windowElement,
+              let app = try? AppDiscovery.resolveRunning(query), snapshot.app.pid == app.pid,
+              snapshot.app.runningApplication.launchDate == app.runningApplication.launchDate,
+              let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: id),
+              CFEqual(window, context.windowElement), snapshot.windowBounds == context.windowBounds,
+              let image = SnapshotBuilder.localWindowImage(context),
+              let crop = LocalWindowImage.downscaled(image) else { return nil }
+        return LocalWindowImage.jpeg(crop)
+    }
+
     public func click(
         app query: String,
         elementIndex: String?,
