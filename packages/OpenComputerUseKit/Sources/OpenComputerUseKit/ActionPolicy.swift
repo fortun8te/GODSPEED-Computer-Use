@@ -156,6 +156,17 @@ struct ActionPolicy: Decodable, Sendable {
         var inDialog = false
     }
 
+    /// Apps where Return (or a newline typed into them) sends the composed message.
+    static let sendCapableBundleIDs: [String] = [
+        "com.apple.mail", "com.apple.MobileSMS", "com.tinyspeck.slackmacgap", "com.hnc.Discord",
+        "net.whatsapp.WhatsApp", "desktop.WhatsApp", "ru.keepcoder.Telegram", "org.telegram.desktop",
+        "com.microsoft.teams2", "com.microsoft.teams", "org.whispersystems.signal-desktop",
+    ]
+
+    static func isSendCapable(_ bundleID: String) -> Bool {
+        sendCapableBundleIDs.contains { $0.caseInsensitiveCompare(bundleID) == .orderedSame }
+    }
+
     static func nativeRisks(tool: String, arguments: [String: Any], bundleID: String?, target: Target?) -> Set<Risk> {
         let key = (arguments["key"] as? String).map(ComputerUseService.canonicalKey) ?? ""
         let path = arguments["path"] as? String
@@ -181,13 +192,15 @@ struct ActionPolicy: Decodable, Sendable {
         case "save_as":
             // A new path can also become occupied while the save dialog is opening.
             result.insert(.fileOverwrite)
-        case "press_menu", "press_key", "click", "perform_secondary_action":
+        case "press_menu", "press_key", "click", "perform_secondary_action", "drag":
+            // For a drag, `target` is the drop destination, not the source.
             result.formUnion(namedRisks([target?.title, target?.identifier,
                                          tool == "press_menu" ? menuTitle : nil,
                                          arguments["action"] as? String,
-                                         arguments["label"] as? String]))
+                                         arguments["label"] as? String,
+                                         tool == "drag" ? arguments["to_label"] as? String : nil]))
             if key == "cmd+s" || key == "cmd+shift+s" { result.insert(.fileOverwrite) }
-            if ["click", "perform_secondary_action"].contains(tool),
+            if ["click", "perform_secondary_action", "drag"].contains(tool),
                target?.role.map(SmartSteps.roleKey).map({ ["textfield", "textarea", "searchfield"].contains($0) }) != true {
                 // AX has no effect metadata for an opaque button, custom action or pixel target.
                 result.formUnion([.send, .submit, .purchase, .delete, .fileOverwrite, .systemSettings])
@@ -203,10 +216,7 @@ struct ActionPolicy: Decodable, Sendable {
             }
             if ["return", "enter", "cmd+return", "cmd+enter"].contains(key) {
                 if target?.inDialog == true { result.insert(.submit) }
-                if let bundleID, ["com.apple.mail", "com.apple.MobileSMS", "com.tinyspeck.slackmacgap", "com.hnc.Discord"]
-                    .contains(where: { $0.caseInsensitiveCompare(bundleID) == .orderedSame }) {
-                    result.insert(.send)
-                }
+                if let bundleID, isSendCapable(bundleID) { result.insert(.send) }
             }
             if target?.secureField == true, !key.isEmpty, !["tab", "escape", "esc", "cmd+c"].contains(key) {
                 result.insert(.credentialEntry)
@@ -214,6 +224,11 @@ struct ActionPolicy: Decodable, Sendable {
         case "type_text", "set_value":
             // An unreadable field cannot establish that a configured credential rule is safe to skip.
             if target?.secureField != false { result.insert(.credentialEntry) }
+            // A newline in typed text presses Return, which sends in a chat composer (any focused field in the app).
+            if tool == "type_text", let bundleID, isSendCapable(bundleID),
+               (arguments["text"] as? String)?.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) == true {
+                result.insert(.send)
+            }
         default:
             break
         }
@@ -246,20 +261,19 @@ struct ActionPolicy: Decodable, Sendable {
         }
     }
 
+    /// Risk classes named by UI labels. The word lists live in RiskLexicon, shared with every other destructive check.
     static func namedRisks(_ names: [String?]) -> Set<Risk> {
-        let names = names.compactMap { $0 }.map {
-            $0.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).joined(separator: " ")
-        }
-        let prefixes: [Risk: [String]] = [
-            .send: ["send", "post", "publish", "sendmessage"],
-            .submit: ["submit", "upload", "sign in", "log in"],
-            .purchase: ["buy", "pay", "purchase", "place order", "checkout", "buy now"],
-            .delete: ["delete", "remove", "erase", "move to trash", "empty trash", "axdelete"],
-            .fileOverwrite: ["save", "replace", "overwrite"],
-            .systemSettings: ["allow access", "grant permission"],
-        ]
-        return Set(prefixes.compactMap { risk, words in
-            names.contains { name in words.contains { name == $0 || name.hasPrefix($0 + " ") } } ? risk : nil
+        Set(RiskLexicon.categories(names).compactMap { category -> Risk? in
+            switch category {
+            case .send: return .send
+            case .submit: return .submit
+            case .purchase: return .purchase
+            case .delete: return .delete
+            case .credentialEntry: return .credentialEntry
+            case .overwrite, .save: return .fileOverwrite
+            case .systemSettings: return .systemSettings
+            case .discard: return nil
+            }
         })
     }
 }

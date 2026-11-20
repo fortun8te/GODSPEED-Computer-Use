@@ -39,7 +39,19 @@ extension ActionPolicy {
         return [id]
     }
 
-    static let nativeTargetTools: Set<String> = ["click", "set_value", "type_text", "press_key", "perform_secondary_action"]
+    /// The element an action would target, read for classification only. Classification runs before
+    /// authorization, so it must never unhide, activate, raise or open a window to find that element.
+    static func classificationRecord(index: String, readSnapshot: (SnapshotRecoveryPolicy) throws -> AppSnapshot) -> ElementRecord? {
+        guard let parsed = Int(index), let snapshot = try? readSnapshot(.readOnly) else { return nil }
+        return snapshot.elements[parsed]
+    }
+
+    static let nativeTargetTools: Set<String> = ["click", "set_value", "type_text", "press_key", "perform_secondary_action", "drag"]
+
+    /// A drag's risk comes from where it drops. The destination arguments name that element.
+    static func dropTargetArguments(_ arguments: [String: Any]) -> [String: Any] {
+        ["label": arguments["to_label"], "element_index": arguments["to_index"]].compactMapValues { $0 }
+    }
     static let nativeScopedTools: Set<String> = nativeTargetTools.union([
         "open", "query", "get_app_state", "press_menu", "save_as", "select_text", "scroll", "hover", "drag", HandoffTool.name,
         // L9 actions: a gesture can press an app menu command; the others act on or read one app's controls.
@@ -58,13 +70,27 @@ extension ComputerUseService {
         if let labels {
             record = try? resolveLabel(app: app, labels: labels)
         } else if let index {
-            record = policyElement(app: app, index: index)
+            record = policyRecord(app: app, index: index)
         } else {
             record = nil
         }
         guard let record else { return nil }
         return ActionPolicy.Target(title: record.title, identifier: record.identifier, role: record.role,
                                    secureField: isSecurePolicyField(record))
+    }
+}
+
+extension ComputerUseService {
+    /// Targeted (registry) indexes never recover a window, so they keep their own lookup. Any other index is read
+    /// with a read-only recovery policy instead of the default that may activate the app.
+    func policyRecord(app: String, index: String) -> ElementRecord? {
+        if ComputerUseService.requiredRefGeneration == nil, let parsed = Int(index),
+           parsed > TargetedElementRegistry<Int>.indexBase {
+            return policyElement(app: app, index: index)
+        }
+        return ActionPolicy.classificationRecord(index: index) { policy in
+            try currentSnapshot(for: app, needScreenshot: false, recoveryPolicy: policy)
+        }
     }
 }
 
@@ -107,8 +133,9 @@ extension ComputerUseToolDispatcher {
     private func nativeRisks(name: String, arguments: [String: Any], bundleID: String?) -> Set<ActionPolicy.Risk> {
         let target: ActionPolicy.Target?
         if let app = arguments["app"] as? String, ActionPolicy.nativeTargetTools.contains(name) {
-            target = service.actionPolicyTarget(tool: name, app: app, index: optionalElementIndex(in: arguments),
-                                                labels: labelArguments(in: arguments))
+            let targetArguments = name == "drag" ? ActionPolicy.dropTargetArguments(arguments) : arguments
+            target = service.actionPolicyTarget(tool: name, app: app, index: optionalElementIndex(in: targetArguments),
+                                                labels: labelArguments(in: targetArguments))
         } else {
             target = nil
         }

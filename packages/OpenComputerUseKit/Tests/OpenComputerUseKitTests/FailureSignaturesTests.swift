@@ -117,6 +117,12 @@ final class FailureSignaturesTests: XCTestCase {
         XCTAssertNil(suggestionAfterTwoSuccesses(riskSignature(label: "Purchase"), store: store))
     }
 
+    func testDutchMoveToTrashPlaceMessageAndSignOutAreRefused() {
+        for label in ["Naar prullenbak verplaatsen", "Plaats bericht", "Uitloggen"] {
+            XCTAssertNil(suggestionAfterTwoSuccesses(riskSignature(label: label)), "expected refusal for \(label)")
+        }
+    }
+
     func testConcurrentRecording() {
         let store = FailureSignatureStore()
         let sig = FailureSignature(appBundleID: "a", toolName: "read", failureCode: "x", targetRole: "button", targetLabel: "go")

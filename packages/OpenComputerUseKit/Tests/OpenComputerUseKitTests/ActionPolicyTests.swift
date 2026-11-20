@@ -238,4 +238,69 @@ final class ActionPolicyTests: XCTestCase {
             assertRefusal(dispatcher.callToolAsResult(name: "clipboard", arguments: ["action": "read"]), "ACTION_DENIED")
         }
     }
+
+    func testDutchLabelsAreClassifiedLikeEnglish() {
+        let expected: [(String, ActionPolicy.Risk)] = [
+            ("Verstuur", .send), ("Verzenden", .send), ("Plaats bericht", .send),
+            ("Verwijder bestand", .delete), ("Naar prullenbak verplaatsen", .delete), ("Prullenmand leegmaken", .delete),
+            ("Betaal nu", .purchase), ("Koop nu", .purchase), ("Bestel", .purchase), ("Afrekenen", .purchase),
+            ("Wachtwoord", .credentialEntry), ("Overschrijven", .fileOverwrite), ("Opslaan", .fileOverwrite),
+        ]
+        for (label, risk) in expected {
+            XCTAssertTrue(ActionPolicy.namedRisks([label]).contains(risk), "\(label) should carry \(risk.rawValue)")
+        }
+        let menu = ActionPolicy.nativeRisks(tool: "press_menu", arguments: ["app": "Finder", "path": "Bestand > Verplaats naar Prullenbak"],
+                                            bundleID: "com.apple.finder", target: nil)
+        XCTAssertTrue(menu.contains(.delete), "\(menu)")
+        for harmless in ["Sender Info", "Border", "Display settings", "Wissel"] {
+            XCTAssertTrue(ActionPolicy.namedRisks([harmless]).isEmpty, harmless)
+        }
+    }
+
+    func testChatAppsSendOnReturnAndOnNewlineText() {
+        let chatApps = ["net.whatsapp.WhatsApp", "desktop.WhatsApp", "ru.keepcoder.Telegram", "org.telegram.desktop",
+                        "com.microsoft.teams2", "com.microsoft.teams", "org.whispersystems.signal-desktop"]
+        for bundleID in chatApps {
+            for key in ["Return", "cmd+Return"] {
+                XCTAssertTrue(ActionPolicy.nativeRisks(tool: "press_key", arguments: ["key": key], bundleID: bundleID, target: nil).contains(.send),
+                              "\(key) in \(bundleID)")
+            }
+            for text in ["ok\n", "ok\r\nthanks", "line\rnext"] {
+                XCTAssertTrue(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": text], bundleID: bundleID, target: nil).contains(.send),
+                              "type_text with a newline in \(bundleID)")
+            }
+            XCTAssertFalse(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": "plain words"], bundleID: bundleID, target: nil).contains(.send))
+        }
+        XCTAssertFalse(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": "a\nb"], bundleID: "com.apple.TextEdit", target: nil).contains(.send))
+    }
+
+    func testClassificationReadsElementsWithoutRecoveringAWindow() {
+        var policies: [SnapshotRecoveryPolicy] = []
+        let record = ActionPolicy.classificationRecord(index: "5") { policy in
+            policies.append(policy)
+            throw ComputerUseError.stateUnavailable("the app has no window")
+        }
+        XCTAssertNil(record)
+        XCTAssertEqual(policies, [.readOnly], "classification must not unhide, activate or open a window")
+        XCTAssertNil(ActionPolicy.classificationRecord(index: "not-a-number") { _ in
+            XCTFail("a non-numeric index must not read the app")
+            throw ComputerUseError.stateUnavailable("unused")
+        })
+    }
+
+    func testDragIsATargetedToolAndItsDropTargetCarriesRisk() {
+        XCTAssertTrue(ActionPolicy.nativeTargetTools.contains("drag"))
+        // A pixel drop has no readable destination, so it is treated like an opaque click.
+        let opaque = ActionPolicy.nativeRisks(tool: "drag", arguments: ["app": "Finder", "from_x": 1.0, "from_y": 2.0, "to_x": 3.0, "to_y": 4.0],
+                                              bundleID: "com.apple.finder", target: nil)
+        XCTAssertTrue(opaque.isSuperset(of: [.send, .submit, .purchase, .delete, .fileOverwrite, .systemSettings]), "\(opaque)")
+        let expected: [(String, ActionPolicy.Risk)] = [
+            ("Trash", .delete), ("Prullenbak", .delete), ("Delete", .delete), ("Upload", .submit), ("Send", .send),
+        ]
+        for (title, risk) in expected {
+            let risks = ActionPolicy.nativeRisks(tool: "drag", arguments: ["app": "Finder"], bundleID: nil,
+                                                 target: ActionPolicy.Target(title: title, role: "AXButton"))
+            XCTAssertTrue(risks.contains(risk), "\(title) drop should carry \(risk.rawValue): \(risks)")
+        }
+    }
 }
