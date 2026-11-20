@@ -894,7 +894,8 @@ final class SmartLog {
             browserObservationURL: result.browserObservationURL,
             browserContinuationTabID: result.browserContinuationTabID,
             browserPreviewPages: result.browserPreviewPages,
-            browserFullObservationText: result.browserFullObservationText
+            browserFullObservationText: result.browserFullObservationText,
+            browserEvidenceScope: result.browserEvidenceScope
         )
     }
 }

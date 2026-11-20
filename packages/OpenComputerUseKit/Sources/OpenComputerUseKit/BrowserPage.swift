@@ -148,7 +148,7 @@ final class BrowserPage {
         "browser: the tab or document changed; browser read again before using an element number"
     )
 
-    private func documentIdentity() throws -> BrowserDocumentIdentity? {
+    func documentIdentity() throws -> BrowserDocumentIdentity? {
         guard let frames = try cdp("Page.getFrameTree")["frameTree"] as? [String: Any] else { return nil }
         return BrowserDocumentIdentity(tree: frames)
     }
@@ -164,7 +164,7 @@ final class BrowserPage {
     func readSnapshot(find: String?, full: Bool, interactive: Bool = false, diff: Bool = false,
                       includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true,
                       findExact: String? = nil) throws
-        -> (text: String, verifiedURL: String?, fullText: String?) {
+        -> (text: String, verifiedURL: String?, fullText: String?, evidenceScope: BrowserEvidenceScope?) {
         guardForeignFrames()
         let identity = remember && tabID != nil ? try? documentIdentity() : nil
         let generation = bridge.referenceGeneration
@@ -185,7 +185,7 @@ final class BrowserPage {
                                        readyState: place?.readyState ?? "complete", wholePage: false, numbered: false,
                                        includeLinkURLs: includeLinkURLs)
             return (text + "\n(exact-name search; read the page for numbered controls or to verify page content)",
-                    stable ? place?.href : nil, "")
+                    stable ? place?.href : nil, "", nil)
         }
         let raw = try fullTree()
         let query = find?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -247,6 +247,9 @@ final class BrowserPage {
                 : "\n(only lines mentioning \"\(query)\"; use \(indicesAvailable ? "indexes or labels" : "labels") for actions)"
         }
         let url = indicesAvailable ? place?.href : nil
+        let scope = url.flatMap { url in
+            identity.flatMap { evidenceScope(document: $0, generation: generation, url: url) }
+        }
         if indicesAvailable, let tabID, let identity {
             let mode = keepsDiffBaseline && query.isEmpty && url != nil ? "\(full):\(interactive):\(includeLinkURLs)" : nil
             BrowserPageMemory.shared.store(parse.controls, bridge: bridge, tab: tabID, document: identity,
@@ -257,10 +260,15 @@ final class BrowserPage {
                let change = AXStateDiff.diff(previous: previous, current: text, matchIndexes: true),
                let header = text.split(separator: "\n").first {
                 let compact = "\(header)\nBrowser changes (read without diff for the full page):\n\(change)"
-                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text) }
+                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text, scope) }
             }
         }
-        return (text, url, evidence)
+        return (text, url, evidence, scope)
+    }
+
+    func evidenceScope(document: BrowserDocumentIdentity, generation: Int, url: String) -> BrowserEvidenceScope? {
+        guard let tabID, generation == bridge.referenceGeneration else { return nil }
+        return .init(connection: bridge.referenceScope, generation: generation, tabID: tabID, document: document, url: url)
     }
 
     /// Labels the controls a model could not otherwise tell apart: those with no name and those that share
@@ -2521,6 +2529,14 @@ enum BrowserReply {
 }
 
 /// The document identity Chrome exposes for each frame in the tab's frame tree.
+struct BrowserEvidenceScope: Equatable {
+    let connection: UUID
+    let generation: Int
+    let tabID: Int
+    let document: BrowserDocumentIdentity
+    let url: String
+}
+
 struct BrowserDocumentIdentity: Equatable {
     private let loadersByFrame: [String: String]
 
