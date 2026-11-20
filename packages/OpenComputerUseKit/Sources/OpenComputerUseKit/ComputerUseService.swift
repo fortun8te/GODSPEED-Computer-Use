@@ -1472,6 +1472,57 @@ public final class ComputerUseService {
         )
     }
 
+    func dragBetween(app query: String, sourceIndex: String?, destinationIndex: String?,
+                     fromX: Double?, fromY: Double?, toX: Double?, toY: Double?,
+                     modifiers: [String], options: DragOptions) throws -> ToolCallResult {
+        try DragOptions.validateEndpoint(index: sourceIndex, x: fromX, y: fromY, name: "source")
+        try DragOptions.validateEndpoint(index: destinationIndex, x: toX, y: toY, name: "destination")
+        let flags = try dragModifierFlags(modifiers)
+        let snapshot = try snapshotForAction(app: query,
+            elementIndex: sourceIndex == nil || destinationIndex == nil ? nil : sourceIndex, recoveryPolicy: .readOnly)
+        guard let id = snapshot.targetWindowID, let bounds = snapshot.windowBounds,
+              let window = snapshot.windowElement, snapshot.mode != .fixture else {
+            throw ComputerUseError.backgroundUnsupported("An element drag needs a readable native window.")
+        }
+        func endpoint(_ index: String?, _ x: Double?, _ y: Double?) throws -> (CGPoint, () throws -> Void) {
+            if let index {
+                let endpointSnapshot = try snapshotForAction(app: query, elementIndex: index, recoveryPolicy: .readOnly)
+                guard endpointSnapshot.targetWindowID == id, endpointSnapshot.windowBounds == bounds,
+                      let endpointWindow = endpointSnapshot.windowElement, CFEqual(endpointWindow, window) else {
+                    throw ComputerUseError.invalidArguments("Drag endpoints must be in the same observed window.")
+                }
+                let record = try lookupElement(snapshot: endpointSnapshot, index: index)
+                guard let local = localCenter(for: record) else {
+                    throw ComputerUseError.stateUnavailable("Drag control has no readable frame.")
+                }
+                return (try windowPointToGlobalPoint(snapshot: snapshot, point: local), {
+                    try self.validatePointerTarget(record, index: index, point: local, snapshot: endpointSnapshot)
+                })
+            }
+            guard let x, let y, snapshot.observation.includeScreenshot,
+                  let size = screenshotPixelSize(snapshot: snapshot),
+                  CGRect(origin: .zero, size: size).contains(CGPoint(x: x, y: y)) else {
+                throw ComputerUseError.stateUnavailable("Drag coordinates need an observed point inside the window screenshot.")
+            }
+            return (try screenshotToGlobalPoint(snapshot: snapshot, x: x, y: y), {})
+        }
+        let (start, checkStart) = try endpoint(sourceIndex, fromX, fromY)
+        let (end, checkEnd) = try endpoint(destinationIndex, toX, toY)
+        guard start != end else { throw ComputerUseError.invalidArguments("Drag endpoints must be distinct.") }
+        let target = BackgroundDragTarget(start: inputEventPoint(fromScreenStatePoint: start),
+            end: inputEventPoint(fromScreenStatePoint: end), windowBounds: bounds, windowID: id, pid: snapshot.app.pid)
+        let visual = makeVisualCursorTarget(at: start, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
+        let finish = makeVisualCursorTarget(at: end, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
+        try withVisualFeedback(.drag, at: visual, completingAt: finish) {
+            try BackgroundDragDispatcher.drag(target: target, flags: flags, steps: options.steps ?? 10, hold: options.hold,
+                validateEndpoints: {
+                    try checkStart()
+                    try checkEnd()
+                })
+        }
+        return appendingDragDeliveryNote(to: try actionResult(for: query, recoveryPolicy: .readOnly), path: .appPost)
+    }
+
     public func typeText(app query: String, text: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
         let recovery: SnapshotRecoveryPolicy = backgroundOnlyMode() ? .readOnly : keyActionSnapshotRecoveryPolicy(for: keyMethod)
         let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: recovery)

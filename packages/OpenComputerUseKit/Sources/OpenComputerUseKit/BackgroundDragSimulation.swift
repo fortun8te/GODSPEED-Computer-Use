@@ -226,13 +226,19 @@ enum BackgroundDragDispatcher {
     static func drag(
         target: BackgroundDragTarget,
         flags: CGEventFlags = [],
+        steps stepCount: Int = 10,
+        hold: TimeInterval = 0,
         io: BackgroundDragIO = .system(),
-        validateSession: () throws -> Void = { try requireUsableComputerUseSession() }
+        validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
+        validateEndpoints: () throws -> Void = {}
     ) throws {
         try validateSession()
         try target.validateGeometry()
+        guard (2...30).contains(stepCount), (0...1).contains(hold) else {
+            throw ComputerUseError.invalidArguments("Drag timing is out of bounds.")
+        }
         guard io.windowLocationCapability.isAvailable else {
-            throw ComputerUseError.message("drag window targeting is unavailable: \(io.windowLocationCapability.unavailableReason)")
+            throw ComputerUseError.backgroundUnsupported("Window-addressed drag is unavailable.")
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
@@ -260,8 +266,8 @@ enum BackgroundDragDispatcher {
         let down = try prepare(.leftMouseDown, at: target.start)
         var release = try prepare(.leftMouseUp, at: target.start)
         var previous = target.start
-        let steps = try (1...10).map { step -> (drag: CGEvent, up: CGEvent) in
-            let t = CGFloat(step) / 10
+        let steps = try (1...stepCount).map { step -> (drag: CGEvent, up: CGEvent) in
+            let t = CGFloat(step) / CGFloat(stepCount)
             let point = CGPoint(x: target.start.x + (target.end.x - target.start.x) * t,
                                 y: target.start.y + (target.end.y - target.start.y) * t)
             let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
@@ -287,7 +293,7 @@ enum BackgroundDragDispatcher {
             if try io.needsFocus(target.pid) {
                 try validateSession()
                 guard io.focusCapability.isAvailable else {
-                    throw ComputerUseError.message("background drag is unavailable: \(io.focusCapability.unavailableReason)")
+                    throw ComputerUseError.backgroundUnsupported("This app needs synthetic window focus for background drag.")
                 }
                 let context = try io.beginFocus(target)
                 focus = context
@@ -297,6 +303,7 @@ enum BackgroundDragDispatcher {
             }
             try send(move)
             io.pause(eventDelay)
+            try validateEndpoints()
             try InputSimulation.withPressedMouseButton(press: {
                 try send(down)
             }, release: {
@@ -304,7 +311,7 @@ enum BackgroundDragDispatcher {
                 io.release(release, target)
                 io.pause(eventDelay)
             }) {
-                io.pause(eventDelay)
+                io.pause(max(eventDelay, hold))
                 for step in steps {
                     try send(step.drag)
                     release = step.up

@@ -490,6 +490,20 @@ public final class ComputerUseToolDispatcher {
             guard arguments["modifiers"] == nil || modifiers != nil else {
                 throw ComputerUseError.invalidArguments("drag modifiers must be an array of strings")
             }
+            // Extended drags resolve both endpoints before the only press.
+            if DragOptions.isRequested(arguments) {
+                let app = try requireString("app", in: arguments)
+                let options = try DragOptions(arguments)
+                let sourceArguments = ["label": arguments["from_label"] ?? arguments["label"],
+                                       "element_index": arguments["from_index"] ?? arguments["element_index"]]
+                let destinationArguments = ["label": arguments["to_label"], "element_index": arguments["to_index"]]
+                let source = try strictActionIndex(app: app, arguments: sourceArguments.compactMapValues { $0 })
+                let destination = try strictActionIndex(app: app, arguments: destinationArguments.compactMapValues { $0 })
+                return try service.dragBetween(app: app, sourceIndex: source, destinationIndex: destination,
+                    fromX: optionalDouble("from_x", in: arguments), fromY: optionalDouble("from_y", in: arguments),
+                    toX: optionalDouble("to_x", in: arguments), toY: optionalDouble("to_y", in: arguments),
+                    modifiers: modifiers ?? [], options: options)
+            }
             return try service.drag(
                 app: requireString("app", in: arguments),
                 fromX: requireDouble("from_x", in: arguments),

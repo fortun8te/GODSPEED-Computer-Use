@@ -7,6 +7,7 @@ enum ActionOptions {
     static func usesStrictRoute(_ tool: String, _ args: [String: Any]) -> Bool {
         switch tool {
         case "scroll_into_view": return true
+        case "drag": return DragOptions.isRequested(args)
         case "scroll": return ScrollChunks.isRequested(args)
         case "click": return ClickPlacement.isRequested(args) || args["modifiers"] != nil
             || (args["click_count"] as? NSNumber)?.intValue == 3 && args["click_method"] == nil
@@ -137,5 +138,30 @@ struct ClickPlacement {
             throw ComputerUseError.invalidArguments("Click offsets place the point outside the control.")
         }
         return point
+    }
+}
+
+
+struct DragOptions {
+    let steps: Int?
+    let hold: TimeInterval
+
+    static func isRequested(_ args: [String: Any]) -> Bool {
+        ["label", "element_index", "from_label", "from_index", "to_label", "to_index", "hold_ms", "drag_steps", "files"]
+            .contains { args[$0] != nil }
+    }
+
+    init(_ args: [String: Any]) throws {
+        if args["files"] != nil {
+            throw ComputerUseError.backgroundUnsupported("Use a file input upload or an app file command for files. A background pointer drag cannot guarantee OS file delivery.")
+        }
+        steps = try ActionOptions.integer("drag_steps", in: args, range: 2...30)
+        hold = try Double(ActionOptions.integer("hold_ms", in: args, range: 0...1000) ?? 0) / 1000
+    }
+
+    static func validateEndpoint(index: String?, x: Double?, y: Double?, name: String) throws {
+        if index != nil, x == nil, y == nil { return }
+        if index == nil, let x, let y, x.isFinite, y.isFinite { return }
+        throw ComputerUseError.invalidArguments("Drag \(name) needs one control or both coordinates.")
     }
 }

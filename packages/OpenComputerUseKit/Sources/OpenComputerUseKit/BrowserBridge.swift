@@ -827,16 +827,21 @@ extension ComputerUseToolDispatcher {
             guard tab["tab_id"] != nil else {
                 throw ComputerUseError.invalidArguments("browser drag needs an open or explicitly selected tab")
             }
-            let destinationLabel = arguments["to_label"] as? String
+            let options = try DragOptions(arguments)
+            let destinationLabel = try ActionOptions.string("to_label", in: arguments)
             let destinationIndex = Self.browserTabID(arguments["to_index"])
-            guard destinationLabel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false || destinationIndex != nil else {
-                throw ComputerUseError.invalidArguments("browser drag needs to_label or to_index for the destination")
-            }
+            let x = BrowserRules.number(arguments["to_x"] ?? NSNull())
+            let y = BrowserRules.number(arguments["to_y"] ?? NSNull())
+            let hasControl = destinationLabel != nil || destinationIndex != nil
+            try DragOptions.validateEndpoint(index: hasControl ? "control" : nil, x: x, y: y, name: "destination")
             let modifiers = try Self.browserPointerModifiers(arguments["modifiers"])
-            let source = try target()
-            let destination = try page.resolve(label: destinationLabel, index: destinationIndex)
-            try page.drag(from: source, to: destination, modifiers: modifiers)
-            return .text("Drag delivered. Read the tab to verify the drop.")
+            let source = try page.resolveExact(label: arguments["from_label"] as? String ?? label,
+                                               index: Self.browserTabID(arguments["from_index"]) ?? index)
+            let destination = try hasControl ? page.resolveExact(label: destinationLabel, index: destinationIndex) : nil
+            let point = x.flatMap { x in y.map { CGPoint(x: x, y: $0) } }
+            try page.drag(from: source, to: destination, point: point, modifiers: modifiers,
+                          steps: options.steps ?? 5, hold: options.hold)
+            return .text("Drag delivered. \(page.settle().line). Verify the drop from the resulting state.")
 
         case "type", "type_text", "fill", "fill_field":
             guard let text = arguments["text"] as? String else {

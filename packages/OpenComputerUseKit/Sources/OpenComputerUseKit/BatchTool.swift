@@ -377,7 +377,7 @@ enum BatchTool {
     /// so such steps are not saved as recipes).
     static func usesPositionalTargets(_ steps: [Step]) -> Bool {
         steps.contains { step in
-            ["element_index", "index", "x", "y", "from_x", "from_y", "to_x", "to_y"].contains { step.arguments[$0] != nil }
+            ["element_index", "index", "from_index", "to_index", "x", "y", "from_x", "from_y", "to_x", "to_y"].contains { step.arguments[$0] != nil }
         }
     }
 

@@ -218,9 +218,11 @@ In a Mac app, target an AX scroll area with a readable scroll bar. Whole pages u
 
 Use `scroll_into_view` when you already know the control. Mac apps need to expose its AX scroll-to-visible action. In a batch, add `web: true` for Chrome. The original Mac `pages` and Chrome `amount` arguments still work on their own.
 
-## Browser drag
+## Drag and reorder
 
-Open or select a tab and read its controls. For example, use `{"action":"drag","label":"Card A","to_label":"Drop zone"}` when both controls are visible in the same page. Read the tab after delivery to verify the drop. Apps can interpret pointer gestures differently.
+Read both endpoints first. A Mac drag accepts `from_label` and `to_label`, or `from_index` and `to_index`. Either endpoint can be a pair of screenshot coordinates in the same window. In Chrome use `label` or `index` for the source and a control or viewport point for the destination. For a handle, target the handle itself. Set `hold_ms` up to 1000 and `drag_steps` from 2 to 30 if needed.
+
+To move a row or card, drag to the destination and check the order or destination state. Use a batch `done_when` or follow the drag with a wait for the expected control. A pointer receipt confirms delivery only. For files, use Finder private clipboard copy and paste or Chrome `upload`. OS-level file drops can require the real pointer.
 
 ## Local traces
 
