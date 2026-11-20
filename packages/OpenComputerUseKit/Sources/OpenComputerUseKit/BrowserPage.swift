@@ -650,22 +650,25 @@ final class BrowserPage {
     """
 
     /// Chrome's own name search: fast, and it does not read the whole page.
-    func resolveExact(label: String?, index: Int?) throws -> BrowserNode {
+    func resolveExact(label: String?, index: Int?, allowPassive: Bool = false) throws -> BrowserNode {
         if let index { return try resolve(label: nil, index: index) }
         guard let label, !Self.normalize(label).isEmpty else {
             throw ComputerUseError.invalidArguments("Give an exact label or a reference from browser read.")
         }
-        let matches = try exactNamedControls(label)
+        let matches = Self.exactControls(in: try queryNamedRaw(label), label: label, allowPassive: allowPassive)
         guard matches.count == 1, let node = matches.first else {
             throw ComputerUseError.stateUnavailable("Expected one control named '\(label)'. Found \(matches.count). Read the tab for a reference.")
         }
         return node
     }
 
-    private func exactNamedControls(_ label: String) throws -> [BrowserNode] {
-        let matches = try queryNamed(label).filter { Self.normalize($0.name) == Self.normalize(label) }
+    static func exactControls(in raw: [[String: Any]], label: String, allowPassive: Bool) -> [BrowserNode] {
+        if allowPassive {
+            // Drop zones and scroll areas may have a name without an interactive role.
+            return scrollLabelCandidates(raw, label: label).filter { !$0.role.isEmpty && $0.role != "StaticText" && $0.role != "InlineTextBox" }
+        }
         var seen: Set<Int> = []
-        return matches.filter { seen.insert($0.backendNodeID).inserted }
+        return namedCandidates(raw).filter { normalize($0.name) == normalize(label) && seen.insert($0.backendNodeID).inserted }
     }
 
     private func queryNamed(_ label: String) throws -> [BrowserNode] {

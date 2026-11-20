@@ -2018,7 +2018,7 @@ public final class ComputerUseService {
         let io = BackgroundDragIO.system()
         let validate = {
             try requireUsableComputerUseSession()
-            guard !(try io.needsFocus(snapshot.app.pid)) else {
+            guard !FocusBorrow.isBorrowed(pid: snapshot.app.pid), !(try io.needsFocus(snapshot.app.pid)) else {
                 throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
             }
             let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)

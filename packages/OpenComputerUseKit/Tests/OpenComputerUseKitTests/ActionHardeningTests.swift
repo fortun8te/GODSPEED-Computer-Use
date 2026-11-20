@@ -164,6 +164,17 @@ final class ActionHardeningTests: XCTestCase {
             [named("End", 2), named("End", 2), named("End other", 3), ignored], label: "End").map(\.backendNodeID), [2])
     }
 
+    func testExactBrowserDragCanNamePassiveDropZonesWithoutGuessing() {
+        let named: (String, Int) -> [String: Any] = { role, id in
+            ["name": ["value": "Drop here"], "role": ["value": role], "backendDOMNodeId": id]
+        }
+        let first = [named("region", 7), named("StaticText", 8)]
+        XCTAssertEqual(BrowserPage.exactControls(in: first, label: "Drop here", allowPassive: true).map(\.backendNodeID), [7])
+        XCTAssertTrue(BrowserPage.exactControls(in: first, label: "Drop here", allowPassive: false).isEmpty)
+        let ambiguous = first + [named("region", 3)]
+        XCTAssertEqual(BrowserPage.exactControls(in: ambiguous, label: "Drop here", allowPassive: true).count, 2)
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

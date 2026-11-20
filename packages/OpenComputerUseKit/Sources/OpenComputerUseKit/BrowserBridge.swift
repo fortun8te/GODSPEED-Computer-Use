@@ -836,8 +836,9 @@ extension ComputerUseToolDispatcher {
             try DragOptions.validateEndpoint(index: hasControl ? "control" : nil, x: x, y: y, name: "destination")
             let modifiers = try Self.browserPointerModifiers(arguments["modifiers"])
             let source = try page.resolveExact(label: arguments["from_label"] as? String ?? label,
-                                               index: Self.browserTabID(arguments["from_index"]) ?? index)
-            let destination = try hasControl ? page.resolveExact(label: destinationLabel, index: destinationIndex) : nil
+                                               index: Self.browserTabID(arguments["from_index"]) ?? index, allowPassive: true)
+            let destination = try hasControl
+                ? page.resolveExact(label: destinationLabel, index: destinationIndex, allowPassive: true) : nil
             let point = x.flatMap { x in y.map { CGPoint(x: x, y: $0) } }
             try page.drag(from: source, to: destination, point: point, modifiers: modifiers,
                           steps: options.steps ?? 5, hold: options.hold)
@@ -918,7 +919,8 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.invalidArguments("browser scroll direction must be up, down, left, right, top or bottom")
             }
             if let chunks = try ScrollChunks(arguments) {
-                let node = try (label != nil || index != nil) ? target() : nil
+                let node = try (label != nil || index != nil)
+                    ? page.resolveExact(label: label, index: index, allowPassive: true) : nil
                 return .text(try page.scroll(node, direction: direction, chunks: chunks))
             }
             let amount = Self.browserTabID(arguments["amount"])
