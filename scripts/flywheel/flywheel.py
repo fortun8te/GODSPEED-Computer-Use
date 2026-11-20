@@ -466,12 +466,78 @@ def evaluate(args):
     print(destination)
 
 
+def learning_label(row):
+    """Label only from an observed step outcome. Model decisions and probabilities never label a row."""
+    if row.get("kind") != "step":
+        return None
+    if row.get("failure_code") == "stuck":
+        return "stuck"
+    if row.get("done_when") == "verified":
+        return "done"
+    if row.get("done_when") == "unmet":
+        return "look_again"
+    if row.get("done_when") is None and row.get("delivery_state") == "delivered":
+        return "act"
+    return None
+
+
+def export_learning(source, destination):
+    """Turn LearningLog JSONL files into labelled rows shaped like the d1 rows (state, answer, meta)."""
+    folder = Path(source)
+    if not folder.is_dir():
+        raise ValueError("Learning folder not found")
+    output_path = writable(destination)
+    rows, goals = [], {}
+    for file in sorted(folder.glob("learning-*.jsonl")):
+        for index, line in enumerate(file.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid learning row")
+            if not isinstance(row, dict):
+                raise ValueError("Invalid learning row")
+            rows.append((f"{file.name}/{index}", row))
+            if row.get("kind") == "episode" and row.get("goal"):
+                goals[row.get("run_id")] = row["goal"]
+    counts, skipped, out = Counter(), 0, []
+    for ident, row in rows:
+        label = learning_label(row)
+        if label is None:
+            skipped += 1
+            continue
+        last_step = " ".join(str(row.get(key) or "") for key in ("tool", "target_role", "target_label")).strip()
+        state = {
+            "goal": goals.get(row.get("run_id")) or row.get("tool") or "unknown",
+            "last_step": last_step or "unknown",
+            "result": (f"delivery {row.get('delivery_state') or 'unknown'}; "
+                       f"verification {row.get('verification') or 'none'}; "
+                       f"failure {row.get('failure_code') or 'none'}"),
+            "view": row.get("after") or row.get("before") or last_step or "unknown",
+        }
+        state = {key: str(value)[:LIMITS[key]] for key, value in state.items()}
+        counts[label] += 1
+        out.append({
+            "state": json.dumps(state, sort_keys=True, ensure_ascii=False),
+            "answer": label,
+            "meta": {"id": ident, "family": "learning", "source": "local_observed", "check": "step",
+                     "outcome": row.get("done_when") or row.get("delivery_state") or "unknown", "variant": "observed"},
+        })
+    with output_path.open("x", encoding="utf-8") as handle:
+        handle.write(jsonl(out).decode())
+    return {"labels": dict(counts), "skipped": skipped, "written": len(out)}
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     commands = cli.add_subparsers(dest="command", required=True)
     pack = commands.add_parser("package", help="Package generated synthetic d1 rows for the PC")
     pack.add_argument("fixtures", type=Path)
     pack.add_argument("output", type=Path)
+    learning = commands.add_parser("export-learning", help="Label LearningLog rows from observed outcomes only")
+    learning.add_argument("dir", type=Path)
+    learning.add_argument("out", type=Path)
     counts = commands.add_parser("counts", help="Count outcomes in a separately reviewed v3 metadata-only file")
     counts.add_argument("metadata", type=Path)
     run = commands.add_parser("eval", help="Score a candidate against the live model artifact")
@@ -489,6 +555,8 @@ def main():
     try:
         if args.command == "package":
             print(json.dumps(package(args.fixtures, args.output), indent=2))
+        elif args.command == "export-learning":
+            print(json.dumps(export_learning(args.dir, args.out), sort_keys=True))
         elif args.command == "counts":
             print(json.dumps(metadata_counts(read_rows(args.metadata.read_bytes())), sort_keys=True))
         else:
