@@ -632,9 +632,9 @@ final class BrowserBridge: @unchecked Sendable {
 
         do {
             // The grant rides in the private initialize request only, never in the environment or arguments.
-            let grant = try RelayGrantLaunch.issue(
+            let grant = RelayGrantLaunch.isEnabled ? try RelayGrantLaunch.issue(
                 keyStore: relayKeyStore, pid: child.processIdentifier, sessionID: sessionID, now: relayClock()
-            )
+            ) : nil
             _ = try request(method: "initialize", params: RelayGrantLaunch.initializeParams(grant: grant), timeout: 10)
             relayGrant = grant
             try BrowserRequestContext.validateCurrent()
