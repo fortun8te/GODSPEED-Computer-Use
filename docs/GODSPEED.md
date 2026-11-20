@@ -210,6 +210,8 @@ Use browser `close_tab` with the explicit `tab_id` returned by `open_tab`. Godsp
 
 MCP cancellation stops queued work and interrupts waits in a running batch or handoff. A disconnect also stops work for that connection. A cancellation reply lists the steps already attempted and the steps skipped. A step interrupted during delivery may have taken effect. Inspect it before trying again.
 
+Godspeed records a write step's intent before dispatch and its outcome afterward in `~/.godspeed/journal/operations.jsonl`. Records contain the tool name, timestamps and generated IDs. They omit arguments, replies and screenshots. After a restart, an intent without an outcome is `outcome_unknown`. Starting Godspeed never replays it.
+
 While the Mac is unlocked, up to four different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. An explicit `wait_for` of 1–3 seconds can also share admission. Each client has its own tab state and can have one read in flight. Native actions, browser writes, mixed batches, and any Locked Use recovery get exclusive access. Exclusive requests run in arrival order. A queued writer normally gets the next turn. When a reader has waited through two exclusive admissions, the oldest eligible reader gets a turn. One client cannot take multiple read slots. Set `OPEN_COMPUTER_USE_PARALLEL_READS` to 1, 2, 3, or 4 in the shared app agent environment to compare reader limits. The default is 3.
 
 If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.

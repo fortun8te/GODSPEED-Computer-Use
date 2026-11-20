@@ -627,7 +627,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                 let browserEnvironment = AppAgentEnvironment.effectiveEnvironment(environment)
                 self.browserEnvironment = browserEnvironment
                 // Record settings belong to this MCP connection, not to the shared agent's launch environment.
-                let server = self.server ?? StdioMCPServer(trajectoryEnvironment: environment)
+                let server = self.server ?? StdioMCPServer(trajectoryEnvironment: environment, recordOperations: true)
                 self.server = server
                 // Handshake and listing never wait behind another agent's running tool call: a slow call
                 // used to hold the lock, so the next session's initialize timed out and it started with no tools.
@@ -815,7 +815,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                 return CLIProxyResponse(stdout: text + "\n", stderr: "", exitCode: EXIT_SUCCESS)
 
             case let .call(invocation):
-                let output = try runOpenComputerUseCall(invocation)
+                let output = try withOperationJournal { try runOpenComputerUseCall(invocation) }
                 return CLIProxyResponse(
                     stdout: try output.jsonText() + "\n",
                     stderr: "",
