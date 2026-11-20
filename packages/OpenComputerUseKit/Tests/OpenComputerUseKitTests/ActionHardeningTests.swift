@@ -253,4 +253,11 @@ final class ActionHardeningTests: XCTestCase {
         try raiseForGlobalPointerInput(app, prepare: { raised.append($0.pid) })
         XCTAssertEqual(raised, [4242])
     }
+
+    func testGlobalMouseEventsThatMoveOrPressAreGuardedExceptReleases() {
+        XCTAssertTrue(InputSimulation.needsHandsOff(.mouseMoved))
+        XCTAssertTrue(InputSimulation.needsHandsOff(.leftMouseDown))
+        XCTAssertTrue(InputSimulation.needsHandsOff(.leftMouseDragged), "a drag moves the real pointer too")
+        XCTAssertFalse(InputSimulation.needsHandsOff(.leftMouseUp), "a release always goes out so no button stays held")
+    }
 }
