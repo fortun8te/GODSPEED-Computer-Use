@@ -841,6 +841,9 @@ extension ComputerUseToolDispatcher {
             let point = x.flatMap { x in y.map { CGPoint(x: x, y: $0) } }
             try page.drag(from: source, to: destination, point: point, modifiers: modifiers,
                           steps: options.steps ?? 5, hold: options.hold)
+            if let verified = try options.verifiedDrop({ try page.waitForControl($0) }) {
+                return .text(verified)
+            }
             return .text("Drag delivered. \(page.settle().line). Verify the drop from the resulting state.")
 
         case "type", "type_text", "fill", "fill_field":

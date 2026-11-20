@@ -145,6 +145,7 @@ public enum ToolDefinitions {
                     "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
                     "hold_ms": integerProperty(description: "Drag or key hold, up to 1000 ms."),
                     "drag_steps": integerProperty(description: "Drag movement steps, 2 to 30."),
+                    "verify": dropVerificationProperty(),
                     "to_x": numberProperty(description: "Drag destination viewport X from screenshot."),
                     "to_y": numberProperty(description: "Drag destination viewport Y from screenshot."),
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
@@ -483,6 +484,7 @@ public enum ToolDefinitions {
                     "to_index": integerProperty(description: "Destination control reference."),
                     "hold_ms": integerProperty(description: "Hold before moving, up to 1000 ms."),
                     "drag_steps": integerProperty(description: "Movement steps, 2 to 30."),
+                    "verify": dropVerificationProperty(),
                     "from_x": numberProperty(description: "Start X coordinate"),
                     "from_y": numberProperty(description: "Start Y coordinate"),
                     "to_x": numberProperty(description: "End X coordinate"),
@@ -502,6 +504,15 @@ private func observedWindowIDProperty() -> [String: Any] {
         "type": "integer", "minimum": 1, "maximum": UInt32.max,
         "description": "Require the native window ID from get_app_state or query. Refuses the action if its observed target changed."
     ]
+}
+
+private func dropVerificationProperty() -> [String: Any] {
+    objectSchema(properties: [
+        "label": stringProperty(description: "Expected control."),
+        "condition": stringProperty(description: "Drop check.", enumValues: ControlWait.Condition.allCases.map(\.rawValue)),
+        "from_value": stringProperty(description: "Previous value for value_changed."),
+        "timeout": integerProperty(description: "Seconds, up to 30."),
+    ], required: ["label", "condition"])
 }
 
 private func labelProperty() -> [String: Any] {

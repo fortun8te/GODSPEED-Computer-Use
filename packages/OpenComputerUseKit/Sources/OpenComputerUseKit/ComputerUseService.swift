@@ -1398,6 +1398,10 @@ public final class ComputerUseService {
 
     func waitForControl(app query: String, wait: ControlWait) throws -> ToolCallResult {
         let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+        return .text(try waitForControl(in: snapshot, wait: wait))
+    }
+
+    private func waitForControl(in snapshot: AppSnapshot, wait: ControlWait) throws -> String {
         guard let id = snapshot.targetWindowID, let window = snapshot.windowElement else {
             throw ComputerUseError.backgroundUnsupported("This wait requires an observed native window.")
         }
@@ -1420,7 +1424,7 @@ public final class ComputerUseService {
             }
             return .value(AXWaitIdentity(element: element), value)
         }
-        return .text(reply)
+        return reply
     }
 
     private struct AXWaitIdentity: Equatable {
@@ -1596,6 +1600,9 @@ public final class ComputerUseService {
                     try checkStart()
                     try checkEnd()
                 })
+        }
+        if let verified = try options.verifiedDrop({ try waitForControl(in: snapshot, wait: $0) }) {
+            return .text(verified)
         }
         return appendingDragDeliveryNote(to: try actionResult(for: query, recoveryPolicy: .readOnly), path: .appPost)
     }

@@ -222,7 +222,7 @@ Use `scroll_into_view` when you already know the control. Mac apps need to expos
 
 Read both endpoints first. A Mac drag accepts `from_label` and `to_label`, or `from_index` and `to_index`. Either endpoint can be a pair of screenshot coordinates in the same window. In Chrome use `label` or `index` for the source and a control or viewport point for the destination. For a handle, target the handle itself. Set `hold_ms` up to 1000 and `drag_steps` from 2 to 30 if needed.
 
-To move a row or card, drag to the destination and check the order or destination state. Use a batch `done_when` or follow the drag with a wait for the expected control. A pointer receipt confirms delivery only. For files, use Finder private clipboard copy and paste or Chrome `upload`. OS-level file drops can require the real pointer.
+To move a row or card, drag to the destination and check the order or destination state. Set `verify` on the drag to check a condition after release, for example `{"label":"Card A","condition":"appears"}`. Use a batch `done_when` when the drop needs more checks. A pointer receipt confirms delivery only. For files, use Finder private clipboard copy and paste or Chrome `upload`. OS-level file drops can require the real pointer.
 
 ## Local traces
 
