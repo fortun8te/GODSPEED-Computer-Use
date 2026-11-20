@@ -132,6 +132,10 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` | off | Allow moving the real pointer. Off means never. |
 | `OPEN_COMPUTER_USE_FOCUS_BORROW` | off | Allow focus borrowing when background-only and strict modes are off. |
 | `OPEN_COMPUTER_USE_STRICT_BACKGROUND` | off | Require strict background delivery (settings key `strict_background`). |
+| `OPEN_COMPUTER_USE_LEARNING_LOG` | on | Local training data in `~/.godspeed/learning` (2 GB cap, oldest days deleted first). Secrets, password fields and the clipboard are never written. `0` turns it off. |
+| `OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES` | on | Keep the window crops already sent to the local vision model. Never saved while a password field is visible. |
+| `OPEN_COMPUTER_USE_SEMANTIC_REPLIES` | on | Add a `Changes:` line to longer change-only replies. `0` restores the previous text exactly. |
+| `OPEN_COMPUTER_USE_AGENT_EVENTS` | on | Add popup, download and closed-tab lines from the Chrome extension to browser replies. |
 | `OPEN_COMPUTER_USE_RECIPES` | on | Saved recipes (settings key `recipes`). |
 | `OPEN_COMPUTER_USE_VIRTUAL_DISPLAY_ENABLED` | off | Adds `window_placement` to `get_app_state`. |
 | `OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE` | none | Separate socket for tests (`godspeed-agent-<hash>.sock`). |
