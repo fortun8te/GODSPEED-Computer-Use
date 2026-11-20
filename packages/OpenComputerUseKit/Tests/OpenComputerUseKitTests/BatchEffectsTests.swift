@@ -149,6 +149,36 @@ final class BatchEffectsTests: XCTestCase {
         XCTAssertEqual(try BatchTool.parseSteps(forty, defaultApp: "Notes").count, 40)
         XCTAssertThrowsError(try BatchTool.parseSteps(forty + forty.prefix(1), defaultApp: "Notes"))
     }
+
+    /// A 40-step element batch. The effect budget is spent after step 20, so no read refreshes the window
+    /// any more. The window changes after step 25. The identity check before each element step must stop
+    /// the batch at step 26, before it can act on the new window's element numbers.
+    func testElementStepsStopAtTheWindowChangeAfterTheEffectBudgetIsSpent() {
+        var budget = BatchEffects.ReadBudget()
+        let original = BatchEffects.WindowIdentity(id: 7, bounds: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let replacement = BatchEffects.WindowIdentity(id: 8, bounds: CGRect(x: 0, y: 0, width: 800, height: 600))
+        var executed = 0
+        var stoppedAt: Int?
+        for step in 1...40 {
+            if step == 20 { budget.record(seconds: 8, settleMs: 0, observed: true) }
+            let now = step > 25 ? replacement : original
+            if BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: budget.exhausted,
+                                                   start: original, now: { now }) {
+                stoppedAt = step
+                break
+            }
+            executed += 1
+        }
+        XCTAssertTrue(budget.exhausted)
+        XCTAssertEqual(stoppedAt, 26)
+        XCTAssertEqual(executed, 25)
+        // Same window, or effects off, or budget still open: nothing extra is decided here.
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { original }))
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: false, budgetExhausted: true, start: original, now: { replacement }))
+        XCTAssertFalse(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: false, start: original, now: { replacement }))
+        XCTAssertTrue(BatchEffects.elementStepMovedWindow(effectsOn: true, budgetExhausted: true, start: original, now: { nil }),
+                      "a window that cannot be found is not confirmed")
+    }
 }
 
 final class ElementNumberingTests: XCTestCase {

@@ -109,6 +109,13 @@ enum BatchTool {
 
     /// Whether the state this agent last saw for `app` had a sheet or dialog open. Steps in a dialog need the
     /// app in front (keys and typing do not reach a background sheet), so the batch borrows focus for them.
+    /// The app's front window, read from the window list only (one query, no accessibility tree).
+    static func windowIdentity(app: String) -> BatchEffects.WindowIdentity? {
+        guard let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
+              let window = WindowCapture.resolve(for: pid, titleHint: nil, capture: false) else { return nil }
+        return BatchEffects.WindowIdentity(id: window.windowID, bounds: window.bounds)
+    }
+
     static func dialogWasShown(app: String) -> Bool {
         BatchObservationMemory.shared.shownText(app: app).map(RefereeSummary.dialogOpen(in:)) ?? false
     }
@@ -696,6 +703,9 @@ extension ComputerUseToolDispatcher {
         var watchState: String?
         var boundWindow: BatchEffects.WindowSig?
         var movedTo: String?
+        /// The window the batch's element numbers belong to, read from the window list. Kept current while the
+        /// effect reads run, and checked before element steps once they stop.
+        var boundIdentity: BatchEffects.WindowIdentity?
         var goneReported = Set<Int>()
         var pendingLastEffect: (app: String, before: String, position: Int, line: Int, tool: String)?
         var failedNumber = 0
@@ -822,7 +832,7 @@ extension ComputerUseToolDispatcher {
                             if !wantsScreenshot { trailingObservation = read.result }
                             watchApp = app
                             watchState = read.text
-                            if case .window = wait.kind { boundWindow = read.sig; movedTo = nil }
+                            if case .window = wait.kind { boundWindow = read.sig; movedTo = nil; boundIdentity = BatchTool.windowIdentity(app: app) }
                             else if boundWindow == nil { boundWindow = read.sig }
                             break
                         }
@@ -865,8 +875,15 @@ extension ComputerUseToolDispatcher {
             let stepApp = (plannedStep.arguments["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             // The batch's numbers belong to the window it started in: stop before an element step that
             // would act on another window (a dialog the previous step opened itself is followed, not a stop).
-            if let title = movedTo, replayed != nil
-                || normalizedElementIndexArgument(plannedStep.arguments["element_index"]) != nil {
+            let elementStep = normalizedElementIndexArgument(plannedStep.arguments["element_index"]) != nil
+                || plannedStep.arguments["ref"] != nil
+            // Once the effect budget is spent nothing refreshes movedTo, so an element step checks the window itself.
+            if movedTo == nil, elementStep, let app = watchApp, BatchEffects.elementStepMovedWindow(
+                effectsOn: effectsOn, budgetExhausted: effectBudget.exhausted, start: boundIdentity,
+                now: { BatchTool.windowIdentity(app: app) }) {
+                movedTo = "another window"
+            }
+            if let title = movedTo, replayed != nil || elementStep {
                 lines.append("window changed after \(offset) steps (now \"\(title)\"). Steps \(number)-\(steps.count) were not run; read the app with get_app_state and send them again.")
                 stoppedForTime = true
                 receipt.stop = .windowChanged
@@ -878,6 +895,7 @@ extension ComputerUseToolDispatcher {
                     watchApp = app
                     watchState = read.text
                     boundWindow = read.sig
+                    boundIdentity = BatchTool.windowIdentity(app: app)
                     movedTo = nil
                     goneReported = []
                 }
@@ -1049,6 +1067,7 @@ extension ComputerUseToolDispatcher {
                 watchApp = app
                 watchState = text
                 boundWindow = BatchEffects.windowSig(state: text, id: windowID(app))
+                boundIdentity = BatchTool.windowIdentity(app: app)
                 movedTo = nil
             }
 
