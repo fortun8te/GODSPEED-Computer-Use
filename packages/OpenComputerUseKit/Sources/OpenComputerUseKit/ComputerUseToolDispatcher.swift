@@ -480,7 +480,11 @@ public final class ComputerUseToolDispatcher {
                 guard labelArguments(in: arguments) == nil, optionalElementIndex(in: arguments) == nil else {
                     throw ComputerUseError.invalidArguments("Use a menu command or a control for the gesture.")
                 }
-                return try service.pressMenu(app: app, titles: menuPathArgument(arguments["menu_path"]))
+                let path = try menuPathArgument(arguments["menu_path"])
+                guard path.count >= 2 else {
+                    throw ComputerUseError.invalidArguments("Give the menu and command, such as View > Zoom In.")
+                }
+                return try service.pressMenu(app: app, titles: path)
             }
             guard let increase = gesture.zoomIncreases,
                   let index = try strictActionIndex(app: app, arguments: arguments) else {

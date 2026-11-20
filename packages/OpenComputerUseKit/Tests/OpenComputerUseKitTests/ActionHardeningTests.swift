@@ -155,6 +155,15 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertNil(try DragOptions([:]).verifiedDrop { _ in XCTFail("Unexpected check"); return "" })
     }
 
+    func testScrollLabelsIncludeStaticTextWithoutCountingRepeatedIDs() {
+        let named: (String, Int) -> [String: Any] = { name, id in
+            ["name": ["value": name], "role": ["value": "StaticText"], "backendDOMNodeId": id]
+        }
+        let ignored = named("End", 5).merging(["ignored": true]) { _, new in new }
+        XCTAssertEqual(BrowserPage.scrollLabelCandidates(
+            [named("End", 2), named("End", 2), named("End other", 3), ignored], label: "End").map(\.backendNodeID), [2])
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0
