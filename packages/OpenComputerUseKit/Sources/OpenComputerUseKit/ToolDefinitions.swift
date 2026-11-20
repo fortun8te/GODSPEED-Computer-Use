@@ -262,6 +262,19 @@ public enum ToolDefinitions {
             )
         ),
         ToolDefinition(
+            name: TeachMode.toolName,
+            description: "Use to watch Michael do a task in one app and save it as a batch recipe. start (app, goal) records only that app, for up to 10 minutes. stop saves the steps as an unverified recipe and prints them. status says whether recording is on. Text typed into secure fields is never stored.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "action": stringProperty(description: "start, stop or status", enumValues: ["start", "stop", "status"]),
+                    "app": stringProperty(description: "App to watch, for start"),
+                    "goal": stringProperty(description: "What the task does, for start, e.g. Email Sam the report"),
+                ],
+                required: ["action"]
+            )
+        ),
+        ToolDefinition(
             name: "type_text",
             description: "Use to type literal text into the focused field; to set a field's whole value use set_value. Click the field first. replace: true selects the focused field's text first (search boxes, chat inputs set_value cannot write).",
             annotations: defaultAnnotations(),

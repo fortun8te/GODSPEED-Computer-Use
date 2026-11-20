@@ -35,6 +35,8 @@ public final class ComputerUseToolDispatcher {
 
     private let actionPolicyURL: URL
     let recipeStore: BatchRecipes
+    /// The `teach` tool's session (watch-me recording).
+    let teach: TeachMode
 
     func localDecisionImage(app: String, state: String) -> Data? {
         service.localDecisionImage(app: app, state: state)
@@ -44,10 +46,12 @@ public final class ComputerUseToolDispatcher {
         self.init(service: service, actionPolicyURL: ActionPolicy.fileURL)
     }
 
-    init(service: ComputerUseService = ComputerUseService(), actionPolicyURL: URL, recipeStore: BatchRecipes = .shared) {
+    init(service: ComputerUseService = ComputerUseService(), actionPolicyURL: URL, recipeStore: BatchRecipes = .shared,
+         teach: TeachMode = .shared) {
         self.service = service
         self.actionPolicyURL = actionPolicyURL
         self.recipeStore = recipeStore
+        self.teach = teach
     }
 
     func currentActionPolicy() throws -> ActionPolicy { try ActionPolicy.load(from: actionPolicyURL) }
@@ -451,6 +455,8 @@ public final class ComputerUseToolDispatcher {
             )
         case SmartSteps.openName:
             return try SmartSteps.open(arguments: arguments, browser: { try self.callTool(name: "browser", arguments: $0) })
+        case TeachMode.toolName:
+            return try teach.run(arguments: arguments)
         case "clipboard":
             let clipboard = PrivateClipboard.current
             switch try requireString("action", in: arguments).lowercased() {
