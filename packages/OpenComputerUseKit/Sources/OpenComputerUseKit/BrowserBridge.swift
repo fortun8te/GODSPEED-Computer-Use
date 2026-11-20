@@ -191,10 +191,20 @@ final class BrowserBridge: @unchecked Sendable {
     let sessionID: String
     let referenceScope = UUID()
     private let launchEnvironment: [String: String]
+    private let relayKeyStore: RelayAuthorityKeyStore
+    private let relayClock: @Sendable () -> Date
 
-    init(sessionID: String, launchEnvironment: [String: String] = GodspeedSettings.environment, isPreview: Bool = false) {
+    init(
+        sessionID: String,
+        launchEnvironment: [String: String] = GodspeedSettings.environment,
+        isPreview: Bool = false,
+        relayKeyStore: RelayAuthorityKeyStore = KeychainRelayAuthorityKeyStore(),
+        relayClock: @escaping @Sendable () -> Date = { Date() }
+    ) {
         self.sessionID = sessionID
         self.launchEnvironment = launchEnvironment
+        self.relayKeyStore = relayKeyStore
+        self.relayClock = relayClock
         idleStopAfter = isPreview ? 60 : Self.stopAfter
         idleTimer = DispatchSource.makeTimerSource(queue: Self.housekeeping)
         idleTimer.setEventHandler { [weak self] in self?.handleIdleDeadline() }
@@ -300,6 +310,8 @@ final class BrowserBridge: @unchecked Sendable {
 
     private let lock = NSLock()
     private var process: Process?
+    // The relay grant of the current child. Held in memory only; never in env, arguments, logs or files.
+    private var relayGrant: RelayGrant?
     private var input: FileHandle?
     private var nextID = 1
     private var helperGeneration = 0
@@ -536,7 +548,10 @@ final class BrowserBridge: @unchecked Sendable {
     }
 
     private func startIfNeeded() throws {
-        if let process, process.isRunning { return }
+        if let process, process.isRunning {
+            try renewRelayGrantIfNeeded()
+            return
+        }
         if StrictBackground.enabled() {
             throw ComputerUseError.backgroundUnsupported("The browser helper is not connected.")
         }
@@ -591,22 +606,38 @@ final class BrowserBridge: @unchecked Sendable {
         nextID = 1
 
         do {
-            _ = try request(
-                method: "initialize",
-                params: [
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": [String: Any](),
-                    "clientInfo": ["name": "godspeed", "version": openComputerUseVersion],
-                ],
-                timeout: 10
+            // The grant rides in the private initialize request only, never in the environment or arguments.
+            let grant = try RelayGrantLaunch.issue(
+                keyStore: relayKeyStore, pid: child.processIdentifier, sessionID: sessionID, now: relayClock()
             )
+            _ = try request(method: "initialize", params: RelayGrantLaunch.initializeParams(grant: grant), timeout: 10)
+            relayGrant = grant
             try BrowserRequestContext.validateCurrent()
             try send(["jsonrpc": "2.0", "method": "notifications/initialized"],
                      deadline: BrowserCallBudget.deadline(after: min(2, BrowserCallBudget.remaining())))
         } catch {
             // Never keep a child that did not finish its handshake: the next call starts a fresh one.
+            relayGrant = nil
             retireConnection()
-            throw error
+            throw RelayGrantRenewal.typedError(for: error)
+        }
+    }
+
+    /// Replaces the child's grant with a fresh `initialize` on the same private pipes before it expires.
+    private func renewRelayGrantIfNeeded() throws {
+        guard let child = process, let current = relayGrant, RelayGrantRenewal.isDue(current, now: relayClock()) else {
+            return
+        }
+        do {
+            let fresh = try RelayGrantLaunch.issue(
+                keyStore: relayKeyStore, pid: child.processIdentifier, sessionID: sessionID, now: relayClock()
+            )
+            _ = try request(method: "initialize", params: RelayGrantLaunch.initializeParams(grant: fresh), timeout: 10)
+            relayGrant = fresh
+        } catch {
+            relayGrant = nil
+            retireConnection()
+            throw RelayGrantRenewal.typedError(for: error)
         }
     }
 
