@@ -823,6 +823,7 @@ extension ComputerUseToolDispatcher {
         for (offset, plannedStep) in steps.enumerated() {
             let number = offset + 1
             if stopIfCancelled() || stopIfOutOfTime(before: number) { break }
+            OperationJournal.markBatchStep(number)
             if plannedStep.tool == BatchTool.waitName {
                 let step = plannedStep
                 lastAttemptedStep = step
