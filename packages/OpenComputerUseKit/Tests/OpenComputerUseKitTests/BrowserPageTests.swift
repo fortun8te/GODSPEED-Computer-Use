@@ -6,6 +6,36 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testFindHintsSkipUnrelatedDuplicatesAndKeepIconOnlyControls() {
+        var parse = BrowserAXParse()
+        parse.controls = (1...24).map { BrowserNode(index: $0, role: "button", name: "Edit", value: "", backendNodeID: $0) }
+        parse.controls.append(.init(index: 25, role: "button", name: "Save", value: "", backendNodeID: 25))
+        parse.controls.append(.init(index: 26, role: "button", name: "", value: "", backendNodeID: 26))
+        XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "Save"), [25])
+        XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "trash").first, 25)
+    }
+
+    func testHintProbesResolveTogetherAndShareOneRuntimeRead() {
+        var waves: [[String]] = []
+        let hints = BrowserPage.readHints(Array(1...24)) { commands in
+            waves.append(commands.map(\.0))
+            switch commands.first?.0 {
+            case "DOM.resolveNode":
+                return commands.map { _, params in
+                    ["object": ["objectId": "handle-\(params["backendNodeId"] as? Int ?? 0)"]]
+                }
+            case "Runtime.callFunctionOn":
+                XCTAssertEqual((commands[0].1["arguments"] as? [[String: String]])?.count, 24)
+                return [["result": ["value": (1...24).map { "hint-\($0)" }]]]
+            default:
+                return []
+            }
+        }
+        XCTAssertEqual(waves, [Array(repeating: "DOM.resolveNode", count: 24), ["Runtime.callFunctionOn"], ["Runtime.releaseObjectGroup"]])
+        XCTAssertEqual(hints.count, 24)
+        XCTAssertEqual(hints[24], "hint-24")
+    }
+
     func testRememberedBrowserControlsRequireTheOriginalHelperAndLoaders() throws {
         let memory = BrowserPageMemory()
         let first = BrowserBridge(sessionID: "test-first")

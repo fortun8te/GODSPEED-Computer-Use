@@ -173,7 +173,9 @@ final class BrowserPage {
             : Self.parseAX(raw, controlBudget: .max, textBudget: interactive ? 0 : .max, maxControls: .max,
                            includeLinkURLs: includeLinkURLs)
         var parse = parsed
-        addHints(to: &parse)
+        TimingLog.measure("browser.read_hints") {
+            addHints(to: &parse, find: query, generation: generation)
+        }
         let context = try? readContext(texts: parse.texts)
         let place = context?.location ?? (try? location())
         if let context { parse.texts = context.texts }
@@ -232,26 +234,65 @@ final class BrowserPage {
     /// Labels the controls a model could not otherwise tell apart: those with no name and those that share
     /// their role and name with another (three "Edit" buttons). Unnamed ones first, then duplicates, in page
     /// order, within a small time budget, so a read never slows down noticeably.
-    private func addHints(to parse: inout BrowserAXParse) {
+    private func addHints(to parse: inout BrowserAXParse, find: String, generation: Int) {
+        let positions = Self.hintCandidates(in: parse, find: find)
+        guard !positions.isEmpty else { return }
+        let deadline = BrowserCallBudget.deadline(after: Self.hintBudget)
+        let hints = Self.readHints(positions.map { parse.controls[$0].backendNodeID }) { commands in
+            (try? bridge.hintCommands(tab: tab, commands: commands, generation: generation, deadline: deadline)) ?? []
+        }
+        for position in positions {
+            if let hint = hints[parse.controls[position].backendNodeID] { parse.controls[position].hint = hint }
+        }
+    }
+
+    static func hintCandidates(in parse: BrowserAXParse, find: String) -> [Int] {
         var counts: [String: Int] = [:]
-        for control in parse.controls { counts["\(control.role)\u{1}\(control.name)", default: 0] += 1 }
+        func key(_ control: BrowserNode) -> String { "\(control.role)\u{1}\(control.name)" }
+        for control in parse.controls { counts[key(control), default: 0] += 1 }
+        let directMatches = find.isEmpty ? [] : filtered(parse, find: find).controls.map(\.index)
+        let matchingIndexes = Set(directMatches)
         let candidates = parse.controls.indices.filter { position in
             let control = parse.controls[position]
-            guard !control.inFrame, Self.clickableRoles.contains(control.role) || Self.fieldRoles.contains(control.role) else { return false }
-            return control.name.isEmpty || counts["\(control.role)\u{1}\(control.name)", default: 0] > 1
+            guard !control.inFrame, clickableRoles.contains(control.role) || fieldRoles.contains(control.role) else { return false }
+            if control.name.isEmpty { return true }
+            return counts[key(control), default: 0] > 1
+                && (matchingIndexes.isEmpty || matchingIndexes.contains(control.index))
         }
-        guard !candidates.isEmpty else { return }
-        let ordered = candidates.filter { parse.controls[$0].name.isEmpty } + candidates.filter { !parse.controls[$0].name.isEmpty }
-        let deadline = Date().addingTimeInterval(Self.hintBudget)
-        for position in ordered.prefix(Self.maxHintedControls) {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0.02 else { break }
-            let control = parse.controls[position]
-            let value = BrowserCallBudget.withDeadline(BrowserCallBudget.deadline(after: remaining)) {
-                try? callOnNode(control, Self.hintJS) as? String
-            }
-            if let value, !value.isEmpty { parse.controls[position].hint = value }
+        // Keep relevant named duplicates ahead of icon-only fallback probes.
+        let unnamed = candidates.filter { parse.controls[$0].name.isEmpty }
+        let named = candidates.filter { !parse.controls[$0].name.isEmpty }
+        return Array((matchingIndexes.isEmpty ? unnamed + named : named + unnamed).prefix(maxHintedControls))
+    }
+
+    static func readHints(
+        _ backendIDs: [Int], call: ([(String, [String: Any])]) -> [[String: Any]?]
+    ) -> [Int: String] {
+        let objectGroup = "godspeed-read-hints"
+        let resolves = backendIDs.map {
+            ("DOM.resolveNode", ["backendNodeId": $0, "objectGroup": objectGroup])
         }
+        let objects = zip(backendIDs, call(resolves)).compactMap { backend, reply -> (Int, String)? in
+            guard let object = reply?["object"] as? [String: Any], let id = object["objectId"] as? String else { return nil }
+            return (backend, id)
+        }
+        defer { _ = call([("Runtime.releaseObjectGroup", ["objectGroup": objectGroup])]) }
+        guard let first = objects.first else { return [:] }
+        // Every handle is from this tab and these controls are outside iframes.
+        // Detached or cross-context handles may fail this optional enrichment.
+        let function = "function(...nodes){const hint=(\(hintJS));return nodes.map(n=>{try{return n.isConnected?hint.call(n):''}catch{return ''}});}"
+        let params: [String: Any] = [
+            "objectId": first.1, "functionDeclaration": function,
+            "arguments": objects.map { ["objectId": $0.1] }, "returnByValue": true,
+        ]
+        guard let reply = call([("Runtime.callFunctionOn", params)]).first ?? nil,
+              let result = reply["result"] as? [String: Any],
+              let values = result["value"] as? [String], values.count == objects.count else { return [:] }
+        var hints: [Int: String] = [:]
+        for (object, value) in zip(objects, values) where !value.isEmpty {
+            hints[object.0] = value
+        }
+        return hints
     }
 
     /// A control's title, icon, image, stable attribute and row, as "icon:trash; testid:delete; in:Invoice 12".
@@ -584,7 +625,12 @@ final class BrowserPage {
             let matches = observation.nodes.filter { Self.hint($0.hint, matches: wanted) }
             if matches.count == 1, let node = matches.first {
                 indexedGeneration = observation.generation
-                return try verified(node, index: node.index)
+                let current = try verified(node, index: node.index)
+                guard let live = try callOnNode(current, Self.hintJS) as? String,
+                      Self.hint(live, matches: wanted), try documentIdentity() == document else {
+                    throw Self.staleIndex
+                }
+                return current
             }
         }
         let raw = try fullTree()

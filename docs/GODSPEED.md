@@ -60,6 +60,8 @@ Save waits for the name field, folder choice and any confirmation to appear. It 
 
 When a visible app is still preparing its web content, Godspeed checks for the web area before walking the full tree again.
 
+Browser `find` checks matching controls first and keeps icon-only controls eligible for hints. Chrome reads the selected hints together.
+
 ### Works only with focus borrowing
 
 Focus borrowing brings one app to the front for a moment, then gives focus back to the app that had it. The pointer does not move. It is used only where background delivery cannot work:
