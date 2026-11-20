@@ -47,6 +47,24 @@ struct BrowserNode: Sendable {
     }
 }
 
+/// Where a navigation ended up against the address that was asked for. Only `arrived` confirms that address.
+enum BrowserNavigationResult: Equatable, Sendable {
+    /// The requested address loaded. `newDocument` is false when the same document was still in place.
+    case arrived(finalURL: String, newDocument: Bool)
+    /// The page loaded on another origin than the one requested (a login or redirect target).
+    case redirected(finalURL: String)
+    /// Chrome's error page (chrome-error://, net::ERR_*) replaced the requested page.
+    case errorPage(finalURL: String)
+    case timedOut
+}
+
+/// One stage of a navigation, as `BrowserRules.navigationStage` reads it.
+enum NavigationStage: Equatable {
+    case arrived
+    case redirected
+    case errorPage
+}
+
 /// What an action did to the page, in the one short line the model reads after it.
 enum BrowserChange: Equatable, Sendable {
     case navigated(String)
@@ -2012,6 +2030,10 @@ final class BrowserPage {
     /// stays at the same address, a short while.
     @discardableResult
     func waitLoad(changedFrom old: String?, expect: String? = nil, timeout: TimeInterval) -> Bool {
+        if let expect {
+            if case .arrived = navigationOutcome(from: old, expected: expect, timeout: timeout) { return true }
+            return false
+        }
         let clock = ProcessInfo.processInfo
         let start = clock.systemUptime
         let deadline = start + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
@@ -2021,10 +2043,7 @@ final class BrowserPage {
                 if let here = try? location(),
                    here.readyState == "interactive" || here.readyState == "complete" {
                     let elapsed = clock.systemUptime - start
-                    if let expect {
-                        if BrowserRules.sameAddress(here.href, expect)
-                            || (elapsed > 4 && here.href != old && BrowserRules.isWebAddress(here.href)) { return true }
-                    } else if old == nil || here.href != old || elapsed > 1.5 {
+                    if old == nil || here.href != old || elapsed > 1.5 {
                         return true
                     }
                 }
@@ -2033,6 +2052,35 @@ final class BrowserPage {
                 Thread.sleep(forTimeInterval: min(0.12, remaining))
             }
             return false
+        }
+    }
+
+    /// Waits for `expected` after a navigation that began at `old`. Only `.arrived` confirms the address. An error
+    /// page or a load that ends on another origin is reported as it is, without waiting out the time limit.
+    func navigationOutcome(from old: String?, expected: String, timeout: TimeInterval) -> BrowserNavigationResult {
+        let clock = ProcessInfo.processInfo
+        let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
+        let startingDocument = try? documentIdentity()
+        return BrowserCallBudget.withDeadline(deadline) {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
+                do { try BrowserRequestContext.validateCurrent() } catch { return .timedOut }
+                if let here = try? location(),
+                   let stage = BrowserRules.navigationStage(expected: expected, from: old, href: here.href,
+                                                            readyState: here.readyState) {
+                    switch stage {
+                    case .arrived:
+                        let current = try? documentIdentity()
+                        let newDocument = current != nil && startingDocument != nil && current != startingDocument
+                        return .arrived(finalURL: here.href, newDocument: newDocument)
+                    case .redirected: return .redirected(finalURL: here.href)
+                    case .errorPage: return .errorPage(finalURL: here.href)
+                    }
+                }
+                let remaining = deadline - clock.systemUptime - 0.3
+                if remaining <= 0 { break }
+                Thread.sleep(forTimeInterval: min(0.12, remaining))
+            }
+            return .timedOut
         }
     }
 
@@ -2174,7 +2222,7 @@ final class BrowserPage {
                 if let urlContains {
                     if let place = try? location(),
                        place.readyState == "interactive" || place.readyState == "complete",
-                       place.href.localizedCaseInsensitiveContains(urlContains) { return true }
+                       BrowserRules.urlContains(place.href, urlContains) { return true }
                 } else if let text {
                     let remaining = deadline - clock.systemUptime
                     let milliseconds = Int(min(1.0, max(0, remaining - 0.05)) * 1000)
@@ -2654,6 +2702,31 @@ enum BrowserRules {
     static func isWebAddress(_ address: String) -> Bool {
         guard let url = URLComponents(string: address), let scheme = url.scheme?.lowercased() else { return false }
         return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
+    }
+
+    /// `url_contains`: the part must appear in the host or the path. The scheme, query and fragment do not count, so
+    /// a page at /login?next=/cart does not match "/cart".
+    static func urlContains(_ address: String, _ part: String) -> Bool {
+        let wanted = part.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !wanted.isEmpty, let url = URLComponents(string: address), let host = url.host else { return false }
+        return (host + url.path).lowercased().contains(wanted)
+    }
+
+    /// Scheme, host and port of a web address, or nil when it is not one.
+    static func origin(_ address: String) -> String? {
+        guard isWebAddress(address), let url = URLComponents(string: address),
+              let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return nil }
+        return "\(scheme)://\(host):\(url.port ?? (scheme == "https" ? 443 : 80))"
+    }
+
+    /// Where a navigation that began at `old` stands against the requested address. Nil while it is still pending.
+    static func navigationStage(expected: String, from old: String?, href: String, readyState: String) -> NavigationStage? {
+        if href.hasPrefix("chrome-error://") || href.contains("net::ERR") { return .errorPage }
+        guard old == nil || href != old else { return nil }
+        guard readyState == "interactive" || readyState == "complete" else { return nil }
+        if sameAddress(href, expected) { return .arrived }
+        if origin(href) != origin(expected) { return .redirected }
+        return nil
     }
 
     /// Match the origin and the requested path boundary. Paths and query values are case-sensitive.

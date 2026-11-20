@@ -932,6 +932,32 @@ extension BrowserPageTests {
         XCTAssertTrue(sent.contains("Page.addScriptToEvaluateOnNewDocument"))
     }
 
+    func testUrlContainsMatchesTheHostAndPathNotTheQuery() {
+        XCTAssertFalse(BrowserRules.urlContains("https://a.test/login?next=/cart", "/cart"))
+        XCTAssertFalse(BrowserRules.urlContains("https://a.test/login#cart", "cart"))
+        XCTAssertTrue(BrowserRules.urlContains("https://a.test/cart?x=1", "/cart"))
+        XCTAssertTrue(BrowserRules.urlContains("https://Shop.test/a", "shop.test"))
+        XCTAssertTrue(BrowserRules.urlContains("https://a.test/checkout/done", "a.test/checkout"))
+    }
+
+    func testNavigationStageNamesArrivalRedirectsAndErrorPagesOnly() {
+        let expected = "https://a.test/order/done"
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: expected,
+                                                    readyState: "complete"), .arrived)
+        // A page that is still loading, or the same address as before the click, is not a result yet.
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: expected,
+                                                  readyState: "loading"))
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/",
+                                                  readyState: "complete"))
+        // Still on the requested origin but not yet at the requested page: keep waiting.
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/cart",
+                                                  readyState: "complete"))
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://login.b.test/sso",
+                                                    readyState: "complete"), .redirected)
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "chrome-error://chromewebdata/",
+                                                    readyState: "complete"), .errorPage)
+    }
+
     func testClickInsideAFrameNeedsTheIntendedElementAtThePoint() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
