@@ -551,6 +551,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(BrowserPage.labelReady(matches: [], state: nil, condition: .exists))
     }
 
+    func testHelperFailuresReadAsPlainWordsNotEnvelopes() {
+        // A click or upload refusal arrives as a JSON-RPC error envelope. The user sees the message alone.
+        let envelope = #"{"id":3,"error":{"code":-32000,"message":"Could not verify an unobstructed click on the requested node. No click sent."}}"#
+        let plain = BrowserReply.failureText(envelope)
+        XCTAssertTrue(plain.contains("Could not verify an unobstructed click"), plain)
+        XCTAssertFalse(plain.contains("{"), plain)
+        XCTAssertEqual(BrowserReply.failureText("unknown tool: click_target"), "unknown tool: click_target")
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {
