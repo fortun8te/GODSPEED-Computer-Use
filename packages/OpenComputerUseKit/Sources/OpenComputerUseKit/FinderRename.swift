@@ -4,8 +4,12 @@ import Foundation
 /// Renames a file through Finder's scripting when the accessibility path cannot (Finder's inline name editor
 /// takes no keys while Finder is in the background). Used only after the normal step failed in Finder.
 enum FinderRename {
+    static func targetsFinder(_ app: String) -> Bool {
+        (try? AppDiscovery.resolveRunning(app))?.bundleIdentifier?.lowercased() == "com.apple.finder"
+    }
+
     static func attempt(tool: String, arguments: [String: Any]) -> ToolCallResult? {
-        guard let app = arguments["app"] as? String, app.lowercased().contains("finder") || app == "com.apple.finder" else { return nil }
+        guard let app = arguments["app"] as? String, targetsFinder(app) else { return nil }
         let newName: String
         let target: String
         switch tool {

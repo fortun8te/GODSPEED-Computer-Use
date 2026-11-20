@@ -25,16 +25,14 @@ enum FocusBorrow {
         "save", "save as", "export", "rename", "new folder", "open", "print", "duplicate", "move to",
     ]
 
-    /// Whether the feature is on (`OPEN_COMPUTER_USE_FOCUS_BORROW`, default on; "0" or "off" disables).
+    /// Focus borrowing is opt-in and unavailable in either background-only mode.
     static var isEnabled: Bool {
         isEnabled(environment: GodspeedSettings.environment)
     }
 
     static func isEnabled(environment: [String: String]) -> Bool {
         guard !backgroundOnlyMode(environment: environment) else { return false }
-        let raw = environment["OPEN_COMPUTER_USE_FOCUS_BORROW"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
-        return !["0", "false", "no", "off"].contains(raw)
+        return StrictBackground.enabledFlag(environment["OPEN_COMPUTER_USE_FOCUS_BORROW"])
     }
 
     /// Whether a menu item with this title opens a dialog or editor (ends with an ellipsis, or is one of
@@ -59,7 +57,7 @@ enum FocusBorrow {
 
     /// Whether the app of `pid` is currently borrowed (so input may use the normal frontmost paths).
     static func isBorrowed(pid: pid_t) -> Bool {
-        shared.isBorrowed(pid: pid)
+        !backgroundOnlyMode() && shared.isBorrowed(pid: pid)
     }
 
     /// Runs `work` with `pid` in front and gives focus back afterwards, also when `work` throws.
@@ -98,7 +96,7 @@ final class FocusBorrowSession {
     /// brought forward (the steps then run as they would in the background).
     @discardableResult
     func ensure(pid: pid_t) -> Bool {
-        guard enabled else { return false }
+        guard enabled, !backgroundOnlyMode() else { return false }
         if let startedAt, Date().timeIntervalSince(startedAt) > Self.maxAge
             || (isActive && FocusBorrowController.secondsSinceUserInput() < Date().timeIntervalSince(startedAt)) {
             // Too long, or the user came back mid-borrow: hand focus back now and run the rest in the background.

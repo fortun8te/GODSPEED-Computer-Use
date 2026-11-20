@@ -49,12 +49,16 @@ public enum ToolDefinitions {
     ) -> [ToolDefinition] {
         // `browser` is listed only when Open Browser Use is installed.
         let definitions = definitions.filter { $0.name != "browser" || browserAvailable }
-        guard !virtualDisplayEnabled else { return definitions }
         return definitions.map { tool in
-            guard tool.name == "get_app_state" else { return tool }
             var schema = tool.inputSchema
             var properties = schema["properties"] as? [String: Any] ?? [:]
-            properties.removeValue(forKey: "window_placement")
+            if !virtualDisplayEnabled, tool.name == "get_app_state" {
+                properties.removeValue(forKey: "window_placement")
+            }
+            properties["strict_background"] = [
+                "type": "boolean",
+                "description": "Require background delivery without app activation, borrowed focus or physical pointer movement. Inherited by nested steps."
+            ]
             schema["properties"] = properties
             return ToolDefinition(name: tool.name, description: tool.description, annotations: tool.annotations, inputSchema: schema)
         }

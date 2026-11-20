@@ -31,11 +31,22 @@ private func normalizedElementIndexNumber(_ value: Double) -> String? {
 }
 
 public final class ComputerUseToolDispatcher {
-    private let service: ComputerUseService
+    let service: ComputerUseService
 
-    public init(service: ComputerUseService = ComputerUseService()) {
-        self.service = service
+    private let actionPolicyURL: URL
+    let recipeStore: BatchRecipes
+
+    public convenience init(service: ComputerUseService = ComputerUseService()) {
+        self.init(service: service, actionPolicyURL: ActionPolicy.fileURL)
     }
+
+    init(service: ComputerUseService = ComputerUseService(), actionPolicyURL: URL, recipeStore: BatchRecipes = .shared) {
+        self.service = service
+        self.actionPolicyURL = actionPolicyURL
+        self.recipeStore = recipeStore
+    }
+
+    func currentActionPolicy() throws -> ActionPolicy { try ActionPolicy.load(from: actionPolicyURL) }
 
     public func callTool(name: String, arguments rawArguments: [String: Any]) throws -> ToolCallResult {
         try callTool(name: name, arguments: rawArguments, log: SmartLog())
@@ -44,7 +55,21 @@ public final class ComputerUseToolDispatcher {
     /// The call, with the notes it collects written to `log`. A batch passes its own log per step, so the
     /// notes (a dialog that opened, a Cancel press) reach the batch reply. `notesInResult: false` keeps them out of
     /// the result text: the batch writes them itself, and a note in the text would also be read as the step's error line.
-    func callTool(name: String, arguments rawArguments: [String: Any], log: SmartLog, notesInResult: Bool = true) throws -> ToolCallResult {
+    func callTool(name: String, arguments rawArguments: [String: Any], log: SmartLog, notesInResult: Bool = true,
+                  beforeNativeDispatch: (() -> Void)? = nil) throws -> ToolCallResult {
+        if let value = rawArguments["strict_background"],
+           !(value is NSNumber && CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID()) {
+            throw ComputerUseError.invalidArguments("strict_background must be true or false")
+        }
+        let strict = StrictBackground.enabled() || StrictBackground.requestedBy(name, arguments: rawArguments)
+        return try StrictBackground.$requested.withValue(strict) {
+            try callScopedTool(name: name, arguments: rawArguments, log: log,
+                               notesInResult: notesInResult, beforeNativeDispatch: beforeNativeDispatch)
+        }
+    }
+
+    private func callScopedTool(name: String, arguments rawArguments: [String: Any], log: SmartLog,
+                                notesInResult: Bool, beforeNativeDispatch: (() -> Void)?) throws -> ToolCallResult {
         // Every call (single, or a batch step) is forgiven first: wrong names, types and key spellings
         // are corrected, and a missing app is taken from the last one used. Still-missing required
         // arguments answer with one corrective line instead of reaching the app.
@@ -54,6 +79,7 @@ public final class ComputerUseToolDispatcher {
         if let problem = ArgumentNormalizer.problem(tool: name, arguments: arguments) {
             throw ComputerUseError.message(problem)
         }
+        try StrictBackground.validate(name, arguments: arguments)
         if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name,
            name != HandoffTool.name {
             guard ArgumentNormalizer.windowBoundTools.contains(name) else {
@@ -66,13 +92,17 @@ public final class ComputerUseToolDispatcher {
             // Routes that guess a replacement target or borrow focus are outside a bound action.
             let result = try autoreleasepool {
                 try ComputerUseService.$requiredWindowID.withValue(windowID) {
-                    try dispatchTool(name: name, arguments: arguments, log: log)
+                    try authorizeNativeAction(name: name, arguments: arguments)
+                    return try dispatchTool(name: name, arguments: arguments, log: log)
                 }
             }
             RecentAppMemory.shared.remember(app)
             let condensed = LeanOutput.condensed(result)
             return notesInResult ? log.apply(to: condensed) : condensed
         }
+        // Focus and legacy shortcuts run only after authorization.
+        try authorizeNativeAction(name: name, arguments: arguments)
+        if !StrictBackground.enabled(), name != "browser" { beforeNativeDispatch?() }
         if let app = arguments["app"] as? String, !app.isEmpty {
             RecentAppMemory.shared.remember(app)
         }
@@ -83,7 +113,7 @@ public final class ComputerUseToolDispatcher {
         // Every state text the model sees is condensed (LeanOutput); indexes are kept.
         // A batch's state was already condensed when its own read went through here.
         // System Settings: a pane's name opens the pane by its link (its sidebar is often unreadable).
-        if ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
+        if !StrictBackground.enabled(), ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
            let app = arguments["app"] as? String, SettingsPanes.isSettings(app),
            let label = SettingsPanes.paneName(in: arguments), SettingsPanes.open(label: label),
            let state = try? runWithSmartSteps(name: "get_app_state", arguments: ["app": app], log: log) {
@@ -91,7 +121,8 @@ public final class ComputerUseToolDispatcher {
             return LeanOutput.condensed(state)
         }
         // Finder: a double click (or open with a label) opens a folder or file; in the background the clicks do nothing.
-        if name == "click" || name == "open", let app = arguments["app"] as? String, app.lowercased().contains("finder") || app == "com.apple.finder",
+        if !StrictBackground.enabled(), name == "click" || name == "open", let app = arguments["app"] as? String,
+           FinderRename.targetsFinder(app),
            let label = arguments["label"] as? String, arguments["path"] == nil,
            name == "open" || ((arguments["click_count"] as? Int) ?? Int((arguments["click_count"] as? String) ?? "") ?? 1) >= 2,
            let opened = FinderOpen.item(named: label),
@@ -114,6 +145,10 @@ public final class ComputerUseToolDispatcher {
         } catch {
             // Renaming in Finder: Finder's rename field takes no typing in the background. Finder's own scripting
             // renames the selected (type_text) or named (set_value) item without focus, keys or a dialog.
+            if StrictBackground.enabled()
+                || (error as? ComputerUseError).map({ TrajectoryLog.failureCode(error: $0, message: "").isActionRefusal }) == true {
+                throw error
+            }
             if let renamed = FinderRename.attempt(tool: name, arguments: arguments) { return renamed }
             // A click on a menu item's name ("Make Plain Text"): press that menu item.
             if name == "click", let label = arguments["label"] as? String, let app = arguments["app"] as? String,
@@ -127,7 +162,7 @@ public final class ComputerUseToolDispatcher {
                         "No '\(label)' button is on screen, so nothing was clicked. \(path.joined(separator: " > ")) is a menu item that acts on the current selection; if that is what you want, use press_menu {path: \"\(path.joined(separator: " > "))\"}. If you expected a dialog, read the app state first."
                     )
                 }
-                let pressed = try runWithSmartSteps(name: "press_menu", arguments: ["app": app, "path": path.joined(separator: " > ")], log: log)
+                let pressed = try callTool(name: "press_menu", arguments: ["app": app, "path": path.joined(separator: " > ")], log: log)
                 log.note("'\(label)' is a menu item; pressed \(path.joined(separator: " > ")).")
                 return pressed
             }
@@ -147,9 +182,12 @@ public final class ComputerUseToolDispatcher {
         if name == "get_app_state", !result.isError, let state = LeanOutput.stateText(of: result),
            RefereeSummary.dialogOpen(in: state) {
             let savePanel = state.contains("save-panel") || state.contains("Save As:")
-            // Keys and typing do not reach a background sheet; a batch brings the app forward for them itself.
-            log.tail("A sheet or dialog is open in this window. Send its steps as a batch: the batch brings the app forward for keys and typing."
-                + (savePanel ? " It is a save panel: save_as {app, path} names and saves in one step; Escape closes it." : ""))
+            if StrictBackground.enabled() {
+                log.tail("A sheet or dialog is open. Use accessible fields and buttons in strict background mode.")
+            } else {
+                log.tail("A sheet or dialog is open. Use its accessible controls. Focus borrowing requires explicit enablement."
+                    + (savePanel ? " Use save_as {app, path} to name and save the file." : ""))
+            }
         }
         // Each element's role and name per number is remembered when the snapshot is stored
         // (ComputerUseService.rememberSnapshot), so a number that later disappears can be healed.
@@ -166,7 +204,7 @@ public final class ComputerUseToolDispatcher {
     /// its previous name, an action with no visible effect in a background window is retried once with focus
     /// borrowed, and a sheet, dialog or alert that opened is reported on one line.
     private func runWithSmartSteps(name: String, arguments: [String: Any], log: SmartLog) throws -> ToolCallResult {
-        guard SmartSteps.actionTools.contains(name), let app = arguments["app"] as? String, !app.isEmpty else {
+        guard !StrictBackground.enabled(), SmartSteps.actionTools.contains(name), let app = arguments["app"] as? String, !app.isEmpty else {
             return try dispatchTool(name: name, arguments: arguments, log: log)
         }
 
@@ -181,7 +219,9 @@ public final class ComputerUseToolDispatcher {
         if name == "press_key", SmartSteps.isEscapeKey(arguments["key"]), !wasFrontmost,
            let snapshot = try? service.currentSnapshot(for: app, needScreenshot: false),
            let cancel = SmartSteps.dialogCancelButton(in: SmartSteps.nodes(of: snapshot)) {
-            let result = try dispatchTool(name: "click", arguments: ["app": app, "element_index": String(cancel)], log: log)
+            let cancelArguments = ["app": app, "element_index": String(cancel)]
+            try authorizeNativeAction(name: "click", arguments: cancelArguments)
+            let result = try dispatchTool(name: "click", arguments: cancelArguments, log: log)
             log.note("A dialog was open, so Escape pressed its Cancel button.")
             return result
         }
@@ -238,7 +278,9 @@ public final class ComputerUseToolDispatcher {
            }(),
            snapshot.treeLines == escapeBefore,
            let cancel = SmartSteps.dialogCancelButton(in: SmartSteps.nodes(of: snapshot)) {
-            result = try dispatchTool(name: "click", arguments: ["app": app, "element_index": String(cancel)], log: log)
+            let cancelArguments = ["app": app, "element_index": String(cancel)]
+            try authorizeNativeAction(name: "click", arguments: cancelArguments)
+            result = try dispatchTool(name: "click", arguments: cancelArguments, log: log)
             log.note("Escape did not close the dialog, so its Cancel button was pressed.")
             latest = SmartSteps.freshSnapshot(app: app, service: service)
         }
@@ -301,6 +343,7 @@ public final class ComputerUseToolDispatcher {
                 log.note(note)
                 var retried = arguments
                 retried["element_index"] = String(now)
+                try authorizeNativeAction(name: name, arguments: retried)
                 return try dispatchTool(name: name, arguments: retried, log: log)
             }
         }
@@ -347,7 +390,7 @@ public final class ComputerUseToolDispatcher {
                 service: service
             )
         case SmartSteps.openName:
-            return try SmartSteps.open(arguments: arguments, browser: { try self.runBrowser(arguments: $0) })
+            return try SmartSteps.open(arguments: arguments, browser: { try self.callTool(name: "browser", arguments: $0) })
         case "clipboard":
             let clipboard = PrivateClipboard.current
             switch try requireString("action", in: arguments).lowercased() {
@@ -415,7 +458,7 @@ public final class ComputerUseToolDispatcher {
             } catch let error as ComputerUseError {
                 // No accessibility element has that label: try finding it on screen, when vision is on.
                 // Several close matches are listed by the label healing, so vision never guesses between them.
-                if ComputerUseService.requiredWindowID == nil, !SmartSteps.isAmbiguous(error), VisionFallback.isEnabled, let label = labelArguments(in: arguments)?.first,
+                if !StrictBackground.enabled(), ComputerUseService.requiredWindowID == nil, !SmartSteps.isAmbiguous(error), VisionFallback.isEnabled, let label = labelArguments(in: arguments)?.first,
                    let result = try visionClick(app: requireString("app", in: arguments), label: label, clickCount: clickCount, arguments: arguments) {
                     return result
                 }
@@ -522,9 +565,11 @@ public final class ComputerUseToolDispatcher {
         callStepAsResult(name: name, arguments: arguments, log: SmartLog())
     }
 
-    func callStepAsResult(name: String, arguments: [String: Any], log: SmartLog, notesInResult: Bool = true) -> ToolCallResult {
+    func callStepAsResult(name: String, arguments: [String: Any], log: SmartLog, notesInResult: Bool = true,
+                          beforeNativeDispatch: (() -> Void)? = nil) -> ToolCallResult {
         do {
-            return try callTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult)
+            return try callTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult,
+                                beforeNativeDispatch: beforeNativeDispatch)
         } catch let error as ComputerUseError {
             let message = error.errorDescription ?? String(describing: error)
             return ToolCallResult(
@@ -641,7 +686,7 @@ public final class ComputerUseToolDispatcher {
     }
 
     /// "label": "Seven" or "labels": ["+", "add"] (first match wins), resolved in the current window.
-    private func labelArguments(in arguments: [String: Any]) -> [String]? {
+    func labelArguments(in arguments: [String: Any]) -> [String]? {
         if let many = arguments["labels"] as? [String], !many.isEmpty { return many }
         if let one = arguments["label"] as? String, !one.isEmpty { return [one] }
         return nil
@@ -688,7 +733,7 @@ public final class ComputerUseToolDispatcher {
         try labelledElementIndex(in: arguments, log: log) ?? requireElementIndex(in: arguments)
     }
 
-    private func optionalElementIndex(in arguments: [String: Any]) -> String? {
+    func optionalElementIndex(in arguments: [String: Any]) -> String? {
         normalizedElementIndexArgument(arguments["element_index"])
     }
 

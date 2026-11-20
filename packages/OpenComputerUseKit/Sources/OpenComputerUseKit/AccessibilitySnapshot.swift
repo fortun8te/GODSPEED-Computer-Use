@@ -53,9 +53,9 @@ enum SnapshotMode {
 /// OPEN_COMPUTER_USE_BACKGROUND_ONLY=1: the user keeps working on this Mac. Nothing OCU does may
 /// bring an app or window in front of their work or take focus: no unhide, activate or raise to
 /// read or click, no foreground launch, no Raise action, no physical-pointer fallback.
-func backgroundOnlyMode(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
-    let raw = environment["OPEN_COMPUTER_USE_BACKGROUND_ONLY"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "0"
-    return ["1", "true", "yes", "on"].contains(raw)
+func backgroundOnlyMode(environment: [String: String] = GodspeedSettings.environment) -> Bool {
+    StrictBackground.enabled(environment: environment)
+        || StrictBackground.enabledFlag(environment["OPEN_COMPUTER_USE_BACKGROUND_ONLY"])
 }
 
 let backgroundOnlyRaiseRefusedMessage = "Raise is refused in background-only mode (OPEN_COMPUTER_USE_BACKGROUND_ONLY=1): it would bring the window in front of the user's work. Clicks, set_value and keys work while the window stays behind."

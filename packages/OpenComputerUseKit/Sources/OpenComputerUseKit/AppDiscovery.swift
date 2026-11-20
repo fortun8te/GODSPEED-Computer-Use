@@ -145,6 +145,11 @@ enum AppDiscovery {
             }
     }
 
+    static func policyBundleIdentifier(_ query: String) -> String? {
+        if let id = (try? resolveRunning(query))?.bundleIdentifier { return id }
+        return applicationURL(named: query).flatMap { Bundle(url: $0)?.bundleIdentifier }
+    }
+
     static func resolveRunning(_ query: String, applications: [RunningAppDescriptor]? = nil) throws -> RunningAppDescriptor {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if let bundleIdentifier = blockedBundleIdentifier(forQuery: query) {
@@ -168,6 +173,9 @@ enum AppDiscovery {
             return match
         }
 
+        if StrictBackground.enabled() {
+            throw ComputerUseError.backgroundUnsupported("The requested app is not running.")
+        }
         try launchIfPossible(normalizedQuery)
 
         // Same 5 s limit as before, polled every 50 ms instead of every 250 ms.

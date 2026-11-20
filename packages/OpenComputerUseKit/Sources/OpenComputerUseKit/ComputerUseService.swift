@@ -247,7 +247,7 @@ func inputFallbackDebugEnabled(environment: [String: String]) -> Bool {
 
 func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
     // The physical pointer path activates the target app and moves the real mouse.
-    guard !backgroundOnlyMode(environment: environment) else { return false }
+    guard !backgroundOnlyMode(environment: environment), !StrictBackground.enabled() else { return false }
     guard let rawValue = environment["OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS"]?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased()
@@ -889,8 +889,14 @@ public final class ComputerUseService {
         mouseButton: String,
         clickMethod requestedMethod: ClickMethod = .auto
     ) throws -> ToolCallResult {
+        let strict = StrictBackground.enabled()
         let clickMethod: ClickMethod
-        if Self.requiredWindowID != nil {
+        if strict {
+            guard elementIndex != nil, requestedMethod == .auto || requestedMethod == .accessibility else {
+                throw ComputerUseError.backgroundUnsupported("Strict background clicks need an accessibility element.")
+            }
+            clickMethod = .accessibility
+        } else if Self.requiredWindowID != nil {
             switch requestedMethod {
             case .auto:
                 clickMethod = elementIndex == nil ? .skyClick : .accessibility
@@ -919,7 +925,7 @@ public final class ComputerUseService {
             throw ComputerUseError.stateUnavailable(SnapshotObservationOptions.screenshotOmittedNote + "; request a screenshot before screenshot-coordinate actions")
         }
         if snapshot.mode == .fixture {
-            guard clickMethod == .auto else {
+            guard clickMethod == .auto || (strict && requestedMethod == .auto) else {
                 throw ComputerUseError.message(
                     "click_method '\(clickMethod.rawValue)' is not supported for fixture apps"
                 )
@@ -989,9 +995,12 @@ public final class ComputerUseService {
                         snapshot: snapshot,
                         button: button,
                         clickCount: clickCount,
-                        includeNearbyHitTesting: Self.requiredWindowID == nil,
-                        allowActivationFallback: Self.requiredWindowID == nil
+                        includeNearbyHitTesting: !strict && Self.requiredWindowID == nil,
+                        allowActivationFallback: !strict && Self.requiredWindowID == nil
                     ) else {
+                        if strict {
+                            throw ComputerUseError.backgroundUnsupported("The element cannot be clicked through accessibility.")
+                        }
                         throw ComputerUseError.message(
                             "click_method 'accessibility' could not click element_index=\(elementIndex)"
                         )
@@ -1191,6 +1200,9 @@ public final class ComputerUseService {
             }
 
             if !scrolledByAccessibility {
+                if StrictBackground.enabled() {
+                    throw ComputerUseError.backgroundUnsupported("This element cannot scroll by whole pages through accessibility.")
+                }
                 guard Self.requiredWindowID == nil else {
                     throw ComputerUseError.stateUnavailable("This element cannot scroll by whole pages through accessibility in the bound window.")
                 }
@@ -1290,6 +1302,20 @@ public final class ComputerUseService {
     }
 
     private func deliverText(app query: String, text: String, keyMethod: KeyMethod, snapshot: AppSnapshot, autoFocused: Bool = false) throws -> ToolCallResult {
+        if StrictBackground.enabled() {
+            let focused: AXUIElement?
+            if Self.requiredWindowID != nil {
+                focused = try requireBoundInputFocus(in: snapshot)
+            } else {
+                focused = Self.currentInputFocus(pid: snapshot.app.pid)
+            }
+            guard keyMethod == .auto, let focused,
+                  try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) else {
+                throw ComputerUseError.backgroundUnsupported("This field needs keyboard events or a focus change. Try set_value on an accessible field.")
+            }
+            if Self.requiredWindowID != nil { return .text("ok") }
+            return try actionResult(for: query, recoveryPolicy: .readOnly)
+        }
         if let windowID = Self.requiredWindowID {
             let focused = try requireBoundInputFocus(in: snapshot)
             if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
@@ -1822,6 +1848,9 @@ public final class ComputerUseService {
         // check with an error). A text field is then filled the way a person does it: focus, select all, type.
         let settable = (try? isSettableForSetValue(element: element, attribute: kAXValueAttribute)) ?? false
         guard settable else {
+            if StrictBackground.enabled() {
+                throw ComputerUseError.backgroundUnsupported("This field cannot be set without focusing it and sending keys.")
+            }
             if let typed = try typeIntoUnsettableTextField(app: query, element: element, record: record, value: value, pid: snapshot.app.pid) {
                 return typed
             }
@@ -2322,6 +2351,27 @@ public final class ComputerUseService {
 
     }
 
+    func isSecurePolicyField(_ record: ElementRecord) -> Bool {
+        let subrole = record.element.flatMap { stringValue(of: $0, attribute: kAXSubroleAttribute) }
+            ?? record.identity?.subrole
+        return isSecureTextField(subrole: subrole)
+    }
+
+    func policyElement(app: String, index: String) -> ElementRecord? {
+        guard let snapshot = try? snapshotForAction(app: app, elementIndex: index) else { return nil }
+        return try? lookupElement(snapshot: snapshot, index: index)
+    }
+
+    func liveInputPolicyTarget(app: String) -> ActionPolicy.Target? {
+        guard let descriptor = try? AppDiscovery.resolveRunning(app),
+              let focus = Self.currentInputFocus(pid: descriptor.pid) else { return nil }
+        return ActionPolicy.Target(
+            role: stringValue(of: focus, attribute: kAXRoleAttribute),
+            secureField: isSecureTextField(subrole: stringValue(of: focus, attribute: kAXSubroleAttribute)),
+            inDialog: Self.isInsideSheetOrDialog(focus)
+        )
+    }
+
     private func lookupElement(snapshot: AppSnapshot, index: String) throws -> ElementRecord {
         guard let parsedIndex = Int(index), let record = snapshot.elements[parsedIndex] else {
             // Numbers are stable across reads: one that was handed out before but is not shown now is gone.
@@ -2408,11 +2458,11 @@ public final class ComputerUseService {
                 return true
             }
 
-            if try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if !StrictBackground.enabled(), try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount) {
                 return true
             }
         case .right:
-            if try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if !StrictBackground.enabled(), try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
                 return true
             }
         case .middle:

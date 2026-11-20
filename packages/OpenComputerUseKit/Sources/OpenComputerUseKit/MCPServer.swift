@@ -16,13 +16,20 @@ public final class StdioMCPServer {
     /// Per-connection record of top-level tool calls.
     private let trajectory: TrajectoryLog
 
-    public init(
+    public convenience init(
         service: ComputerUseService = ComputerUseService(),
         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
         trajectoryEnvironment: [String: String]? = nil
     ) {
-        self.service = service
-        self.dispatcher = ComputerUseToolDispatcher(service: service)
+        self.init(dispatcher: ComputerUseToolDispatcher(service: service), backgroundStateReset: backgroundStateReset,
+                  trajectoryEnvironment: trajectoryEnvironment)
+    }
+
+    init(dispatcher: ComputerUseToolDispatcher,
+         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
+         trajectoryEnvironment: [String: String]? = nil) {
+        self.service = dispatcher.service
+        self.dispatcher = dispatcher
         self.backgroundStateReset = backgroundStateReset
         self.trajectory = TrajectoryLog(environment: trajectoryEnvironment ?? GodspeedSettings.environment)
     }
@@ -119,7 +126,9 @@ public final class StdioMCPServer {
                 return try encodeJSONRPCError(id: id, code: -32601, message: "Method not found: \(method ?? "")")
             }
         } catch let error as ComputerUseError {
-            let result = ToolCallResult.text(error.errorDescription ?? String(describing: error), isError: error.toolResultIsError)
+            let message = error.errorDescription ?? String(describing: error)
+            let result = ToolCallResult(content: [.text(message)], isError: error.toolResultIsError,
+                                        failureCode: TrajectoryLog.failureCode(error: error, message: message))
             return try? encodeJSONRPCResult(id: id, result: result.asDictionary)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
