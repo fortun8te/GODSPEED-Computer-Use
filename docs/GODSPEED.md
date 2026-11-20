@@ -35,7 +35,9 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
 | `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
 | `click`, `hover`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
-| `drag` | Two points on an app screenshot. Both must be in the observed window. Optional `modifiers` such as `["shift"]`. |
+| `drag` | Drag between controls or points in one window. Add `verify` for a drop check. |
+| `gesture` | Zoom or invoke an app command equivalent. Chrome also supports tab history. |
+| `wait_for` | Wait for a control to appear, disappear or change value. |
 | `press_menu` | Chooses a menu item in one call, e.g. `path: "File > Save"`, through accessibility. |
 | `query` | Finds elements by text or role. |
 | `list_apps` | Recently used apps. |
@@ -291,7 +293,7 @@ Browser reads include reported focus, disabled, selected, checked and expanded s
 
 Set `if_changed: true` on `browser screenshot` to avoid returning an identical capture. The comparison is exact and scoped to the client, tab, address, and browser helper generation. Godspeed keeps a digest in memory, not a saved image. In the REPL, `cua.browser("read", { tab_id: 12 })` uses the same persistent connection as native app bindings. `cua.batch(steps, options)` can alternate browser steps with native steps that each name their app. Keep dependent actions ordered and check the batch receipt before resuming. The REPL discards queued input from ended evaluations. Saved-recipe handoffs and final browser observations share the time left in the original operation.
 
-Use `browser outline` for visible headings in the main document, `browser frames` for the tab's document tree, and `browser scroll_into_view` with a label or current reference to reveal one control. Frame listings are for inspection. Actions still need a control reference or label. A browser click can use the left, middle, or right button, or a left double-click. Clicks and drags accept Alt, Control, Command, or Shift modifiers. The click checks its hit point before sending input.
+Use `browser outline` for visible headings in the main document, `browser frames` for the tab's document tree, and `browser scroll_into_view` with a label or current reference to reveal one control. Frame listings are for inspection. Actions still need a control reference or label. A browser click can use the left, middle or right button. Left clicks accept a count of up to three. Clicks and drags accept Alt, Control, Command, or Shift modifiers. The click checks its hit point before sending input.
 
 Use `browser read_text` for rendered text from a uniquely named control or region, or a current control reference. Use `browser link_destination` with a label or current reference to inspect an HTTP(S) link without clicking it. Add `include_link_urls: true` to a read for destinations that Chrome exposes in its accessibility tree. Use `browser control_state` with a label or current reference for visibility, enabled status and checked state when available. Visibility describes rendering. It does not guarantee the control is unobstructed. Use `browser value` with a field label or current reference to read one editable value. Password inputs return no value. Use `browser location` for the tab URL, title, and readiness without reading page content. Use `browser fill_field` to replace an ordinary editable value with one insertion. Use `type` for controls that need keyboard events. Use `browser wait_for` with `url_contains` for a redirect or confirmation page. Use `wait_for` with a `label` and `condition: "enabled"` to wait for a control. Other conditions are `visible`, `checked`, and `unchecked`. Use an explicit `tab_id` when multiple tabs are open.
 
@@ -313,7 +315,19 @@ Set `OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES=1` in the app agent's launch envi
 
 Local model calls release desktop admission while they wait for an answer. If another request takes admission in the meantime, Godspeed stops the interrupted workflow and asks for a fresh look. Calls skip the model during a focus borrow or Locked Use lease. The shared app agent uses an already-running model helper.
 
-## Browser drag
+## Verified scroll chunks
+
+Use `scroll` in a Mac window or Chrome tab. Pass `unit` with `lines`, `points`, or `pages`. Set `step_size` for lines or points. A page is one viewport chunk. For a longer search, set `until_visible` to the exact label and `max_steps` to a limit of 20 or less. Godspeed stops when the control is in view or the scroll position stops changing. The reply reports the number of chunks that moved.
+
+In a Mac app, target an AX scroll area with a readable scroll bar. Whole pages use the app's AX page action. Lines and points use the specified wheel units. The app controls the resulting distance. In Chrome, a point is one CSS pixel and a line is 40 CSS pixels. Omit the scroll area's label to scroll the whole page. Chrome checks whether the label can be reached in the viewport.
+
+Use `scroll_into_view` when you already know the control. Mac apps need to expose its AX scroll-to-visible action. In a batch, add `web: true` for Chrome. The original Mac `pages` and Chrome `amount` arguments still work on their own.
+
+## Drag and reorder
+
+Read both endpoints first. A Mac drag accepts `from_label` and `to_label`, or `from_index` and `to_index`. Either endpoint can be a pair of screenshot coordinates in the same window. In Chrome use `label` or `index` for the source and a control or viewport point for the destination. For a handle, target the handle itself. Set `hold_ms` up to 1000 and `drag_steps` from 2 to 30 if needed.
+
+To move a row or card, drag to the destination and check the order or destination state. Set `verify` on the drag to check a condition after release, for example `{"label":"Card A","condition":"appears"}`. Use a batch `done_when` when the drop needs more checks. A pointer receipt confirms delivery only. For files, use Finder private clipboard copy and paste or Chrome `upload`. OS-level file drops can require the real pointer.
 
 Open or select a tab and read its controls. For example, use `{"action":"drag","label":"Card A","to_label":"Drop zone"}` when both controls are visible in the same page. Read the tab after delivery to verify the drop. Apps can interpret pointer gestures differently.
 
@@ -351,4 +365,38 @@ The local `OpenComputerUse locked-use status --json` command reports `not-packag
 
 The fork's page cursor reacts to acknowledged browser movement, press, drag, drop, click, text insertion and scroll. Feedback is sent only to an active matching tab and never delays the input reply. Intermediate moves can be coalesced. Hidden pages suppress the overlay. Near a display or viewport edge, the cursor follows a straight eased path to the action point. The web renderer shares interaction meanings with the Mac cursor.
 
-Use independent browser connections for concurrent reads. Each helper has one idle timer.
+Use independent browser connections for concurrent reads. Browser writes and native input retain exclusive admission while the app agent applies process-wide settings. A shared budget caps active preview loads, and each helper has one rescheduled idle timer. Compare end-to-end fixture timings and slow runs before promoting the candidate.
+
+## Precise clicks
+
+Use `anchor` with `center`, `left`, `right`, `top` or `bottom` on a control. Optional `offset_x` and `offset_y` move right and down from that point. The target point must still hit the control. Mac offsets are window points. Chrome offsets are CSS pixels. Chrome needs the control in the main frame for precise clicks.
+
+Click with `modifiers` such as `["cmd"]` to toggle an item, or `["shift"]` to extend a selection from an item you have already selected. The app defines which ranges it supports. Use `click_count: 2` or `3` on a left click. In a Mac app, supply the control for a triple click. Read back selected rows or text to confirm the result.
+
+Use `mouse_button: "right"` to open a context menu. Read the resulting state, then click the observed menu item by reference if the app or website exposes it. Chrome's own context menu requires its native window. Web pages can expose their own menu inside the tab.
+
+## Wait for a control
+
+Use `wait_for` with a label, a timeout of 1 to 30 seconds, and `condition` set to `appears`, `disappears` or `value_changed`. Use the same step names in Mac and web batches. The label is checked in the window or tab's accessibility tree. An incomplete read cannot confirm absence.
+
+For `value_changed`, give `from_value` to compare against a value you read before the previous action. Without it, the wait starts from the first value it reads. Secure fields are excluded. Set a separate completion check if a specific value matters.
+
+## Select text
+
+Use `select_text` with exact `text`. Add `prefix` or `suffix` for repeats. For an exact range, supply `start` and `length` in UTF-16 units. A zero-length range places the cursor. Give a control label or reference. Godspeed checks the field value and reads back the selected range.
+
+Mac apps need a writable accessibility text range. Chrome supports plain inputs and text areas that expose a selection range. A password field or a custom editor can refuse this action.
+
+## Hover
+
+Use `hover` with `dwell_ms` up to 2000 for a delayed tooltip or hover menu. Read the result or wait for the expected control. Some Mac apps only show tooltips under the real pointer.
+
+## Hold a key
+
+Use `press_key` with `hold_ms` up to 1000 to send one key-down and key-up with a pause. Chrome targets its own tab. Mac holds require the observed window to already have focus, and Godspeed leaves focus where it is. Clipboard shortcuts still use the private clipboard.
+
+## Gesture equivalents
+
+Use `gesture` for pinch, zoom, rotate, or history navigation. In a Mac app, give a zoom control that exposes increment or decrement, or the app's explicit `menu_path` for an equivalent action. Menu commands act at app level. Pair them with a check when the resulting state matters.
+
+In Chrome use `swipe_back` or `swipe_forward` for the tab's history. Use `pinch_out` or `zoom_in` to increase the page scale and `pinch_in` or `zoom_out` to decrease it. The reply verifies the resulting scale. Raw multitouch, smart zoom and rotation need an app command or real trackpad input. The tool returns `BACKGROUND_UNSUPPORTED` when it has no safe route. [Apple trackpad events](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/HandlingTouchEvents/HandlingTouchEvents.html), [Chrome page scale command](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setPageScaleFactor)

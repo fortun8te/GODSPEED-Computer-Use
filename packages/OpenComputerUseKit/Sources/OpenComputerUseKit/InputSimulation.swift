@@ -258,6 +258,53 @@ enum InputSimulation {
         return chunks
     }
 
+    /// Build every release before sending any input. On failure only release keys that went down.
+    static func deliverHeldKey(_ parsed: ParsedKeyPress, hold: TimeInterval,
+                               validate: () throws -> Void, post: (CGEvent) -> Void, release: (CGEvent) -> Void,
+                               pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws {
+        var flags: CGEventFlags = []
+        let modifiers = try parsed.modifiers.map { modifier -> (CGEvent, CGEvent) in
+            flags.insert(modifier.flag)
+            let (down, up) = try heldKeyPair(code: modifier.keyCode, flags: flags)
+            up.flags = flags.subtracting(modifier.flag)
+            return (down, up)
+        }
+        let key = try heldKeyPair(code: parsed.keyCode, flags: flags)
+        let pairs = modifiers + [key]
+        var pressed: [CGEvent] = []
+        defer {
+            for event in pressed.reversed() {
+                event.timestamp = DispatchTime.now().uptimeNanoseconds
+                release(event)
+            }
+        }
+        do {
+            for (down, up) in pairs {
+                try validate()
+                down.timestamp = DispatchTime.now().uptimeNanoseconds
+                post(down)
+                pressed.append(up)
+            }
+            if hold > 0 { pause(hold) }
+            try validate()
+        } catch {
+            if !pressed.isEmpty {
+                throw ComputerUseError.stateUnavailable("Focus changed during the held key. Inspect the app before repeating.")
+            }
+            throw error
+        }
+    }
+
+    private static func heldKeyPair(code: CGKeyCode, flags: CGEventFlags) throws -> (CGEvent, CGEvent) {
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else {
+            throw ComputerUseError.stateUnavailable("Could not prepare the key events.")
+        }
+        down.flags = flags
+        up.flags = flags
+        return (down, up)
+    }
+
     static func pressKey(_ specification: String, pid: pid_t, authenticated: Bool = false) throws {
         try requireUsableComputerUseSession()
         let parsed = try KeyPressParser.parse(specification)

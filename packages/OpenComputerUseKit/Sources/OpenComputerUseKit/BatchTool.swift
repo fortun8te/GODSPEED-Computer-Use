@@ -30,7 +30,7 @@ enum BatchTool {
     static let informationalTools: Set<String> = ["query", "list_apps", "browser"]
 
     /// Tools that only read; a batch made only of these never triggers the unchanged-screen note.
-    static let readOnlyTools: Set<String> = ["query", "list_apps", "get_app_state"]
+    static let readOnlyTools: Set<String> = ["query", "list_apps", "get_app_state", "wait_for"]
     private static let readOnlyBrowserActions: Set<String> = [
         "read", "state", "look", "snapshot", "screenshot", "see", "look_at", "location", "info", "page", "page_info",
         "outline", "frames", "read_text", "link_destination", "control_state", "value", "tabs", "list",
@@ -211,17 +211,22 @@ enum BatchTool {
             // {"tool": "select", "web": true, ...}: a browser action named as the tool. Browser-only names
             // Hover with an app belongs to the native tool.
             let browserOnly: Set<String> = ["select", "check", "uncheck", "go", "goto", "navigate", "back",
-                                            "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "upload", "peek", "outline", "frames", "scroll_into_view"]
-            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "scroll", "wait", "open", "screenshot"]
+                                            "forward", "reload", "tabs", "use_tab", "close_tab", "upload", "peek", "outline", "frames"]
+            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "drag", "gesture", "scroll", "scroll_into_view", "select_text", "wait", "wait_for", "open", "screenshot"]
             let isWeb = (arguments["web"] as? Bool) == true || (arguments["web"] as? String)?.lowercased() == "true"
             // With "web": true, the native names a model reaches for mean the browser action of the same job. Without
             // this, {"tool": "type_text", "web": true} would type into the app named, which may be the user's own Chrome.
             let webSpellings = ["type_text": "type", "press_key": "key", "get_app_state": "read"]
             let browserName = isWeb ? (webSpellings[lowered] ?? lowered) : lowered
+            let nativeWait = (arguments["condition"] as? String).flatMap(ControlWait.Condition.init(rawValue:)) != nil
+            let tabWait = lowered == "wait_for" && (!nativeWait || (defaultApp == nil && arguments["app"] == nil))
             let tabHover = lowered == "hover" && defaultApp == nil
                 && !arguments.keys.contains(where: { ["app", "application", "app_name", "appName", "bundle_id", "bundleId", "target_app", "program", "application_name"].contains($0) })
-            if known.contains("browser"), lowered != "browser",
-               browserOnly.contains(lowered) || tabHover || (isWeb && browserShared.contains(browserName)) {
+            // An explicit web step must never fall through to a native app when Chrome is unavailable.
+            if lowered != "browser",
+               (isWeb && browserShared.contains(browserName)) || (known.contains("browser")
+                   && (browserOnly.contains(lowered) || tabHover || tabWait
+                       || (lowered == "scroll_into_view" && defaultApp == nil && arguments["app"] == nil))) {
                 arguments["web"] = nil
                 if arguments["action"] == nil {
                     arguments["action"] = ["goto": "go", "navigate": "go"][browserName] ?? browserName
@@ -376,7 +381,7 @@ enum BatchTool {
     /// so such steps are not saved as recipes).
     static func usesPositionalTargets(_ steps: [Step]) -> Bool {
         steps.contains { step in
-            ["element_index", "index", "ref", "x", "y", "from_x", "from_y", "to_x", "to_y"].contains { step.arguments[$0] != nil }
+            ["element_index", "index", "ref", "from_index", "to_index", "x", "y", "from_x", "from_y", "to_x", "to_y"].contains { step.arguments[$0] != nil }
         }
     }
 
@@ -940,6 +945,7 @@ extension ComputerUseToolDispatcher {
                                 callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false) {
                                     // An authorized step may borrow focus. Strict and window-bound steps skip this hook.
                                     guard replayed == nil, validatedHandoffRecipe == nil, !hasPinnedSteps, FocusBorrow.isEnabled,
+                                      !ActionOptions.usesStrictRoute(step.tool, step.arguments),  // L9: checked actions never borrow focus
                                           let app = step.arguments["app"] as? String, !app.isEmpty,
                                           let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
                                           foreground || self.stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) else { return }
@@ -1011,6 +1017,9 @@ extension ComputerUseToolDispatcher {
             if BatchTool.informationalTools.contains(step.tool), !isPageRead || !isLastStep {
                 // A page read in the middle of a batch keeps its numbered list; the last one becomes the state.
                 lines.append("\(number). \(BatchTool.describe(step)): ok\n\(BatchTool.clipped(result.textContent))")
+            } else if ActionOptions.usesStrictRoute(step.tool, step.arguments) {
+                // Keep the action's own receipt even when general effect reads are disabled.
+                lines.append("\(number). \(BatchTool.describe(step)): \(BatchTool.firstLine(result.textContent))")
             } else {
                 lines.append("\(number). \(BatchTool.describe(step)): ok")
             }
