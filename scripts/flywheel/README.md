@@ -128,3 +128,11 @@ python3 -I scripts/flywheel/flywheel.py select-for-labeling --pool pool-probs.js
 ```
 
 Validation rows are `{"id", "gold", "probs", "question"}`; `question` defaults to `default` and gets its own temperature. The done threshold is the highest calibrated P(done) any non-done row received, so false done is zero on that file. The report is in-sample, so check it on a separate file before trusting it. Pool rows are `{"id", "family", "probs"}`. Selection ranks by uncertainty (margin and entropy), adds model disagreement when a second file is given, and keeps every family at or below 40 percent of the picks. Output rows carry a `reason`. The current eval writes reports, not probability files, so these inputs must be produced separately.
+
+## Propose recipes from the learning log
+
+```sh
+python3 -I scripts/flywheel/flywheel.py mine-recipes ~/.godspeed/learning --min-support 3 --out candidates.json
+```
+
+Groups verified batches by app, goal template and step sequence (tool, role, label). Typed values are not in the log, so each typing step becomes a `{{slot}}` with a kind from its field label. Sequences that verified only some of the time are dropped. Secure or redacted episodes are excluded. Sends, payments and deletes are marked `requiresConfirmation`. Output is a BatchRecipes-shaped JSON array that is always unverified and has no `done_when`: the log stores only the verified flag, not the condition, so a reviewed condition must be added before any candidate can replay. Write the output outside the live Godspeed folders.
