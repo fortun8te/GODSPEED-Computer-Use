@@ -1675,6 +1675,44 @@ final class BrowserPage {
     }
 
     /// Back, forward or reload in this tab, waiting for the page to load again.
+    func zoom(_ gesture: GestureAction) throws -> String {
+        guard gesture.zoomIncreases != nil else {
+            throw ComputerUseError.backgroundUnsupported("Chrome has no background equivalent for this gesture.")
+        }
+        guard let document = try documentIdentity() else {
+            throw ComputerUseError.stateUnavailable("Could not bind zoom to the current tab document.")
+        }
+        func scale() throws -> Double {
+            guard let value = try evaluate("window.visualViewport?.scale") as? NSNumber,
+                  value.doubleValue.isFinite, value.doubleValue > 0 else {
+                throw ComputerUseError.backgroundUnsupported("The tab does not report a page scale.")
+            }
+            return value.doubleValue
+        }
+        let before = try scale()
+        guard let target = gesture.zoomTarget(from: before), try documentIdentity() == document else {
+            throw ComputerUseError.stateUnavailable("Tab document changed before zoom.")
+        }
+        guard abs(target - before) > 0.001 else { return "Page zoom is already at the limit." }
+        do {
+            try cdp("Emulation.setPageScaleFactor", ["pageScaleFactor": target])
+        } catch {
+            throw ComputerUseError.stateUnavailable("Could not confirm the zoom command. Inspect the tab before repeating.")
+        }
+        let deadline = BrowserCallBudget.deadline(after: min(0.4, BrowserCallBudget.remaining()))
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            guard try documentIdentity() == document else {
+                throw ComputerUseError.stateUnavailable("Tab document changed after zoom.")
+            }
+            if GestureAction.zoomWasVerified(before: before, target: target, after: try scale()) {
+                let percent = Int((target * 100).rounded())
+                return "Page scale changed to \(percent)%."
+            }
+            Thread.sleep(forTimeInterval: min(0.04, max(0, deadline - ProcessInfo.processInfo.systemUptime)))
+        }
+        throw ComputerUseError.stateUnavailable("Zoom command delivered. The tab did not report the requested scale.")
+    }
+
     func history(_ operation: String) throws -> String {
         if operation == "reload" {
             guard let before = try evaluate("performance.timeOrigin") as? NSNumber else {

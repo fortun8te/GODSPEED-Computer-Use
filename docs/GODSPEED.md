@@ -284,3 +284,9 @@ Use `hover` with `dwell_ms` up to 2000 for a delayed tooltip or hover menu. Read
 ## Hold a key
 
 Use `press_key` with `hold_ms` up to 1000 to send one key-down and key-up with a pause. Chrome targets its own tab. Mac holds require the observed window to already have focus, and Godspeed leaves focus where it is. Clipboard shortcuts still use the private clipboard.
+
+## Gesture equivalents
+
+Use `gesture` for pinch, zoom, rotate, or history navigation. In a Mac app, give a zoom control that exposes increment or decrement, or the app's explicit `menu_path` for an equivalent action. Menu commands act at app level. Pair them with a check when the resulting state matters.
+
+In Chrome use `swipe_back` or `swipe_forward` for the tab's history. Use `pinch_out` or `zoom_in` to increase the page scale and `pinch_in` or `zoom_out` to decrease it. The reply verifies the resulting scale. Raw multitouch, smart zoom and rotation need an app command or real trackpad input. The tool returns `BACKGROUND_UNSUPPORTED` when it has no safe route. [Apple trackpad events](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/EventOverview/HandlingTouchEvents/HandlingTouchEvents.html), [Chrome page scale command](https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setPageScaleFactor)

@@ -924,6 +924,14 @@ extension ComputerUseToolDispatcher {
             }
             return .text(try page.scrollPage(direction: direction, amount: amount))
 
+        case "gesture":
+            let gesture = try GestureAction(arguments: arguments)
+            guard arguments["menu_path"] == nil, label == nil, index == nil else {
+                throw ComputerUseError.invalidArguments("Chrome gesture equivalents act on the whole tab.")
+            }
+            if let operation = gesture.historyOperation { return .text(try page.history(operation)) }
+            return .text(try page.zoom(gesture))
+
         case "back", "forward", "reload":
             return .text(try page.history(action))
 
