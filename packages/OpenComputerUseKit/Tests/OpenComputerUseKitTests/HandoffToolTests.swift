@@ -250,6 +250,34 @@ final class HandoffToolTests: XCTestCase {
         }
     }
 
+    func testGoalAlreadyOnScreenIsWeakAndNeverActs() {
+        // "Saved" is already on screen before anything runs: weak evidence, so no action is taken and the
+        // caller decides. It must not end as done.
+        let app = FakeApp()
+        app.saved = true
+        let outcome = HandoffTool.run(request(), app.deps(choose: { _ in
+            XCTFail("a weak match must not reach the chooser")
+            return nil
+        }))
+        XCTAssertEqual(outcome.kind, .notVerified)
+        XCTAssertTrue(outcome.steps.isEmpty)
+        XCTAssertTrue(app.acts.isEmpty)
+        XCTAssertTrue(outcome.reply().hasPrefix("Not verified:"), outcome.reply())
+        XCTAssertTrue(outcome.reply().contains("already satisfied (weak evidence"), outcome.reply())
+    }
+
+    func testSavedRecipeReportingWeakEvidenceIsNotDone() {
+        let app = FakeApp()
+        var deps = app.deps(choose: { _ in XCTFail("no choice after a weak recipe check"); return nil })
+        deps.replay = { _ in
+            .alreadySatisfied("Already satisfied before replay (weak evidence): Saved. No steps ran.")
+        }
+        let outcome = HandoffTool.run(request(), deps)
+        XCTAssertEqual(outcome.kind, .notVerified)
+        XCTAssertTrue(outcome.steps.isEmpty)
+        XCTAssertTrue(app.acts.isEmpty)
+    }
+
     func testRunsToDone() {
         let app = FakeApp()
         let outcome = HandoffTool.run(request(), app.deps(choose: { options in
@@ -381,7 +409,8 @@ final class HandoffToolTests: XCTestCase {
         let app = FakeApp()
         app.saved = true
         let outcome = HandoffTool.run(request(), app.deps(choose: { _ in nil }))
-        XCTAssertEqual(outcome.kind, .done)
+        // A match already on screen is weak evidence: no steps, and the caller decides.
+        XCTAssertEqual(outcome.kind, .notVerified)
         XCTAssertTrue(app.acts.isEmpty)
     }
 
