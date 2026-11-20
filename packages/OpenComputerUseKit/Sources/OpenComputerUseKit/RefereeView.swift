@@ -107,6 +107,18 @@ enum RefereeView {
         return (lines + [RefereeSummary.clip(note, to: noteRoom)]).joined(separator: "\n")
     }
 
+    static func isThin(_ state: String) -> Bool {
+        let rows = parse(state)
+        let actionable = rows.filter { controls.contains($0.role) }
+        let labelled = actionable.filter { !$0.label.isEmpty }.count
+        let detailedRegions = Set(rows.compactMap { row in
+            row.label.isEmpty ? nil : row.parent
+        })
+        return labelled < 3 || actionable.count > labelled || rows.indices.contains {
+            regions.contains(rows[$0].role) && rows[$0].label.isEmpty && !detailedRegions.contains($0)
+        }
+    }
+
     private static func excerpt(_ row: Row, limit: Int, terms: Set<String>) -> String {
         guard row.text.unicodeScalars.count > limit else { return row.text }
         let words = row.body.split(separator: " ")

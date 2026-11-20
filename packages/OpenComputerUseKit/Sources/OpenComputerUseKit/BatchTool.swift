@@ -1220,8 +1220,14 @@ extension ComputerUseToolDispatcher {
                 maxCharacters: Referee.maxViewCharacters
             )
             let result = unchanged ? lastResultText + "; app unchanged since the previous batch" : lastResultText
+            // Page text has no native window binding. Do not capture a different window for it.
+            let picture = lastApp.flatMap { app in
+                Referee.picture(url: Referee.baseURL, state: state, remaining: deadline - clock.systemUptime) {
+                    localDecisionImage(app: app, state: state)
+                }
+            }
             if let verdict = Referee.decide(goal: goal, lastStep: lastStepText, result: result, summary: summary,
-                                            remaining: deadline - clock.systemUptime) {
+                                            imageBase64: picture, remaining: deadline - clock.systemUptime) {
                 let showHint = verdict.label != "done" || Referee.allowsCompletionHints
                 if showHint, let hint = Referee.hint(for: verdict, browser: lastAttemptedStep?.tool == "browser") {
                     lines.append(hint)

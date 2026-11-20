@@ -33,6 +33,10 @@ private func normalizedElementIndexNumber(_ value: Double) -> String? {
 public final class ComputerUseToolDispatcher {
     private let service: ComputerUseService
 
+    func localDecisionImage(app: String, state: String) -> Data? {
+        service.localDecisionImage(app: app, state: state)
+    }
+
     public init(service: ComputerUseService = ComputerUseService()) {
         self.service = service
     }
