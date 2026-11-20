@@ -1447,6 +1447,26 @@ extension ComputerUseToolDispatcher {
         return mask
     }
 
+    /// ACT-02: one verified left click on a `_blank` link through `click_target`. Nil when the helper has no such
+    /// command, so the caller takes the open_tab path. The new tab is reported only as Chrome verified it.
+    private func clickNewTabLink(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge) throws -> ClickedNewTab? {
+        guard let tab = page.tab["tab_id"] as? Int, let loader = page.topFrameLoaderID() else { return nil }
+        let point = try page.clickPoint(of: node, beforeFirstAction: true)
+        let reply = try bridge.callTool("click_target", arguments: [
+            "tab_id": tab, "backend_node_id": node.backendNodeID, "loader_id": loader,
+            "x": Double(point.x), "y": Double(point.y), "expect_new_tab": true,
+        ], timeout: 20)
+        if reply.isError, BrowserReply.isUnsupportedTool(reply.text) { return nil }
+        guard !reply.isError, let clicked = BrowserReply.clickedTab(in: reply.text), clicked.clicked else {
+            throw ComputerUseError.stateUnavailable("browser: \(BatchTool.firstLine(reply.text)) Inspect the tab before repeating the click.")
+        }
+        return ClickedNewTab(openedTabID: clicked.openedTabID)
+    }
+
+    struct ClickedNewTab {
+        let openedTabID: Int?
+    }
+
     /// Clicks an element. A link is followed for a moment, so the reply says where it landed. A click that
     /// opens a new tab makes that tab the working tab, and the reply says so.
     private func clickAndWatch(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge,
@@ -1461,6 +1481,22 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.backgroundUnsupported("This link needs a new tab.")
             }
             try Self.authorizeBrowserAddresses(policy, addresses: [url])
+            // ACT-02: a real click on the verified link, so the site's own link behaviour runs. An older helper
+            // without click_target keeps the open_tab shortcut.
+            if let click = try clickNewTabLink(node, page: page, bridge: bridge) {
+                guard let newID = click.openedTabID else {
+                    throw ComputerUseError.stateUnavailable("browser: the link was clicked, but Chrome did not confirm the new tab. List tabs before repeating the click.")
+                }
+                BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: newID)
+                let destination = BrowserPage(bridge: bridge, tab: ["tab_id": newID])
+                guard destination.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
+                    try Self.authorizeBrowserPage(policy, page: destination, afterDelivery: true)
+                    throw ComputerUseError.stateUnavailable("browser: link opened tab \(newID), but the destination did not become ready. Inspect that tab before retrying.")
+                }
+                try Self.authorizeBrowserPage(policy, page: destination, afterDelivery: true)
+                bridge.currentTab = newID
+                return ("clicked \"\(node.name)\"; it opened a new tab (id \(newID)), and browser now works in that tab", newID)
+            }
             let opened = try bridge.callTool("open_tab", arguments: ["url": url], timeout: 20)
             guard !opened.isError, let newID = BrowserReply.createdTabID(in: opened.text) else {
                 throw ComputerUseError.stateUnavailable("browser: the background link may have opened. List tabs before repeating the click.")

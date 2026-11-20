@@ -499,6 +499,23 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNil(BrowserRules.appendNote(expected: expected, actual: "helloxx"))
     }
 
+    func testClickTargetReplyNamesTheTabItOpened() {
+        let opened = BrowserReply.clickedTab(in: #"{"result":{"clicked":true,"openedTabId":42}}"#)
+        XCTAssertEqual(opened?.clicked, true)
+        XCTAssertEqual(opened?.openedTabID, 42)
+        // Chrome could not verify a child: the click happened, but no tab is named.
+        let unverified = BrowserReply.clickedTab(in: #"{"clicked":true,"openedTabId":null}"#)
+        XCTAssertEqual(unverified?.clicked, true)
+        XCTAssertNil(unverified?.openedTabID)
+        XCTAssertNil(BrowserReply.clickedTab(in: "not json"))
+    }
+
+    func testOlderHelpersAreRecognisedAsLackingACommand() {
+        XCTAssertTrue(BrowserReply.isUnsupportedTool("unknown tool: click_target"))
+        XCTAssertFalse(BrowserReply.isUnsupportedTool("The click ran and multiple tabs opened."))
+        XCTAssertFalse(BrowserReply.isUnsupportedTool("Could not verify an unobstructed click on the requested node. No click sent."))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {

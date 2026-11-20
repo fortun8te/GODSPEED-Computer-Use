@@ -174,6 +174,14 @@ final class BrowserPage {
         "browser: the tab or document changed; browser read again before using an element number"
     )
 
+    /// The top document's loader ID from the same frame tree the verified click reads (ACT-02).
+    func topFrameLoaderID() -> String? {
+        guard let tree = try? cdp("Page.getFrameTree"), let frameTree = tree["frameTree"] as? [String: Any],
+              let frame = frameTree["frame"] as? [String: Any], let loader = frame["loaderId"] as? String,
+              !loader.isEmpty else { return nil }
+        return loader
+    }
+
     func documentIdentity() throws -> BrowserDocumentIdentity? {
         guard let frames = try cdp("Page.getFrameTree")["frameTree"] as? [String: Any] else { return nil }
         return BrowserDocumentIdentity(tree: frames)
@@ -2968,6 +2976,21 @@ enum BrowserReply {
               let result = envelope["result"] as? [String: Any],
               let tab = result["tab"] as? [String: Any], let id = tab["id"] as? Int, id > 0 else { return nil }
         return id
+    }
+
+    /// ACT-02: `click_target`'s receipt. `openedTabID` is nil when Chrome could not verify a new tab.
+    static func clickedTab(in text: String) -> (clicked: Bool, openedTabID: Int?)? {
+        guard let object = json(text) as? [String: Any] else { return nil }
+        let body = (object["result"] as? [String: Any]) ?? object
+        guard let clicked = body["clicked"] as? Bool else { return nil }
+        let id = body["openedTabId"] as? Int
+        return (clicked, id.flatMap { $0 > 0 ? $0 : nil })
+    }
+
+    /// True when the helper does not know a tool at all (an older helper), so the caller takes its usual path.
+    static func isUnsupportedTool(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("unknown tool") || lower.contains("method not found")
     }
 
     /// Every object that has an id and a url or title: a tab listing entry.
