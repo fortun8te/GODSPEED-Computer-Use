@@ -516,7 +516,7 @@ extension BatchRecipes {
         func alreadySatisfied() -> ToolCallResult? {
             guard case .weak(let met) = initialCheck() else { return nil }
             return ToolCallResult(
-                content: [.text("Already satisfied before replay (weak evidence): \(met.joined(separator: ", ")). No steps ran.")],
+                content: [.text("Already satisfied before replay (weak evidence): \(met.joined(separator: ", ")). No steps ran. Not verified: the caller decides whether the goal is met.")],
                 isError: false, batchReceipt: .init(totalSteps: 0, doneCheck: .weakEvidence), deliveryState: .notSent
             )
         }
