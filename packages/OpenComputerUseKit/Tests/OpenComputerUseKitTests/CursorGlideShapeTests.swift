@@ -70,4 +70,26 @@ final class CursorGlideShapeTests: XCTestCase {
         XCTAssertTrue(route.path.sampledConstraintPoints().allSatisfy(bounds.contains))
         XCTAssertGreaterThanOrEqual(route.length, 1298)
     }
+
+    func testStaggeredDisplaysUseASharedEdgeInsteadOfTheGap() throws {
+        let left = CGRect(x: 0, y: 0, width: 1000, height: 600)
+        let right = CGRect(x: 1000, y: 300, width: 1200, height: 800)
+        let start = CGPoint(x: 990, y: 15)
+        let end = CGPoint(x: 1800, y: 420)
+        XCTAssertFalse(CursorPathPlanner.isVisibleTrip(from: start, to: end, displays: [left, right]))
+        let seam = try XCTUnwrap(CursorPathPlanner.crossing(from: start, to: end, between: left, and: right))
+        let glide = CursorGlide(
+            start: start, end: end, startVelocity: .zero, startForward: restForward(), restForward: restForward(),
+            bounds: nil, planned: false, via: seam, startTime: 0, speed: 1, queuedBehind: 0
+        )
+        for sample in 0...100 {
+            let point = glide.point(progress: CGFloat(sample) / 100)
+            XCTAssertTrue(left.contains(point) || right.contains(point))
+        }
+        XCTAssertEqual(glide.point(progress: 1), end)
+        let detached = right.offsetBy(dx: 50, dy: 0)
+        XCTAssertFalse(CursorPathPlanner.isVisibleTrip(from: start, to: end, displays: [left, detached]))
+        XCTAssertNil(CursorPathPlanner.crossing(from: start, to: end, between: left, and: detached))
+        XCTAssertTrue(CursorPathPlanner.isVisibleTrip(from: CGPoint(x: 980, y: 410), to: end, displays: [left, right]))
+    }
 }

@@ -11,6 +11,8 @@ These runs measure the UTF-8 text passed back to the agent. Input token counts d
 
 Run `swift test --filter CompactVerifiedReplyTests` to reproduce the reply checks. The first case selects the smaller of the state and its diff. The second uses `compact: true` and an explicit passing check. A later read still returns information the client has yet to see.
 
+A local MCP handshake with all 19 tools advertised sent 673 bytes of startup instructions, down from 1,001. The serialized `tools/list` response fell from 24,054 to 22,575 bytes. Tool names and supported actions stayed available in both runs.
+
 The app agent used to check for idle exit every five seconds. It now arms a single deadline after the last client disconnects. `swift test --filter LifecycleTests` covers deadline changes as clients connect and disconnect. Whole-machine CPU, GPU and power measurements are pending.
 
 ### Desktop cursor checks
