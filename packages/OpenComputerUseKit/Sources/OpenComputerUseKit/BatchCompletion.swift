@@ -93,8 +93,12 @@ struct BatchCompletion {
         self.startedAt = startedAt
         self.before = before
         var files: [String: Artifact.Sample] = [:]
-        for case .fileChanged(let path) in conditions where files[path] == nil {
-            files[path] = Artifact.sample(path)
+        for condition in conditions {
+            switch condition {
+            case .fileChanged(let path), .fileExists(let path):
+                if files[path] == nil { files[path] = Artifact.sample(path) }
+            default: break
+            }
         }
         self.files = files
     }
@@ -127,6 +131,33 @@ struct BatchCompletion {
         case .disappeared(let text):
             guard after.canProveAbsence, let previous = before.screen, let current = after.screen else { return false }
             return DoneCheck.textMatches(previous, text) && !DoneCheck.textMatches(current, text)
+        default:
+            return false
+        }
+    }
+
+    /// Whether a plain presence check (text, field equals, gone, url_contains, file_exists) became true during
+    /// the batch: false at the start (provably, on the same target) and true now. Such a match is strong evidence;
+    /// one that was already true before step 1 stays weak.
+    func confirmsTransition(_ condition: DoneCheck.Condition, after: Observation?) -> Bool {
+        switch condition {
+        case .text(let text): return meets(.appeared(text), after: after)
+        case .field(let label, let value): return meets(.fieldChanged(label: label, equals: value), after: after)
+        case .gone(let label): return meets(.disappeared(label), after: after)
+        case .urlContains(let part):
+            guard let before, let after, before.target == after.target,
+                  let previous = before.url, let current = after.url else { return false }
+            return !DoneCheck.contains(previous, part) && DoneCheck.contains(current, part)
+        case .fileExists(let path):
+            guard let prior = files[path], case .file(let current) = Artifact.sample(path) else { return false }
+            switch prior {
+            case .absent: return true
+            case .unavailable: return false
+            case .file(let previous):
+                return current.size != previous.size
+                    || (current.modified > previous.modified && current.modified >= startedAt)
+                    || (previous.digest != nil && current.digest != nil && previous.digest != current.digest)
+            }
         default:
             return false
         }

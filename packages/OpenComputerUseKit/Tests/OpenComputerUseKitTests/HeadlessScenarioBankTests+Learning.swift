@@ -113,13 +113,23 @@ extension HeadlessScenarioBankTests {
         )
         receipt.steps = Array(repeating: step, count: clicks)
         receipt.stop = changedWindow ? .windowChanged : disabled ? .stepFailure : nil
-        let output = "/fixture/" + value
+        // A real temporary file, written after the baseline only when the fixture commits, so file_exists
+        // can prove the file appeared during the batch.
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("godspeed-learning-\(UUID().uuidString)-\(value)").path
+        defer { try? FileManager.default.removeItem(atPath: output) }
         var checks: [DoneCheck.Condition] = [.field(label: family.field, equals: value), .text(family.confirmation)]
         if archiveProof { checks.append(.gone("Original in Inbox")) }
         if outputProof { checks.append(.fileExists(output)) }
+        // Change-aware completion (L2): the proof must appear since the batch started, so the
+        // fixture passes its starting screen as the baseline.
+        let target = BatchCompletion.Target.native(pid: 1, launch: Date(timeIntervalSince1970: 0), window: 1)
+        let baseline = BatchCompletion(conditions: checks, startedAt: Date(),
+                                       before: .init(target: target, screen: before, canProveAbsence: true))
+        if committed, outputProof { FileManager.default.createFile(atPath: output, contents: Data(value.utf8)) }
         if !changedWindow, case .verified = DoneCheck.check(checks, evidence: .init(
-            screenText: screen, pageURL: { nil }, fileExists: { $0 == output && committed }
-        )) {
+            screenText: screen, pageURL: { nil }
+        ), baseline: baseline, after: .init(target: target, screen: screen, canProveAbsence: true)) {
             receipt.doneCheck = .verified
         } else {
             receipt.doneCheck = .unmet
