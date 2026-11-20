@@ -15,19 +15,22 @@ public final class StdioMCPServer {
     private let backgroundStateReset: () -> Void
     /// Per-connection record of top-level tool calls.
     private let trajectory: TrajectoryLog
+    private let recordOperations: Bool
 
     public convenience init(
         service: ComputerUseService = ComputerUseService(),
         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
-        trajectoryEnvironment: [String: String]? = nil
+        trajectoryEnvironment: [String: String]? = nil,
+        recordOperations: Bool = false
     ) {
         self.init(dispatcher: ComputerUseToolDispatcher(service: service), backgroundStateReset: backgroundStateReset,
-                  trajectoryEnvironment: trajectoryEnvironment)
+                  trajectoryEnvironment: trajectoryEnvironment, recordOperations: recordOperations)
     }
 
     init(dispatcher: ComputerUseToolDispatcher,
          backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
-         trajectoryEnvironment: [String: String]? = nil) {
+         trajectoryEnvironment: [String: String]? = nil, recordOperations: Bool = false) {
+        self.recordOperations = recordOperations
         self.service = dispatcher.service
         self.dispatcher = dispatcher
         self.backgroundStateReset = backgroundStateReset
@@ -36,16 +39,20 @@ public final class StdioMCPServer {
 
     public func run() throws {
         defer { endSession() }
-        while let line = readLine(strippingNewline: true) {
-            guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                continue
+        let requests = MCPRequestStream()
+        Thread.detachNewThread {
+            while let line = readLine(strippingNewline: true) {
+                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
+                if !accepted { break }
             }
-
-            // This thread's autorelease pool never drains on its own: each response's encoded
-            // bytes (a screenshot's base64 among them) stayed alive for the whole session.
+            requests.disconnect()
+        }
+        while let request = requests.next() {
             autoreleasepool {
-                if let response = handle(line: line) {
-                    FileHandle.standardOutput.write((response + "\n").data(using: .utf8)!)
+                RequestCancellation.$current.withValue(request.cancellation) {
+                    if let response = withOperationJournal({ handle(line: request.line) }) {
+                        FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                    }
                 }
             }
         }
@@ -80,7 +87,7 @@ public final class StdioMCPServer {
                         "instructions": computerUseServerInstructions,
                     ]
                 )
-            case "notifications/initialized":
+            case "notifications/initialized", "notifications/cancelled":
                 return nil
             case "notifications/turn-ended":
                 endSession()
@@ -101,7 +108,8 @@ public final class StdioMCPServer {
                 let startedAt = Date()
                 let result: ToolCallResult
                 do {
-                    result = try dispatcher.callTool(name: name, arguments: arguments)
+                    let call = { try self.dispatcher.callTool(name: name, arguments: arguments) }
+                    result = try recordOperations ? withOperationJournal(call) : call()
                 } catch {
                     trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt, admissionMs: admissionMs)
                     throw error

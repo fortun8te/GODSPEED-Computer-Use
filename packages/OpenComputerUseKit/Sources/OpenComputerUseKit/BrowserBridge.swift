@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Runs a synchronous browser request with its own effective launch environment and authorization.
@@ -9,6 +10,17 @@ public func withBrowserRequestEnvironment<T>(
     try BrowserRequestContext.withContext(
         BrowserRequestContext(environment: GodspeedSettings.merged(environment), validate: validate), body
     )
+}
+
+public enum BrowserTabWriteNeedsExclusive: Error { case unconfirmedOwnership }
+
+/// Parallel writes must use a tab opened by this exact running helper.
+public func withOwnedBrowserTabWrite<T>(_ id: Int, _ body: () throws -> T) throws -> T {
+    let bridge = BrowserBridge.shared
+    guard let generation = bridge.ownedTabGeneration(id) else {
+        throw BrowserTabWriteNeedsExclusive.unconfirmedOwnership
+    }
+    return try BrowserBridge.$ownedWrite.withValue(.init(bridge: bridge, id: id, generation: generation), operation: body)
 }
 
 /// Require an available desktop at each transport boundary of a serialized GUI request.
@@ -34,6 +46,7 @@ struct BrowserRequestContext: Sendable {
     }
 
     static func validateCurrent() throws {
+        try RequestCancellation.check()
         try current?.validate?()
     }
 
@@ -62,6 +75,14 @@ struct BrowserRequestContext: Sendable {
 /// tabs. `obu mcp` answers one request at a time, so parallel page work uses extra "lanes": more
 /// `obu mcp` children, each with its own session (`<session>-lane<N>`) and its own tabs.
 final class BrowserBridge: @unchecked Sendable {
+    struct OwnedWrite: Sendable {
+        let bridge: BrowserBridge
+        let id: Int
+        let generation: Int
+    }
+
+    @TaskLocal static var ownedWrite: OwnedWrite?
+
     static var baseSessionID: String {
         baseSessionID(environment: BrowserRequestContext.environment)
     }
@@ -287,6 +308,10 @@ final class BrowserBridge: @unchecked Sendable {
     // Only direct open_tab replies confer ownership. A tab in the session list may be a user's claimed tab.
     private var openedTabs: Set<Int> = []
 
+    func ownedTabGeneration(_ id: Int) -> Int? {
+        lock.withLock { process?.isRunning == true && openedTabs.contains(id) ? helperGeneration : nil }
+    }
+
     var referenceGeneration: Int {
         lock.lock()
         defer { lock.unlock() }
@@ -341,6 +366,22 @@ final class BrowserBridge: @unchecked Sendable {
         _ name: String, arguments: [String: Any], timeout: TimeInterval, referenceGeneration: Int? = nil
     ) throws -> (text: String, isError: Bool) {
         try withToolConnection {
+            if let write = Self.ownedWrite {
+                // Fence helper restart, a different tab, and commands that can
+                // move UI focus or affect anything outside this CDP target.
+                let allowed: Set<String> = [
+                    "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+                    "Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.getPartialAXTree",
+                    "Accessibility.queryAXTree", "DOM.getDocument", "DOM.resolveNode", "DOM.focus",
+                    "DOM.describeNode", "Page.getFrameTree", "Emulation.setFocusEmulationEnabled",
+                    "Input.insertText",
+                ]
+                guard write.bridge === self, process?.isRunning == true, helperGeneration == write.generation,
+                      openedTabs.contains(write.id), arguments["tab_id"] as? Int == write.id,
+                      name == "cdp", let method = arguments["method"] as? String, allowed.contains(method) else {
+                    throw ComputerUseError.stateUnavailable("browser: the parallel write lost its owned tab or needs exclusive access. Inspect the tab before repeating the action.")
+                }
+            }
             if let referenceGeneration, process?.isRunning != true || referenceGeneration != helperGeneration {
                 throw ComputerUseError.invalidArguments("browser: the tab connection changed; browser read again before using an element number")
             }
@@ -427,14 +468,21 @@ final class BrowserBridge: @unchecked Sendable {
         }
     }
 
-    private func withToolConnection<T>(_ body: () throws -> T) rethrows -> T {
-        lock.lock()
+    private func withToolConnection<T>(_ body: () throws -> T) throws -> T {
+        if RequestCancellation.current == nil {
+            lock.lock()
+        } else {
+            while !lock.lock(before: Date().addingTimeInterval(0.05)) {
+                try RequestCancellation.check()
+            }
+        }
         defer {
             lastUse = ProcessInfo.processInfo.systemUptime
             detached = false
             idleTimer.schedule(deadline: .now() + Self.detachAfter, leeway: .milliseconds(500))
             lock.unlock()
         }
+        try RequestCancellation.check()
         return try body()
     }
 
@@ -512,7 +560,12 @@ final class BrowserBridge: @unchecked Sendable {
         let toChild = Pipe()
         let fromChild = Pipe()
         // Writing to a child that already exited must return an error, not raise SIGPIPE and end GODSPEED.
-        _ = fcntl(toChild.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        let writeFD = toChild.fileHandleForWriting.fileDescriptor
+        _ = fcntl(writeFD, F_SETNOSIGPIPE, 1)
+        let flags = fcntl(writeFD, F_GETFL)
+        guard flags >= 0, fcntl(writeFD, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw ComputerUseError.stateUnavailable("Could not prepare the browser helper connection. No input was sent.")
+        }
         child.standardInput = toChild
         child.standardOutput = fromChild
         child.standardError = FileHandle.nullDevice
@@ -548,12 +601,11 @@ final class BrowserBridge: @unchecked Sendable {
                 timeout: 10
             )
             try BrowserRequestContext.validateCurrent()
-            try send(["jsonrpc": "2.0", "method": "notifications/initialized"])
+            try send(["jsonrpc": "2.0", "method": "notifications/initialized"],
+                     deadline: BrowserCallBudget.deadline(after: min(2, BrowserCallBudget.remaining())))
         } catch {
             // Never keep a child that did not finish its handshake: the next call starts a fresh one.
-            child.terminate()
-            process = nil
-            input = nil
+            retireConnection()
             throw error
         }
     }
@@ -576,14 +628,13 @@ final class BrowserBridge: @unchecked Sendable {
         guard wait > 0 else { throw ComputerUseError.timedOut("The browser request ran out of time.", delivery: .notSent) }
         let id = nextID
         nextID += 1
-        try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
-        guard let message = responses.wait(for: id, timeout: wait) else {
+        let deadline = BrowserCallBudget.deadline(after: wait)
+        try RequestCancellation.check()
+        try send(["jsonrpc": "2.0", "id": id, "method": method, "params": params], deadline: deadline)
+        guard let message = responses.wait(for: id, timeout: max(0, deadline - ProcessInfo.processInfo.systemUptime)) else {
             // The command may already have landed. Retire this transport and let a later
             // request reconnect, without resending the timed-out command.
-            if process?.isRunning == true { process?.terminate() }
-            process = nil
-            input = nil
-            openedTabs.removeAll()
+            retireConnection()
             throw ComputerUseError.timedOut(
                 "Open Browser Use did not answer \(method) within \(Int(wait.rounded())) s. Inspect the tab before repeating the action.",
                 delivery: .outcomeUnknown
@@ -603,21 +654,49 @@ final class BrowserBridge: @unchecked Sendable {
         "browser: the helper returned an unreadable reply. Inspect the tab before repeating the command."
     )
 
-    private func send(_ object: [String: Any]) throws {
+    private func send(_ object: [String: Any], deadline: TimeInterval) throws {
         guard let input else {
             throw ComputerUseError.notSent("Open Browser Use is not running.")
         }
         var data = try JSONSerialization.data(withJSONObject: object)
         data.append(0x0A)
+        let fd = input.fileDescriptor
         do {
-            try input.write(contentsOf: data)
+            try data.withUnsafeBytes { bytes in
+                guard let start = bytes.baseAddress else { return }
+                var offset = 0
+                while offset < bytes.count {
+                    try RequestCancellation.check()
+                    let timeLeft = deadline - ProcessInfo.processInfo.systemUptime
+                    guard timeLeft > 0 else { throw POSIXError(.ETIMEDOUT) }
+                    let count = Darwin.write(fd, start.advanced(by: offset), bytes.count - offset)
+                    if count > 0 {
+                        offset += count
+                    } else if count < 0 && errno == EINTR {
+                        continue
+                    } else if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                        let milliseconds = Int32(max(1, min(50, timeLeft * 1000)))
+                        if poll(&descriptor, 1, milliseconds) < 0 && errno != EINTR {
+                            throw POSIXError(.EIO)
+                        }
+                    } else {
+                        throw POSIXError(.EIO)
+                    }
+                }
+            }
         } catch {
-            // Stop the broken child too, or it would stay alive without a way to reach it.
-            process?.terminate()
-            process = nil
-            self.input = nil
-            throw ComputerUseError.stateUnavailable("Open Browser Use disconnected during the send. Inspect the tab before retrying.")
+            // A partial line must never reach a later request on this pipe.
+            retireConnection()
+            throw ComputerUseError.stateUnavailable("Open Browser Use stopped while sending the request. Outcome unknown. Inspect the tab before retrying.")
         }
+    }
+
+    private func retireConnection() {
+        if process?.isRunning == true { process?.terminate() }
+        process = nil
+        input = nil
+        openedTabs.removeAll()
     }
 }
 
@@ -657,7 +736,7 @@ private final class PeekResults: @unchecked Sendable {
 }
 
 /// Newline-delimited JSON-RPC responses from `obu mcp`, keyed by request id.
-private final class BrowserBridgeResponses: @unchecked Sendable {
+final class BrowserBridgeResponses: @unchecked Sendable {
     private let condition = NSCondition()
     private var pending = Data()
     private var messages: [Int: [String: Any]] = [:]
@@ -706,10 +785,11 @@ private final class BrowserBridgeResponses: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         defer { condition.unlock() }
-        while messages[id] == nil, !closed {
-            if !condition.wait(until: deadline) { break }
+        while messages[id] == nil, !closed, !RequestCancellation.requested, Date() < deadline {
+            _ = condition.wait(until: min(deadline, Date().addingTimeInterval(0.05)))
         }
-        return messages.removeValue(forKey: id)
+        let message = messages.removeValue(forKey: id)
+        return RequestCancellation.requested ? nil : message
     }
 }
 
@@ -1356,32 +1436,36 @@ extension ComputerUseToolDispatcher {
         let scope = ClientScope.current
         let context = BrowserRequestContext.current
         let bridges = (0..<laneCount).map(BrowserBridge.lane)
+        let cancellation = RequestCancellation.current
         DispatchQueue.concurrentPerform(iterations: laneCount) { lane in
-            BrowserRequestContext.withContext(context) {
-                ClientScope.withScope(scope) {
-                    BrowserCallBudget.withDeadline(deadline) {
-                        let bridge = bridges[lane]
-                        let permits = BrowserBridge.previewPermits
-                        let wait = max(0, BrowserCallBudget.remaining() - 4)
-                        guard permits.wait(timeout: .now() + wait) == .success else { return }
-                        defer { permits.signal() }
-                        var tab: PeekTab?
-                        runPeekLane(next: {
-                            BrowserCallBudget.remaining() > 4 ? results.takeNextIndex() : nil
-                        }, read: { index in
-                            peek(urls[index], bridge: bridge, tab: &tab, deadline: deadline - 3, verifyPage: verifyPage)
-                        }, cleanup: {
-                            defer { tab = nil }
-                            if let tab {
-                                // A live lane owns this exact tab. A dropped
-                                // generation requires the lane's scoped cleanup.
-                                if tab.generation == bridge.referenceGeneration {
-                                    return (try? bridge.closeOpenedTab(tab.id)) != nil
+            RequestCancellation.$current.withValue(cancellation) {
+                BrowserRequestContext.withContext(context) {
+                    ClientScope.withScope(scope) {
+                        BrowserCallBudget.withDeadline(deadline) {
+                            let bridge = bridges[lane]
+                            let permits = BrowserBridge.previewPermits
+                            var tab: PeekTab?
+                            runPeekLane(next: {
+                                guard !RequestCancellation.requested, BrowserCallBudget.remaining() > 4 else { return nil }
+                                return results.takeNextIndex()
+                            }, read: { index in
+                                guard acquirePreviewPermit(permits) else {
+                                    return ("not_started", "Preview cancelled or out of time before the page load.")
                                 }
-                            }
-                            let cleanup = try? bridge.callTool("finalize_tabs", arguments: [:], timeout: 3)
-                            return cleanup?.isError == false
-                        }, store: results.set)
+                                defer { permits.signal() }
+                                return peek(urls[index], bridge: bridge, tab: &tab, deadline: deadline - 3, verifyPage: verifyPage)
+                            }, cleanup: {
+                                defer { tab = nil }
+                                // Cleanup can only touch this preview lane's tabs.
+                                return RequestCancellation.$current.withValue(nil) {
+                                    if let tab, tab.generation == bridge.referenceGeneration {
+                                        return (try? bridge.closeOpenedTab(tab.id)) != nil
+                                    }
+                                    let cleanup = try? bridge.callTool("finalize_tabs", arguments: [:], timeout: 3)
+                                    return cleanup?.isError == false
+                                }
+                            }, store: results.set)
+                        }
                     }
                 }
             }
@@ -1417,6 +1501,13 @@ extension ComputerUseToolDispatcher {
             if outcome.status != "read", !finish() { return }
         }
         _ = finish()
+    }
+
+    private static func acquirePreviewPermit(_ permits: DispatchSemaphore) -> Bool {
+        while !RequestCancellation.requested, BrowserCallBudget.remaining() > 4 {
+            if permits.wait(timeout: .now() + .milliseconds(50)) == .success { return true }
+        }
+        return false
     }
 
     private static func peek(

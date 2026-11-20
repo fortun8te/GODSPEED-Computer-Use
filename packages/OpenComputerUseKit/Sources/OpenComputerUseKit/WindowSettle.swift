@@ -30,6 +30,7 @@ enum WindowSettle {
         axBusy: () -> Bool = { false },
         sample: () -> UInt64?
     ) -> TimeInterval {
+        guard !RequestCancellation.requested else { return 0 }
         let start = now()
         let deadline = start + cap
         // Skip capture entirely if there is no room to establish a quiet period.
@@ -40,7 +41,7 @@ enum WindowSettle {
         sleep(min(floor, cap))
         var previous: UInt64?
         var stableSince: TimeInterval?
-        while now() < deadline {
+        while !RequestCancellation.requested, now() < deadline {
             let current = sample()
             if let current, now() < deadline, !axBusy() {
                 let sampledAt = now()
@@ -127,7 +128,7 @@ enum WindowSettle {
     ) rethrows -> Bool {
         let deadline = now() + timeout
         var quietSince: TimeInterval?
-        while now() < deadline {
+        while !RequestCancellation.requested, now() < deadline {
             let sawBusy = try busy()
             let sampledAt = now()
             guard sampledAt <= deadline else { return false }

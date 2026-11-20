@@ -114,11 +114,17 @@ public struct ToolCallResult: @unchecked Sendable {
         )
     }
 
+    static func delivery(of error: Error) -> DeliveryState {
+        (error as? ComputerUseError)?.deliveryState
+            ?? (error as? RequestCancellation.Cancelled)?.deliveryState
+            ?? .outcomeUnknown
+    }
+
     static func failure(_ error: Error) -> ToolCallResult {
         let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         return ToolCallResult(
             content: [.text(message)], isError: true, failureCode: TrajectoryLog.failureCode(error: error),
-            deliveryState: (error as? ComputerUseError)?.deliveryState ?? .outcomeUnknown
+            deliveryState: delivery(of: error)
         )
     }
 

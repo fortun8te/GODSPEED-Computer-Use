@@ -70,6 +70,8 @@ public final class ComputerUseToolDispatcher {
 
     private func callScopedTool(name: String, arguments rawArguments: [String: Any], log: SmartLog,
                                 notesInResult: Bool, beforeNativeDispatch: (() -> Void)?) throws -> ToolCallResult {
+        // Workflow tools return their own partial cancellation receipts.
+        if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check(delivery: .notSent) }
         // Every call (single, or a batch step) is forgiven first: wrong names, types and key spellings
         // are corrected, and a missing app is taken from the last one used. Still-missing required
         // arguments answer with one corrective line instead of reaching the app.
@@ -81,6 +83,17 @@ public final class ComputerUseToolDispatcher {
             throw ComputerUseError.notSent(problem)
         }
         try StrictBackground.validate(name, arguments: arguments)
+        // Journal logical steps here so standalone actions, batches and handoffs share the same boundary.
+        return try OperationJournal.recordStep(tool: name, arguments: arguments) {
+            try callNormalizedTool(name: name, arguments: arguments, ref: ref, log: log,
+                                   notesInResult: notesInResult, beforeNativeDispatch: beforeNativeDispatch)
+        }
+    }
+
+    private func callNormalizedTool(
+        name: String, arguments: [String: Any], ref: String?, log: SmartLog, notesInResult: Bool,
+        beforeNativeDispatch: (() -> Void)?
+    ) throws -> ToolCallResult {
         let hasWindowPin = arguments["window_id"] != nil && name != "query" && name != "get_app_state"
             && name != BatchTool.name && name != HandoffTool.name
         if ref != nil || hasWindowPin {
@@ -160,6 +173,7 @@ public final class ComputerUseToolDispatcher {
         do {
             result = try autoreleasepool { try runWithSmartSteps(name: name, arguments: arguments, log: log) }
         } catch {
+            if RequestCancellation.requested { throw error }
             // Renaming in Finder: Finder's rename field takes no typing in the background. Finder's own scripting
             // renames the selected (type_text) or named (set_value) item without focus, keys or a dialog.
             // Strict background mode and policy refusals never fall back to another route.
@@ -410,6 +424,8 @@ public final class ComputerUseToolDispatcher {
     }
 
     private func dispatchTool(name: String, arguments: [String: Any], log: SmartLog) throws -> ToolCallResult {
+        // Smart fallbacks can reach the native dispatcher without another tool call.
+        if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check() }
         switch name {
         case BatchTool.name:
             return try runBatch(arguments: arguments)
@@ -746,6 +762,7 @@ public final class ComputerUseToolDispatcher {
               (BrowserCallBudget.activeRemaining ?? .infinity) > 0
         else { return nil }
 
+        try RequestCancellation.check()
         let x = min(size.width - 1, (fraction.x * size.width).rounded())
         let y = min(size.height - 1, (fraction.y * size.height).rounded())
         let clicked = try service.click(
