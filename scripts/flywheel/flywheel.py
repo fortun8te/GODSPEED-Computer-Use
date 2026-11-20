@@ -466,6 +466,256 @@ def evaluate(args):
     print(destination)
 
 
+# Offline calibration and labeling selection. These read probability files only; no model is loaded.
+# Probability row (validation): {"id", "gold", "probs": {label: p}, "question"?}  ("question" defaults to "default")
+# Probability row (pool):       {"id", "family", "probs": {label: p}}
+CALIBRATION_BINS = 15
+TEMPERATURE_GRID = [0.05 * (400 ** (i / 199)) for i in range(200)]  # 0.05 to 20, log-spaced, deterministic
+
+
+def read_probability_file(path, need_gold):
+    rows, seen = [], set()
+    for raw in read_rows(path.read_bytes()):
+        probs = raw.get("probs") if isinstance(raw, dict) else None
+        row_id = raw.get("id") if isinstance(raw, dict) else None
+        if (not isinstance(row_id, str) or not row_id or row_id in seen
+                or not isinstance(probs, dict) or set(probs) != LABELS):
+            raise ValueError("Invalid probability row")
+        seen.add(row_id)
+        row = {"id": row_id, "probs": normalize_probs(probs)}
+        if need_gold:
+            if raw.get("gold") not in LABELS:
+                raise ValueError("Invalid gold label")
+            question = raw.get("question", "default")
+            if not isinstance(question, str) or not question:
+                raise ValueError("Invalid question name")
+            row.update(gold=raw["gold"], question=question)
+        else:
+            family = raw.get("family")
+            if not isinstance(family, str) or not family:
+                raise ValueError("Pool row needs a family")
+            row["family"] = family
+        rows.append(row)
+    if not rows:
+        raise ValueError("No probability rows")
+    return rows
+
+
+def normalize_probs(probs):
+    clean = {}
+    for label in sorted(probs):
+        value = probs[label]
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError("Invalid probability")
+        clean[label] = max(float(value), 1e-12)
+    total = sum(clean.values())
+    return {label: value / total for label, value in clean.items()}
+
+
+def argmax(probs):
+    return max(sorted(probs), key=lambda label: (probs[label], label))
+
+
+def temper(probs, temperature):
+    logits = {label: math.log(p) / temperature for label, p in probs.items()}
+    top = max(logits.values())
+    weights = {label: math.exp(value - top) for label, value in logits.items()}
+    total = sum(weights.values())
+    return {label: weight / total for label, weight in weights.items()}
+
+
+def nll(rows, temperature):
+    return -sum(math.log(temper(row["probs"], temperature)[row["gold"]]) for row in rows) / len(rows)
+
+
+def fit_temperature(rows):
+    return min(TEMPERATURE_GRID, key=lambda value: (nll(rows, value), value))
+
+
+def fit_isotonic(xs, ys):
+    """Pool-adjacent-violators on distinct x values. Returns [(upper_x, value)] knots."""
+    grouped = {}
+    for x, y in zip(xs, ys):
+        total, count = grouped.get(x, (0.0, 0))
+        grouped[x] = (total + y, count + 1)
+    blocks = []  # [sum_y, count, upper_x]
+    for x in sorted(grouped):
+        total, count = grouped[x]
+        blocks.append([total, count, x])
+        while len(blocks) > 1 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
+            total, count, upper = blocks.pop()
+            blocks[-1][0] += total
+            blocks[-1][1] += count
+            blocks[-1][2] = upper
+    return [(upper, total / count) for total, count, upper in blocks]
+
+
+def apply_isotonic(knots, x):
+    for upper, value in knots:
+        if x <= upper:
+            return value
+    return knots[-1][1]
+
+
+def reliability_bins(pairs):
+    buckets = [[] for _ in range(CALIBRATION_BINS)]
+    for confidence, correct in pairs:
+        buckets[min(int(confidence * CALIBRATION_BINS), CALIBRATION_BINS - 1)].append((confidence, correct))
+    table = []
+    for index, bucket in enumerate(buckets):
+        row = {"lo": round(index / CALIBRATION_BINS, 4), "hi": round((index + 1) / CALIBRATION_BINS, 4),
+               "count": len(bucket), "confidence": None, "accuracy": None}
+        if bucket:
+            row["confidence"] = round(sum(c for c, _ in bucket) / len(bucket), 4)
+            row["accuracy"] = round(sum(int(ok) for _, ok in bucket) / len(bucket), 4)
+        table.append(row)
+    return table
+
+
+def expected_calibration_error(table):
+    total = sum(row["count"] for row in table)
+    return round(sum(row["count"] / total * abs(row["accuracy"] - row["confidence"])
+                     for row in table if row["count"]), 6)
+
+
+def fit_calibration(rows, isotonic):
+    groups, scaled = {}, {}
+    for question in sorted({row["question"] for row in rows}):
+        group = [row for row in rows if row["question"] == question]
+        temperature = fit_temperature(group)
+        knots = None
+        for row in group:
+            scaled[row["id"]] = temper(row["probs"], temperature)
+        if isotonic:
+            knots = fit_isotonic([max(scaled[row["id"]].values()) for row in group],
+                                 [int(argmax(scaled[row["id"]]) == row["gold"]) for row in group])
+        groups[question] = {"temperature": temperature, "isotonic": knots, "rows": len(group)}
+
+    def calibrated_confidence(row):
+        confidence = max(scaled[row["id"]].values())
+        knots = groups[row["question"]]["isotonic"]
+        return apply_isotonic(knots, confidence) if knots else confidence
+
+    before = [(max(row["probs"].values()), argmax(row["probs"]) == row["gold"]) for row in rows]
+    after = [(calibrated_confidence(row), argmax(scaled[row["id"]]) == row["gold"]) for row in rows]
+    before_table, after_table = reliability_bins(before), reliability_bins(after)
+
+    done = [(scaled[row["id"]]["done"], row["gold"] == "done") for row in rows]
+    # Strict rule: predict done only when P(done) is above the highest P(done) any non-done row received.
+    threshold = max((p for p, is_done in done if not is_done), default=0.0)
+    false_done = sum(1 for p, is_done in done if not is_done and p > threshold)
+    done_total = sum(1 for _, is_done in done if is_done)
+    recall = sum(1 for p, is_done in done if is_done and p > threshold) / done_total if done_total else None
+    params = {
+        "method": "temperature scaling" + (" plus isotonic on top-label confidence" if isotonic else ""),
+        "done_rule": "predict done when calibrated P(done) > done_threshold",
+        "done_threshold": threshold,
+        "groups": groups,
+        "fit_rows": len(rows),
+    }
+    report = {
+        "rows": len(rows),
+        "in_sample": "Fitted and scored on the same validation rows. Use a separate file to check generalization.",
+        "ece": {"before": expected_calibration_error(before_table), "after": expected_calibration_error(after_table)},
+        "reliability": {"before": before_table, "after": after_table},
+        "temperatures": {question: group["temperature"] for question, group in groups.items()},
+        "done": {"validation_done_rows": done_total, "done_threshold": threshold, "false_done": false_done,
+                 "done_recall": None if recall is None else round(recall, 6),
+                 "recall_cost": None if recall is None else round(1 - recall, 6)},
+    }
+    return params, report
+
+
+def calibrate_command(args):
+    rows = read_probability_file(args.validation, need_gold=True)
+    params, report = fit_calibration(rows, args.isotonic)
+    destination = writable(args.params)
+    with destination.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(params, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def entropy_norm(probs):
+    return -sum(p * math.log(p) for p in probs.values()) / math.log(len(probs))
+
+
+def total_variation(a, b):
+    return 0.5 * sum(abs(a[label] - b[label]) for label in LABELS)
+
+
+def labeling_candidates(pool, other=None):
+    other_by_id = {}
+    if other is not None:
+        other_by_id = {row["id"]: row for row in other}
+        if set(other_by_id) != {row["id"] for row in pool}:
+            raise ValueError("Both probability files must cover the same ids")
+    scored = []
+    for row in pool:
+        partner = other_by_id[row["id"]]["probs"] if other is not None else None
+        if partner is not None and other_by_id[row["id"]]["family"] != row["family"]:
+            raise ValueError("Family differs between probability files")
+        mean = {label: (row["probs"][label] + partner[label]) / 2 for label in LABELS} if partner else row["probs"]
+        ordered = sorted(mean.values(), reverse=True)
+        margin = ordered[0] - ordered[1]
+        entropy = entropy_norm(mean)
+        uncertainty = 0.5 * entropy + 0.5 * (1 - margin)
+        reasons = [f"uncertain: margin {margin:.2f}, entropy {entropy:.2f}"]
+        disagreement = 0.0
+        if partner:
+            disagreement = total_variation(row["probs"], partner)
+            if argmax(row["probs"]) != argmax(partner):
+                reasons.append(f"models disagree: {argmax(row['probs'])} vs {argmax(partner)}")
+            else:
+                reasons.append(f"models differ by {disagreement:.2f}")
+        scored.append({"id": row["id"], "family": row["family"],
+                       "score": round(uncertainty + disagreement, 6), "reason": "; ".join(reasons)})
+    return scored
+
+
+def select_for_labeling(pool, count, cap_percent):
+    """Greedy by score, skipping any family that would pass cap_percent of the requested count.
+
+    The final check runs on the picks actually returned, so no family exceeds the cap share of them.
+    """
+    cap = count * cap_percent // 100
+    if cap < 1:
+        raise ValueError("N is too small for the family cap")
+    ranked = sorted(pool, key=lambda row: (-row["score"], row["id"]))
+    picked, taken = [], Counter()
+    for row in ranked:
+        if len(picked) == count:
+            break
+        if taken[row["family"]] < cap:
+            picked.append(row)
+            taken[row["family"]] += 1
+    while picked:
+        counts = Counter(row["family"] for row in picked)
+        over = max(counts, key=lambda family: (counts[family], family))
+        if counts[over] * 100 <= cap_percent * len(picked):
+            break
+        # Drop the lowest-ranked pick from the over-share family; the pool may not hold enough other families.
+        index = max(i for i, row in enumerate(picked) if row["family"] == over)
+        del picked[index]
+    return picked
+
+
+def select_command(args):
+    pool = read_probability_file(args.pool, need_gold=False)
+    other = read_probability_file(args.other_probs, need_gold=False) if args.other_probs else None
+    scored = labeling_candidates(pool, other)
+    picked = select_for_labeling(scored, args.n, args.family_cap_percent)
+    destination = writable(args.out)
+    lines = [{"rank": rank, **row} for rank, row in enumerate(picked, start=1)]
+    with destination.open("x", encoding="utf-8") as handle:
+        handle.write(jsonl(lines).decode())
+    summary = {"requested": args.n, "selected": len(picked),
+               "families": dict(sorted(Counter(row["family"] for row in picked).items())),
+               "family_cap_percent": args.family_cap_percent, "two_models": other is not None}
+    if len(picked) < args.n:
+        summary["note"] = "Fewer picks than requested: the cap would otherwise be breached with this pool."
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     commands = cli.add_subparsers(dest="command", required=True)
@@ -485,12 +735,28 @@ def main():
     run.add_argument("--done-confidence", type=float, default=DONE_CONFIDENCE)
     run.add_argument("--hint-confidence", type=float, default=HINT_CONFIDENCE)
     run.add_argument("--zoom", action="store_true")
+    cal = commands.add_parser("calibrate", help="Fit per-question temperature (optional isotonic) and a done threshold")
+    cal.add_argument("validation", type=Path, help="Validation probability JSONL")
+    cal.add_argument("--params", required=True, type=Path, help="Output JSON of fitted parameters (new file)")
+    cal.add_argument("--isotonic", action="store_true")
+    pick = commands.add_parser("select-for-labeling", help="Pick the most informative unlabeled rows")
+    pick.add_argument("--pool", required=True, type=Path, help="Unlabeled pool probability JSONL")
+    pick.add_argument("--other-probs", type=Path, help="Second model's probability JSONL over the same ids")
+    pick.add_argument("--n", required=True, type=int)
+    pick.add_argument("--out", required=True, type=Path, help="Output JSONL with a reason per row (new file)")
+    pick.add_argument("--family-cap-percent", type=int, default=40)
     args = cli.parse_args()
     try:
         if args.command == "package":
             print(json.dumps(package(args.fixtures, args.output), indent=2))
         elif args.command == "counts":
             print(json.dumps(metadata_counts(read_rows(args.metadata.read_bytes())), sort_keys=True))
+        elif args.command == "calibrate":
+            calibrate_command(args)
+        elif args.command == "select-for-labeling":
+            if args.n < 1 or not 1 <= args.family_cap_percent <= 100:
+                cli.exit(1, "flywheel: invalid --n or --family-cap-percent\n")
+            select_command(args)
         else:
             number(args.done_confidence, 0, 1)
             number(args.hint_confidence, 0, 1)
