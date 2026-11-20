@@ -23,6 +23,10 @@ jobs:
         run: swift test --filter 'AXTreeCondenserTests/testCompactObservation|DocsDriftTests|DoneCheckTransitionTests|GestureSafetyTests|NegativeLookupCacheTests|RegionFingerprintTests|SemanticChangesTests|AppTimingProfileTests|FocusTransitionTests|ShortcutCacheTests|FailureSignaturesTests|RouteBanditTests|LearningLogTests|CursorMotionQualityTests|BackgroundDragTests|AppAgentAdmissionTests|AppAgentProxyTests|TrajectoryLogTests|BatchEffectsTests|DoneCheckTests|CursorTimingTests/testClickRipple|CursorTimingTests/testCursorLens|CursorTimingTests/testInteractionIndicator|GodspeedLeanTests|BrowserPageTests|HeadlessScenarioBankTests|PrivateClipboardTests|RecipeSafetyTests|BatchReceiptsTests|LabelSpellingsTests|ClientScopeTests|ClientScopeSafetyTests|testInitializeResponseContainsComputerUseInstructions'
       - name: Verify compact replies, cursor identity and idle exit
         run: swift test --filter 'CompactVerifiedReplyTests|CursorRequestEnvironmentTests|CursorGlideShapeTests|CursorWindowAnchorTests|CursorDeliveryTests/testGestureBoundariesRetainMovesForTheirOwnClient|HandoffToolTests|LifecycleTests|LockedUseDispatchTests|testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep'
+      - name: Verify safety, delivery, durability and browser policy
+        run: swift test --filter 'ActionHardeningTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests'
+      - name: Verify the local training tools
+        run: python3 -I -m unittest discover -s scripts/flywheel -p 'test_*.py' && python3 -I -m unittest discover -s scripts/flywheel/synth -p 'test_*.py'
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '24'
