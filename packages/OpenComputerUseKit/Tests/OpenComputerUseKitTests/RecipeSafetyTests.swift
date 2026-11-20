@@ -137,6 +137,7 @@ final class RecipeSafetyTests: XCTestCase {
         XCTAssertEqual(result.batchReceipt?.totalSteps, 0)
         XCTAssertEqual(result.deliveryState, .notSent)
         XCTAssertTrue(result.textContent.contains("Already satisfied"))
+        XCTAssertTrue(result.textContent.contains("Not verified"), "weak evidence never reads as done")
         XCTAssertEqual(HandoffTool.replayResult(result), .alreadySatisfied(result.textContent))
         run.doneWhen = [.appeared("Saved")]
         XCTAssertNil(run.alreadySatisfied(), "A pre-existing label cannot meet a change check")
@@ -367,7 +368,8 @@ final class RecipeSafetyTests: XCTestCase {
             check: { DoneCheck.check([.text("Saved")], evidence: .init(screenText: $0, pageURL: { nil })) },
             replay: { _ in replayed = true; return .verified }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "g", doneWhen: [.text("Saved")], values: [], maxSteps: 3, timeBudget: 30), deps)
-        XCTAssertEqual(outcome.kind, .done)
+        // Already on screen is weak evidence: reported as not verified, and no replay runs.
+        XCTAssertEqual(outcome.kind, .notVerified)
         XCTAssertFalse(replayed)
     }
 
