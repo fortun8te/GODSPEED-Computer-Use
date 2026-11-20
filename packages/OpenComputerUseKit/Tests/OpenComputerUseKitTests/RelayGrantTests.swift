@@ -126,3 +126,12 @@ extension Data {
         self.init(base64Encoded: standard)
     }
 }
+
+final class RelayGrantReplyMappingTests: XCTestCase {
+    func testRelayDenialTextMapsToTheTypedError() {
+        let denied = RelayGrantRenewal.typedError(for: ComputerUseError.message("Open Browser Use: relay grant is invalid"))
+        XCTAssertEqual(denied as? RelayGrantError, .helperNeedsRelayKey)
+        let other = RelayGrantRenewal.typedError(for: ComputerUseError.message("Open Browser Use: tab not found"))
+        XCTAssertNil(other as? RelayGrantError)
+    }
+}
