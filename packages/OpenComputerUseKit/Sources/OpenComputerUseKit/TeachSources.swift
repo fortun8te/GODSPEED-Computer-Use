@@ -152,6 +152,12 @@ final class LiveTeachSource: TeachInputSource {
     private var observer: AXObserver?
     private var tap: CFMachPort?
     private var host: TeachLoopHost?
+    private var terminationObserver: NSObjectProtocol?
+
+    /// The input for an app that quit, or nil when it is some other app.
+    static func terminationInput(terminated pid: pid_t, target: pid_t) -> TeachInput? {
+        pid == target ? TeachInput(pid: pid, event: .appQuit) : nil
+    }
 
     func start(pid: pid_t, deliver: @escaping (TeachInput) -> Void) -> Bool {
         guard AXIsProcessTrusted() else { return false }
@@ -185,10 +191,20 @@ final class LiveTeachSource: TeachInputSource {
         self.observer = created
         self.tap = tap
         self.host = host
+        // The target app quitting ends the recording (the recorder reads this as .appQuit).
+        terminationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let input = LiveTeachSource.terminationInput(terminated: app.processIdentifier, target: pid) else { return }
+            self?.deliver?(input)
+        }
         return true
     }
 
     func stop() {
+        if let terminationObserver { NSWorkspace.shared.notificationCenter.removeObserver(terminationObserver) }
+        terminationObserver = nil
         if let tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
