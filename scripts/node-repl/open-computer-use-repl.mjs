@@ -10,6 +10,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { inspectConfig } from "./ocu-config.mjs";
+import { createBrowserPage } from "./page-api.mjs";
 
 const require = createRequire(import.meta.url);
 // The js call whose code is running. Timers and promises carry it, so a callback
@@ -557,6 +558,8 @@ export function createCuaApi(native, activeOutput) {
     },
     async rewriteDocumentation() { activeOutput().write(computerUseGuidance(), "cua.core"); },
   };
+  // cua.browser.page(tabId?, options?): Playwright-style subset over the same browser action.
+  api.browser.page = (tabId, options) => createBrowserPage(api.browser, tabId, options);
   return Object.freeze(api);
 }
 
