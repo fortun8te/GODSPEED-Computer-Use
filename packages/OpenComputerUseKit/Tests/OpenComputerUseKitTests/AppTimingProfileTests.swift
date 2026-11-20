@@ -16,8 +16,27 @@ final class AppTimingProfileTests: XCTestCase {
         p.record(app: "a", axLatencyMs: 20)
         for _ in 0..<3 { p.recordTimeout(app: "a", now: now) }
         XCTAssertTrue(p.isUnresponsive(app: "a", now: now))
-        XCTAssertEqual(p.messagingTimeout(for: "a"), 0.05)
+        XCTAssertEqual(p.messagingTimeout(for: "a", now: now), 0.05)
         XCTAssertFalse(p.isUnresponsive(app: "a", now: now.addingTimeInterval(11)))
+        XCTAssertEqual(p.messagingTimeout(for: "a", now: now.addingTimeInterval(11)), 0.25, "recovers after the window")
+    }
+
+    func testTimeoutFollowsObservedLatencyWithinClamps() {
+        let p = AppTimingProfiles()
+        for _ in 0..<10 { p.record(app: "fast", axLatencyMs: 5) }
+        XCTAssertEqual(p.messagingTimeout(for: "fast"), 0.05, accuracy: 1e-9, "3x a 5 ms p95 is clamped up to the floor")
+        for _ in 0..<10 { p.record(app: "slow", axLatencyMs: 900) }
+        XCTAssertEqual(p.messagingTimeout(for: "slow"), 1.0, accuracy: 1e-9, "clamped to one second")
+        for _ in 0..<10 { p.record(app: "mid", axLatencyMs: 100) }
+        XCTAssertEqual(p.messagingTimeout(for: "mid"), 0.3, accuracy: 1e-9)
+    }
+
+    func testOldTimeoutsOutsideThirtySecondsDoNotCount() {
+        let p = AppTimingProfiles(), now = Date()
+        p.recordTimeout(app: "a", now: now)
+        p.recordTimeout(app: "a", now: now.addingTimeInterval(1))
+        p.recordTimeout(app: "a", now: now.addingTimeInterval(40))
+        XCTAssertFalse(p.isUnresponsive(app: "a", now: now.addingTimeInterval(40)))
     }
     func testPersistenceRoundTrip() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
