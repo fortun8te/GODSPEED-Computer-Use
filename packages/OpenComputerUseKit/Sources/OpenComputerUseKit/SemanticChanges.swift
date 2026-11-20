@@ -113,8 +113,24 @@ enum SemanticChanges {
         "w", "w:str", "w:bool", "w:float", "string", "boolean", "float",
     ]
 
-    /// Words in a label that mark a field as secret. Its value is never printed.
-    private static let secretWords: Set<String> = ["password", "passcode", "passphrase", "pin", "otp", "secret", "token"]
+    /// Label terms that mark a field as secret. Matched after lowercasing and removing diacritics.
+    /// Single words of six or more letters also match inside a longer word; shorter ones must be
+    /// a whole word, so "pin" does not match "Shipping". Multi-word terms match as consecutive words.
+    private static let secretTerms: [String] = [
+        "password", "passcode", "passphrase", "pin", "secret", "token", "api key", "apikey", "key",
+        "credential", "otp", "2fa", "verification code", "security code", "cvv", "cvc", "card number",
+        // Dutch
+        "wachtwoord", "toegangscode", "pincode", "geheim", "sleutel", "verificatiecode", "beveiligingscode",
+        // German
+        "passwort", "kennwort",
+        // French
+        "mot de passe",
+        // Spanish
+        "contraseña",
+    ]
+
+    /// Value prefixes that look like API keys or tokens.
+    private static let secretValuePrefixes = ["sk-", "ghp_", "xox", "AKIA"]
 
     // MARK: - Items
 
@@ -144,11 +160,9 @@ enum SemanticChanges {
             }
         }
 
-        /// Secure fields, and labels with a secret word (such as "PIN code"), never show values.
+        /// Secure fields, and labels with a secret term (such as "PIN code" or "Wachtwoord"), never show values.
         var isSecret: Bool {
-            if role == "secure text field" { return true }
-            let words = label.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init)
-            return words.contains { secretWords.contains($0) }
+            role == "secure text field" || containsSecretTerm(label)
         }
     }
 
@@ -300,8 +314,69 @@ enum SemanticChanges {
     }
 
     private static func fieldChange(_ item: Item, from: String, to: String) -> String {
-        if item.isSecret { return "\(fieldName(item)) changed" }
+        if item.isSecret || looksLikeSecretValue(from) || looksLikeSecretValue(to) {
+            return "\(fieldName(item)) changed"
+        }
         return "\(fieldName(item)): \(display(from)) → \(display(to))"
+    }
+
+    /// Lowercased, diacritics removed, split into words on anything that is not a letter or digit.
+    private static func normalizedWords(_ text: String) -> [String] {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+    }
+
+    /// True when the label contains one of the `secretTerms`, in any supported language.
+    private static func containsSecretTerm(_ label: String) -> Bool {
+        let words = normalizedWords(label)
+        for term in secretTerms {
+            let parts = normalizedWords(term)
+            if parts.count > 1 {
+                if containsPhrase(words, parts) { return true }
+            } else if let part = parts.first {
+                let matched = words.contains { $0 == part || (part.count >= 6 && $0.contains(part)) }
+                if matched { return true }
+            }
+        }
+        return false
+    }
+
+    private static func containsPhrase(_ words: [String], _ phrase: [String]) -> Bool {
+        guard phrase.count <= words.count else { return false }
+        for start in 0...(words.count - phrase.count) where Array(words[start..<start + phrase.count]) == phrase {
+            return true
+        }
+        return false
+    }
+
+    /// True when a value looks like a credential or card number, whatever the field is called:
+    /// a long letter-and-digit token, a known key prefix, or a 13-19 digit number that passes Luhn.
+    private static func looksLikeSecretValue(_ value: String) -> Bool {
+        for token in value.split(whereSeparator: { $0.isWhitespace }) {
+            if token.count >= 20, token.contains(where: \.isLetter), token.contains(where: \.isNumber) {
+                return true
+            }
+            if secretValuePrefixes.contains(where: { token.hasPrefix($0) }) { return true }
+        }
+        // Card numbers may be grouped with spaces or dashes.
+        let digits = value.filter { $0 != " " && $0 != "-" }
+        return (13...19).contains(digits.count)
+            && digits.allSatisfy { $0.isASCII && $0.isNumber }
+            && passesLuhn(digits)
+    }
+
+    private static func passesLuhn(_ digits: String) -> Bool {
+        var sum = 0
+        for (index, character) in digits.reversed().enumerated() {
+            var digit = character.wholeNumberValue ?? 0
+            if index % 2 == 1 {
+                digit *= 2
+                if digit > 9 { digit -= 9 }
+            }
+            sum += digit
+        }
+        return sum % 10 == 0
     }
 
     private static func display(_ value: String) -> String {
