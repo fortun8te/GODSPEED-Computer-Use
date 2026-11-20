@@ -12,6 +12,7 @@ final class BackgroundDragTests: XCTestCase {
         var events: [CGEvent] = []
         var locations: [CGPoint] = []
         var lifecycle: [String] = []
+        var pauses: [TimeInterval] = []
         var foreground = false
         var validations = 0
         var failValidation: Int?
@@ -55,7 +56,7 @@ final class BackgroundDragTests: XCTestCase {
                     self.events.append(event)
                     self.lifecycle.append("release")
                 },
-                pause: { _ in }
+                pause: { self.pauses.append($0) }
             )
         }
     }
@@ -108,6 +109,20 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertTrue(probe.locations.allSatisfy { CGRect(origin: .zero, size: target.windowBounds.size).contains($0) })
         XCTAssertEqual(probe.locations.first, CGPoint(x: 20, y: 40))
         XCTAssertEqual(probe.locations.last, CGPoint(x: 180, y: 120))
+    }
+
+    func testDragHonorsHoldStepsAndRefusesChangedEndpointsBeforeDown() throws {
+        let probe = Probe()
+        try BackgroundDragDispatcher.drag(target: target, steps: 4, hold: 0.4, io: probe.io, validateSession: {})
+        XCTAssertEqual(probe.events.filter { $0.type == .leftMouseDragged }.count, 4)
+        XCTAssertTrue(probe.pauses.contains(0.4))
+        XCTAssertEqual(probe.events.last?.location, target.end)
+
+        let stale = Probe()
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: stale.io, validateSession: {}) {
+            throw ComputerUseError.stateUnavailable("Endpoint moved.")
+        })
+        XCTAssertEqual(stale.events.map(\.type), [.mouseMoved])
     }
 
     func testModifiedDragKeepsFlagsAndMotionTogetherUntilRelease() throws {

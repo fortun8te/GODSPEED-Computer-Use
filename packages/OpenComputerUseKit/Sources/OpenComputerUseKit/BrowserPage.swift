@@ -829,7 +829,8 @@ final class BrowserPage {
     }
 
     /// A pointer gesture within one viewport, using live hit testing at both ends.
-    func drag(from source: BrowserNode, to destination: BrowserNode, modifiers: Int = 0) throws {
+    func drag(from source: BrowserNode, to destination: BrowserNode?, point: CGPoint? = nil, modifiers: Int = 0,
+              steps: Int = 5, hold: TimeInterval = 0) throws {
         restoreSetup()
         func visiblePoint(_ node: BrowserNode) throws -> CGPoint {
             guard let probe = try callOnNode(node, Self.clickProbeJS) as? [Any],
@@ -841,21 +842,33 @@ final class BrowserPage {
             return CGPoint(x: x, y: y)
         }
         let start = try visiblePoint(source)
-        let end = try visiblePoint(destination)
+        let end: CGPoint
+        if let destination {
+            end = try visiblePoint(destination)
+        } else if let point, point.x.isFinite, point.y.isFinite,
+                  try evaluate("Boolean(document.elementFromPoint(\(point.x),\(point.y)))") as? Bool == true {
+            end = point
+        } else {
+            throw ComputerUseError.invalidArguments("Drag destination must be inside the tab viewport.")
+        }
         guard hypot(end.x - start.x, end.y - start.y) >= 4 else {
             throw ComputerUseError.invalidArguments("browser drag needs two distinct visible positions")
         }
-        try Self.deliverDrag(from: start, to: end) { type, point, buttons, count in
+        try Self.deliverDrag(from: start, to: end, steps: steps, hold: hold) { type, point, buttons, count in
             try self.mouse(type, point, buttons: buttons, clickCount: count, modifiers: modifiers)
         }
     }
 
     static func deliverDrag(
-        from start: CGPoint, to end: CGPoint,
+        from start: CGPoint, to end: CGPoint, steps: Int = 5, hold: TimeInterval = 0,
+        pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         send: (String, CGPoint, Int, Int) throws -> Void
     ) throws {
         let remaining = BrowserCallBudget.remaining()
-        guard remaining > 4 else { throw ComputerUseError.stateUnavailable("browser drag ran out of time before pressing") }
+        guard (2...30).contains(steps), (0...1).contains(hold) else {
+            throw ComputerUseError.invalidArguments("Drag timing is out of bounds.")
+        }
+        guard remaining > 4 + hold else { throw ComputerUseError.stateUnavailable("browser drag ran out of time before pressing") }
         let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
         let movementDeadline = releaseDeadline - 3
         try send("mouseMoved", start, 0, 0)
@@ -863,8 +876,9 @@ final class BrowserPage {
         do {
             try BrowserCallBudget.withDeadline(movementDeadline) {
                 try send("mousePressed", start, 1, 1)
-                for step in 1...5 {
-                    let progress = Double(step) / 5
+                if hold > 0 { pause(hold) }
+                for step in 1...steps {
+                    let progress = Double(step) / Double(steps)
                     last = CGPoint(x: start.x + (end.x - start.x) * progress, y: start.y + (end.y - start.y) * progress)
                     try send("mouseMoved", last, 1, 0)
                 }
@@ -876,7 +890,11 @@ final class BrowserPage {
             }
             throw ComputerUseError.stateUnavailable("browser drag was interrupted after starting. Read the tab before retrying.")
         }
-        try send("mouseReleased", end, 0, 1)
+        do {
+            try send("mouseReleased", end, 0, 1)
+        } catch {
+            throw ComputerUseError.stateUnavailable("The drop may have happened. Inspect the tab before repeating.")
+        }
     }
 
     private func precisePoint(of node: BrowserNode, placement: ClickPlacement) throws -> CGPoint {

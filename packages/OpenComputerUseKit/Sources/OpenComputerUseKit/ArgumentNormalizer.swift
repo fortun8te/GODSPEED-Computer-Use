@@ -134,10 +134,8 @@ enum ArgumentNormalizer {
         )],
         "drag": [
             appNeed,
-            Need(keys: ["from_x"], text: "\"from_x\" (pixels)"),
-            Need(keys: ["from_y"], text: "\"from_y\" (pixels)"),
-            Need(keys: ["to_x"], text: "\"to_x\" (pixels)"),
-            Need(keys: ["to_y"], text: "\"to_y\" (pixels)"),
+            Need(keys: ["from_x", "from_label", "from_index", "label", "element_index", "files"], text: "a drag source"),
+            Need(keys: ["to_x", "to_label", "to_index", "files"], text: "a drag destination"),
         ],
         "type_text": [appNeed, Need(keys: ["text"], text: "\"text\" (what to type)")],
         "press_key": [appNeed, Need(keys: ["key"], text: "\"key\", e.g. \"cmd+s\"")],

@@ -11,6 +11,24 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertTrue(ActionOptions.usesStrictRoute("click", ["modifiers": ["shift"]]))
     }
 
+    func testBrowserDragHoldAndStepsRemainInOneButtonSequence() throws {
+        var events: [String] = []
+        var pauses: [TimeInterval] = []
+        try BrowserPage.deliverDrag(from: .zero, to: CGPoint(x: 24, y: 12), steps: 3, hold: 0.3,
+                                    pause: { pauses.append($0) }) { type, _, buttons, _ in
+            events.append("\(type):\(buttons)")
+        }
+        XCTAssertEqual(events, ["mouseMoved:0", "mousePressed:1", "mouseMoved:1", "mouseMoved:1", "mouseMoved:1", "mouseReleased:0"])
+        XCTAssertEqual(pauses, [0.3])
+        XCTAssertThrowsError(try DragOptions(["drag_steps": 31]))
+        XCTAssertThrowsError(try DragOptions(["files": ["/tmp/file.txt"]]))
+        XCTAssertThrowsError(try DragOptions.validateEndpoint(index: "1", x: 20, y: 30, name: "destination"))
+        let native = try BatchTool.parseSteps([["tool": "drag", "from_label": "Card", "to_label": "List"]], defaultApp: "Fixture")
+        XCTAssertEqual(native.first?.tool, "drag")
+        let web = try BatchTool.parseSteps([["tool": "drag", "web": true, "label": "Card", "to_label": "List"]], defaultApp: "Fixture")
+        XCTAssertEqual(web.first?.tool, "browser")
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

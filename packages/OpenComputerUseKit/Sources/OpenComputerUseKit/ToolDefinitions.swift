@@ -141,6 +141,10 @@ public enum ToolDefinitions {
                     "offset_y": numberProperty(description: "Click offset down from the anchor."),
                     "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
                                   "description": "click or drag: optional modifier keys."],
+                    "hold_ms": integerProperty(description: "Drag hold before moving, up to 1000 ms."),
+                    "drag_steps": integerProperty(description: "Drag movement steps, 2 to 30."),
+                    "to_x": numberProperty(description: "Drag destination viewport X from screenshot."),
+                    "to_y": numberProperty(description: "Drag destination viewport Y from screenshot."),
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
                     "to_index": integerProperty(description: "drag: destination element number from read"),
                     "text": stringProperty(description: "type: text to enter. wait_for: text to wait for"),
@@ -429,12 +433,18 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "drag",
-            description: "Use to drag between two pixel points only when no other tool does it (not for scrolling or selecting text). Both points must be inside the app's window. Delivery does not verify the UI result; window moves or Finder drag-and-drop are not guaranteed. Global pointer use is off unless the user has enabled it.",
+            description: "Use to drag controls or screenshot points inside one window. Add a batch check to verify the drop.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
+                    "from_label": stringProperty(description: "Source control label."),
+                    "from_index": integerProperty(description: "Source control reference."),
+                    "to_label": stringProperty(description: "Destination control label."),
+                    "to_index": integerProperty(description: "Destination control reference."),
+                    "hold_ms": integerProperty(description: "Hold before moving, up to 1000 ms."),
+                    "drag_steps": integerProperty(description: "Movement steps, 2 to 30."),
                     "from_x": numberProperty(description: "Start X coordinate"),
                     "from_y": numberProperty(description: "Start Y coordinate"),
                     "to_x": numberProperty(description: "End X coordinate"),
@@ -442,7 +452,7 @@ public enum ToolDefinitions {
                     "modifiers": ["type": "array", "items": ["type": "string"],
                                   "description": "Optional shift, option, command, or control during the drag"],
                 ],
-                required: ["app", "from_x", "from_y", "to_x", "to_y"]
+                required: ["app"]
             )
         ),
     ]
