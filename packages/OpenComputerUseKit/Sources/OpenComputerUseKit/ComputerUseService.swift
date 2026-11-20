@@ -2763,7 +2763,9 @@ public final class ComputerUseService {
     /// in the app's current window. Clickable roles win over others; a partial match (3+ characters)
     /// is the last resort. A miss re-reads the window once, so an item that appeared after an earlier
     /// step (an opened menu) is found. Returns the record too, so callers can see role and value.
-    func resolveLabel(app query: String, labels: [String], strict: Bool = false) throws -> ElementRecord {
+    /// `recoveryPolicy` is `.readOnly` for policy classification, so judging an action never raises an app.
+    func resolveLabel(app query: String, labels: [String], strict: Bool = false,
+                      recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ElementRecord {
         // Compared without spaces, so "All Clear" matches the identifier "AllClear".
         func norm(_ s: String?) -> String {
             (s ?? "").replacingOccurrences(of: " External link", with: "").lowercased().filter { !$0.isWhitespace }
@@ -2915,7 +2917,8 @@ public final class ComputerUseService {
                 generation: { self.snapshotStoreCount },
                 now: { TimingLog.now() },
                 find: { try find(in: $0) },
-                readFresh: { try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false)) })
+                readFresh: { try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy,
+                                                 observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false)) })
             if let hit = outcome.hit { return hit }
             fresh = outcome.state
         }
