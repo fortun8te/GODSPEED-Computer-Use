@@ -739,7 +739,9 @@ extension ComputerUseToolDispatcher {
                 var observed = false
                 // Shallow checks can defer an expensive read. Only full state
                 // can satisfy the original wait predicate or bind its window.
-                var readGate = BatchEffects.WaitReadGate(nextFullRead: waitStart + BatchEffects.WaitReadGate.fallbackInterval)
+                let fallbackInterval = BatchEffects.WaitReadGate.fallbackInterval
+                let firstFullRead = limit <= fallbackInterval ? waitStart : waitStart + fallbackInterval
+                var readGate = BatchEffects.WaitReadGate(nextFullRead: firstFullRead)
                 while clock.systemUptime - waitStart < limit {
                     let shouldRead = readGate.shouldRead(at: clock.systemUptime) {
                         TimingLog.measure("batch.wait_readiness") {
@@ -1079,6 +1081,7 @@ extension ComputerUseToolDispatcher {
             earlyCompletion = TimingLog.measure("batch.final_direct_check") {
                 DoneCheck.directCompletion(doneConditions) { label in
                     guard clock.systemUptime < deadline, let lastApp,
+                          (try? requireUsableComputerUseSession()) != nil,
                           let app = try? AppDiscovery.resolveRunning(lastApp),
                           let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: verificationWindow) else { return nil }
                     return SnapshotBuilder.directFieldValue(label, in: context)

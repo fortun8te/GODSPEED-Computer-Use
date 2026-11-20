@@ -303,7 +303,8 @@ enum BatchEffects {
     }
 
     static func waitMayBeReady(_ kind: Wait.Kind, app: String, windowID: UInt32?) -> Bool? {
-        guard let app = try? AppDiscovery.resolveRunning(app),
+        guard (try? requireUsableComputerUseSession()) != nil,
+              let app = try? AppDiscovery.resolveRunning(app),
               let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID) else { return nil }
         switch kind {
         case .window(let title):
