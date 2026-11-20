@@ -55,6 +55,8 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 
 Native actions read back accessibility text. Use `get_app_state` with `include_screenshot: true` or set `screenshot: true` on a batch when you need an image.
 
+When a visible app is still preparing its web content, Godspeed checks for the web area before walking the full tree again.
+
 ### Works only with focus borrowing
 
 Focus borrowing brings one app to the front for a moment, then gives focus back to the app that had it. The pointer does not move. It is used only where background delivery cannot work:
