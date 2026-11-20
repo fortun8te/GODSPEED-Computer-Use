@@ -1820,7 +1820,10 @@ public final class ComputerUseService {
 
         if keyMethod == .skyKey, !Self.awaitsModalTextFocus {
             let target = try skyKeyTarget(for: snapshot)
-            if let focused = Self.focusedElement(pid: target.pid) {
+            // Keys go to whatever has focus: refuse unless it is the field the snapshot showed.
+            let focused = Self.focusedElement(pid: target.pid)
+            try requireKeyboardFocusMatchesRead(focused, snapshot: snapshot)
+            if let focused {
                 try selectWholeNameForKeys(text: text, focused: focused, pid: target.pid, windowID: target.windowID)
             }
             try InputSimulation.typeTextWithSkyLight(text, windowID: target.windowID, pid: target.pid)
@@ -1888,6 +1891,8 @@ public final class ComputerUseService {
         }
 
         try requireCurrentTextFocus(focused, pid: snapshot.app.pid)
+        // A modal editor (Go to Folder) is picked above from its own focus, so only the plain path is checked here.
+        if !Self.awaitsModalTextFocus { try requireKeyboardFocusMatchesRead(focused, snapshot: snapshot) }
         let isSecure = isSecureTextField(subrole: stringValue(of: focused, attribute: kAXSubroleAttribute))
         let before = isSecure ? nil : stringValue(of: focused, attribute: kAXValueAttribute)
         if keyMethod == .skyKey || useSkyLightKeyRoute(snapshot: snapshot, focused: focused, opensDialogFromMenu: false, hasLiveTextFocus: true) {
@@ -1998,6 +2003,35 @@ public final class ComputerUseService {
             current = (parent as! AXUIElement)
         }
         return false
+    }
+
+    /// Pure gate for keyboard text: nil when the observed focus is the field the snapshot showed (FocusTransition
+    /// `.ok`), otherwise the notSent refusal. Unknown focus on either side is refused too: unknown means do not type.
+    static func keyboardFocusRefusal(read: ObservedFocus, observed: ObservedFocus) -> ComputerUseError? {
+        guard let role = read.elementRole, let label = read.label else {
+            return .notSent("Typing would go to an unknown control; read the app and target the field.")
+        }
+        let target = FocusTarget(windowID: read.windowID ?? 0, elementRole: role, label: label)
+        guard FocusTransition.check(target: target, observed: observed) == .ok else {
+            let seen = observed.label ?? observed.elementRole ?? "an unknown control"
+            return .notSent("Typing would go to \(seen); read the app and target the field.")
+        }
+        return nil
+    }
+
+    /// Checks the focus that is about to get keys (sky_key and the keyboard fallback) against the snapshot's focus.
+    private func requireKeyboardFocusMatchesRead(_ focused: AXUIElement?, snapshot: AppSnapshot) throws {
+        func describe(_ element: AXUIElement) -> (role: String?, label: String?) {
+            (stringValue(of: element, attribute: kAXRoleAttribute), accessibilityLabels(for: element).first)
+        }
+        let windowID = snapshot.targetWindowID.map { Int($0) }
+        let read = snapshot.focusedElement.map(describe)
+        let now = focused.map(describe)
+        if let refusal = Self.keyboardFocusRefusal(
+            read: ObservedFocus(windowID: windowID, elementRole: read?.role, label: read?.label),
+            observed: ObservedFocus(windowID: windowID, elementRole: now?.role, label: now?.label)) {
+            throw refusal
+        }
     }
 
     private static func focusedElement(pid: pid_t) -> AXUIElement? {
