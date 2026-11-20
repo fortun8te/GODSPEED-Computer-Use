@@ -52,6 +52,18 @@ final class RelayGrantKeyTests: XCTestCase {
         XCTAssertEqual(raw, try store.signingKey().publicKey.rawRepresentation)
     }
 
+    func testCLIParsesRelayAuthorityPublicKeyCommand() throws {
+        XCTAssertEqual(
+            try parseOpenComputerUseCLI(arguments: ["relay-authority-public-key"]),
+            .relayAuthorityPublicKey
+        )
+        XCTAssertThrowsError(try parseOpenComputerUseCLI(arguments: ["relay-authority-public-key", "extra"]))
+        XCTAssertFalse(shouldUseMacOSAppAgentProxy(
+            command: .relayAuthorityPublicKey, proxyDisabled: false,
+            appBundleAvailable: true, runningFromLaunchServicesAppInstance: false
+        ))
+    }
+
     func testBase64URLUsesURLAlphabetWithoutPadding() {
         // 0xFB 0xFF encodes to "+/8=" in standard base64 and "-_8" when unpadded base64url.
         XCTAssertEqual(RelayBase64URL.encode(Data([0xFB, 0xFF])), "-_8")

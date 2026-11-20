@@ -88,6 +88,8 @@ enum OpenComputerUseMain {
             print(openComputerUseHelpText(command: command))
         case .version:
             print(resolvedOpenComputerUseVersion())
+        case .relayAuthorityPublicKey:
+            print(try RelayAuthorityPublicKey.base64URL())
         case .launchOnboarding:
             if !PermissionDiagnostics.current().allGranted {
                 PermissionOnboardingApp.launch()
