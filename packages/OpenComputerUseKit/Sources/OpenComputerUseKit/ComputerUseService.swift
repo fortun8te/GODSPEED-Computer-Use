@@ -723,6 +723,7 @@ func shouldPreferContainingWebRowAXClickCandidate(
 
 public final class ComputerUseService {
     @TaskLocal static var requiredWindowID: CGWindowID?
+    @TaskLocal static var requiredRefGeneration: UUID?
     @TaskLocal static var awaitsModalTextFocus = false
 
     private var snapshotsByApp: [String: AppSnapshot] = [:]
@@ -744,6 +745,21 @@ public final class ComputerUseService {
     private let targetedElements = TargetedElementRegistry<TargetedElement>()
 
     public func clearQueryIndexes() { targetedElements.clear() }
+
+    func clearSnapshotRefs() {
+        for key in Array(snapshotsByApp.keys) {
+            snapshotsByApp[key]?.elementRefs = nil
+        }
+    }
+
+    func resolveElementRef(_ ref: String, app query: String) throws -> (index: Int, windowID: CGWindowID, generation: UUID) {
+        guard let snapshot = snapshotsByApp[query.lowercased()], let refs = snapshot.elementRefs,
+              let binding = snapshot.nativeWindow, binding.app.launchedAt != nil,
+              snapshotsByApp[String(binding.app.pid)]?.elementRefs?.generation == refs.generation else {
+            throw ComputerUseError.staleRef
+        }
+        return (try refs.index(for: ref), binding.id, refs.generation)
+    }
 
     public init() {}
 
@@ -820,7 +836,7 @@ public final class ComputerUseService {
             return render(snapshot)
         }
         if let settleMs {
-            let note = try waitForWindowToSettle(app: query, timeoutMs: settleMs)
+            let note = try waitForWindowToSettle(app: query, timeoutMs: settleMs, runningOnly: observation.includeRefs)
             let result = try getAppState(app: query, textLimit: textLimit, treeLimits: treeLimits,
                                          windowPlacement: windowPlacement, observation: observation, compact: compact)
             // After the state text and before the screenshot, so primaryText stays the state.
@@ -865,10 +881,11 @@ public final class ComputerUseService {
 
     /// Waits while the app's window shows a busy sign, for at most `timeoutMs` (capped at 5 s).
     /// Read-only: no activation, no capture.
-    private func waitForWindowToSettle(app query: String, timeoutMs: Int) throws -> String {
+    private func waitForWindowToSettle(app query: String, timeoutMs: Int, runningOnly: Bool = false) throws -> String {
         try requireUsableComputerUseSession()
         let start = ProcessInfo.processInfo.systemUptime
-        guard let context = try? SnapshotBuilder.resolveTargetWindow(for: try AppDiscovery.resolve(query)) else {
+        guard let app = try? (runningOnly ? AppDiscovery.resolveRunning(query) : AppDiscovery.resolve(query)),
+              let context = try? SnapshotBuilder.resolveTargetWindow(for: app) else {
             return "Settle skipped: no window to watch yet."
         }
         let settled = WindowSettle.wait(timeout: TimeInterval(min(timeoutMs, 5000)) / 1000) {
@@ -894,7 +911,12 @@ public final class ComputerUseService {
             switch requestedMethod {
             case .auto:
                 clickMethod = elementIndex == nil ? .skyClick : .accessibility
-            case .accessibility, .skyClick:
+            case .accessibility:
+                clickMethod = requestedMethod
+            case .skyClick:
+                guard Self.requiredRefGeneration == nil else {
+                    throw ComputerUseError.invalidArguments("A ref click requires accessibility delivery.")
+                }
                 clickMethod = requestedMethod
             case .global, .appPost:
                 throw ComputerUseError.invalidArguments("A bound click requires accessibility or sky_click delivery.")
@@ -1128,6 +1150,12 @@ public final class ComputerUseService {
     public func hover(app query: String, elementIndex: String) throws -> ToolCallResult {
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        if Self.requiredRefGeneration != nil {
+            guard let element = record.element, let frame = record.localFrame,
+                  localFrame(of: element, windowBounds: snapshot.windowBounds) == frame else {
+                throw ComputerUseError.staleRef
+            }
+        }
         guard snapshot.mode != .fixture, let windowID = snapshot.targetWindowID,
               let bounds = snapshot.windowBounds,
               let point = try globalPoint(for: record, snapshot: snapshot) else {
@@ -1988,7 +2016,8 @@ public final class ComputerUseService {
     /// that control's own window context with no snapshot; any other index uses
     /// the normal current snapshot.
     private func snapshotForAction(app query: String, elementIndex: String?) throws -> AppSnapshot {
-        if let elementIndex, let index = Int(elementIndex), index > TargetedElementRegistry<TargetedElement>.indexBase {
+        if Self.requiredRefGeneration == nil,
+           let elementIndex, let index = Int(elementIndex), index > TargetedElementRegistry<TargetedElement>.indexBase {
             try requireUsableComputerUseSession()
             let app = try AppDiscovery.resolveRunning(query)
             let target = try targetedElements.resolve(index, app: TargetedAppIdentity(app: app))
@@ -2036,7 +2065,7 @@ public final class ComputerUseService {
     }
 
     private func windowBindingError(_ id: CGWindowID) -> ComputerUseError {
-        .stateUnavailable("Observed window \(id) changed or is unavailable. Read its state or query it again before acting.")
+        .windowChanged(id)
     }
 
     private func requireBoundFocusedWindow(in snapshot: AppSnapshot) throws {
@@ -2064,17 +2093,34 @@ public final class ComputerUseService {
     func currentSnapshot(for query: String, needScreenshot: Bool = true, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
         if let windowID = Self.requiredWindowID {
             try requireUsableComputerUseSession()
-            let app = try AppDiscovery.resolveRunning(query)
+            let app: RunningAppDescriptor
+            do {
+                app = try AppDiscovery.resolveRunning(query)
+            } catch ComputerUseError.appNotFound {
+                throw windowBindingError(windowID)
+            }
             guard let snapshot = snapshotsByApp[query.lowercased()],
-                  snapshot.app.pid == app.pid,
-                  snapshot.app.runningApplication.launchDate == app.runningApplication.launchDate,
+                  let binding = snapshot.nativeWindow,
+                  binding.matches(windowID: windowID, app: TargetedAppIdentity(app: app)),
                   !snapshot.app.runningApplication.isTerminated,
-                  snapshot.observedWindowID == windowID,
                   let observedWindow = snapshot.windowElement else {
                 throw windowBindingError(windowID)
             }
-            let live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID, matchingRoot: observedWindow)
-            guard SnapshotBuilder.isUsableWindowElement(live.windowElement),
+            if let generation = Self.requiredRefGeneration {
+                guard snapshot.elementRefs?.generation == generation,
+                      snapshot.elementRefs?.client == ClientScope.current,
+                      snapshotsByApp[String(app.pid)]?.elementRefs?.generation == generation else {
+                    throw ComputerUseError.staleRef
+                }
+            }
+            let live: TargetedAX.WindowContext
+            do {
+                live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID, matchingRoot: observedWindow)
+            } catch ComputerUseError.stateUnavailable {
+                throw windowBindingError(windowID)
+            }
+            guard live.windowID == windowID,
+                  SnapshotBuilder.isUsableWindowElement(live.windowElement),
                   live.windowBounds == snapshot.windowBounds else {
                 throw windowBindingError(windowID)
             }
@@ -2276,12 +2322,12 @@ public final class ComputerUseService {
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
         observation: SnapshotObservationOptions = .defaults
     ) throws -> AppSnapshot {
-        let app = try AppDiscovery.resolve(query)
+        let app = try observation.includeRefs ? AppDiscovery.resolveRunning(query) : AppDiscovery.resolve(query)
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
             treeLimits: treeLimits,
-            recoveryPolicy: recoveryPolicy,
+            recoveryPolicy: observation.includeRefs ? .readOnly : recoveryPolicy,
             observation: observation
         )
 
@@ -2323,6 +2369,7 @@ public final class ComputerUseService {
 
     private func lookupElement(snapshot: AppSnapshot, index: String) throws -> ElementRecord {
         guard let parsedIndex = Int(index), let record = snapshot.elements[parsedIndex] else {
+            if Self.requiredRefGeneration != nil { throw ComputerUseError.staleRef }
             // Numbers are stable across reads: one that was handed out before but is not shown now is gone.
             if let parsedIndex = Int(index), parsedIndex >= 0, let high = snapshot.numberingHighWater, parsedIndex < high {
                 let known = ElementNumbering.forApp(pid: snapshot.app.pid).remembered(parsedIndex)
@@ -2336,6 +2383,15 @@ public final class ComputerUseService {
                   SnapshotBuilder.belongsToWindow(element, window: window) else {
                 throw windowBindingError(windowID)
             }
+        }
+        if Self.requiredRefGeneration != nil {
+            var pid: pid_t = 0
+            guard let element = record.element, let identity = record.identity, identity.role != nil,
+                  AXUIElementGetPid(element, &pid) == .success, pid == snapshot.app.pid,
+                  try ElementIdentity.read(element) == identity else {
+                throw ComputerUseError.staleRef
+            }
+            return record
         }
         return try keptRecord(record, index: index, snapshot: snapshot)
     }
@@ -2392,7 +2448,7 @@ public final class ComputerUseService {
 
         switch button {
         case .left:
-            if clickCount <= 1,
+            if Self.requiredRefGeneration == nil, clickCount <= 1,
                !hasAncestorRole("AXWebArea", of: element),
                try selectContainingListItem(for: element)
             {
@@ -2540,6 +2596,12 @@ public final class ComputerUseService {
         allowActivationFallback: Bool,
         clickPoint: CGPoint? = nil
     ) throws -> Bool {
+        // A ref authorizes exactly this AX object. Parent, descendant and pixel
+        // fallbacks can activate a different control.
+        if Self.requiredRefGeneration != nil {
+            return try performPreferredClick(on: record, button: button, clickCount: clickCount)
+        }
+
         // The activation fallback raises and focuses the window, which takes the user's focus. It only runs while
         // the app is borrowed (a batch with foreground: true), in every mode.
         let allowActivationFallback = allowActivationFallback
@@ -3679,6 +3741,9 @@ public final class ComputerUseService {
 
     private func snapshotResult(for snapshot: AppSnapshot, style: SnapshotTextStyle) -> ToolCallResult {
         var content = [ToolResultContentItem.text(snapshot.renderedText(style: style))]
+        if snapshot.observation.includeRefs {
+            content.append(.text(snapshot.elementRefs?.text ?? "No element refs available for this window."))
+        }
         if let note = snapshot.screenshotNote { content.append(.text(note)) }
         if let screenshotData = snapshot.screenshotData {
             content.append(.screenshotImage(screenshotData))

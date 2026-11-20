@@ -9,6 +9,8 @@ public enum ComputerUseError: Error, LocalizedError {
     case appNotFound(String)
     case permissionDenied(String)
     case stateUnavailable(String)
+    case staleRef
+    case windowChanged(UInt32)
 
     public var errorDescription: String? {
         switch self {
@@ -24,6 +26,10 @@ public enum ComputerUseError: Error, LocalizedError {
             return message
         case .stateUnavailable(let message):
             return message
+        case .staleRef:
+            return "STALE_REF. Nothing was sent. Run get_app_state with include_refs=true."
+        case .windowChanged(let id):
+            return "WINDOW_CHANGED. Observed window \(id) changed or is unavailable. Nothing was sent. Read the intended window again."
         }
     }
 

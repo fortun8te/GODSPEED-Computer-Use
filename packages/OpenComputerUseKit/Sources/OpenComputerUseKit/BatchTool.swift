@@ -203,6 +203,8 @@ enum BatchTool {
             // alias of set_value for one field.
             let lowered = rawTool.lowercased()
             if ["form", "fill_form"].contains(lowered) || (lowered == "fill" && arguments["fields"] != nil) {
+                // The form macro sends its own targets and cannot consume a ref.
+                _ = try NativeSnapshotRefs.argument(in: arguments, tool: "fill_form")
                 return try expandFill(arguments, number: number, defaultApp: defaultApp, known: known)
             }
 
@@ -370,11 +372,11 @@ enum BatchTool {
             .joined(separator: "\n")
     }
 
-    /// Whether any step targets an element by number or by coordinates (these go stale between reads,
+    /// Whether any step uses a snapshot index, ref or coordinates (these go stale between reads,
     /// so such steps are not saved as recipes).
     static func usesPositionalTargets(_ steps: [Step]) -> Bool {
         steps.contains { step in
-            ["element_index", "index", "x", "y", "from_x", "from_y", "to_x", "to_y"].contains { step.arguments[$0] != nil }
+            ["element_index", "index", "ref", "x", "y", "from_x", "from_y", "to_x", "to_y"].contains { step.arguments[$0] != nil }
         }
     }
 
@@ -592,6 +594,7 @@ extension ComputerUseToolDispatcher {
         for (offset, step) in steps.enumerated() {
             do {
                 if step.tool == BatchTool.waitName { _ = try BatchEffects.Wait(arguments: step.arguments) }
+                _ = try NativeSnapshotRefs.argument(in: step.arguments, tool: step.tool)
                 if try validatedQueryWindowID(step.arguments["window_id"]) != nil,
                    !ArgumentNormalizer.windowBoundTools.contains(step.tool),
                    step.tool != "query", step.tool != "get_app_state" {
@@ -609,7 +612,9 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.invalidArguments("step \(offset + 1): \(error.errorDescription ?? String(describing: error))")
             }
         }
-        let hasPinnedSteps = pinnedWindow != nil || steps.contains { $0.arguments["window_id"] != nil }
+        // Ref steps already own an exact observation. Background focus and
+        // effect reads must not replace it before the ref can be used.
+        let hasPinnedSteps = pinnedWindow != nil || steps.contains { $0.arguments["window_id"] != nil || $0.arguments["ref"] != nil }
         if hasPinnedSteps && foreground {
             throw ComputerUseError.invalidArguments("A window-bound step requires a background batch.")
         }
@@ -977,6 +982,7 @@ extension ComputerUseToolDispatcher {
         }
 
         let verificationWindow = pinnedWindow ?? (try? validatedQueryWindowID(lastAttemptedStep?.arguments["window_id"]))
+            ?? lastAttemptedStep.flatMap { observedNativeRefWindow(in: $0.arguments) }
         // One fresh look at the app after the steps (reuse a get_app_state the batch ended with).
         let lastBrowserAction = (lastAttemptedStep?.arguments["action"] as? String)?
             .trimmingCharacters(in: .whitespaces).lowercased()
@@ -1054,7 +1060,9 @@ extension ComputerUseToolDispatcher {
         if unconfirmedOpen {
             lines.append("List browser tabs to check whether the open created a tab before trying again.")
         }
+        // An expired ref without a window pin cannot tell us which window to read.
         if earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool != "browser",
+           lastAttemptedStep?.arguments["ref"] == nil || verificationWindow != nil,
            clock.systemUptime < deadline, let lastApp {
             var readArguments: [String: Any] = [
                 "app": lastApp, "include_screenshot": NSNumber(value: wantsScreenshot),

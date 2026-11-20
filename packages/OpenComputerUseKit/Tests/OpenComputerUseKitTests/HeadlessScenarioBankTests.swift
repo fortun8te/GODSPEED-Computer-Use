@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import OpenComputerUseKit
@@ -86,6 +87,126 @@ final class HeadlessScenarioBankTests: XCTestCase {
                 live.map { String($0.object) } ?? "refused"
             )
         }
+    }
+
+    func testUnknownNativeRefReturnsTypedFailure() {
+        let dispatcher = ComputerUseToolDispatcher()
+        let args = ["app": "NoSuchNativeRefTestApp", "ref": UUID().uuidString]
+        let result = dispatcher.callToolAsResult(name: "click", arguments: args)
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual((result.asDictionary["_meta"] as? [String: Any])?["godspeed/error_code"] as? String, "STALE_REF")
+        XCTAssertTrue(result.textContent.contains("get_app_state"))
+
+        let batch = dispatcher.callToolAsResult(name: "batch", arguments: [
+            "app": args["app"]!, "steps": [["tool": "click", "ref": args["ref"]!], ["tool": "list_apps"]],
+        ])
+        XCTAssertTrue(batch.isError)
+        let step = batch.batchReceipt?.steps.first
+        XCTAssertEqual(step?.failureCode?.rawValue, "STALE_REF")
+        XCTAssertEqual(step?.observation, .notSent)
+        XCTAssertEqual(batch.batchReceipt?.steps.count, 1)
+    }
+
+    func testNativeRefExpiresAcrossReadsAndClients() throws {
+        let app = RunningAppDescriptor(name: "NativeRefFixture", bundleIdentifier: "test.native-ref",
+                                       pid: 312, runningApplication: .current)
+        let service = ComputerUseService()
+
+        func snapshot(windowID: UInt32, identifier: String) -> AppSnapshot {
+            let frame = FixtureRect(rect: CGRect(x: 0, y: 0, width: 20, height: 20))
+            let state = FixtureAppState(windowTitle: "Same title", windowBounds: frame, focusedIdentifier: nil,
+                                        elements: [.init(identifier: identifier, index: 3, role: "button",
+                                                         title: "Send", value: nil, actions: [], frame: frame)])
+            var snapshot = SnapshotBuilder.buildFixtureSnapshot(app: app, state: state, observation: .defaults)
+            snapshot.nativeWindow = NativeWindowObservation(
+                id: windowID,
+                app: TargetedAppIdentity(pid: app.pid, bundleIdentifier: app.bundleIdentifier,
+                                         launchedAt: Date(timeIntervalSince1970: 42))
+            )
+            snapshot.elementRefs = NativeSnapshotRefs(elementIndexes: [3])
+            return snapshot
+        }
+
+        try ClientScope.with("native-ref-owner") {
+            let first = snapshot(windowID: 17, identifier: "send-original")
+            let old = try XCTUnwrap(first.elementRefs?.text.split(separator: " ").last.map(String.init))
+            service.rememberSnapshot(first, for: "legacy-alias")
+            XCTAssertEqual(try service.resolveElementRef(old, app: app.name).index, 3)
+            XCTAssertThrowsError(try ClientScope.with("native-ref-other") {
+                try service.resolveElementRef(old, app: app.name)
+            }) { XCTAssertEqual(($0 as? ComputerUseError)?.errorDescription, ComputerUseError.staleRef.errorDescription) }
+
+            let second = snapshot(windowID: 18, identifier: "send-replacement")
+            let fresh = try XCTUnwrap(second.elementRefs?.text.split(separator: " ").last.map(String.init))
+            service.rememberSnapshot(second, for: app.name)
+            XCTAssertNotEqual(fresh, old)
+            XCTAssertThrowsError(try service.resolveElementRef(old, app: app.name))
+            XCTAssertThrowsError(try service.resolveElementRef(old, app: "legacy-alias"))
+            XCTAssertEqual(try service.resolveElementRef(fresh, app: app.name).windowID, 18)
+
+            let dispatcher = ComputerUseToolDispatcher(service: service)
+            let wrongWindow = dispatcher.callToolAsResult(name: "click", arguments: [
+                "app": app.name, "ref": fresh, "window_id": 17,
+            ])
+            XCTAssertTrue(wrongWindow.isError)
+            XCTAssertEqual(wrongWindow.failureCode, .windowChanged)
+            XCTAssertTrue(wrongWindow.textContent.contains("Nothing was sent"))
+            let conflicting = dispatcher.callToolAsResult(name: "select_text", arguments: [
+                "app": app.name, "ref": fresh, "label": "Send", "text": "Example",
+            ])
+            XCTAssertTrue(conflicting.isError)
+            XCTAssertEqual(conflicting.failureCode, .invalidArguments)
+
+            service.clearSnapshotRefs()
+            XCTAssertThrowsError(try service.resolveElementRef(fresh, app: app.name))
+        }
+    }
+
+    func testNativeWindowBindingRejectsReusedProcessAndWindowNumbers() {
+        let bundle = "test.native-ref"
+        let firstLaunch = Date(timeIntervalSince1970: 42)
+        let original = TargetedAppIdentity(pid: 312, bundleIdentifier: bundle, launchedAt: firstLaunch)
+        let binding = NativeWindowObservation(id: 17, app: original)
+        XCTAssertTrue(binding.matches(windowID: 17, app: original))
+        XCTAssertFalse(binding.matches(windowID: 18, app: original))
+        XCTAssertFalse(binding.matches(windowID: 17, app: .init(
+            pid: 312, bundleIdentifier: bundle, launchedAt: firstLaunch.addingTimeInterval(1)
+        )))
+        XCTAssertFalse(binding.matches(windowID: 17, app: .init(pid: 313, bundleIdentifier: bundle, launchedAt: firstLaunch)))
+        XCTAssertFalse(binding.matches(windowID: 17, app: .init(pid: 312, bundleIdentifier: bundle, launchedAt: nil)))
+    }
+
+    func testMCPReportsNativeRefFailureCode() throws {
+        let server = StdioMCPServer(trajectoryEnvironment: ["OPEN_COMPUTER_USE_TRAJECTORY_LOG": "0"])
+        let line = """
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"click","arguments":{"app":"NativeRefFixture","ref":"missing"}}}
+        """
+        let response = try XCTUnwrap(server.handle(line: line))
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
+        let result = try XCTUnwrap(body["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, true)
+        XCTAssertEqual((result["_meta"] as? [String: Any])?["godspeed/error_code"] as? String, "STALE_REF")
+    }
+
+    func testNativeRefArgumentsDoNotFallBackToAnotherTarget() throws {
+        let dispatcher = ComputerUseToolDispatcher()
+        let app = "NoSuchNativeRefTestApp"
+        let badSteps: [[String: Any]] = [
+            ["tool": "click", "ref": "expired", "label": "Send"],
+            ["tool": "click", "ref": "expired", "x": 10, "y": 15],
+            ["tool": "fill_form", "ref": "expired", "fields": ["Message": "Example"]],
+            ["tool": "type_text", "ref": "expired", "text": "Example"],
+        ]
+        for step in badSteps {
+            let result = dispatcher.callToolAsResult(name: "batch", arguments: ["app": app, "steps": [step]])
+            XCTAssertTrue(result.isError, result.textContent)
+            XCTAssertEqual(result.failureCode, .invalidArguments)
+            XCTAssertNil(result.batchReceipt, result.textContent)
+        }
+        let noAX = dispatcher.callToolAsResult(name: "get_app_state", arguments: [
+            "app": app, "include_refs": true, "include_ax": false,
+        ])
+        XCTAssertEqual(noAX.failureCode, .invalidArguments)
     }
 
     func testFormExpansion() throws {

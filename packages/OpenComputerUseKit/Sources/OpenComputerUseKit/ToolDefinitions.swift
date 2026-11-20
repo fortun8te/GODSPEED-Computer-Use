@@ -178,6 +178,7 @@ public enum ToolDefinitions {
                                 "description": "Keep actionable controls and focus, omit extra layout text"],
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "include_ax": ["type": "boolean", "default": true, "description": "False skips the element list and invalidates earlier element numbers."],
+                    "include_refs": ["type": "boolean", "default": false, "description": "Return opaque refs for exact native element actions. Requires include_ax."],
                     "include_screenshot": ["type": "boolean", "default": LeanDefaults.includeScreenshot, "description": "Also return a screenshot, e.g. for pixel clicks."],
                     "text_limit": textLimitProperty(description: "Max text characters per element; \"max\" for all. Default 500."),
                     "max_tree_nodes": positiveIntegerProperty(description: "Default 1200."),
@@ -201,6 +202,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
+                    "ref": nativeElementRefProperty(),
                     "x": numberProperty(description: "X pixel from a screenshot"),
                     "y": numberProperty(description: "Y pixel from a screenshot"),
                     "click_count": integerProperty(description: "1 to 32, default 1. sky_click allows 1 or 2."),
@@ -267,6 +269,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
+                    "ref": nativeElementRefProperty(),
                     "value": stringProperty(description: "Value to assign"),
                 ],
                 required: ["app", "value"]
@@ -320,6 +323,7 @@ public enum ToolDefinitions {
                     "direction": stringProperty(description: "Scroll direction: up, down, left, or right"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element identifier"),
+                    "ref": nativeElementRefProperty(),
                     "pages": numberProperty(description: "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
                 ],
                 required: ["app", "direction"]
@@ -358,6 +362,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Text element identifier"),
+                    "ref": nativeElementRefProperty(),
                     "text": stringProperty(description: "Target text as shown in the accessibility tree"),
                     "prefix": stringProperty(description: "Optional text immediately before the target, used to disambiguate repeated matches"),
                     "suffix": stringProperty(description: "Optional text immediately after the target, used to disambiguate repeated matches"),
@@ -379,6 +384,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element identifier"),
+                    "ref": nativeElementRefProperty(),
                     "action": stringProperty(description: "Secondary accessibility action name, e.g. \"AXShowMenu\""),
                 ],
                 required: ["app", "action"]
@@ -394,6 +400,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
+                    "ref": nativeElementRefProperty(),
                 ],
                 required: ["app"]
             )
@@ -425,6 +432,10 @@ private func observedWindowIDProperty() -> [String: Any] {
         "type": "integer", "minimum": 1, "maximum": UInt32.max,
         "description": "Require the native window ID from get_app_state or query. Refuses the action if its observed target changed."
     ]
+}
+
+private func nativeElementRefProperty() -> [String: Any] {
+    stringProperty(description: "Exact element ref from the latest get_app_state with include_refs. Use instead of a label, index or pixels.")
 }
 
 private func labelProperty() -> [String: Any] {
