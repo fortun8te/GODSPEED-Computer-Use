@@ -4,11 +4,14 @@ import Foundation
 /// A durable record of dispatch attempts. The journal never drives execution.
 struct OperationJournal: Sendable {
     struct Entry: Codable, Sendable {
-        enum Phase: String, Codable, Sendable { case intent, outcome }
+        /// `reported` marks an unfinished intent that was already shown to the model after a restart.
+        enum Phase: String, Codable, Sendable { case intent, outcome, reported }
 
         let operationID: UUID
         let requestID: UUID
         let tool: String
+        /// The app the operation targeted, if any. Never arguments, labels or reply text.
+        let app: String?
         let phase: Phase
         let state: DeliveryState
         let time: Date
@@ -36,7 +39,13 @@ struct OperationJournal: Sendable {
         tool: String, arguments: [String: Any], _ body: () throws -> ToolCallResult
     ) throws -> ToolCallResult {
         guard let recording, mustRecord(tool: tool, arguments: arguments) else { return try body() }
-        return try recording.journal.record(tool: tool, requestID: recording.requestID, body)
+        return try recording.journal.record(tool: tool, requestID: recording.requestID, app: appName(arguments), body)
+    }
+
+    private static func appName(_ arguments: [String: Any]) -> String? {
+        guard let app = arguments["app"] as? String else { return nil }
+        let trimmed = app.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : String(trimmed.prefix(80))
     }
 
     private static func mustRecord(tool: String, arguments: [String: Any]) -> Bool {
@@ -57,9 +66,9 @@ struct OperationJournal: Sendable {
         return !BatchTool.Step(tool: tool, arguments: arguments).isReadOnly
     }
 
-    func record(tool: String, requestID: UUID, _ body: () throws -> ToolCallResult) throws -> ToolCallResult {
+    func record(tool: String, requestID: UUID, app: String? = nil, _ body: () throws -> ToolCallResult) throws -> ToolCallResult {
         let intent: Entry
-        do { intent = try begin(tool: tool, requestID: requestID) }
+        do { intent = try begin(tool: tool, requestID: requestID, app: app) }
         catch {
             throw ComputerUseError.notSent("The operation journal could not save the intent. No input was sent.")
         }
@@ -83,10 +92,10 @@ struct OperationJournal: Sendable {
         return result
     }
 
-    func begin(tool: String, requestID: UUID) throws -> Entry {
+    func begin(tool: String, requestID: UUID, app: String? = nil) throws -> Entry {
         // Keep the journal free of request payloads, target labels and reply text.
         guard ToolDefinitions.isKnown(tool) else { throw CocoaError(.fileWriteUnknown) }
-        let entry = Entry(operationID: UUID(), requestID: requestID, tool: tool, phase: .intent,
+        let entry = Entry(operationID: UUID(), requestID: requestID, tool: tool, app: app, phase: .intent,
                           state: .outcomeUnknown, time: Date())
         try append(entry)
         return entry
@@ -94,7 +103,19 @@ struct OperationJournal: Sendable {
 
     func finish(_ intent: Entry, state: DeliveryState) throws {
         try append(Entry(operationID: intent.operationID, requestID: intent.requestID, tool: intent.tool,
-                         phase: .outcome, state: state, time: Date()))
+                         app: intent.app, phase: .outcome, state: state, time: Date()))
+    }
+
+    /// Intents with no outcome and no report yet. Recovery never replays them.
+    func unfinishedIntents() throws -> [Entry] {
+        try recoveredEntries().filter { $0.phase == .intent }
+    }
+
+    func markReported(_ entries: [Entry]) throws {
+        for entry in entries {
+            try append(Entry(operationID: entry.operationID, requestID: entry.requestID, tool: entry.tool,
+                             app: entry.app, phase: .reported, state: entry.state, time: Date()))
+        }
     }
 
     /// An intent without an outcome stays unknown. Reading the file has no side effects.
@@ -145,6 +166,69 @@ struct OperationJournal: Sendable {
     }
 
     private func posixError() -> POSIXError { POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+}
+
+/// Tells the model once per process about intents that a crash or restart left unfinished.
+final class RestartNoticeState: @unchecked Sendable {
+    static let shared = RestartNoticeState(journal: .shared)
+
+    private let lock = NSLock()
+    private let journal: OperationJournal
+    private var pending: [OperationJournal.Entry]?
+    private var delivered = false
+
+    init(journal: OperationJournal) { self.journal = journal }
+
+    /// The notice text for the next tool reply, or nil. Entries are marked reported when text is returned.
+    func claim() -> String? {
+        lock.withLock {
+            guard !delivered else { return nil }
+            if pending == nil {
+                // A read failure leaves the notice for a later reply.
+                guard let found = try? journal.unfinishedIntents() else { return nil }
+                pending = found
+            }
+            guard let entries = pending, !entries.isEmpty else {
+                delivered = true
+                return nil
+            }
+            delivered = true
+            // Even when the mark fails, the model hears about these once. The next start may repeat it.
+            try? journal.markReported(entries)
+            let names = entries.map { entry in entry.app.map { "\(entry.tool) in \($0)" } ?? entry.tool }
+            let shown = names.prefix(3).joined(separator: ", ") + (names.count > 3 ? " and \(names.count - 3) more" : "")
+            return "After a restart: \(shown) may or may not have happened. Read the app before repeating it."
+        }
+    }
+}
+
+/// Adds the restart notice to the first tool reply of this process.
+public enum OperationRestartNotice {
+    public static func attach(to envelope: [String: Any], requestLine: String) -> [String: Any] {
+        attach(to: envelope, requestLine: requestLine, state: .shared)
+    }
+
+    static func attach(to envelope: [String: Any], requestLine: String, state: RestartNoticeState) -> [String: Any] {
+        guard let request = try? JSONSerialization.jsonObject(with: Data(requestLine.utf8)) as? [String: Any] else { return envelope }
+        // Pipelined MCP lines arrive wrapped as {"kind":"mcp","line":...}.
+        let rpcText = request["kind"] as? String == "mcp" ? request["line"] as? String : requestLine
+        guard let rpcText, let call = try? JSONSerialization.jsonObject(with: Data(rpcText.utf8)) as? [String: Any],
+              call["method"] as? String == "tools/call",
+              let line = envelope["response"] as? String,
+              var rpc = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              var result = rpc["result"] as? [String: Any],
+              var content = result["content"] as? [[String: Any]],
+              let text = state.claim()
+        else { return envelope }
+        content.append(["type": "text", "text": text])
+        result["content"] = content
+        rpc["result"] = result
+        guard let data = try? JSONSerialization.data(withJSONObject: rpc, options: [.withoutEscapingSlashes]),
+              let rewritten = String(data: data, encoding: .utf8) else { return envelope }
+        var output = envelope
+        output["response"] = rewritten
+        return output
+    }
 }
 
 /// Enables the local write-ahead journal for a production CLI call.

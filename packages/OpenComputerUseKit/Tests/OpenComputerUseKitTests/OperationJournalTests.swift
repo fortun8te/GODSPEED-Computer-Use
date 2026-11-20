@@ -91,6 +91,35 @@ final class OperationJournalTests: XCTestCase {
         }
     }
 
+    func testRestartNoticeNamesUnfinishedIntentsOnceAndNeverReplays() throws {
+        try withJournal { journal in
+            _ = try journal.begin(tool: "click", requestID: UUID(), app: "Notes")
+            let state = RestartNoticeState(journal: journal)
+            XCTAssertEqual(state.claim(), "After a restart: click in Notes may or may not have happened. Read the app before repeating it.")
+            XCTAssertNil(state.claim())
+            XCTAssertNil(RestartNoticeState(journal: journal).claim())
+            XCTAssertTrue(try journal.unfinishedIntents().isEmpty)
+            XCTAssertEqual(try journal.recoveredEntries().map(\.phase), [.reported])
+        }
+    }
+
+    func testRestartNoticeRidesTheFirstToolReplyOnly() throws {
+        try withJournal { journal in
+            _ = try journal.begin(tool: "click", requestID: UUID(), app: "Notes")
+            let state = RestartNoticeState(journal: journal)
+            let initialize = ["response": #"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#]
+            let initializeRequest = #"{"kind":"mcp","line":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"}"#
+            XCTAssertEqual(OperationRestartNotice.attach(to: initialize, requestLine: initializeRequest, state: state)["response"] as? String,
+                           initialize["response"])
+            let call = ["response": #"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}"#]
+            let callRequest = #"{"kind":"mcp","line":"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{}}"}"#
+            let attached = try XCTUnwrap(OperationRestartNotice.attach(to: call, requestLine: callRequest, state: state)["response"] as? String)
+            XCTAssertTrue(attached.contains("After a restart: click in Notes may or may not have happened."), attached)
+            let again = OperationRestartNotice.attach(to: call, requestLine: callRequest, state: state)["response"] as? String
+            XCTAssertEqual(again, call["response"])
+        }
+    }
+
     func testJournalChildFixture() throws {
         guard let folder = ProcessInfo.processInfo.environment["GODSPEED_L6_JOURNAL_FIXTURE_DIRECTORY"] else {
             return

@@ -593,7 +593,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                 let response = RequestCancellation.$current.withValue(request.cancellation) {
                     handle(requestLine: request.line)
                 }
-                writeAgentLine(response, to: output)
+                writeAgentLine(OperationRestartNotice.attach(to: response, requestLine: request.line), to: output)
             }
         }
     }
