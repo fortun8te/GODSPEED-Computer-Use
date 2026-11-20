@@ -965,8 +965,7 @@ extension ComputerUseToolDispatcher {
                 let unknown = delivery == .outcomeUnknown
                 receipt.steps.append(.init(failureCode: .cancelled, observation: unknown ? .outcomeUnknown : nil,
                                            durationMs: durationMs, deliveryState: delivery))
-                lines.append("\(number). \(BatchTool.describe(step)): cancelled during step" +
-                             (unknown ? " (outcome unknown. Inspect before retrying.)" : ""))
+                lines.append(BatchEffects.cancelledStepLine(number: number, description: BatchTool.describe(step), delivery: delivery))
                 _ = stopIfCancelled()
                 break
             }

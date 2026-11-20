@@ -65,6 +65,19 @@ enum BatchEffects {
         return parts.joined(separator: "\n")
     }
 
+    /// The step line when cancellation arrives during a step. A step whose input went out says so.
+    static func cancelledStepLine(number: Int, description: String, delivery: DeliveryState) -> String {
+        let head = "\(number). \(description): "
+        switch delivery {
+        case .notSent:
+            return head + "cancelled during step"
+        case .acknowledged, .verified:
+            return head + "sent, cancelled after delivery (\(delivery.rawValue))"
+        case .outcomeUnknown:
+            return head + "sent, outcome unknown after cancellation. Inspect before retrying."
+        }
+    }
+
     /// The closing advice after a failed step.
     static func advice(for delivery: DeliveryState, stepNumber: Int) -> String {
         switch delivery {
