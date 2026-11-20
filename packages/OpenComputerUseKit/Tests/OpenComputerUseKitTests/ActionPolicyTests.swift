@@ -232,4 +232,22 @@ final class ActionPolicyTests: XCTestCase {
             assertRefusal(dispatcher.callToolAsResult(name: "clipboard", arguments: ["action": "read"]), "ACTION_DENIED")
         }
     }
+
+    func testDutchLabelsAreClassifiedLikeEnglish() {
+        let expected: [(String, ActionPolicy.Risk)] = [
+            ("Verstuur", .send), ("Verzenden", .send), ("Plaats bericht", .send),
+            ("Verwijder bestand", .delete), ("Naar prullenbak verplaatsen", .delete), ("Prullenmand leegmaken", .delete),
+            ("Betaal nu", .purchase), ("Koop nu", .purchase), ("Bestel", .purchase), ("Afrekenen", .purchase),
+            ("Wachtwoord", .credentialEntry), ("Overschrijven", .fileOverwrite), ("Opslaan", .fileOverwrite),
+        ]
+        for (label, risk) in expected {
+            XCTAssertTrue(ActionPolicy.namedRisks([label]).contains(risk), "\(label) should carry \(risk.rawValue)")
+        }
+        let menu = ActionPolicy.nativeRisks(tool: "press_menu", arguments: ["app": "Finder", "path": "Bestand > Verplaats naar Prullenbak"],
+                                            bundleID: "com.apple.finder", target: nil)
+        XCTAssertTrue(menu.contains(.delete), "\(menu)")
+        for harmless in ["Sender Info", "Border", "Display settings", "Wissel"] {
+            XCTAssertTrue(ActionPolicy.namedRisks([harmless]).isEmpty, harmless)
+        }
+    }
 }

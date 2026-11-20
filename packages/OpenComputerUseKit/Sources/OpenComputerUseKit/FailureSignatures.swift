@@ -98,37 +98,8 @@ public final class FailureSignatureStore: @unchecked Sendable {
         return extraRisk(sig)
     }
 
-    // Word stems in lowercase without diacritics. Stems under 4 letters match whole words only;
-    // stems of 6+ letters match anywhere in a word (so compounds such as "absenden" match); others match word starts.
-    private static let riskStems: [String] = [
-        // English
-        "send", "submit", "post", "publish", "pay", "payment", "paying", "purchase", "buy", "buying", "order",
-        "checkout", "transfer", "delete", "remove", "erase", "discard", "unsubscribe",
-        // Dutch
-        "verzend", "verstuur", "stuur", "betal", "koop", "bestel", "afreken", "overmaak", "overmaken", "verwijder", "wis", "wissen",
-        // German
-        "senden", "kauf", "bezahl", "losch",
-        // French
-        "envoyer", "acheter", "payer", "supprim", "paiement",
-        // Spanish
-        "enviar", "comprar", "pagar", "elimin",
-    ]
-    private static let riskPhrases: [String] = ["confirm payment", "cancel subscription"]
-
+    /// Risky tool names and labels are the destructive classes of RiskLexicon, the same list ActionPolicy uses.
     static func containsRiskyWord(toolName: String, label: String) -> Bool {
-        let folded = "\(toolName) \(label)"
-            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
-            .map { $0.isLetter ? String($0) : " " }
-            .joined()
-        let tokens = folded.split(whereSeparator: \.isWhitespace).map(String.init)
-        let padded = " " + tokens.joined(separator: " ") + " "
-        if riskPhrases.contains(where: { padded.contains(" \($0) ") }) { return true }
-        return tokens.contains { token in riskStems.contains { stemMatches(token, stem: $0) } }
-    }
-
-    private static func stemMatches(_ token: String, stem: String) -> Bool {
-        if stem.count < 4 { return token == stem }
-        if stem.count >= 6 { return token.contains(stem) }
-        return token.hasPrefix(stem)
+        !RiskLexicon.categories([toolName, label]).isDisjoint(with: RiskLexicon.destructiveCategories)
     }
 }

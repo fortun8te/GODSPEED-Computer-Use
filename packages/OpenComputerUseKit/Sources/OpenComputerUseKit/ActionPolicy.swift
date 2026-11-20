@@ -246,20 +246,19 @@ struct ActionPolicy: Decodable, Sendable {
         }
     }
 
+    /// Risk classes named by UI labels. The word lists live in RiskLexicon, shared with every other destructive check.
     static func namedRisks(_ names: [String?]) -> Set<Risk> {
-        let names = names.compactMap { $0 }.map {
-            $0.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).joined(separator: " ")
-        }
-        let prefixes: [Risk: [String]] = [
-            .send: ["send", "post", "publish", "sendmessage"],
-            .submit: ["submit", "upload", "sign in", "log in"],
-            .purchase: ["buy", "pay", "purchase", "place order", "checkout", "buy now"],
-            .delete: ["delete", "remove", "erase", "move to trash", "empty trash", "axdelete"],
-            .fileOverwrite: ["save", "replace", "overwrite"],
-            .systemSettings: ["allow access", "grant permission"],
-        ]
-        return Set(prefixes.compactMap { risk, words in
-            names.contains { name in words.contains { name == $0 || name.hasPrefix($0 + " ") } } ? risk : nil
+        Set(RiskLexicon.categories(names).compactMap { category -> Risk? in
+            switch category {
+            case .send: return .send
+            case .submit: return .submit
+            case .purchase: return .purchase
+            case .delete: return .delete
+            case .credentialEntry: return .credentialEntry
+            case .overwrite, .save: return .fileOverwrite
+            case .systemSettings: return .systemSettings
+            case .discard: return nil
+            }
         })
     }
 }
