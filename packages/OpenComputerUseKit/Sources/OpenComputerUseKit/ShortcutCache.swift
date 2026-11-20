@@ -11,31 +11,6 @@ public final class ShortcutCache: @unchecked Sendable {
         }
     }
 
-    /// Destructive word stems, English first, then Dutch, German, French and Spanish.
-    /// Stems are folded (lowercase, no diacritics, ß as ss) and matched per word:
-    /// short stems (4 letters or fewer) must match a whole word, longer ones a word prefix.
-    private static let destructiveStems: [String] = [
-        // English
-        "delete", "remove", "erase", "quit", "close", "stop", "empty trash", "move to trash",
-        "log out", "logout", "sign out", "signout", "restart", "shut down", "shutdown",
-        "force quit", "discard", "revert", "format",
-        // Dutch
-        "verwijder", "wis", "wissen", "sluit", "afmelden", "uitloggen", "herstart",
-        "opnieuw opstarten", "zet uit", "prullenmand", "leegmaken", "weggooien",
-        // German
-        "löschen", "entfernen", "beenden", "schließen", "abmelden", "neustarten",
-        "herunterfahren", "papierkorb leeren", "verwerfen", "zurücksetzen", "formatieren",
-        // French
-        "supprimer", "effacer", "quitter", "fermer", "déconnexion", "déconnecter",
-        "vider la corbeille", "corbeille", "redémarrer", "éteindre", "forcer à quitter",
-        "réinitialiser", "formater",
-        // Spanish
-        "eliminar", "borrar", "suprimir", "salir", "cerrar", "cerrar sesión", "vaciar la papelera",
-        "papelera", "reiniciar", "apagar", "descartar", "restablecer", "formatear",
-    ]
-
-    private static let destructivePhrases: [[String]] = destructiveStems.map(words(in:))
-
     private let lock = NSLock()
     private let extraDestructive: @Sendable (String) -> Bool
     private var chords: [String: [String: String]] = [:]
@@ -75,36 +50,13 @@ public final class ShortcutCache: @unchecked Sendable {
     }
 
     /// True when a menu title names an action that must never be replayed as a shortcut.
-    /// Matching is case-, diacritic- and punctuation-insensitive ("Log out…", "Löschen", "Déconnexion").
+    /// The word list is RiskLexicon's, shared with every other destructive check.
     public static func isDestructive(_ title: String) -> Bool {
-        let tokens = words(in: title)
-        guard !tokens.isEmpty else { return false }
-        return destructivePhrases.contains { phrase in containsPhrase(phrase, in: tokens) }
+        RiskLexicon.isDestructive(title)
     }
 
     private func blocked(_ title: String) -> Bool {
         Self.isDestructive(title) || extraDestructive(title)
-    }
-
-    /// Folds case, diacritics and ß, then splits on anything that is not a letter,
-    /// so ellipses, hyphens and punctuation all act as separators.
-    private static func words(in text: String) -> [String] {
-        text.replacingOccurrences(of: "ß", with: "ss")
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
-            .components(separatedBy: CharacterSet.letters.inverted)
-            .filter { !$0.isEmpty }
-    }
-
-    private static func containsPhrase(_ phrase: [String], in tokens: [String]) -> Bool {
-        guard !phrase.isEmpty, phrase.count <= tokens.count else { return false }
-        for start in 0...(tokens.count - phrase.count) {
-            let matched = phrase.enumerated().allSatisfy { offset, stem in
-                let token = tokens[start + offset]
-                return stem.count <= 4 ? token == stem : token.hasPrefix(stem)
-            }
-            if matched { return true }
-        }
-        return false
     }
 
     private static func key(_ app: String, _ path: String) -> String { app + "\u{1f}" + path }

@@ -129,20 +129,10 @@ enum FinderClipboard {
 /// A click on a label that is not in the window but is an item of the app's menus ("Make Plain Text",
 /// "New Folder", "Duplicate"): the menu path that holds it, top menu first. Nil when no single item matches.
 enum MenuItemLookup {
-    /// Labels that destroy, discard or quit. A click by one of these names never falls through to a menu item.
-    static let destructiveWords: [String] = [
-        "delete", "remove", "erase", "trash", "discard", "don't save", "don’t save", "dont save",
-        "quit", "close", "clear", "cut", "revert", "empty", "log out", "shut down", "restart",
-        "force quit", "uninstall", "reset", "overwrite", "replace", "send", "purchase", "buy",
-    ]
-
+    /// Labels that destroy, discard, send or buy. A click by one of these names never falls through to a menu item.
+    /// The word list is RiskLexicon's, shared with ActionPolicy and ShortcutCache.
     static func isDestructive(_ label: String) -> Bool {
-        let lowered = label.lowercased().replacingOccurrences(of: "…", with: "").replacingOccurrences(of: "...", with: "")
-        let words = lowered.split(whereSeparator: { !$0.isLetter && $0 != "'" && $0 != "’" }).map(String.init)
-        let joined = words.joined(separator: " ")
-        return destructiveWords.contains { word in
-            word.contains(" ") ? joined.contains(word) : words.contains(word)
-        }
+        RiskLexicon.isDestructive(label)
     }
 
     static func path(for label: String, pid: pid_t) -> [String]? {
