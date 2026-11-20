@@ -156,6 +156,17 @@ struct ActionPolicy: Decodable, Sendable {
         var inDialog = false
     }
 
+    /// Apps where Return (or a newline typed into them) sends the composed message.
+    static let sendCapableBundleIDs: [String] = [
+        "com.apple.mail", "com.apple.MobileSMS", "com.tinyspeck.slackmacgap", "com.hnc.Discord",
+        "net.whatsapp.WhatsApp", "desktop.WhatsApp", "ru.keepcoder.Telegram", "org.telegram.desktop",
+        "com.microsoft.teams2", "com.microsoft.teams", "org.whispersystems.signal-desktop",
+    ]
+
+    static func isSendCapable(_ bundleID: String) -> Bool {
+        sendCapableBundleIDs.contains { $0.caseInsensitiveCompare(bundleID) == .orderedSame }
+    }
+
     static func nativeRisks(tool: String, arguments: [String: Any], bundleID: String?, target: Target?) -> Set<Risk> {
         let key = (arguments["key"] as? String).map(ComputerUseService.canonicalKey) ?? ""
         let path = arguments["path"] as? String
@@ -205,10 +216,7 @@ struct ActionPolicy: Decodable, Sendable {
             }
             if ["return", "enter", "cmd+return", "cmd+enter"].contains(key) {
                 if target?.inDialog == true { result.insert(.submit) }
-                if let bundleID, ["com.apple.mail", "com.apple.MobileSMS", "com.tinyspeck.slackmacgap", "com.hnc.Discord"]
-                    .contains(where: { $0.caseInsensitiveCompare(bundleID) == .orderedSame }) {
-                    result.insert(.send)
-                }
+                if let bundleID, isSendCapable(bundleID) { result.insert(.send) }
             }
             if target?.secureField == true, !key.isEmpty, !["tab", "escape", "esc", "cmd+c"].contains(key) {
                 result.insert(.credentialEntry)
@@ -216,6 +224,11 @@ struct ActionPolicy: Decodable, Sendable {
         case "type_text", "set_value":
             // An unreadable field cannot establish that a configured credential rule is safe to skip.
             if target?.secureField != false { result.insert(.credentialEntry) }
+            // A newline in typed text presses Return, which sends in a chat composer (any focused field in the app).
+            if tool == "type_text", let bundleID, isSendCapable(bundleID),
+               (arguments["text"] as? String)?.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) == true {
+                result.insert(.send)
+            }
         default:
             break
         }

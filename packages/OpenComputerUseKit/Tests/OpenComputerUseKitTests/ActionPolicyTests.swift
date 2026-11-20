@@ -251,6 +251,23 @@ final class ActionPolicyTests: XCTestCase {
         }
     }
 
+    func testChatAppsSendOnReturnAndOnNewlineText() {
+        let chatApps = ["net.whatsapp.WhatsApp", "desktop.WhatsApp", "ru.keepcoder.Telegram", "org.telegram.desktop",
+                        "com.microsoft.teams2", "com.microsoft.teams", "org.whispersystems.signal-desktop"]
+        for bundleID in chatApps {
+            for key in ["Return", "cmd+Return"] {
+                XCTAssertTrue(ActionPolicy.nativeRisks(tool: "press_key", arguments: ["key": key], bundleID: bundleID, target: nil).contains(.send),
+                              "\(key) in \(bundleID)")
+            }
+            for text in ["ok\n", "ok\r\nthanks", "line\rnext"] {
+                XCTAssertTrue(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": text], bundleID: bundleID, target: nil).contains(.send),
+                              "type_text with a newline in \(bundleID)")
+            }
+            XCTAssertFalse(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": "plain words"], bundleID: bundleID, target: nil).contains(.send))
+        }
+        XCTAssertFalse(ActionPolicy.nativeRisks(tool: "type_text", arguments: ["text": "a\nb"], bundleID: "com.apple.TextEdit", target: nil).contains(.send))
+    }
+
     func testDragIsATargetedToolAndItsDropTargetCarriesRisk() {
         XCTAssertTrue(ActionPolicy.nativeTargetTools.contains("drag"))
         // A pixel drop has no readable destination, so it is treated like an opaque click.
