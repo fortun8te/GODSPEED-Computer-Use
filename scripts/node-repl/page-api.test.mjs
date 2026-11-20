@@ -77,12 +77,14 @@ test("goto, press and type map to navigation and key actions", async () => {
 test("click resolves the label exactly before it sends the click", async () => {
   const browser = fakeBrowser(byAction({ read: () => readWith("button Save") }));
   const page = createBrowserPage(browser, 7);
-  assert.equal(await page.click("Save", { button: "right", clickCount: 2, modifiers: ["shift"] }), "click ok");
+  assert.equal(await page.click("Save", { button: "right", modifiers: ["shift"] }), "click ok");
   assert.deepEqual(actions(browser), ["read", "click"]);
   assert.deepEqual(browser.calls[0].args, { tab_id: 7, find_exact: "Save" });
   assert.deepEqual(browser.calls[1].args, {
-    tab_id: 7, label: "Save", mouse_button: "right", click_count: 2, modifiers: ["shift"],
+    tab_id: 7, label: "Save", mouse_button: "right", modifiers: ["shift"],
   });
+  await page.click("Save", { clickCount: 2 });
+  assert.equal(browser.calls.at(-1).args.click_count, 2, "a double click uses the left button by default");
 });
 
 test("exact: false skips the preflight read and sends the label as given", async () => {
