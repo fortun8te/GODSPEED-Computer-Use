@@ -12,7 +12,7 @@ import Foundation
 /// stopped animating: a sheet slide, a menu fade, a window open). The fixed
 /// interval stays the cap, so a window still changing at the cap is read exactly
 /// as before; a missing sample falls back to the full cap.
-/// Disable with OPEN_COMPUTER_USE_SETTLE_BY_FRAME=0.
+/// Opt in with OPEN_COMPUTER_USE_SETTLE_BY_FRAME=1.
 ///
 /// Waiting for a window to settle the way Codex's `waitForUIToSettle` judges it: by busy signs in the window
 /// (an AXBusyIndicator, an AXWebArea whose AXLoaded is false, an element whose AXElementBusy is true), with no
@@ -21,11 +21,13 @@ import Foundation
 enum WindowSettle {
     // MARK: Still: frame-driven settle for action read-back
 
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_SETTLE_BY_FRAME"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
-        return !["0", "false", "no", "off"].contains(value)
-    }()
+    static var enabled: Bool { frameSamplingEnabled(environment: ProcessInfo.processInfo.environment) }
+
+    static func frameSamplingEnabled(environment: [String: String]) -> Bool {
+        let value = environment["OPEN_COMPUTER_USE_SETTLE_BY_FRAME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return ["1", "true", "yes", "on"].contains(value)
+    }
 
     /// Minimum wait before the first comparison, so an animation that has not started yet is not missed.
     static let floor: TimeInterval = 0.02
