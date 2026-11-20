@@ -62,11 +62,11 @@ final class CursorTimingTests: XCTestCase {
         let hop = visualCursorTravelDuration(distance: 40, speed: 1)
         let typical = visualCursorTravelDuration(distance: 400, speed: 1)
         let far = visualCursorTravelDuration(distance: 3000, speed: 1)
-        XCTAssertGreaterThanOrEqual(hop, 0.12)
-        XCTAssertLessThan(hop, 0.14)
-        XCTAssertGreaterThan(typical, 0.18)
-        XCTAssertLessThan(typical, 0.22)
-        XCTAssertLessThanOrEqual(far, 0.30)
+        XCTAssertGreaterThanOrEqual(hop, 0.15)
+        XCTAssertLessThan(hop, 0.18)
+        XCTAssertGreaterThan(typical, 0.24)
+        XCTAssertLessThan(typical, 0.29)
+        XCTAssertLessThanOrEqual(far, 0.45)
         XCTAssertLessThan(hop, typical)
         XCTAssertLessThan(typical, far)
     }
@@ -87,10 +87,10 @@ final class CursorTimingTests: XCTestCase {
         let alone = visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 0)
         let behind = visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 4)
         XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: -1), alone)
-        XCTAssertLessThan(behind, alone / 2)
-        XCTAssertLessThan(visualCursorClickPulseDuration(speed: 1, queuedBehind: 4), 0.06)
-        // A long backlog speeds up but still glides (floored at 35%) instead of turning every step into a jump.
-        XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 100), alone * 0.35, accuracy: 1e-9)
+        XCTAssertLessThan(behind, alone * 0.65)
+        XCTAssertLessThan(visualCursorClickPulseDuration(speed: 1, queuedBehind: 4), 0.1)
+        // A long backlog speeds up but still glides (floored at 60%) instead of turning every step into a jump.
+        XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 100), alone * 0.6, accuracy: 1e-9)
         XCTAssertGreaterThan(visualCursorTravelDuration(distance: 40, speed: 1, queuedBehind: 100), 0)
     }
 
@@ -219,7 +219,7 @@ final class CursorTimingTests: XCTestCase {
             let panel = try XCTUnwrap(SoftwareCursorOverlay.overlayPanelForTesting)
             XCTAssertTrue(panel.isVisible)
             XCTAssertEqual(panel.alphaValue, 1)
-            let tip = SoftwareCursorGlyphMetrics.tipAnchor
+            let tip = SoftwareCursorPanelMetrics.tipAnchor
             XCTAssertEqual(panel.frame.origin.x + tip.x, center.x, accuracy: 1)  // whole-pixel window origin
             XCTAssertEqual(panel.frame.origin.y + tip.y, center.y, accuracy: 1)
             XCTAssertTrue(try XCTUnwrap(try moves(in: file).first).contains("ms=0"))
