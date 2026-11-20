@@ -12,7 +12,7 @@ enum BatchEffects {
     }
 
     /// Most effect lines one step adds.
-    static let maxEffectLines = 5
+    static let maxEffectLines = 3
 
     /// Optional reads stop once they consume the budget. Failed reads count
     /// at full cost because there is no evidence that they settled a window.
