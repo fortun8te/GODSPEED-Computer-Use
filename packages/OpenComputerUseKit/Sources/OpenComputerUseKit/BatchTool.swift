@@ -348,8 +348,12 @@ enum BatchTool {
     /// One `step` row per executed step and one `episode` row for the batch. Receipt steps are appended in order and
     /// only the last one can be a stop, so receipt.steps[i] is steps[i]. Labels come from observed results only.
     /// Typed values and before/after text are never written.
-    static func learn(receipt: TrajectoryLog.BatchReceipt, steps: [Step], goal: String, app: String?, log: LearningLog) {
+    /// `doneWhen` and `window` (the window the batch started in, when recipes read it) add the batch's done_when and
+    /// its window identity to every row. Both are optional, so older callers still write the same rows.
+    static func learn(receipt: TrajectoryLog.BatchReceipt, steps: [Step], goal: String, app: String?, log: LearningLog,
+                      doneWhen: [DoneCheck.Condition] = [], window: BatchRecipes.Window? = nil) {
         guard log.isEnabled else { return }
+        let learningWindow = window.map(LearningWindow.init)
         for (index, executed) in receipt.steps.enumerated() where index < steps.count {
             let step = steps[index]
             let isLast = index == receipt.steps.count - 1
@@ -360,10 +364,14 @@ enum BatchTool {
                 failure_code: executed.failureCode?.rawValue,
                 verification: executed.observation?.rawValue,
                 done_when: isLast ? doneLabel(receipt.doneCheck) : nil,
-                n: index + 1
+                n: index + 1,
+                window: learningWindow
             ))
         }
-        log.append(LearningEpisodeRow(app: app, goal: goal, outcome: episodeOutcome(receipt)))
+        log.append(LearningEpisodeRow(
+            app: app, goal: goal, outcome: episodeOutcome(receipt),
+            done_when: LearningDoneWhen.rows(doneWhen), done: doneLabel(receipt.doneCheck), window: learningWindow
+        ))
     }
 
     private static func doneLabel(_ check: TrajectoryLog.BatchReceipt.DoneCheck) -> String? {
@@ -702,7 +710,11 @@ extension ComputerUseToolDispatcher {
         var lastStepText = ""
         var lastResultText = ""
         // Learning rows for this batch, written on every exit below (see learn). Reads only what the batch computed.
-        defer { BatchTool.learn(receipt: receipt, steps: steps, goal: goal, app: defaultApp ?? lastApp, log: LearningLog.shared) }
+        // The window comes from the batch's starting state, when recipes read it. done_when is the batch's final value.
+        defer {
+            BatchTool.learn(receipt: receipt, steps: steps, goal: goal, app: defaultApp ?? lastApp, log: LearningLog.shared,
+                            doneWhen: doneConditions, window: BatchRecipes.Window(state: recipeRun.startingState))
+        }
         var lastAttemptedStep: BatchTool.Step?
         var lastBrowserContinuationTab: Int?
         var stepResults: [(step: String, result: String)] = []
