@@ -28,10 +28,7 @@ enum SmartSteps {
         "radiobutton", "tabbutton", "tab", "row", "cell", "outlinerow", "statictext",
     ]
 
-    /// Phrases the healing code looks for in error messages raised by the service.
-    static let notFoundPhrase = "no element labelled"
     static let ambiguousPhrase = "matches several controls"
-    static let stalePhrase = "no longer has the identity"
 
     // MARK: - Paths
 
@@ -592,7 +589,7 @@ enum SmartSteps {
                let record = records.first(where: { $0.index == index }) {
                 return (record, "\"\(wanted)\" also matched buttons; used the text field it captions.")
             }
-            throw ComputerUseError.invalidArguments(
+            throw ComputerUseError.ambiguousTarget(
                 "\"\(wanted)\" \(ambiguousPhrase): \(names.joined(separator: ", ")). Give one of these exact labels, or an element_index."
             )
         case .none:
@@ -622,7 +619,7 @@ enum SmartSteps {
     /// all inside a focus borrow. The file is checked on disk before the reply says it was saved.
     /// Saves the app's front document to `path` through AppleScript. False when the app is not scriptable or
     /// the save failed (the caller then uses the save sheet). Never activates the app.
-    static func scriptedSave(bundle: String, path: String) -> Bool {
+    static func scriptedSave(bundle: String, path: String) throws -> Bool {
         let scriptable: Set<String> = [
             "com.apple.TextEdit", "com.apple.Preview", "com.apple.iWork.Pages", "com.apple.iWork.Numbers",
             "com.apple.iWork.Keynote", "com.apple.ScriptEditor2",
@@ -632,7 +629,7 @@ enum SmartSteps {
             "\"" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
         }
         let source = "tell application id \(quoted(bundle)) to save document 1 in POSIX file \(quoted(path))"
-        return AppleEventsGate.run(source, bundle: bundle) != nil
+        return try AppleEventsGate.send(source, bundle: bundle) != nil
     }
 
     static func saveAs(app: String, path rawPath: String, service: ComputerUseService, home: String = NSHomeDirectory()) throws -> ToolCallResult {
@@ -648,13 +645,14 @@ enum SmartSteps {
         // others). It saves the front document straight to the path, as the type the extension names, with no
         // dialog, no keys and no focus change. A sheet that is already open is closed by it as well.
         if !sheetIsOpen(pid: descriptor.pid), let bundle = NSRunningApplication(processIdentifier: descriptor.pid)?.bundleIdentifier,
-           scriptedSave(bundle: bundle, path: full) {
+           try scriptedSave(bundle: bundle, path: full) {
             let deadline = Date().addingTimeInterval(3)
             while !fileManager.fileExists(atPath: full), Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
             let modified = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date
             if fileManager.fileExists(atPath: full), modifiedBefore == nil || modified != modifiedBefore {
-                return .text("Saved \(full).")
+                return .text("Saved \(full).", deliveryState: .verified)
             }
+            throw ComputerUseError.acknowledged("The save was acknowledged. Check \(full) before trying again.")
         }
 
         // No keys and no focus change: the sheet is driven through accessibility only (set the name field to the
@@ -663,7 +661,7 @@ enum SmartSteps {
         if savePanel(pid: descriptor.pid) == nil {
             do {
                 _ = try service.pressMenu(app: app, titles: ["File", "Save As"])
-            } catch {
+            } catch let error as ComputerUseError where error.deliveryState == .notSent {
                 _ = try service.pressMenu(app: app, titles: ["File", "Save"])
             }
             let openDeadline = Date().addingTimeInterval(3)
@@ -708,13 +706,13 @@ enum SmartSteps {
             Thread.sleep(forTimeInterval: 0.25)
         }
         if isSaved() {
-            return .text("Saved \(full).")
+            return .text("Saved \(full).", deliveryState: .verified)
         }
         var reply = "Save was sent, but \(full) is not on disk."
         reply += sheetIsOpen(pid: descriptor.pid)
             ? " A sheet is still open in \(app) (a question such as Replace or a file format choice): read the app's state and click its answer by label."
             : " Check the app's state."
-        return .text(reply, isError: true)
+        return .text(reply, isError: true, deliveryState: .acknowledged)
     }
 
     /// `open`: a URL goes through the browser tool, a path opens in its default app (or in `app`) and an app
@@ -798,15 +796,16 @@ enum SmartSteps {
     }
 
     /// Runs an NSWorkspace call and waits (up to 5 s) for its completion, turning its error into a message.
-    private static func openWorkspace(_ start: @Sendable (@escaping @Sendable (Error?) -> Void) -> Void) throws {
+    static func openWorkspace(timeout: TimeInterval = 5,
+                              _ start: @Sendable (@escaping @Sendable (Error?) -> Void) -> Void) throws {
         let done = DispatchSemaphore(value: 0)
         let outcome = OpenOutcome()
         start { error in
             outcome.error = error
             done.signal()
         }
-        guard done.wait(timeout: .now() + 5) == .success else {
-            throw ComputerUseError.message("macOS did not answer the open request in time.")
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            throw ComputerUseError.timedOut("macOS did not answer the open request in time.", delivery: .outcomeUnknown)
         }
         if let failure = outcome.error {
             throw ComputerUseError.message("macOS could not open it: \(failure.localizedDescription)")
@@ -837,9 +836,20 @@ enum SmartSteps {
         (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 
-    static func isNotFound(_ error: Error) -> Bool { messageText(error).contains(notFoundPhrase) }
-    static func isAmbiguous(_ error: Error) -> Bool { messageText(error).contains(ambiguousPhrase) }
-    static func isStale(_ error: Error) -> Bool { messageText(error).contains(stalePhrase) }
+    static func isNotFound(_ error: Error) -> Bool {
+        if case .targetNotFound? = error as? ComputerUseError { return true }
+        return false
+    }
+
+    static func isAmbiguous(_ error: Error) -> Bool {
+        if case .ambiguousTarget? = error as? ComputerUseError { return true }
+        return false
+    }
+
+    static func isStale(_ error: Error) -> Bool {
+        if case .staleTarget? = error as? ComputerUseError { return true }
+        return false
+    }
 }
 
 /// The error an NSWorkspace open reported, handed from its completion handler to the waiting caller.
@@ -867,13 +877,6 @@ final class SmartLog {
         guard !leading.isEmpty || !trailing.isEmpty else { return result }
         let before = leading.map { ToolResultContentItem.text($0) }
         let after = trailing.map { ToolResultContentItem.text($0) }
-        return ToolCallResult(
-            content: before + result.content + after, isError: result.isError,
-            batchReceipt: result.batchReceipt, failureCode: result.failureCode,
-            browserObservationURL: result.browserObservationURL,
-            browserContinuationTabID: result.browserContinuationTabID,
-            browserPreviewPages: result.browserPreviewPages,
-            browserFullObservationText: result.browserFullObservationText
-        )
+        return result.replacingContent(before + result.content + after)
     }
 }

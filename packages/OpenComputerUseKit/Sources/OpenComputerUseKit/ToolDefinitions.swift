@@ -88,7 +88,7 @@ public enum ToolDefinitions {
                         ],
                     ],
                     "goal": stringProperty(description: "One sentence: what you are trying to get done. The reply may then say done or stuck. With no steps, replays the saved recipe for it."),
-                    "done_when": ["type": ["object", "array"], "description": "How the reply knows the goal is done, checked directly: {\"text\": \"Message sent\"} (on screen), {\"field\": \"Volume\", \"equals\": \"40\"}, {\"gone\": \"Loading\"} (native, requires an untruncated read), {\"file_exists\": \"~/Desktop/out.pdf\"}, {\"url_contains\": \"/thanks\"}. One object or a list. Met: the reply says \"Done: verified\"."],
+                    "done_when": ["type": ["object", "array"], "description": #"Completion check. Use {"appeared":"Message sent"}, {"disappeared":"Loading"}, {"file_changed":"~/Desktop/out.pdf"}, {"url_changed":"https://example.com/thanks"}, or {"field":"Volume","equals":"40","since_start":"changed"} for a change since step 1. Plain text, gone, field, URL substring and file_exists checks are weak evidence. Give one check or a list."#],
                     "foreground": ["type": "boolean", "default": false, "description": "Last resort only: bring the app forward (skipped while the user is using the Mac). Steps, dialogs included, normally work in the background."],
                     "remember": ["type": "boolean", "default": false, "description": "Save these steps as the recipe for goal once they all succeed."],
                     "return_state": ["type": "boolean", "default": true, "description": "False skips the final browser snapshot when a URL-only completion check already passed. Recovery still includes state."],

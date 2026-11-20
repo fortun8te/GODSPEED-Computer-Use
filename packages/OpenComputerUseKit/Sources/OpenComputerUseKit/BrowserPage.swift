@@ -71,6 +71,7 @@ struct BrowserTypeOutcome: Sendable {
     /// Visible role=option entries that appeared under a combobox / autocomplete.
     var options: [String] = []
     var change: BrowserChange = .none
+    var deliveryState: DeliveryState = .acknowledged
 
     func reply(verb: String, target: String) -> String {
         if let picked { return picked }
@@ -296,6 +297,25 @@ final class BrowserPage {
             throw ComputerUseError.message("browser: Chrome returned no screenshot; browser wait, then try again")
         }
         return data
+    }
+
+    /// Checks only visible document text and the URL. No element resolution or saved read baseline.
+    func completionObservation(tabID: Int, needsText: Bool) -> BatchCompletion.Observation? {
+        let generation = bridge.referenceGeneration
+        let script = """
+        (() => {
+            const text = \(needsText) ? document.body?.innerText ?? null : null;
+            return [location.href, text?.slice(0, 100000) ?? null,
+                    document.readyState === 'complete' && text !== null && text.length <= 100000];
+        })()
+        """
+        guard let value = (try? evaluate(script)) as? [Any], value.count == 3,
+              let url = value[0] as? String, !url.isEmpty,
+              generation == bridge.referenceGeneration else { return nil }
+        return BatchCompletion.Observation(
+            target: .browser(tab: tabID, generation: generation), screen: value[1] as? String,
+            url: url, canProveAbsence: value[2] as? Bool == true
+        )
     }
 
     /// Fetch page metadata and filter visible AX text in one evaluation. Reference validation still
@@ -769,7 +789,7 @@ final class BrowserPage {
         // The press already carries the verified point. A separate mouse-move can stall a
         // background tab before the click is sent. Explicit hover still delivers movement.
         let remaining = BrowserCallBudget.remaining()
-        guard remaining > 2 else { throw ComputerUseError.stateUnavailable("browser click did not send a press because little time remained") }
+        guard remaining > 2 else { throw ComputerUseError.timedOut("browser click did not send a press because little time remained", delivery: .notSent) }
         let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
         do {
             for beat in 1...count {
@@ -835,7 +855,7 @@ final class BrowserPage {
         send: (String, CGPoint, Int, Int) throws -> Void
     ) throws {
         let remaining = BrowserCallBudget.remaining()
-        guard remaining > 4 else { throw ComputerUseError.stateUnavailable("browser drag ran out of time before pressing") }
+        guard remaining > 4 else { throw ComputerUseError.timedOut("browser drag ran out of time before pressing", delivery: .notSent) }
         let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
         let movementDeadline = releaseDeadline - 3
         try send("mouseMoved", start, 0, 0)
@@ -889,7 +909,8 @@ final class BrowserPage {
            let x = BrowserRules.number(found[1]), let y = BrowserRules.number(found[2]) {
             if kind == "covered" {
                 let what = found.count > 3 ? "\(found[3])".trimmingCharacters(in: .whitespacesAndNewlines) : ""
-                throw ComputerUseError.message(BrowserRules.coveredMessage(role: node.role, name: node.name, by: what) + delivery)
+                let message = BrowserRules.coveredMessage(role: node.role, name: node.name, by: what) + delivery
+                throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.message(message)
             }
             return CGPoint(x: x, y: y)
         }
@@ -897,7 +918,8 @@ final class BrowserPage {
             reveal(node)
             return try center(of: node)
         }
-        throw ComputerUseError.stateUnavailable("browser: could not confirm an unobstructed click point.\(delivery) Reveal the control and read the tab again.")
+        let message = "browser: could not confirm an unobstructed click point.\(delivery) Reveal the control and read the tab again."
+        throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
     }
 
     /// ["ok", x, y]: a probed point of the element reaches it. ["covered", x, y, text]: every probed point
@@ -1011,7 +1033,8 @@ final class BrowserPage {
             if let node, let document, let expected, BrowserCallBudget.remaining() > 0.6,
                (try? documentIdentity()) == document,
                (try? fieldText(node)) == expected {
-                return BrowserTypeOutcome(note: "field value verified after Chrome did not acknowledge the input")
+                return BrowserTypeOutcome(note: "field value verified after Chrome did not acknowledge the input",
+                                          deliveryState: .verified)
             }
             throw ComputerUseError.stateUnavailable("browser: typing may have taken effect in part. Read the field before sending any more text.")
         }
@@ -1035,6 +1058,9 @@ final class BrowserPage {
                 throw ComputerUseError.stateUnavailable("browser: typing may have taken effect, but the field does not show the requested value. Read it before continuing.")
             }
             outcome.note = "(field now shows \"\(actual.prefix(80))\"; inspect the field before sending more text)"
+        }
+        if let actual, let expected, actual == expected {
+            outcome.deliveryState = .verified
         }
         if watchSuggestions { outcome.options = comboOptions() }
         return outcome
@@ -1276,7 +1302,7 @@ final class BrowserPage {
         var capacity = readCapacity()
         if case .failure = capacity, BrowserCallBudget.remaining() > 3 { capacity = readCapacity() }
         guard case .success(let value) = capacity else {
-            throw ComputerUseError.stateUnavailable("Could not confirm the Chrome file input. Nothing was sent. Read the tab and try again.")
+            throw ComputerUseError.notSent("Could not confirm the Chrome file input. Nothing was sent. Read the tab and try again.")
         }
         guard let multiple = value as? Bool else {
             throw ComputerUseError.invalidArguments("Browser upload target is not an enabled file input. Nothing was sent.")

@@ -52,7 +52,7 @@ public final class ComputerUseToolDispatcher {
             tool: name, arguments: rawArguments, lastApp: RecentAppMemory.shared.current
         )
         if let problem = ArgumentNormalizer.problem(tool: name, arguments: arguments) {
-            throw ComputerUseError.message(problem)
+            throw ComputerUseError.notSent(problem)
         }
         if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name,
            name != HandoffTool.name {
@@ -85,8 +85,11 @@ public final class ComputerUseToolDispatcher {
         // System Settings: a pane's name opens the pane by its link (its sidebar is often unreadable).
         if ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
            let app = arguments["app"] as? String, SettingsPanes.isSettings(app),
-           let label = SettingsPanes.paneName(in: arguments), SettingsPanes.open(label: label),
-           let state = try? runWithSmartSteps(name: "get_app_state", arguments: ["app": app], log: log) {
+           let label = SettingsPanes.paneName(in: arguments), try SettingsPanes.open(label: label) {
+            // A failed readback cannot justify running the original action too.
+            guard let state = try? runWithSmartSteps(name: "get_app_state", arguments: ["app": app], log: log) else {
+                return .text("Opened the \(label) pane. Read Settings to check the result.")
+            }
             log.note("Opened the \(label) pane directly.")
             return LeanOutput.condensed(state)
         }
@@ -94,8 +97,10 @@ public final class ComputerUseToolDispatcher {
         if name == "click" || name == "open", let app = arguments["app"] as? String, app.lowercased().contains("finder") || app == "com.apple.finder",
            let label = arguments["label"] as? String, arguments["path"] == nil,
            name == "open" || ((arguments["click_count"] as? Int) ?? Int((arguments["click_count"] as? String) ?? "") ?? 1) >= 2,
-           let opened = FinderOpen.item(named: label),
-           let state = try? runWithSmartSteps(name: "get_app_state", arguments: ["app": app], log: log) {
+           let opened = try FinderOpen.item(named: label) {
+            guard let state = try? runWithSmartSteps(name: "get_app_state", arguments: ["app": app], log: log) else {
+                return .text(opened)
+            }
             log.note(opened)
             return LeanOutput.condensed(state)
         }
@@ -114,16 +119,18 @@ public final class ComputerUseToolDispatcher {
         } catch {
             // Renaming in Finder: Finder's rename field takes no typing in the background. Finder's own scripting
             // renames the selected (type_text) or named (set_value) item without focus, keys or a dialog.
-            if let renamed = FinderRename.attempt(tool: name, arguments: arguments) { return renamed }
+            // A failed reply can follow actual delivery. Only an explicitly unsent action can use a fallback.
+            if (error as? ComputerUseError)?.deliveryState == .notSent,
+               let renamed = try FinderRename.attempt(tool: name, arguments: arguments) { return renamed }
             // A click on a menu item's name ("Make Plain Text"): press that menu item.
             if name == "click", let label = arguments["label"] as? String, let app = arguments["app"] as? String,
-               String(describing: error).contains("no element labelled"),
+               SmartSteps.isNotFound(error),
                let descriptor = try? AppDiscovery.resolveRunning(app),
                let path = MenuItemLookup.path(for: label, pid: descriptor.pid) {
                 // "Delete", "Don't Save", "Quit": usually a dialog button the model expected. Its menu
                 // namesake acts on whatever is selected, so it is never pressed in its place.
                 if MenuItemLookup.isDestructive(label) {
-                    throw ComputerUseError.message(
+                    throw ComputerUseError.notSent(
                         "No '\(label)' button is on screen, so nothing was clicked. \(path.joined(separator: " > ")) is a menu item that acts on the current selection; if that is what you want, use press_menu {path: \"\(path.joined(separator: " > "))\"}. If you expected a dialog, read the app state first."
                     )
                 }
@@ -140,7 +147,7 @@ public final class ComputerUseToolDispatcher {
             if SettingsPanes.isSettings(app) {
                 log.tail("To go to a pane, click it by name: click {app, label: \"Desktop & Dock\"}. The sidebar and search need not be used.")
             }
-            return LeanOutput.condensed(ToolCallResult(content: result.content + state.content, isError: false))
+            return LeanOutput.condensed(result.replacingContent(result.content + state.content))
         }
         // A read that shows an open sheet or dialog says so in one line (with save_as for a save panel), so the
         // model handles the dialog first instead of working around it.
@@ -212,9 +219,8 @@ public final class ComputerUseToolDispatcher {
             // "Reported ok, tree unchanged" does not prove the step was lost: a Send, Buy or Like click, a
             // toggle, or a shortcut can work without changing the window. Only steps that are harmless twice
             // are repeated; for the rest the model is told and decides.
-            // An answer that says the input may have gone out is never repeated.
-            let unknown = BatchEffects.failureReceipt(result.textContent) == .outcomeUnknown
-            if shouldRetry, !unknown, isSafeToRepeat(name: name, arguments: arguments, app: app, snapshot: after) {
+            // An uncertain or independently verified action is never repeated.
+            if shouldRetry, result.deliveryState == .acknowledged, isSafeToRepeat(name: name, arguments: arguments, app: app, snapshot: after) {
                 result = try FocusBorrow.withBorrow(pid: pid) {
                     try dispatchHealingStaleIndex(name: name, arguments: arguments, app: app, log: log)
                 }
@@ -230,7 +236,7 @@ public final class ComputerUseToolDispatcher {
         // Only when Escape changed nothing: an Escape that closed a suggestion list inside the dialog must not
         // also cancel the dialog.
         // The sheet may still be animating out right after the key, so look again after a short wait.
-        if let escapeBefore, !result.isError,
+        if let escapeBefore, !result.isError, result.deliveryState == .acknowledged,
            (latest ?? SmartSteps.freshSnapshot(app: app, service: service))?.treeLines == escapeBefore,
            let snapshot = { () -> AppSnapshot? in
                Thread.sleep(forTimeInterval: 0.35)
@@ -296,7 +302,7 @@ public final class ComputerUseToolDispatcher {
             guard let fresh = SmartSteps.freshSnapshot(app: app, service: service) else { throw error }
             switch StaleHealing.resolve(index: index, role: prior.role, label: prior.label, nodes: SmartSteps.nodes(of: fresh)) {
             case .refuse(let message):
-                throw ComputerUseError.stateUnavailable(message)
+                throw ComputerUseError.staleTarget(message)
             case .use(let now, let note):
                 log.note(note)
                 var retried = arguments
@@ -525,18 +531,8 @@ public final class ComputerUseToolDispatcher {
     func callStepAsResult(name: String, arguments: [String: Any], log: SmartLog, notesInResult: Bool = true) -> ToolCallResult {
         do {
             return try callTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult)
-        } catch let error as ComputerUseError {
-            let message = error.errorDescription ?? String(describing: error)
-            return ToolCallResult(
-                content: [.text(message)], isError: error.toolResultIsError,
-                failureCode: TrajectoryLog.failureCode(error: error, message: message)
-            )
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            return ToolCallResult(
-                content: [.text(message)], isError: true,
-                failureCode: TrajectoryLog.failureCode(error: error, message: message)
-            )
+            return .failure(error)
         }
     }
 

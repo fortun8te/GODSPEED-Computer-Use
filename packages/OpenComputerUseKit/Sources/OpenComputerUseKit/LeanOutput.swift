@@ -42,7 +42,7 @@ enum LeanOutput {
             case .compactBatch: return .text(AXTreeCondenser.batchReply(text))
             }
         }
-        return changed ? ToolCallResult(content: content, isError: result.isError) : result
+        return changed ? result.replacingContent(content) : result
     }
 
     /// `observation` with its state text replaced by the change summary against `previous`, when the
@@ -67,7 +67,7 @@ enum LeanOutput {
             replaced = true
             return .text(compact)
         }
-        return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+        return replaced ? observation.replacingContent(content) : observation
     }
 
     /// Only the state's header (app, window, window ID), with a pointer to the full read.
@@ -83,7 +83,7 @@ enum LeanOutput {
             replaced = true
             return .text(compact)
         }
-        return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+        return replaced ? observation.replacingContent(content) : observation
     }
 
     /// A verified browser batch: the page snapshot's first lines (tab, URL) only.
@@ -96,7 +96,7 @@ enum LeanOutput {
             let head = text.split(separator: "\n", maxSplits: 3).prefix(3).joined(separator: "\n")
             return .text(head + "\nPage snapshot omitted (goal verified); browser read shows it.")
         }
-        return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+        return replaced ? observation.replacingContent(content) : observation
     }
 
     static func batchNativeObservation(

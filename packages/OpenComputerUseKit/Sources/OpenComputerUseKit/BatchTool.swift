@@ -491,6 +491,7 @@ extension ComputerUseToolDispatcher {
                   validatedHandoffRecipe: BatchRecipes.Recipe? = nil) throws -> ToolCallResult {
         let clock = ProcessInfo.processInfo
         let startedAt = clock.systemUptime
+        let startedOnDisk = Date()
         let deadline = min(startedAt + BatchTool.timeBudget, inheritedDeadline ?? .infinity)
         // Leave a small portion of the same budget for recovery and completion evidence.
         let duration = max(0, deadline - startedAt)
@@ -662,7 +663,6 @@ extension ComputerUseToolDispatcher {
         var movedTo: String?
         var goneReported = Set<Int>()
         var pendingLastEffect: (app: String, before: String, position: Int, line: Int, tool: String)?
-        var failureReceipt: BatchEffects.Receipt?
         var failedNumber = 0
         func windowID(_ app: String) -> UInt32? {
             (try? AppDiscovery.resolveRunning(app)).flatMap { ElementNumbering.forApp(pid: $0.pid).currentWindowID }
@@ -710,6 +710,30 @@ extension ComputerUseToolDispatcher {
             return (result, noEffect)
         }
 
+        // These private baseline reads leave the caller's window and element references in place.
+        let needsTemporalScreen = doneConditions.contains(where: \.needsTemporalScreen)
+        let needsTemporalURL = doneConditions.contains(where: \.needsTemporalURL)
+        func completionObservation(step: BatchTool.Step?, app: String?, window: UInt32?, tab: Int?) -> BatchCompletion.Observation? {
+            guard clock.systemUptime < deadline else { return nil }
+            if step?.tool == "browser", needsTemporalScreen || needsTemporalURL {
+                return BatchCompletion.browser(tabID: tab, needsText: needsTemporalScreen,
+                                               deadline: min(deadline, clock.systemUptime + 4))
+            }
+            if needsTemporalScreen, let app { return BatchCompletion.native(app: app, windowID: window) }
+            return nil
+        }
+        let completionBaseline: BatchCompletion?
+        if doneConditions.contains(where: \.requiresBaseline), clock.systemUptime < actionDeadline {
+            let finalStep = steps.last
+            let finalApp = steps.reversed().compactMap { $0.arguments["app"] as? String }.first ?? lastApp
+            let window = pinnedWindow ?? (try? validatedQueryWindowID(finalStep?.arguments["window_id"]))
+            let tab = try? Self.validatedBrowserTabID(finalStep?.arguments["tab_id"])
+            let before = completionObservation(step: finalStep, app: finalApp, window: window, tab: tab)
+            completionBaseline = BatchCompletion(conditions: doneConditions, startedAt: startedOnDisk, before: before)
+        } else {
+            completionBaseline = nil
+        }
+
         for (offset, plannedStep) in steps.enumerated() {
             let number = offset + 1
             if stopIfOutOfTime(before: number) { break }
@@ -727,7 +751,7 @@ extension ComputerUseToolDispatcher {
                     lastResultText = "failed: wait needs an app"
                     failed = true
                     failedNumber = number
-                    receipt.steps.append(.init(failureCode: .invalidArguments, observation: .notSent))
+                    receipt.steps.append(.init(failureCode: .invalidArguments, observation: .notSent, deliveryState: .notSent))
                     receipt.stop = .stepFailure
                     break
                 }
@@ -778,7 +802,7 @@ extension ComputerUseToolDispatcher {
                 stepResults.append((lastStepText, "FAILED: \(reason)"))
                 failed = true
                 failedNumber = number
-                receipt.steps.append(.init(failureCode: .timeout))
+                receipt.steps.append(.init(failureCode: .timeout, deliveryState: .notSent))
                 receipt.stop = .stepFailure
                 break
             }
@@ -822,8 +846,7 @@ extension ComputerUseToolDispatcher {
                 lastResultText = "failed: the saved target could not be confirmed"
                 lines.append("\(number). \(lastStepText): FAILED: the saved target could not be confirmed. Read the app before continuing.")
                 if number < steps.count { lines.append("Steps \(number + 1)-\(steps.count) were not run.") }
-                failureReceipt = .notSent
-                receipt.steps.append(.init(failureCode: .stateUnavailable, observation: .notSent))
+                receipt.steps.append(.init(failureCode: .stateUnavailable, observation: .notSent, deliveryState: .notSent))
                 receipt.stop = .recipeVerification
                 failedNumber = number
                 failed = true
@@ -875,14 +898,14 @@ extension ComputerUseToolDispatcher {
             lastBrowserContinuationTab = result.browserContinuationTabID
             let stepNotes = stepLog.notes
             lastStepText = BatchTool.describe(step)
-            if result.isError {
+            if result.isError || result.deliveryState == .outcomeUnknown {
                 lastResultText = "failed: \(BatchTool.firstLine(result.textContent))"
                 stepResults.append((BatchTool.describe(step), "FAILED: \(BatchTool.firstLine(result.textContent))"))
                 // Never retried here: a failure that may have reached the app says "outcome unknown".
-                failureReceipt = BatchEffects.failureReceipt(result.textContent)
+                let failureReceipt = BatchEffects.failureReceipt(result.deliveryState)
                 receipt.steps.append(.init(
-                    failureCode: result.failureCode ?? TrajectoryLog.failureCode(message: result.textContent),
-                    observation: failureReceipt, durationMs: durationMs
+                    failureCode: result.failureCode ?? .toolError,
+                    observation: failureReceipt, durationMs: durationMs, deliveryState: result.deliveryState
                 ))
                 receipt.stop = .stepFailure
                 failedNumber = number
@@ -899,7 +922,7 @@ extension ComputerUseToolDispatcher {
             }
 
             lastResultText = "ok"
-            receipt.steps.append(.init(durationMs: durationMs))
+            receipt.steps.append(.init(durationMs: durationMs, deliveryState: result.deliveryState))
             stepResults.append((BatchTool.describe(step), "ok"))
             let browserAction = ((step.arguments["action"] as? String) ?? "").lowercased()
             if !step.isReadOnly {
@@ -980,17 +1003,18 @@ extension ComputerUseToolDispatcher {
         // One fresh look at the app after the steps (reuse a get_app_state the batch ended with).
         let lastBrowserAction = (lastAttemptedStep?.arguments["action"] as? String)?
             .trimmingCharacters(in: .whitespaces).lowercased()
-        let unconfirmedOpen = failed && lastAttemptedStep?.tool == "browser"
+        let lastDelivery = receipt.steps.last?.deliveryState ?? .notSent
+        let unconfirmedOpen = failed && lastDelivery == .outcomeUnknown && lastAttemptedStep?.tool == "browser"
             && ["open", "new_tab", "open_tab"].contains(lastBrowserAction ?? "")
         let finalClickChecksPage = lastAttemptedStep?.tool == "browser"
             && ["click", "press", "tap"].contains(lastBrowserAction ?? "")
             && !doneConditions.isEmpty && doneConditions.allSatisfy { condition in
                 switch condition {
-                case .text, .urlContains: return true
-                case .gone, .fileExists, .field: return false
+                case .text, .urlContains, .appeared, .urlChanged: return true
+                default: return false
                 }
             }
-        let unconfirmedFinalClick = finalClickChecksPage && failed && failureReceipt == .outcomeUnknown && failedNumber == steps.count
+        let unconfirmedFinalClick = finalClickChecksPage && failed && lastDelivery == .outcomeUnknown && failedNumber == steps.count
         let finalBrowserTab: Any? = lastAttemptedStep.flatMap { last in
             guard last.tool == "browser" else { return nil }
             if let lastBrowserContinuationTab { return lastBrowserContinuationTab }
@@ -1020,7 +1044,12 @@ extension ComputerUseToolDispatcher {
             // existing event-based wait a short part of the same recovery budget.
             var args = browserVerificationArgs("wait_for")
             args["timeout"] = 5
-            for (key, value) in condition.arguments { args[key] = value }
+            switch condition {
+            case .appeared(let text): args["text"] = text
+            case .urlChanged(let url): args["url_contains"] = url
+            default:
+                for (key, value) in condition.arguments { args[key] = value }
+            }
             return BrowserCallBudget.withDeadline(waitDeadline) {
                 !callToolAsResult(name: "browser", arguments: args).isError
             }
@@ -1030,16 +1059,27 @@ extension ComputerUseToolDispatcher {
             let read = browserObservation("location")
             return read.isError ? nil : read.browserObservationURL
         }
+        func temporalEvidence() -> BatchCompletion.Observation? {
+            guard completionBaseline?.before != nil else { return nil }
+            return completionObservation(step: lastAttemptedStep, app: lastApp, window: verificationWindow,
+                                         tab: finalBrowserTab as? Int ?? (try? Self.validatedBrowserTabID(finalBrowserTab)))
+        }
         var earlyCompletion: DoneCheck.Result?
         if (arguments["return_state"] as? Bool) == false,
            !failed, !stoppedForTime, !wantsScreenshot, trailingObservation == nil,
            pendingLastEffect == nil, lastAttemptedStep?.tool == "browser", !doneConditions.isEmpty,
            doneConditions.allSatisfy({ condition in
-               if case .urlContains = condition { return true }
-               return false
+               switch condition {
+               case .urlContains, .urlChanged: return true
+               default: return false
+               }
            }) {
-            let result = DoneCheck.check(doneConditions, evidence: .init(screenText: nil, pageURL: pageURL))
-            if case .verified = result { earlyCompletion = result }
+            let result = DoneCheck.check(doneConditions, evidence: .init(screenText: nil, pageURL: pageURL),
+                                         baseline: completionBaseline, after: temporalEvidence())
+            switch result {
+            case .verified, .weak: earlyCompletion = result
+            case .missing: break
+            }
         }
         var observation = trailingObservation
         if !unconfirmedOpen, earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool == "browser" {
@@ -1122,9 +1162,7 @@ extension ComputerUseToolDispatcher {
         )
         // Done by check: each done_when condition is tested directly. A verified goal needs no model.
         var verifiedDone = false
-        var recoveredBrowserOutcome = false
-        // A click can reach Chrome before a reply is lost. For the last step only, a fresh
-        // positive page observation can establish the requested result without repeating it.
+        // A final click may have landed. Read its postcondition without replaying the click.
         let ambiguousFinalClick = unconfirmedFinalClick && observation?.isError == false
             && observation?.browserObservationURL?.isEmpty == false
         if !doneConditions.isEmpty, (!failed || ambiguousFinalClick), !stoppedForTime {
@@ -1163,7 +1201,7 @@ extension ComputerUseToolDispatcher {
                         return pageURL()
                     },
                     supportsAbsence: lastAttemptedStep?.tool != "browser"
-                ))
+                ), baseline: completionBaseline, after: temporalEvidence())
             }
             var doneResult = earlyCompletion ?? checkConditions()
             if (!failed || ambiguousFinalClick), finalClickChecksPage, case .missing(let unmet) = doneResult,
@@ -1173,16 +1211,15 @@ extension ComputerUseToolDispatcher {
                 doneResult = checkConditions()
             }
             if case .verified = doneResult { verifiedDone = true }
-            receipt.doneCheck = verifiedDone ? .verified : .unmet
-            lines.append(DoneCheck.line(for: doneResult))
-            if ambiguousFinalClick, verifiedDone {
-                recoveredBrowserOutcome = true
-                receipt.stop = nil
-                lines.append("Chrome did not acknowledge the last click. The requested result was verified from the page.")
+            switch doneResult {
+            case .verified: receipt.doneCheck = .verified
+            case .weak: receipt.doneCheck = .weakEvidence
+            case .missing: receipt.doneCheck = .unmet
             }
+            lines.append(DoneCheck.line(for: doneResult))
         }
-        if failed, !recoveredBrowserOutcome {
-            lines.append(BatchEffects.advice(for: failureReceipt, stepNumber: failedNumber))
+        if failed {
+            lines.append(BatchEffects.advice(for: lastDelivery, stepNumber: failedNumber))
         }
         if let stuckLine, !verifiedDone { lines.append(stuckLine) }
 
@@ -1253,6 +1290,6 @@ extension ComputerUseToolDispatcher {
             content.append(contentsOf: shown.content)
         }
         content.append(contentsOf: browserImages)
-        return ToolCallResult(content: content, isError: failed && !recoveredBrowserOutcome, batchReceipt: receipt)
+        return ToolCallResult(content: content, isError: failed, batchReceipt: receipt, deliveryState: receipt.deliveryState)
     }
 }

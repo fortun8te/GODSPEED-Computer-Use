@@ -44,6 +44,9 @@ enum HandoffTool {
             throw ComputerUseError.invalidArguments("handoff needs \"goal\" (one bounded subtask)")
         }
         let doneWhen = try DoneCheck.parse(arguments["done_when"])
+        guard !doneWhen.contains(where: \.requiresBaseline) else {
+            throw ComputerUseError.invalidArguments("Use batch for a change-aware done_when check.")
+        }
         guard !doneWhen.isEmpty else {
             throw ComputerUseError.invalidArguments(
                 "handoff needs \"done_when\", how GODSPEED knows it is finished, e.g. {\"text\": \"Saved\"} or {\"field\": \"Name\", \"equals\": \"Ann\"}"
@@ -322,7 +325,7 @@ enum HandoffTool {
                 unmet.append(contentsOf: reasons)
             }
         }
-        return unmet.isEmpty ? .verified(met: conditions.map(\.summary)) : .missing(unmet: unmet)
+        return unmet.isEmpty ? .weak(met: conditions.map(\.summary)) : .missing(unmet: unmet)
     }
 
     /// Acts only on a clear winner: probability at least `minProbability`, a lead of at least `minMargin` over
@@ -399,7 +402,7 @@ enum HandoffTool {
     static func replayResult(_ result: ToolCallResult) -> Replay {
         if batchReportsVerifiedDone(result) { return .verified }
         guard let receipt = result.batchReceipt,
-              receipt.steps.allSatisfy({ $0.observation == .notSent }) else { return .uncertain }
+              receipt.steps.allSatisfy({ $0.deliveryState == .notSent }) else { return .uncertain }
         return .incomplete
     }
 
@@ -410,7 +413,7 @@ enum HandoffTool {
     struct ActResult {
         let ok: Bool
         let message: String
-        var delivery: BatchEffects.Receipt? = nil
+        var delivery: DeliveryState? = nil
         var observedState: String? = nil
     }
 
@@ -426,12 +429,14 @@ enum HandoffTool {
         var screen: String = ""
         /// What done_when still lacks.
         var unmet: [String] = []
+        var deliveryState: DeliveryState = .notSent
 
         /// One outcome line, the steps taken, the net change and, when it needs the model, the top options.
         func reply() -> String {
             var lines: [String] = []
             switch kind {
-            case .done: lines.append("Done: \(reason)")
+            case .done:
+                lines.append(deliveryState == .verified ? "Done: \(reason)" : "Weak evidence: \(reason)")
             case .stuck: lines.append("Stuck: \(reason)")
             case .escalate: lines.append("Needs you: \(reason)")
             case .budget: lines.append("Stopped: \(reason)")
@@ -488,10 +493,16 @@ enum HandoffTool {
         var failures = 0
         let doneSummary = request.doneWhen.map(\.summary).joined(separator: "; ")
         var lastUnmet: [String] = []
-        func verdict(_ state: String) -> DoneCheck.Result {
-            let result = deps.check(state)
-            if case .missing(let unmet) = result { lastUnmet = unmet } else { lastUnmet = [] }
-            return result
+        var deliveryState: DeliveryState = .notSent
+        func matched(_ state: String) -> [String]? {
+            switch deps.check(state) {
+            case .verified(let met), .weak(let met):
+                lastUnmet = []
+                return met
+            case .missing(let unmet):
+                lastUnmet = unmet
+                return nil
+            }
         }
 
         func finish(_ kind: Outcome.Kind, _ reason: String, initial: String?, latest: String?,
@@ -503,7 +514,7 @@ enum HandoffTool {
                 if changes == AXStateDiff.noChangesMessage { changes = "the screen did not change" }
             }
             return Outcome(kind: kind, reason: reason, steps: steps, changes: changes, options: options,
-                           screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet)
+                           screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet, deliveryState: deliveryState)
         }
 
         guard hasTime() else {
@@ -515,7 +526,7 @@ enum HandoffTool {
         }
         var initial = state
         // Already true: nothing to do, and no saved recipe may run (it could undo or repeat the work).
-        if case .verified(let met) = verdict(state) {
+        if let met = matched(state) {
             return Outcome(kind: .done, reason: "already true (\(met.joined(separator: "; ")))", steps: [], changes: nil, options: [])
         }
 
@@ -524,7 +535,11 @@ enum HandoffTool {
         }
         if request.windowID == nil, let replayed = deps.replay(state) {
             steps.append("replayed the saved recipe")
-            if replayed == .verified { return Outcome(kind: .done, reason: "\(doneSummary) (saved recipe)", steps: steps, changes: nil, options: []) }
+            if replayed == .verified {
+                deliveryState = .verified
+                return finish(.done, "\(doneSummary) (saved recipe)", initial: initial, latest: state)
+            }
+            if replayed == .uncertain { deliveryState = .outcomeUnknown }
             guard hasTime() else {
                 return finish(.budget, "the recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: nil)
             }
@@ -533,11 +548,11 @@ enum HandoffTool {
                 return finish(.failed, "the saved recipe may have partially run; the app could not be read afterward", initial: initial, latest: nil)
             }
             state = fresh
-            if case .verified(let met) = verdict(state) {
-                return finish(.done, met.joined(separator: "; "), initial: initial, latest: state)
-            }
             if replayed == .uncertain {
                 return finish(.escalate, "the saved recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: state)
+            }
+            if let met = matched(state) {
+                return finish(.done, met.joined(separator: ", "), initial: initial, latest: state)
             }
             steps[steps.count - 1] = "the saved recipe did not finish; continued by hand"
             initial = fresh
@@ -576,20 +591,20 @@ enum HandoffTool {
                 }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
+                let stepDelivery = result.delivery ?? (result.ok ? .acknowledged : .outcomeUnknown)
+                if stepDelivery != .notSent {
+                    deliveryState = stepDelivery == .outcomeUnknown ? .outcomeUnknown : .acknowledged
+                }
                 if choice.kind == .setValue { typedAny = true }
                 if choice.kind == .scroll { scrolls += 1 }
                 if !hasTime(), result.observedState == nil {
                     steps.append(result.ok ? choice.text : "\(choice.text) failed")
                     return finish(.budget, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: nil)
                 }
-                guard result.ok else {
+                guard result.ok, stepDelivery != .outcomeUnknown else {
                     steps.append("\(choice.text) failed")
-                    if result.delivery != .notSent {
-                        let fresh = readState()
-                        if let fresh, case .verified(let met) = verdict(fresh) {
-                            return finish(.done, met.joined(separator: "; "), initial: initial, latest: fresh)
-                        }
-                        return finish(.escalate, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: fresh)
+                    if stepDelivery != .notSent {
+                        return finish(.escalate, DeliveryState.reconcileHint, initial: initial, latest: readState())
                     }
                     failures += 1
                     if failures >= 2 {
@@ -607,7 +622,7 @@ enum HandoffTool {
                 guard let next = actionState ?? readState() else {
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
-                if case .verified(let met) = verdict(next) {
+                if let met = matched(next) {
                     return finish(.done, met.joined(separator: "; "), initial: initial, latest: next)
                 }
                 let unchanged = AXStateDiff.diff(previous: state, current: next) == AXStateDiff.noChangesMessage
@@ -675,7 +690,7 @@ extension ComputerUseToolDispatcher {
                 let state = !result.isError && candidate.kind != .pressReturn ? LeanOutput.stateText(of: result) : nil
                 return HandoffTool.ActResult(
                     ok: !result.isError, message: BatchTool.firstLine(result.textContent),
-                    delivery: result.isError ? BatchEffects.failureReceipt(result.textContent) : nil,
+                    delivery: result.deliveryState,
                     observedState: state.flatMap { text in
                         text.contains(SnapshotObservationOptions.accessibilityOmittedNote) ? nil : text
                     }
@@ -714,6 +729,6 @@ extension ComputerUseToolDispatcher {
             now: { clock.systemUptime }
         )
         let outcome = HandoffTool.run(request, deps, deadline: deadline)
-        return .text(outcome.reply(), isError: outcome.kind == .failed)
+        return .text(outcome.reply(), isError: outcome.kind == .failed, deliveryState: outcome.deliveryState)
     }
 }

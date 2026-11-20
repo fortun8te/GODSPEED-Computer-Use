@@ -201,9 +201,10 @@ final class HeadlessScenarioBankTests: XCTestCase {
             let actual: String
             switch result {
             case .verified: actual = "verified"
+            case .weak: actual = "weak_evidence"
             case .missing(let unmet): actual = unmet.joined(separator: ",")
             }
-            let expected = ["verified", "the page URL contains \(destination)", "\"Export complete\" is on screen", "file \(file) exists"][seed % 4]
+            let expected = ["weak_evidence", "the page URL contains \(destination)", "\"Export complete\" is on screen", "file \(file) exists"][seed % 4]
             return (["url": url, "visible": String(visible), "saved": String(saved)], expected, actual)
         }
     }
@@ -250,9 +251,9 @@ final class HeadlessScenarioBankTests: XCTestCase {
             let result = DoneCheck.check([.gone(label)], evidence: .init(
                 screenText: screen, pageURL: { nil }, supportsAbsence: full
             ))
-            let verified: Bool
-            if case .verified = result { verified = true } else { verified = false }
-            return (["complete": String(full), "screen": screen], String(full && seed % 3 != 0), String(verified))
+            let matched: Bool
+            if case .weak = result { matched = true } else { matched = false }
+            return (["complete": String(full), "screen": screen], String(full && seed % 3 != 0), String(matched))
         }
     }
 }

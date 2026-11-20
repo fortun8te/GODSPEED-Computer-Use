@@ -178,10 +178,9 @@ final class ElementNumbering: @unchecked Sendable {
         return "stale: element \(index)\(what) is gone, nothing sent. Call get_app_state for the current numbers."
     }
 
-    static let gonePhrase = " is gone, nothing sent"
-
     static func isGone(_ error: Error) -> Bool {
-        SmartSteps.messageText(error).contains(gonePhrase)
+        if case .elementGone? = error as? ComputerUseError { return true }
+        return false
     }
 }
 

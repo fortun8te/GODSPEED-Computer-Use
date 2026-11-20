@@ -160,14 +160,14 @@ final class TargetedQuerySafetyTests: XCTestCase {
             }
         }
 
-        // Showing no busy sign: one look, no wait.
         XCTAssertTrue(wait { _ in false })
-        XCTAssertEqual(looks, [0])
+        XCTAssertGreaterThanOrEqual(clock, WindowSettle.quietPeriod)
+        XCTAssertLessThan(clock, 0.2)
 
-        // Loading until 0.3 s: looked at again every 50 ms, read on the first look after it ends.
+        // The quiet period starts once the busy sign clears.
         XCTAssertTrue(wait { $0 < 0.3 })
-        XCTAssertEqual(looks.count, 7)
-        XCTAssertLessThan(clock, 0.36)
+        XCTAssertGreaterThanOrEqual(clock, 0.3 + WindowSettle.quietPeriod)
+        XCTAssertLessThan(clock, 0.55)
 
         // Never done: gives up at the ceiling, and no look starts past it.
         XCTAssertFalse(wait(timeout: 1) { _ in true })
