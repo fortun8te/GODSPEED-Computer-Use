@@ -142,14 +142,28 @@ enum WindowSettle {
         return true
     }
 
-    /// Each element's signs, read side by side: the app answers one read while the next is on its way.
+    /// Split a frontier into a fixed number of lanes. Read signs in the
+    /// original node order without making one concurrent AX call per node.
+    static let scanConcurrency = 4
+
+    static func scanRanges(count: Int) -> [Range<Int>] {
+        guard count > 0 else { return [] }
+        let lanes = min(scanConcurrency, count)
+        return (0..<lanes).map { lane in
+            (lane * count / lanes)..<((lane + 1) * count / lanes)
+        }
+    }
+
     static func readAll(_ elements: [AXUIElement]) -> [Signs<AXUIElement>?] {
         // Each slot is written by its own iteration only.
         nonisolated(unsafe) let signs = UnsafeMutableBufferPointer<Signs<AXUIElement>?>.allocate(capacity: elements.count)
         nonisolated(unsafe) let elements = elements
         signs.initialize(repeating: nil)
         defer { signs.deinitialize(); signs.deallocate() }
-        DispatchQueue.concurrentPerform(iterations: elements.count) { signs[$0] = read(elements[$0]) }
+        let ranges = scanRanges(count: elements.count)
+        DispatchQueue.concurrentPerform(iterations: ranges.count) { lane in
+            for index in ranges[lane] { signs[index] = read(elements[index]) }
+        }
         return Array(signs)
     }
 

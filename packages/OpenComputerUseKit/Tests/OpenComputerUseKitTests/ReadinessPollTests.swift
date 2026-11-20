@@ -2,6 +2,14 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class ReadinessPollTests: XCTestCase {
+    func testLargeSettleFrontiersUseAtMostFourReadLanesAndKeepOrder() {
+        let ranges = WindowSettle.scanRanges(count: 99)
+        XCTAssertEqual(ranges.count, 4)
+        XCTAssertEqual(ranges.flatMap(Array.init), Array(0..<99))
+        XCTAssertEqual(WindowSettle.scanRanges(count: 2), [0..<1, 1..<2])
+        XCTAssertTrue(WindowSettle.scanRanges(count: 0).isEmpty)
+    }
+
     func testReadyDialogDoesNotSleep() {
         let ready = ReadinessPoll.first(timeout: 0.6, now: { 0 }, sleep: { _ in
             XCTFail("An already available dialog should not sleep")
