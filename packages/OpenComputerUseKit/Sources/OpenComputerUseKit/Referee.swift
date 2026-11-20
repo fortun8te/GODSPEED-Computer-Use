@@ -115,14 +115,17 @@ enum Referee {
     /// Asks the helper to score candidate actions for a handoff (POST /choose): one probability per option id
     /// plus "none". Nil when the referee is off, down or answers badly, so the handoff escalates instead of guessing.
     /// The handoff needs the helper even when batch hints are off, so it falls back to the default local helper.
-    static var chooseURL: URL? {
-        if let off = environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"), ["0", "false", "off", "no"].contains(off.lowercased()) { return nil }
-        return baseURL ?? URL(string: "http://127.0.0.1:8765")
+    static func localChooseURL(refereeURL: URL?, setting: String?) -> URL? {
+        if let setting, ["0", "false", "off", "no"].contains(setting.lowercased()) { return nil }
+        guard let url = refereeURL ?? URL(string: "http://127.0.0.1:8765"),
+              HelperAutoStarter.isLoopback(url) else { return nil }
+        return url
     }
 
     static func choose(goal: String, doneWhen: String, history: String, screen: String, options: [(id: String, text: String)],
                        remaining: TimeInterval? = nil) -> [String: Double]? {
-        guard let baseURL = chooseURL, !options.isEmpty else { return nil }
+        guard let baseURL = localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER")),
+              !options.isEmpty else { return nil }
         let wait = min(chooseTimeout, remaining ?? chooseTimeout)
         guard wait > 0 else { return nil }
         let body: [String: Any] = [
@@ -304,7 +307,7 @@ final class HelperAutoStarter: @unchecked Sendable {
     }
 
     static func isLoopback(_ url: URL) -> Bool {
-        ["127.0.0.1", "localhost", "::1"].contains(url.host?.lowercased() ?? "")
+        ["127.0.0.1", "localhost", "::1", "[::1]"].contains(url.host?.lowercased() ?? "")
     }
 
     static func shouldCheck(lastCheck: TimeInterval?, now: TimeInterval, cooldown: TimeInterval) -> Bool {

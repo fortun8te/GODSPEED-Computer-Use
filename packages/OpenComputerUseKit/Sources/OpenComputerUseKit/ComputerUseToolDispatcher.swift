@@ -212,7 +212,7 @@ public final class ComputerUseToolDispatcher {
         // Each element's role and name per number is remembered when the snapshot is stored
         // (ComputerUseService.rememberSnapshot), so a number that later disappears can be healed.
         if name == "get_app_state", !result.isError, let app = arguments["app"] as? String,
-           let hint = BatchRecipes.shared.hint(app: app) {
+           let hint = BatchRecipes.shared.hint(app: app, state: LeanOutput.stateText(of: result)) {
             log.tail(hint)
         }
         let compact = name == "get_app_state" && (arguments["compact"] as? Bool) == true

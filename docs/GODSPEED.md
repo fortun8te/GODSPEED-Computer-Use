@@ -46,7 +46,9 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Labels**: use visible text first. Current element indexes also work.
 - **Fill**: `{"tool": "fill", "fields": {"To": "sam@x.com"}, "submit": "Send"}` becomes one `set_value` per field and a click. Add `"web": true` for a page.
 - **Goal**: `goal` is one sentence. The reply may add a `Check:` line (done, stuck, or still loading) from the referee. Treat it as a hint.
-- **Recipes**: send `remember: true` with a goal that reached it. Later, send only `goal` to replay the saved steps and their completion checks. Changed recipe values need a fresh check. Keep secrets out of completion conditions because saved recipes store them locally. Steps with element numbers or coordinates are never saved. A recipe that fails twice in a row is dropped.
+- **Recipes** require a passing `done_when` to save mutating steps. To replay, send the same `app` and exact `goal` without steps. Supply each recorded slot in `values`. Slots can hold a recipient, email, number, path, or text. Missing or changed slots need confirmation and changed inputs need fresh steps.
+- Unattended replay requires a verified recipe and the original open Mac window. Each write checks its label, role and surrounding controls again. Recipes from older versions need a fresh verified run. Keep secrets out of completion checks and steps with element numbers or coordinates out of recipes.
+- Godspeed keeps the current recipe and one alternate version. Two consecutive replay failures drop the current version. A verified alternate with the same inputs and check can take over on a later call.
 - **Verified receipts**. With `return_state: false`, a verified file, exact native field, or browser URL can finish the batch without a final tree. Missing evidence still gets a recovery read. Partial or clipped trees are for discovery. Completion needs an independent check or a complete observation.
 - **Wait steps**. Godspeed can check for a window, matching text, or busy indicator before taking a full read. The full read still confirms the wait. Busy checks make up to four accessibility reads at a time.
 - **Action readback**. The dialog check reuses the action’s window read when available. A verified field write can use the next scheduled read. Batch effect checks can reuse a complete read of the same window when it shows a change. A delayed result or a change of window can require another read.
@@ -152,7 +154,7 @@ Helpers (referee and vision):
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPEN_COMPUTER_USE_REFEREE_URL` | unset (off) | Helper service base URL, e.g. `http://127.0.0.1:8765`. |
-| `OPEN_COMPUTER_USE_HANDOFF_HELPER` | on with a configured referee | Set to `0` to skip model-ranked recipe handoff. |
+| `OPEN_COMPUTER_USE_HANDOFF_HELPER` | on with a configured referee | Set to `0` to skip local chooser calls during handoff. |
 | `OPEN_COMPUTER_USE_REFEREE_DONE_HINTS` | off | Optional model hints. `done_when` controls verified completion. |
 | `OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS` | 1500 | Longest wait for a verdict. |
 | `OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE` | 0.6 | Below this, no hint. |
@@ -205,7 +207,7 @@ Finder file copies go to the same private clipboard. Paste them into Finder or s
 
 Screenshots are available for controls that the accessibility tree misses. The optional decision helper is for ambiguous, goal-directed work. Routine reads and explicit completion checks can use the current observation directly.
 
-Handoff can fill an empty, uniquely named field directly when its supplied value matches the completion check. A pinned handoff reads that window. It stops for inspection when input may already have landed. Use a batch for change-aware checks.
+Handoff fills a unique, empty field directly when its value matches the completion check. It can also act on an explicit `Click <label>` goal with one enabled, low-risk target. These matches use zero model calls for that action. If a choice remains, handoff ranks the most relevant 12 options before asking the local Referee chooser. The local helper uses d1-2B 8-bit by default. It hands control back if confidence or the lead over the next option is too low. A pinned handoff verifies against that window. If input might already have landed, it reads back before continuing.
 
 ### Completion checks
 
