@@ -35,7 +35,9 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
 | `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
 | `click`, `hover`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
-| `drag` | Two points on an app screenshot. Both must be in the observed window. Optional `modifiers` such as `["shift"]`. |
+| `drag` | Drag between controls or points in one window. Add `verify` for a drop check. |
+| `gesture` | Zoom or invoke an app command equivalent. Chrome also supports tab history. |
+| `wait_for` | Wait for a control to appear, disappear or change value. |
 | `press_menu` | Chooses a menu item in one call, e.g. `path: "File > Save"`, through accessibility. |
 | `query` | Finds elements by text or role. |
 | `list_apps` | Recently used apps. |
@@ -198,7 +200,7 @@ Browser reads include reported focus, disabled, selected, checked and expanded s
 
 Set `if_changed: true` on `browser screenshot` to avoid returning an identical capture. The comparison is exact and scoped to the client, tab, address, and browser helper generation. Godspeed keeps a digest in memory, not a saved image. In the REPL, `cua.browser("read", { tab_id: 12 })` uses the same persistent connection as native app bindings. `cua.batch(steps, options)` can alternate browser steps with native steps that each name their app. Keep dependent actions ordered and check the batch receipt before resuming. The REPL discards queued input from ended evaluations. Saved-recipe handoffs and final browser observations share the time left in the original operation.
 
-Use `browser outline` for visible headings in the main document, `browser frames` for the tab's document tree, and `browser scroll_into_view` with a label or current reference to reveal one control. Frame listings are for inspection. Actions still need a control reference or label. A browser click can use the left, middle, or right button, or a left double-click. Clicks and drags accept Alt, Control, Command, or Shift modifiers. The click checks its hit point before sending input.
+Use `browser outline` for visible headings in the main document, `browser frames` for the tab's document tree, and `browser scroll_into_view` with a label or current reference to reveal one control. Frame listings are for inspection. Actions still need a control reference or label. A browser click can use the left, middle or right button. Left clicks accept a count of up to three. Clicks and drags accept Alt, Control, Command, or Shift modifiers. The click checks its hit point before sending input.
 
 Use `browser read_text` for rendered text from a uniquely named control or region, or a current control reference. Use `browser link_destination` with a label or current reference to inspect an HTTP(S) link without clicking it. Add `include_link_urls: true` to a read for destinations that Chrome exposes in its accessibility tree. Use `browser control_state` with a label or current reference for visibility, enabled status and checked state when available. Visibility describes rendering. It does not guarantee the control is unobstructed. Use `browser value` with a field label or current reference to read one editable value. Password inputs return no value. Use `browser location` for the tab URL, title, and readiness without reading page content. Use `browser fill_field` to replace an ordinary editable value with one insertion. Use `type` for controls that need keyboard events. Use `browser wait_for` with `url_contains` for a redirect or confirmation page. Use `wait_for` with a `label` and `condition: "enabled"` to wait for a control. Other conditions are `visible`, `checked`, and `unchecked`. Use an explicit `tab_id` when multiple tabs are open.
 
@@ -265,7 +267,7 @@ Use `anchor` with `center`, `left`, `right`, `top` or `bottom` on a control. Opt
 
 Click with `modifiers` such as `["cmd"]` to toggle an item, or `["shift"]` to extend a selection from an item you have already selected. The app defines which ranges it supports. Use `click_count: 2` or `3` on a left click. In a Mac app, supply the control for a triple click. Read back selected rows or text to confirm the result.
 
-Use `mouse_button: "right"` to open a context menu. Read the resulting state, then click the menu item if the app or website exposes it. Chrome's own context menu requires its native window. Web pages can expose their own menu inside the tab.
+Use `mouse_button: "right"` to open a context menu. Read the resulting state, then click the observed menu item by reference if the app or website exposes it. Chrome's own context menu requires its native window. Web pages can expose their own menu inside the tab.
 
 ## Wait for a control
 
@@ -278,6 +280,8 @@ For `value_changed`, give `from_value` to compare against a value you read befor
 Use `select_text` with exact `text`. Add `prefix` or `suffix` for repeats. For an exact range, supply `start` and `length` in UTF-16 units. A zero-length range places the cursor. Give a control label or reference. Godspeed checks the field value and reads back the selected range.
 
 Mac apps need a writable accessibility text range. Chrome supports plain inputs and text areas that expose a selection range. A password field or a custom editor can refuse this action.
+
+## Hover
 
 Use `hover` with `dwell_ms` up to 2000 for a delayed tooltip or hover menu. Read the result or wait for the expected control. Some Mac apps only show tooltips under the real pointer.
 

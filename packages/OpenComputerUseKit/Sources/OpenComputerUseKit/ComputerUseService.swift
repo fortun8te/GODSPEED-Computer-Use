@@ -1604,7 +1604,9 @@ public final class ComputerUseService {
         if let verified = try options.verifiedDrop({ try waitForControl(in: snapshot, wait: $0) }) {
             return .text(verified)
         }
-        return appendingDragDeliveryNote(to: try actionResult(for: query, recoveryPolicy: .readOnly), path: .appPost)
+        let state = try actionResult(for: query, recoveryPolicy: .readOnly)
+        return ToolCallResult(content: [.text("Drag delivered. Use the resulting state to verify the drop.")] + state.content,
+                              isError: state.isError)
     }
 
     public func typeText(app query: String, text: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
