@@ -120,6 +120,24 @@ final class OperationJournalTests: XCTestCase {
         }
     }
 
+    func testIntentIsFullySyncedAndNewJournalFileIsDirectorySynced() throws {
+        final class FlushLog: @unchecked Sendable {
+            private let lock = NSLock()
+            private var events: [OperationJournal.Flush] = []
+            func add(_ event: OperationJournal.Flush) { lock.withLock { events.append(event) } }
+            var all: [OperationJournal.Flush] { lock.withLock { events } }
+        }
+        try withJournal { base in
+            let log = FlushLog()
+            var journal = base
+            journal.onFlush = { log.add($0) }
+            _ = try journal.begin(tool: "click", requestID: UUID())
+            XCTAssertEqual(log.all, [.fullSync, .directory])
+            _ = try journal.begin(tool: "click", requestID: UUID())
+            XCTAssertEqual(log.all, [.fullSync, .directory, .fullSync])
+        }
+    }
+
     func testJournalChildFixture() throws {
         guard let folder = ProcessInfo.processInfo.environment["GODSPEED_L6_JOURNAL_FIXTURE_DIRECTORY"] else {
             return
