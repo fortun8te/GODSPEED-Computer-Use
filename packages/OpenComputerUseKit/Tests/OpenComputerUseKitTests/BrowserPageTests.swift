@@ -47,6 +47,42 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "trash").first, 25)
     }
 
+    func testHintTransportSendsBothProbesBeforeWaitingForReplies() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        // The fake helper withholds both replies until both requests arrive,
+        // then sends them out of order.
+        let script = #"""
+        #!/bin/sh
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"[]"}]}}'
+        IFS= read -r first
+        IFS= read -r second
+        case "$first" in *DOM.resolveNode*) ;; *) exit 1 ;; esac
+        case "$second" in *DOM.resolveNode*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"result\":{\"object\":{\"objectId\":\"second\"}}}"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"result\":{\"object\":{\"objectId\":\"first\"}}}"}]}}'
+        IFS= read -r finalize
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "hint-pipeline-test", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("tabs", arguments: [:], timeout: 3)
+        let replies = try bridge.hintCommands(tab: ["tab_id": 12], commands: [
+            ("DOM.resolveNode", ["backendNodeId": 101]),
+            ("DOM.resolveNode", ["backendNodeId": 102]),
+        ], generation: bridge.referenceGeneration, deadline: TimingLog.now() + 2)
+        XCTAssertEqual(replies.compactMap { ($0?["object"] as? [String: Any])?["objectId"] as? String }, ["first", "second"])
+    }
+
     func testHintProbesResolveTogetherAndShareOneRuntimeRead() {
         var waves: [[String]] = []
         let hints = BrowserPage.readHints(Array(1...24)) { commands in
