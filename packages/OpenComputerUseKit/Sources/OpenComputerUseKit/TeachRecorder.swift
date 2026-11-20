@@ -73,10 +73,7 @@ final class TeachRecorder {
     @discardableResult
     func handle(_ input: TeachInput, now: Date) -> Bool {
         guard isRecording else { return false }
-        if now.timeIntervalSince(startedAt) >= Self.timeLimit {
-            end("10-minute limit")
-            return false
-        }
+        if expireIfNeeded(now: now) { return false }
         if case .appQuit = input.event, input.pid == pid {
             end("app quit")
             return true
@@ -139,6 +136,14 @@ final class TeachRecorder {
             needsValue: needsValue,
             notes: notes
         )
+    }
+
+    /// Ends the recording once the time limit has passed, even when no input arrives. Returns true if it ended now.
+    @discardableResult
+    func expireIfNeeded(now: Date) -> Bool {
+        guard isRecording, now.timeIntervalSince(startedAt) >= Self.timeLimit else { return false }
+        end("10-minute limit")
+        return true
     }
 
     // MARK: Private
