@@ -1,0 +1,301 @@
+import Foundation
+
+/// Local training-data log. Rows are appended as JSONL, one file per UTC day, and scrubbed before they
+/// reach disk. Nothing is sent anywhere. Clipboard content is never read, so it is never stored.
+/// OPEN_COMPUTER_USE_LEARNING_LOG=0 turns the log off. OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES=0 skips PNG saves.
+final class LearningLog: @unchecked Sendable {
+    static let enabledVariable = "OPEN_COMPUTER_USE_LEARNING_LOG"
+    static let imagesVariable = "OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES"
+    static let runIDVariable = "OPEN_COMPUTER_USE_RUN_ID"
+    static let disabledValues = ["0", "false", "no", "off"]
+    /// Whole-folder cap. When the folder passes it, the oldest files are deleted first.
+    static let defaultMaxBytes: UInt64 = 2 * 1024 * 1024 * 1024
+
+    static var defaultDirectory: URL {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".godspeed/learning", isDirectory: true)
+    }
+
+    static func isEnabled(environment: [String: String]) -> Bool {
+        !disabledValues.contains(flag(environment[enabledVariable]))
+    }
+
+    static func imagesEnabled(environment: [String: String]) -> Bool {
+        !disabledValues.contains(flag(environment[imagesVariable]))
+    }
+
+    private static func flag(_ value: String?) -> String {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    }
+
+    let directory: URL
+    let maxBytes: UInt64
+    let isEnabled: Bool
+    let imagesEnabled: Bool
+    let runID: String
+    private let clock: () -> Date
+    private let lock = NSLock()
+
+    init(
+        directory: URL = LearningLog.defaultDirectory,
+        maxBytes: UInt64 = LearningLog.defaultMaxBytes,
+        enabled: Bool = LearningLog.isEnabled(environment: ProcessInfo.processInfo.environment),
+        imagesEnabled: Bool = LearningLog.imagesEnabled(environment: ProcessInfo.processInfo.environment),
+        runID: String? = ProcessInfo.processInfo.environment[LearningLog.runIDVariable],
+        clock: @escaping () -> Date = { Date() }
+    ) {
+        self.directory = directory
+        self.maxBytes = maxBytes
+        isEnabled = enabled
+        self.imagesEnabled = imagesEnabled
+        self.runID = runID ?? UUID().uuidString.lowercased()
+        self.clock = clock
+    }
+
+    /// Scrubs one row and appends it as a JSON line. Returns false when the log is off or the write fails.
+    @discardableResult
+    func append<Row: Encodable>(_ row: Row) -> Bool {
+        guard isEnabled, let data = try? JSONEncoder().encode(row),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        let now = clock()
+        // Timestamps and ids are added after scrubbing so they are never redacted.
+        var scrubbed = LearningScrubber.scrub(object)
+        if scrubbed["ts"] == nil { scrubbed["ts"] = Self.timestamp(now) }
+        if scrubbed["run_id"] == nil { scrubbed["run_id"] = runID }
+        guard let line = try? JSONSerialization.data(
+            withJSONObject: scrubbed, options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else { return false }
+        let url = directory.appendingPathComponent("learning-\(Self.format(now, "yyyy-MM-dd")).jsonl")
+        guard write(line + Data("\n".utf8), to: url) else { return false }
+        enforceCap(keeping: url.lastPathComponent)
+        return true
+    }
+
+    /// Saves a PNG beside the JSONL. Returns the file name for a locate row, or nil when images are off.
+    func saveImage(_ png: Data) -> String? {
+        guard isEnabled, imagesEnabled else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        let now = clock()
+        let name = "learning-\(Self.format(now, "yyyy-MM-dd-HHmmss-SSS"))-\(UUID().uuidString.lowercased().prefix(8)).png"
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try png.write(to: directory.appendingPathComponent(name), options: .atomic)
+        } catch {
+            return nil
+        }
+        enforceCap(keeping: name)
+        return name
+    }
+
+    private func write(_ data: Data, to url: URL) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Deletes the oldest learning files until the folder fits the cap. The file just written is kept.
+    private func enforceCap(keeping name: String) {
+        let files = learningFiles()
+        var total = files.reduce(UInt64(0)) { $0 + $1.size }
+        for file in files where total > maxBytes && file.name != name {
+            try? FileManager.default.removeItem(at: file.url)
+            total -= file.size
+        }
+    }
+
+    /// Learning files, oldest first. Names start with the UTC date, so sorting by name sorts by time.
+    private func learningFiles() -> [(name: String, url: URL, size: UInt64)] {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.fileSizeKey]
+        )) ?? []
+        return urls
+            .filter { $0.lastPathComponent.hasPrefix("learning-") }
+            .map { url -> (name: String, url: URL, size: UInt64) in
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                return (name: url.lastPathComponent, url: url, size: UInt64(max(size, 0)))
+            }
+            .sorted { $0.name < $1.name }
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private static func format(_ date: Date, _ pattern: String) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = pattern
+        return formatter.string(from: date)
+    }
+}
+
+struct LearningOption: Codable {
+    var id: String
+    var text: String
+}
+
+/// A decide or choose call. The outcome is what the model returned, not a label.
+struct LearningDecisionRow: Codable {
+    var kind = "decide"
+    var ts: String?
+    var run_id: String?
+    var app: String?
+    var view: String?
+    var options: [LearningOption]?
+    var probabilities: [String: Double]?
+    var outcome: String?
+    var latency_ms: Double?
+    var model: String?
+}
+
+/// A grounding call: where the model pointed in a crop.
+struct LearningLocateRow: Codable {
+    var kind = "locate"
+    var ts: String?
+    var run_id: String?
+    var app: String?
+    var query: String?
+    var crop_width: Double?
+    var crop_height: Double?
+    var point: [Double]?
+    var box: [Double]?
+    var confidence: Double?
+    var verified: Bool?
+    var image: String?
+}
+
+/// One action step and what was observed after it.
+struct LearningStepRow: Codable {
+    var kind = "step"
+    var ts: String?
+    var run_id: String?
+    var app: String?
+    var tool: String?
+    var target_role: String?
+    var target_label: String?
+    var delivery_state: String?
+    var failure_code: String?
+    var verification: String?
+    var done_when: String?
+    var before: String?
+    var after: String?
+}
+
+/// The end of a goal, with its final outcome.
+struct LearningEpisodeRow: Codable {
+    var kind = "episode"
+    var ts: String?
+    var run_id: String?
+    var app: String?
+    var goal: String?
+    var outcome: String?
+}
+
+/// Removes secrets and private values from a JSON row. Works on the encoded object, so every row type is covered.
+enum LearningScrubber {
+    static let redacted = "[redacted]"
+    static let textLimit = 6_000
+    static let secureMarkers = ["password", "passcode", "secure"]
+    static let codeMarkers = ["code", "otp", "2fa", "verification"]
+    static let labelKeys: Set<String> = ["role", "subrole", "label", "target_role", "target_label"]
+    /// Keys we write ourselves or that hold file names and ids. They are never scrubbed.
+    static let exemptKeys: Set<String> = ["ts", "run_id", "app", "image", "kind"]
+    static let keyPattern = regex(#"\b(?:sk-|ghp_|xox|AKIA)[A-Za-z0-9_\-]{8,}"#)
+    static let tokenPattern = regex(#"[A-Za-z0-9_\-]{24,}"#)
+    static let cardPattern = regex(#"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)"#)
+
+    /// Scrubs every string in an encoded row. Secure fields lose their label and values.
+    /// Code and verification fields keep their label but lose their values.
+    static func scrub(_ object: [String: Any]) -> [String: Any] {
+        let secure = object.contains { key, value in
+            labelKeys.contains(key) && isMarked(value as? String, secureMarkers)
+        }
+        let codeLabel = object.contains { key, value in
+            labelKeys.contains(key) && isMarked(value as? String, codeMarkers)
+        }
+        var output: [String: Any] = [:]
+        for (key, value) in object {
+            if exemptKeys.contains(key) {
+                output[key] = value
+            } else if secure && ["label", "target_label", "value", "before", "after"].contains(key) {
+                continue
+            } else if codeLabel && ["value", "before", "after"].contains(key) && value is String {
+                output[key] = redacted
+            } else {
+                output[key] = scrubValue(value)
+            }
+        }
+        return output
+    }
+
+    private static func scrubValue(_ value: Any) -> Any {
+        if let text = value as? String { return clean(text) }
+        if let object = value as? [String: Any] { return scrub(object) }
+        if let list = value as? [Any] { return list.map(scrubValue) }
+        return value
+    }
+
+    /// Redacts API keys, card numbers that pass Luhn and long mixed tokens, then clips to the limit.
+    static func clean(_ input: String) -> String {
+        var text = replacing(input, keyPattern) { _ in true }
+        text = replacing(text, cardPattern) { found in
+            let digits = found.filter { $0.isASCII && $0.isNumber }
+            return (13...19).contains(digits.count) && isLuhn(digits)
+        }
+        text = replacing(text, tokenPattern) { found in
+            found.contains { $0.isLetter } && found.contains { $0.isNumber }
+        }
+        return String(text.prefix(textLimit))
+    }
+
+    static func isLuhn(_ digits: String) -> Bool {
+        var sum = 0
+        for (index, character) in digits.reversed().enumerated() {
+            guard let number = character.wholeNumberValue else { return false }
+            if index % 2 == 1 {
+                let doubled = number * 2
+                sum += doubled > 9 ? doubled - 9 : doubled
+            } else {
+                sum += number
+            }
+        }
+        return sum % 10 == 0
+    }
+
+    private static func isMarked(_ value: String?, _ markers: [String]) -> Bool {
+        guard let value = value?.lowercased() else { return false }
+        return markers.contains { value.contains($0) }
+    }
+
+    private static func replacing(_ text: String, _ pattern: NSRegularExpression, when shouldRedact: (String) -> Bool) -> String {
+        let source = text as NSString
+        var result = text
+        // Walk matches from the end so earlier ranges stay valid.
+        for match in pattern.matches(in: text, range: NSRange(location: 0, length: source.length)).reversed()
+        where shouldRedact(source.substring(with: match.range)) {
+            result = (result as NSString).replacingCharacters(in: match.range, with: redacted)
+        }
+        return result
+    }
+
+    private static func regex(_ pattern: String) -> NSRegularExpression {
+        // The patterns are constants, so a failure here is a programming error.
+        try! NSRegularExpression(pattern: pattern)
+    }
+}
