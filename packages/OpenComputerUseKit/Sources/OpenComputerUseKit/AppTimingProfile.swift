@@ -81,3 +81,21 @@ public final class AppTimingProfiles: @unchecked Sendable {
         lock.lock(); profiles = loaded; lock.unlock()
     }
 }
+
+/// The one timing profile set for this process, keyed by app pid. AX call sites share it, so a slow or
+/// frozen app adapts every read, not only the read that noticed it.
+enum AppTiming {
+    static let shared = AppTimingProfiles()
+
+    static func key(pid: pid_t) -> String { "pid:\(pid)" }
+
+    /// AX messaging timeout for `pid`: the learned value, but never above `fixed` (today's value at the call site).
+    static func messagingTimeout(pid: pid_t, fixed: Float) -> Float {
+        Float(min(TimeInterval(fixed), shared.messagingTimeout(for: key(pid: pid))))
+    }
+
+    /// Upper bound for a post-action settle wait on `pid`: the learned budget, but never above `fixed`.
+    static func settleCap(pid: pid_t, fixed: TimeInterval) -> TimeInterval {
+        min(fixed, shared.settleBudget(for: key(pid: pid)))
+    }
+}

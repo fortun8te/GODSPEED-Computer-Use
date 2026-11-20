@@ -55,6 +55,30 @@ final class AppTimingProfileTests: XCTestCase {
         p.recordTimeout(app: "a", now: now.addingTimeInterval(40))
         XCTAssertFalse(p.isUnresponsive(app: "a", now: now.addingTimeInterval(40)))
     }
+    /// The shared helper that call sites use: it adapts to fast and frozen apps, and never exceeds today's value.
+    func testSharedHelperAdaptsAndNeverExceedsFixedValue() {
+        let pid: pid_t = 987_001 // a fixture pid no real app uses; AppTiming.shared is process-wide
+        XCTAssertEqual(AppTiming.messagingTimeout(pid: pid, fixed: 0.2), 0.2, "an unknown app keeps today's value")
+        for _ in 0..<10 { AppTiming.shared.record(app: AppTiming.key(pid: pid), axLatencyMs: 5) }
+        XCTAssertEqual(AppTiming.messagingTimeout(pid: pid, fixed: 0.2), 0.05, accuracy: 1e-9, "fast samples shorten the wait")
+        for _ in 0..<10 { AppTiming.shared.record(app: AppTiming.key(pid: pid), axLatencyMs: 900) }
+        XCTAssertEqual(AppTiming.messagingTimeout(pid: pid, fixed: 0.2), 0.2, accuracy: 1e-9, "slow samples never raise it above 0.2")
+
+        let frozen: pid_t = 987_002
+        let now = Date()
+        for _ in 0..<3 { AppTiming.shared.recordTimeout(app: AppTiming.key(pid: frozen), now: now) }
+        XCTAssertEqual(AppTiming.messagingTimeout(pid: frozen, fixed: 0.2), 0.05, accuracy: 1e-9, "a timeout burst uses the floor")
+    }
+
+    func testSharedSettleCapIsBoundedByTheCallSite() {
+        let pid: pid_t = 987_003
+        XCTAssertEqual(AppTiming.settleCap(pid: pid, fixed: 0.15), 0.15, "no samples: the call site's interval")
+        AppTiming.shared.recordSettle(app: AppTiming.key(pid: pid), ms: 0)
+        XCTAssertEqual(AppTiming.settleCap(pid: pid, fixed: 0.15), 0.08, accuracy: 1e-9, "a fast app settles within the learned budget")
+        AppTiming.shared.recordSettle(app: AppTiming.key(pid: pid), ms: 5000)
+        XCTAssertEqual(AppTiming.settleCap(pid: pid, fixed: 0.15), 0.15, "a slow app never waits longer than the interval")
+    }
+
     private func withTempFile(_ body: (URL) throws -> Void) rethrows {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

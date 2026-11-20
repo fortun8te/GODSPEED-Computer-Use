@@ -733,6 +733,9 @@ public final class ComputerUseService {
     @TaskLocal static var defersVerifiedSetValueObservation = false
 
     private var snapshotsByApp: [String: AppSnapshot] = [:]
+    /// Counts stored reads; the label-miss cache treats each count as one snapshot generation.
+    private var snapshotStoreCount = 0
+    private let negativeLookups = NegativeLookupCache()
     private var invalidatedSnapshotAliases: Set<String> = []
     // Read per call: the app agent applies the caller's OPEN_COMPUTER_USE_* variables
     // for the duration of each request.
@@ -782,9 +785,16 @@ public final class ComputerUseService {
             Thread.sleep(forTimeInterval: interval)
             return
         }
-        WindowSettle.waitUntilStill(cap: interval, axBusy: { WindowSettle.rootShowsBusy(window) }) {
+        // The learned settle budget for this app caps the wait, never above the call site's interval.
+        let pid = window.flatMap { element -> pid_t? in
+            var value: pid_t = 0
+            return AXUIElementGetPid(element, &value) == .success ? value : nil
+        }
+        let cap = pid.map { AppTiming.settleCap(pid: $0, fixed: interval) } ?? interval
+        let waited = WindowSettle.waitUntilStill(cap: cap, axBusy: { WindowSettle.rootShowsBusy(window) }) {
             SkyLightSPI.shared.hardwareCaptureWindow(windowID).flatMap(WindowSettle.fingerprint(of:))
         }
+        if let pid { AppTiming.shared.recordSettle(app: AppTiming.key(pid: pid), ms: waited * 1000) }
     }
 
     /// The result an action returns: the after-action snapshot, or a short status
@@ -1810,7 +1820,10 @@ public final class ComputerUseService {
 
         if keyMethod == .skyKey, !Self.awaitsModalTextFocus {
             let target = try skyKeyTarget(for: snapshot)
-            if let focused = Self.focusedElement(pid: target.pid) {
+            // Keys go to whatever has focus: refuse unless it is the field the snapshot showed.
+            let focused = Self.focusedElement(pid: target.pid)
+            try requireKeyboardFocusMatchesRead(focused, snapshot: snapshot)
+            if let focused {
                 try selectWholeNameForKeys(text: text, focused: focused, pid: target.pid, windowID: target.windowID)
             }
             try InputSimulation.typeTextWithSkyLight(text, windowID: target.windowID, pid: target.pid)
@@ -1878,6 +1891,8 @@ public final class ComputerUseService {
         }
 
         try requireCurrentTextFocus(focused, pid: snapshot.app.pid)
+        // A modal editor (Go to Folder) is picked above from its own focus, so only the plain path is checked here.
+        if !Self.awaitsModalTextFocus { try requireKeyboardFocusMatchesRead(focused, snapshot: snapshot) }
         let isSecure = isSecureTextField(subrole: stringValue(of: focused, attribute: kAXSubroleAttribute))
         let before = isSecure ? nil : stringValue(of: focused, attribute: kAXValueAttribute)
         if keyMethod == .skyKey || useSkyLightKeyRoute(snapshot: snapshot, focused: focused, opensDialogFromMenu: false, hasLiveTextFocus: true) {
@@ -1990,10 +2005,39 @@ public final class ComputerUseService {
         return false
     }
 
+    /// Pure gate for keyboard text: nil when the observed focus is the field the snapshot showed (FocusTransition
+    /// `.ok`), otherwise the notSent refusal. Unknown focus on either side is refused too: unknown means do not type.
+    static func keyboardFocusRefusal(read: ObservedFocus, observed: ObservedFocus) -> ComputerUseError? {
+        guard let role = read.elementRole, let label = read.label else {
+            return .notSent("Typing would go to an unknown control; read the app and target the field.")
+        }
+        let target = FocusTarget(windowID: read.windowID ?? 0, elementRole: role, label: label)
+        guard FocusTransition.check(target: target, observed: observed) == .ok else {
+            let seen = observed.label ?? observed.elementRole ?? "an unknown control"
+            return .notSent("Typing would go to \(seen); read the app and target the field.")
+        }
+        return nil
+    }
+
+    /// Checks the focus that is about to get keys (sky_key and the keyboard fallback) against the snapshot's focus.
+    private func requireKeyboardFocusMatchesRead(_ focused: AXUIElement?, snapshot: AppSnapshot) throws {
+        func describe(_ element: AXUIElement) -> (role: String?, label: String?) {
+            (stringValue(of: element, attribute: kAXRoleAttribute), accessibilityLabels(for: element).first)
+        }
+        let windowID = snapshot.targetWindowID.map { Int($0) }
+        let read = snapshot.focusedElement.map(describe)
+        let now = focused.map(describe)
+        if let refusal = Self.keyboardFocusRefusal(
+            read: ObservedFocus(windowID: windowID, elementRole: read?.role, label: read?.label),
+            observed: ObservedFocus(windowID: windowID, elementRole: now?.role, label: now?.label)) {
+            throw refusal
+        }
+    }
+
     private static func focusedElement(pid: pid_t) -> AXUIElement? {
         var focused: CFTypeRef?
         let appElement = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appElement, 0.2)
+        AXUIElementSetMessagingTimeout(appElement, AppTiming.messagingTimeout(pid: pid, fixed: 0.2))
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
               let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
         return (focused as! AXUIElement)
@@ -2008,7 +2052,7 @@ public final class ComputerUseService {
 
     private static func currentInputFocus(pid: pid_t, requireModal: Bool = false) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.2)
+        AXUIElementSetMessagingTimeout(app, AppTiming.messagingTimeout(pid: pid, fixed: 0.2))
         let appFocus = elementAttribute(app, kAXFocusedUIElementAttribute)
         guard let window = elementAttribute(app, kAXFocusedWindowAttribute) else { return requireModal ? nil : appFocus }
 
@@ -2620,7 +2664,7 @@ public final class ComputerUseService {
     private func requireBoundFocusedWindow(in snapshot: AppSnapshot) throws {
         guard let windowID = Self.requiredWindowID else { return }
         let appElement = AXUIElementCreateApplication(snapshot.app.pid)
-        AXUIElementSetMessagingTimeout(appElement, 0.2)
+        AXUIElementSetMessagingTimeout(appElement, AppTiming.messagingTimeout(pid: snapshot.app.pid, fixed: 0.2))
         guard let window = snapshot.windowElement,
               let focused = Self.elementAttribute(appElement, kAXFocusedWindowAttribute),
               CFEqual(focused, window),
@@ -2841,11 +2885,21 @@ public final class ComputerUseService {
         let fresh: AppSnapshot
         if Self.requiredWindowID != nil {
             fresh = try currentSnapshot(for: query, needScreenshot: false)
+            if let hit = try find(in: fresh) { return hit }
         } else {
-            if let hit = try? find(in: try currentSnapshot(for: query, needScreenshot: false)) { return hit }
-            fresh = try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false))
+            // The expensive fresh read is skipped when this same label already missed on the current snapshot
+            // generation (the generation changes on every stored read, so a new read always searches again).
+            let labelKey = given.joined(separator: "\n")
+            let outcome = try negativeLookups.searchTwoStep(
+                keyFor: { NegativeLookupCache.Key(app: query.lowercased(), windowID: Int($0.targetWindowID ?? 0), label: labelKey, role: "") },
+                cached: try? currentSnapshot(for: query, needScreenshot: false),
+                generation: { self.snapshotStoreCount },
+                now: { TimingLog.now() },
+                find: { try find(in: $0) },
+                readFresh: { try refreshSnapshot(for: query, observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false)) })
+            if let hit = outcome.hit { return hit }
+            fresh = outcome.state
         }
-        if let hit = try find(in: fresh) { return hit }
         // A text field or document named by what it contains ("The quick blue fox."): the one field holding it.
         if let w = given.first, w.count >= 4 {
             let holders = fresh.elements.values.filter { r in
@@ -2926,6 +2980,8 @@ public final class ComputerUseService {
             (app.bundleIdentifier ?? "").lowercased(),
         ].filter { !$0.isEmpty })
 
+        // Every stored read is a new generation for NegativeLookupCache, so misses from an older tree are not reused.
+        snapshotStoreCount += 1
         for key in keys {
             snapshotsByApp[key] = snapshot
             invalidatedSnapshotAliases.remove(key)
