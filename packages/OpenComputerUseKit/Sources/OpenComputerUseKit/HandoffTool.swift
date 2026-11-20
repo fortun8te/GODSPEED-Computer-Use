@@ -542,6 +542,7 @@ enum HandoffTool {
         let kind: String
         switch outcome.kind {
         case .done: kind = outcome.deliveryState == .verified ? "verified" : "weak"
+        case .notVerified: kind = "not_verified"  // weak evidence only; never a training "done"
         case .stuck: kind = "stuck"
         case .escalate: kind = "escalate"
         case .budget: kind = "budget"
