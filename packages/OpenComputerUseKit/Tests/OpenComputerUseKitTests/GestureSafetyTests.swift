@@ -18,6 +18,12 @@ final class GestureSafetyTests: XCTestCase {
         XCTAssertTrue(zoom.isEmpty, "\(zoom)")
     }
 
+    func testDutchDestructiveMenuTitlesNeverFallThroughToMenuItems() {
+        for label in ["Naar prullenbak verplaatsen", "Prullenbak leegmaken", "Plaats bericht", "Afmelden"] {
+            XCTAssertTrue(MenuItemLookup.isDestructive(label), label)
+        }
+    }
+
     func testDestructiveTitlesAreRecognisedInEnglishAndDutch() {
         for title in ["Delete", "Move to Trash", "Quit Preview", "Verwijderen", "Prullenmand leegmaken", "Afmelden"] {
             XCTAssertTrue(MenuItemLookup.isDestructive(title) || ShortcutCache.isDestructive(title), title)
