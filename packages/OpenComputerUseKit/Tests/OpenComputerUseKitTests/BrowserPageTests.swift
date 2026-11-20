@@ -6,6 +6,28 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testExactLookupUsesOneQueryAndFallsBackOnNoCertainMatch() throws {
+        let save: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
+        let duplicate: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 43]
+        var queries = 0
+        var fullReads = 0
+        func fullTree() -> [[String: Any]] {
+            fullReads += 1
+            return [save, duplicate]
+        }
+        let targeted = try BrowserPage.exactControls(named: "Save", query: {
+            queries += 1
+            return [save, duplicate]
+        }, fallback: fullTree)
+        XCTAssertEqual(targeted.map(\.backendNodeID), [42, 43])
+        XCTAssertEqual(queries, 1)
+        XCTAssertEqual(fullReads, 0)
+
+        let fallback = try BrowserPage.exactControls(named: "Save", query: { [] }, fallback: fullTree)
+        XCTAssertEqual(fallback.map(\.backendNodeID), [42, 43])
+        XCTAssertEqual(fullReads, 1)
+    }
+
     func testFindHintsSkipUnrelatedDuplicatesAndKeepIconOnlyControls() {
         var parse = BrowserAXParse()
         parse.controls = (1...24).map { BrowserNode(index: $0, role: "button", name: "Edit", value: "", backendNodeID: $0) }

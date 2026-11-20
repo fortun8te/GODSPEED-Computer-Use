@@ -60,7 +60,7 @@ Save waits for the name field, folder choice and any confirmation to appear. It 
 
 When a visible app is still preparing its web content, Godspeed checks for the web area before walking the full tree again.
 
-Browser `find` checks matching controls first and keeps icon-only controls eligible for hints. Chrome reads the selected hints together.
+Browser `find` checks matching controls first and keeps icon-only controls eligible for hints. Chrome reads the selected hints together. Use `find_exact` to look up controls by their exact accessible name. Use a regular read for numbered controls and page verification.
 
 ### Works only with focus borrowing
 

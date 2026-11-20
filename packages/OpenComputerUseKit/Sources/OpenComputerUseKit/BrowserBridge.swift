@@ -828,11 +828,15 @@ extension ComputerUseToolDispatcher {
             return try clipboardAction(operation)
         case "read", "state", "look", "snapshot":
             let find = (arguments["find"] ?? arguments["query"] ?? arguments["filter"]) as? String
+            let exact = arguments["find_exact"] as? String
+            if arguments["find_exact"] != nil, (exact?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false || find != nil) {
+                throw ComputerUseError.invalidArguments("Give find_exact a control's name and omit find.")
+            }
             let snapshot = try page.readSnapshot(
                 find: find, full: Self.browserFlag(arguments["full"]),
                 interactive: Self.browserFlag(arguments["interactive"]), diff: Self.browserFlag(arguments["diff"]),
                 includeLinkURLs: Self.browserFlag(arguments["include_link_urls"]),
-                keepsDiffBaseline: !Self.clipsBrowserStepObservation
+                keepsDiffBaseline: !Self.clipsBrowserStepObservation, findExact: exact
             )
             return ToolCallResult(
                 content: [.text(snapshot.text)], isError: false, browserObservationURL: snapshot.verifiedURL,

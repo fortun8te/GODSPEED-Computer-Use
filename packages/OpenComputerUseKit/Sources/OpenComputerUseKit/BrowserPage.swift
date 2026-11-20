@@ -155,11 +155,31 @@ final class BrowserPage {
     }
 
     func readSnapshot(find: String?, full: Bool, interactive: Bool = false, diff: Bool = false,
-                      includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true) throws
+                      includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true,
+                      findExact: String? = nil) throws
         -> (text: String, verifiedURL: String?, fullText: String?) {
         guardForeignFrames()
         let identity = remember && tabID != nil ? try? documentIdentity() : nil
         let generation = bridge.referenceGeneration
+        if let exact = findExact?.trimmingCharacters(in: .whitespacesAndNewlines), !exact.isEmpty {
+            let matches = try Self.exactControls(named: exact, query: { try queryNamedRaw(exact) }, fallback: fullTree)
+            var parse = BrowserAXParse()
+            parse.controls = Array(matches.prefix(150))
+            parse.droppedControls = max(0, matches.count - parse.controls.count)
+            let place = try? location()
+            // Scope this discovery to labels. An exact-name result lacks the
+            // neighboring text used to fingerprint an indexed control.
+            let stable = identity != nil && (try? documentIdentity()) == identity && generation == bridge.referenceGeneration
+            if !stable {
+                if let tabID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID) }
+                parse.controls = []
+            }
+            let text = Self.renderRead(parse, href: place?.href ?? "?", title: place?.title ?? "",
+                                       readyState: place?.readyState ?? "complete", wholePage: false, numbered: false,
+                                       includeLinkURLs: includeLinkURLs)
+            return (text + "\n(exact-name search; read the page for numbered controls or to verify page content)",
+                    stable ? place?.href : nil, "")
+        }
         let raw = try fullTree()
         let query = find?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A find looks through the whole page, however long (only its matches are printed); a full read lists
@@ -709,6 +729,20 @@ final class BrowserPage {
         }
         let payload = try cdp("Accessibility.queryAXTree", ["objectId": objectID, "accessibleName": label])
         return Self.nodes(of: payload)
+    }
+
+    static func exactControls(
+        named name: String, query: () throws -> [[String: Any]], fallback: () throws -> [[String: Any]]
+    ) throws -> [BrowserNode] {
+        let wanted = normalize(name)
+        func matches(_ raw: [[String: Any]]) -> [BrowserNode] {
+            namedCandidates(raw).filter { normalize($0.name) == wanted }
+        }
+        if let raw = try? query(), !raw.isEmpty {
+            let found = matches(raw)
+            if !found.isEmpty { return found }
+        }
+        return matches(try fallback())
     }
 
     static func namedCandidates(_ raw: [[String: Any]]) -> [BrowserNode] {
