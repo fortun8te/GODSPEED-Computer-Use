@@ -211,6 +211,8 @@ public enum SnapshotTextStyle {
 }
 
 enum SnapshotBuilder {
+    @TaskLocal static var publishesElementNumbers = true
+
     static func build(
         for app: RunningAppDescriptor,
         textLimit: SnapshotTextLimit = .defaults,
@@ -362,7 +364,7 @@ enum SnapshotBuilder {
             treeLimits: treeLimits
         )
 
-        let numbering = ElementNumbering.isEnabled ? ElementNumbering.forApp(pid: app.pid) : nil
+        let numbering = publishesElementNumbers && ElementNumbering.isEnabled ? ElementNumbering.forApp(pid: app.pid) : nil
         context.numbering = numbering
         numbering?.beginSnapshot()
         var renderer = TreeRenderer(context: context)

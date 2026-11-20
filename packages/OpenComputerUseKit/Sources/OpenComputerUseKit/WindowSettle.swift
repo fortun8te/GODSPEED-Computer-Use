@@ -2,22 +2,8 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
-/// Two ways to tell that a window has settled, kept together:
-/// - Still (action read-back): the window's pixels stopped changing.
-/// - Not busy (get_app_state settle and batch): the window shows no busy sign.
-///
-/// Frame-driven settle for action read-back. Instead of always sleeping a fixed
-/// interval before reading a window back, sample a small grayscale thumbnail of
-/// the window and return once two consecutive samples match (the window has
-/// stopped animating: a sheet slide, a menu fade, a window open). The fixed
-/// interval stays the cap, so a window still changing at the cap is read exactly
-/// as before; a missing sample falls back to the full cap.
-/// Disable with OPEN_COMPUTER_USE_SETTLE_BY_FRAME=0.
-///
-/// Waiting for a window to settle the way Codex's `waitForUIToSettle` judges it: by busy signs in the window
-/// (an AXBusyIndicator, an AXWebArea whose AXLoaded is false, an element whose AXElementBusy is true), with no
-/// quiet period first. A quiet period is paid by every read whether or not anything moved; a window showing no
-/// busy sign is read after one scan.
+/// Bounded settling for window reads. Action readback samples small frames.
+/// An explicit settle also waits out AX busy indicators.
 enum WindowSettle {
     // MARK: Still: frame-driven settle for action read-back
 
@@ -27,41 +13,46 @@ enum WindowSettle {
         return !["0", "false", "no", "off"].contains(value)
     }
 
-    /// Minimum wait before the first comparison, so an animation that has not started yet is not missed.
     static let floor: TimeInterval = 0.02
-    /// One 60 Hz frame: sampling faster than the display refreshes would compare a frame with itself.
-    static let sampleInterval: TimeInterval = 0.017
+    static let sampleInterval: TimeInterval = 0.04
+    static let quietPeriod: TimeInterval = 0.12
     static let thumbnailSide = 24
 
-    /// Matching comparisons needed in a row before the window counts as still. Two
-    /// guards against an animation's eased start, where frames look identical for a moment.
-    static let requiredMatches = 2
-
-    /// Waits until `sample()` returns the same fingerprint `requiredMatches` times in a row
-    /// (after `floor`), or until `cap` elapses. Returns the elapsed time.
+    /// Reads at the cap if the frame keeps changing, capture fails, or AX is still busy.
     @discardableResult
     static func waitUntilStill(
         floor: TimeInterval = floor,
         cap: TimeInterval,
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        axBusy: () -> Bool = { false },
         sample: () -> UInt64?
     ) -> TimeInterval {
-        let start = TimingLog.now()
-        let floor = min(floor, cap)
-        Thread.sleep(forTimeInterval: floor)
-        var previous = sample()
-        var matches = 0
-        while TimingLog.now() - start < cap {
-            Thread.sleep(forTimeInterval: min(sampleInterval, max(0, cap - (TimingLog.now() - start))))
-            guard let current = sample() else {
-                previous = nil
-                matches = 0
-                continue
-            }
-            matches = current == previous ? matches + 1 : 0
-            if matches >= requiredMatches { return TimingLog.now() - start }
-            previous = current
+        let start = now()
+        let deadline = start + cap
+        // Skip capture entirely if there is no room to establish a quiet period.
+        guard cap > floor + quietPeriod else {
+            if cap > 0 { sleep(cap) }
+            return now() - start
         }
-        return TimingLog.now() - start
+        sleep(min(floor, cap))
+        var previous: UInt64?
+        var stableSince: TimeInterval?
+        while now() < deadline {
+            let current = sample()
+            if let current, now() < deadline, !axBusy() {
+                let sampledAt = now()
+                if current != previous || stableSince == nil { stableSince = sampledAt }
+                if let since = stableSince, sampledAt - since >= quietPeriod { break }
+            } else {
+                stableSince = nil
+            }
+            previous = current
+            let remaining = deadline - now()
+            if remaining <= 0 { break }
+            sleep(min(sampleInterval, remaining))
+        }
+        return now() - start
     }
 
     /// FNV-1a over a 24x24 grayscale rendering of the image.
@@ -123,9 +114,7 @@ enum WindowSettle {
         return false
     }
 
-    /// Looks at `busy` until it is false, again `interval` after each busy look, within `timeout`. Returns
-    /// whether the window stopped looking busy; no look starts past the deadline. Clock and sleep are
-    /// injectable for tests.
+    /// Requires a quiet interval between successful non-busy scans. A busy scan resets the timer.
     static func wait(
         timeout: TimeInterval,
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
@@ -133,11 +122,31 @@ enum WindowSettle {
         busy: () throws -> Bool
     ) rethrows -> Bool {
         let deadline = now() + timeout
-        while try busy() {
-            guard now() + interval < deadline else { return false }
-            sleep(interval)
+        var quietSince: TimeInterval?
+        while now() < deadline {
+            let sawBusy = try busy()
+            let sampledAt = now()
+            guard sampledAt <= deadline else { return false }
+            if sawBusy {
+                quietSince = nil
+            } else if let since = quietSince {
+                if sampledAt - since >= quietPeriod { return true }
+            } else {
+                quietSince = sampledAt
+            }
+            let remaining = deadline - sampledAt
+            if remaining <= 0 { break }
+            sleep(min(interval, remaining))
         }
-        return true
+        return false
+    }
+
+    /// A cheap AX veto on the frame path. A full tree scan is reserved for explicit settle reads.
+    static func rootShowsBusy(_ root: AXUIElement?) -> Bool {
+        guard let root else { return false }
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(root, "AXElementBusy" as CFString, &value) == .success
+            && value as? Bool == true
     }
 
     /// Each element's signs, read side by side: the app answers one read while the next is on its way.

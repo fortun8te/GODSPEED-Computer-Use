@@ -55,15 +55,14 @@ enum SettingsPanes {
     }
 
     /// Opens the pane named `label`; true when the name is a known pane and the link was handed to macOS.
-    static func open(label: String) -> Bool {
+    static func open(label: String) throws -> Bool {
         let key = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: " and ", with: " & ")
         guard let id = links[key], let url = URL(string: "x-apple.systempreferences:\(id)") else { return false }
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        let done = DispatchSemaphore(value: 0)
-        var failed = false
-        NSWorkspace.shared.open(url, configuration: configuration) { _, error in failed = error != nil; done.signal() }
-        guard done.wait(timeout: .now() + 5) == .success, !failed else { return false }
+        try SmartSteps.openWorkspace { complete in
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = false
+            NSWorkspace.shared.open(url, configuration: configuration) { _, error in complete(error) }
+        }
         Thread.sleep(forTimeInterval: 0.6)
         return true
     }

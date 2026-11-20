@@ -9,6 +9,13 @@ public enum ComputerUseError: Error, LocalizedError {
     case appNotFound(String)
     case permissionDenied(String)
     case stateUnavailable(String)
+    case notSent(String)
+    case targetNotFound(String)
+    case ambiguousTarget(String)
+    case staleTarget(String)
+    case elementGone(String)
+    case timedOut(String, delivery: DeliveryState)
+    case acknowledged(String)
 
     public var errorDescription: String? {
         switch self {
@@ -22,18 +29,34 @@ public enum ComputerUseError: Error, LocalizedError {
             return "appNotFound(\"\(app)\")"
         case .permissionDenied(let message):
             return message
-        case .stateUnavailable(let message):
+        case .stateUnavailable(let message), .notSent(let message), .staleTarget(let message),
+             .elementGone(let message), .timedOut(let message, _), .acknowledged(let message):
             return message
+        case .targetNotFound(let message), .ambiguousTarget(let message):
+            return "invalidArguments(\"\(message)\")"
         }
     }
 
-    var toolResultIsError: Bool {
-        true
+    var toolResultIsError: Bool { true }
+
+    /// Unclassified errors are conservative: they do not prove a command was never sent.
+    public var deliveryState: DeliveryState {
+        switch self {
+        case .unsupportedTool, .invalidArguments, .appNotFound, .permissionDenied, .notSent,
+             .targetNotFound, .ambiguousTarget, .staleTarget, .elementGone:
+            return .notSent
+        case .timedOut(_, let delivery):
+            return delivery
+        case .acknowledged:
+            return .acknowledged
+        case .stateUnavailable, .message:
+            return .outcomeUnknown
+        }
     }
 }
 
 extension ComputerUseError {
     static func missingArgument(_ name: String) -> ComputerUseError {
-        .message("Missing required argument: \(name)")
+        .notSent("Missing required argument: \(name)")
     }
 }

@@ -171,12 +171,41 @@ Finder file copies go to the same private clipboard. Paste them into Finder or s
 ## Verified workflows
 
 1. Read the active window or tab. Use a label that identifies one control.
-2. Batch related steps with `done_when` set to a visible result. Add `compact: true` to get a short reply when the check passes.
+2. Batch related steps with `done_when` set to the change you expect. Use `compact: true` for a shorter verified reply.
 3. If the batch stops, use its recovery receipt. Inspect the current state before retrying a step whose effect is unknown.
 
 Screenshots are available for controls that the accessibility tree misses. The optional decision helper is for ambiguous, goal-directed work. Routine reads and explicit completion checks can use the current observation directly.
 
-Handoff can fill an empty, uniquely named field directly when its supplied value matches the explicit completion check. The helper ranks candidates only when the workflow still has a choice to make. A pinned handoff verifies against that window. If input might already have landed, it reads back before deciding whether to continue.
+Handoff can fill an empty, uniquely named field directly when its supplied value matches the completion check. A pinned handoff reads that window. It stops for inspection when input may already have landed. Use a batch for change-aware checks.
+
+### Completion checks
+
+Godspeed takes a baseline before step 1. Use one check or a list.
+
+| Check | Evidence |
+| --- | --- |
+| `{"appeared":"Message sent"}` | Text appeared in the same window or tab. Chrome checks visible text in the main document. |
+| `{"disappeared":"Loading"}` | Previously visible text disappeared. |
+| `{"field":"Volume","equals":"40","since_start":"changed"}` | One readable field in the same Mac window changed to the exact value. |
+| `{"url_changed":"https://example.com/thanks"}` | An existing tab changed to the exact URL. |
+| `{"file_changed":"~/Desktop/out.pdf"}` | A regular file appeared at the path or its size, fresh modification time, or contents changed. Files up to 16 MiB are hashed. |
+
+A check that only matches final text, a field, a missing label, part of a URL, or an existing file reports `weak_evidence`. A preexisting match can pass those checks. The full reply stays available for inspection and recipe auto-save requires verified checks. An unavailable baseline leaves a change check unconfirmed. A UI change proves what Godspeed observed during the batch. Check the app's own receipt when you need to confirm that a send, payment, or save persisted.
+
+For window settling, Godspeed looks for 120 ms of quiet and checks Accessibility where it can. It reads at the time limit if the window keeps moving or shows a busy sign.
+
+### Delivery receipts
+
+`OpenComputerUseKit.DeliveryState` is a public Swift `Codable` enum. Use its stable strings in journals and receipts. MCP replies expose `godspeed/delivery_state` and `godspeed/safe_retry` in `_meta`. Each batch step carries `delivery_state` and `safe_retry`. If the app agent times out before returning a tool response, the JSON-RPC error carries delivery in `error.data`.
+
+| Delivery | Safe retry class | Meaning |
+| --- | --- | --- |
+| `not_sent` | `after_correction` | Input never went out. Correct the precondition first. |
+| `outcome_unknown` | `reconcile_first` | Input may have reached the target. Inspect the current state before retrying. |
+| `acknowledged` | `do_not_retry` | The action returned or the target acknowledged input. Check its effect if needed. |
+| `verified` | `do_not_retry` | A readback or change-aware check confirmed the requested result. |
+
+A batch stops on uncertain delivery. A completion check can still report what changed, and the affected step keeps its uncertain receipt.
 
 The visible cursor is feedback. Godspeed resolves and checks the target independently, keeps each agent's window anchor separate, and plays cursor motion on the display clock. If a path crosses a gap with no screen, it reappears beside the next target. The app never needs to move your physical pointer with the default background settings.
 
@@ -190,13 +219,13 @@ To inspect a known native window directly, pass its ID to `get_app_state`. This 
 
 For a known workflow, use `app.batch(steps, { windowId, doneWhen, compact: true, effects: false })`. Compact mode trims surplus plain text from the final reply after the checks run. Failed or incomplete batches keep their normal detail. Disabling effects skips per-step observation reads, so use it when the sequence needs only a final check.
 
-For a browser batch whose final success is a known URL, set `return_state: false` with a URL-only `done_when` (REPL option `returnState`). Godspeed reads the tab's address directly. A passing check can return the receipt without fetching the page snapshot. A failed check keeps the normal recovery read.
+For a browser batch whose final success is a known URL, set `return_state: false` with a URL-only `done_when` (REPL option `returnState`). Use `url_changed` to confirm a transition to a full URL. Godspeed can return a passing receipt after reading the tab's address alone. A failed check keeps the normal recovery read.
 
 For longer tasks, check `receipt.recovery` before resuming a partial batch. `refresh_then_continue` marks a step that never started, `fix_then_continue` marks an explicitly unsent failure, and `inspect_before_retry` means the action may have landed. `inspect_result` asks you to check the outcome without resending inputs. Recovery step numbers refer to expanded steps in the receipt, so a single form instruction can occupy several numbered steps.
 
 Use `browser read` with `interactive: true` to find controls with fewer tokens. Use the default read when prose or confirmation messages matter. Interactive reads retain tab- and document-scoped references and can overlap across independent clients. Add `diff: true` on repeated, unfiltered browser reads for a smaller change summary. Godspeed returns the full view when the document, mode or reference mapping changes. Batch completion checks still use the full current observation.
 
-Browser reads include reported focus, disabled, selected, checked and expanded states. Use these to confirm the control before asking for an image. If Chrome times out after `fill_field`, Godspeed can verify the exact value on the same control and document without sending the text again. If the final click has uncertain delivery, a fresh page read can still verify an explicit text or URL condition. The step receipt retains the missing acknowledgement. A lookup timeout uses a full-tree fallback when the tab connection is still valid.
+Browser reads include reported focus, disabled, selected, checked and expanded states. Use these to confirm the control before asking for an image. If Chrome times out after `fill_field`, Godspeed can read back the exact value on the same control and document. A lookup timeout uses a full-tree fallback when the tab connection is still valid.
 
 Set `if_changed: true` on `browser screenshot` to avoid returning an identical capture. The comparison is exact and scoped to the client, tab, address, and browser helper generation. Godspeed keeps a digest in memory, not a saved image. In the REPL, `cua.browser("read", { tab_id: 12 })` uses the same persistent connection as native app bindings. `cua.batch(steps, options)` can alternate browser steps with native steps that each name their app. Keep dependent actions ordered and check the batch receipt before resuming. The REPL discards queued input from ended evaluations. Saved-recipe handoffs and final browser observations share the time left in the original operation.
 

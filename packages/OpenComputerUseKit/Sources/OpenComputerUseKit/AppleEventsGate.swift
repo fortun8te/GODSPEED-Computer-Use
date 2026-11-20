@@ -28,6 +28,12 @@ enum AppleEventsGate {
 
     /// Runs AppleScript source only when allowed; nil otherwise or on error. A 6 s Apple Event timeout applies.
     static func run(_ source: String, bundle: String, limit: TimeInterval = 7) -> NSAppleEventDescriptor? {
+        try? send(source, bundle: bundle, limit: limit)
+    }
+
+    /// Nil means the permission gate stopped the script before sending. A failure after dispatch
+    /// must reach the caller, since falling through to input could repeat the same mutation.
+    static func send(_ source: String, bundle: String, limit: TimeInterval = 7) throws -> NSAppleEventDescriptor? {
         guard allowed(bundle: bundle) else { return nil }
         // The script runs on its own thread and is given up on after `limit`: an app showing a modal sheet
         // answered nothing for minutes, which held every other agent's calls.
@@ -42,7 +48,12 @@ enum AppleEventsGate {
             box.failed = error != nil
             done.signal()
         }
-        guard done.wait(timeout: .now() + limit) == .success, !box.failed else { return nil }
-        return box.value
+        guard done.wait(timeout: .now() + limit) == .success else {
+            throw ComputerUseError.timedOut("The app did not acknowledge the Apple Event.", delivery: .outcomeUnknown)
+        }
+        guard !box.failed, let result = box.value else {
+            throw ComputerUseError.stateUnavailable("The app did not confirm the Apple Event. Inspect it before retrying.")
+        }
+        return result
     }
 }

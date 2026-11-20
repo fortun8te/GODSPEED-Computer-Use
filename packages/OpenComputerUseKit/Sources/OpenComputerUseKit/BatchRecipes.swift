@@ -433,7 +433,7 @@ extension BatchRecipes {
                 if case .fileExists = condition { return true }
                 return false
             }) {
-                if case .verified = DoneCheck.check(doneWhen, evidence: DoneCheck.Evidence(screenText: initialState, pageURL: { nil })) {
+                if case .weak = DoneCheck.check(doneWhen, evidence: DoneCheck.Evidence(screenText: initialState, pageURL: { nil })) {
                     result = true
                 } else { result = false }
             } else {
