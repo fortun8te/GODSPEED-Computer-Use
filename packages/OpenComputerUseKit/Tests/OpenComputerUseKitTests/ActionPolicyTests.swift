@@ -250,4 +250,20 @@ final class ActionPolicyTests: XCTestCase {
             XCTAssertTrue(ActionPolicy.namedRisks([harmless]).isEmpty, harmless)
         }
     }
+
+    func testDragIsATargetedToolAndItsDropTargetCarriesRisk() {
+        XCTAssertTrue(ActionPolicy.nativeTargetTools.contains("drag"))
+        // A pixel drop has no readable destination, so it is treated like an opaque click.
+        let opaque = ActionPolicy.nativeRisks(tool: "drag", arguments: ["app": "Finder", "from_x": 1.0, "from_y": 2.0, "to_x": 3.0, "to_y": 4.0],
+                                              bundleID: "com.apple.finder", target: nil)
+        XCTAssertTrue(opaque.isSuperset(of: [.send, .submit, .purchase, .delete, .fileOverwrite, .systemSettings]), "\(opaque)")
+        let expected: [(String, ActionPolicy.Risk)] = [
+            ("Trash", .delete), ("Prullenbak", .delete), ("Delete", .delete), ("Upload", .submit), ("Send", .send),
+        ]
+        for (title, risk) in expected {
+            let risks = ActionPolicy.nativeRisks(tool: "drag", arguments: ["app": "Finder"], bundleID: nil,
+                                                 target: ActionPolicy.Target(title: title, role: "AXButton"))
+            XCTAssertTrue(risks.contains(risk), "\(title) drop should carry \(risk.rawValue): \(risks)")
+        }
+    }
 }
