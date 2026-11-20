@@ -85,6 +85,43 @@ enum GroundingCascade {
             .map(\.option)
     }
 
+    /// What the cascade decided for one labelled click.
+    enum Decision: Equatable {
+        /// Click this control. `probability` and `lead` are set only for a model ranking.
+        case act(id: String, provenance: Provenance, probability: Double?, lead: Double?)
+        /// Never clicked here: the ranked control ids go back to the model to choose from.
+        case offer(ids: [String])
+        /// Nothing clear enough: the caller goes on to OCR and vision.
+        case abstain(String)
+    }
+
+    /// Steps 1 to 3 for one label. `choose` ranks the candidates (ids plus "none", each a probability) and is
+    /// only called for 2-12 prefiltered candidates. A risky control is never acted on here: it is offered.
+    static func resolve(label: String, options: [Option], isRisky: (String) -> Bool = VisionFallback.risky,
+                        choose: ([Option]) -> [String: Double]?) -> Decision {
+        // Step 1: one exact name, as before. Exact matches are not risk-checked here; the existing click path does that.
+        let exact = options.filter { VisionFallback.sameName($0.text, label) }
+        if exact.count == 1, let only = exact.first {
+            return .act(id: only.id, provenance: .ax, probability: nil, lead: nil)
+        }
+        // Step 2.
+        let candidates = prefilter(label: label, options: options)
+        guard candidates.count >= 2 else { return .abstain("no close control") }
+        // Step 3.
+        guard let probabilities = choose(candidates) else { return .abstain("the local helper gave no ranking") }
+        let ranked = candidates.sorted { (probabilities[$0.id] ?? 0) > (probabilities[$1.id] ?? 0) }
+        guard let top = ranked.first, let topProbability = probabilities[top.id] else {
+            return .abstain("the local helper gave no ranking")
+        }
+        if (probabilities["none"] ?? 0) >= topProbability { return .abstain("the helper chose none") }
+        let next = ranked.dropFirst().map { probabilities[$0.id] ?? 0 }.max() ?? 0
+        let lead = topProbability - next
+        guard topProbability >= minProbability else { return .abstain("the top choice is below 0.70") }
+        guard lead >= minLead else { return .abstain("the top choice does not lead by 0.35") }
+        guard !isRisky(top.text) else { return .offer(ids: ranked.map(\.id)) }
+        return .act(id: top.id, provenance: .model, probability: topProbability, lead: lead)
+    }
+
     /// Levenshtein distance over characters. Inputs are short control names.
     static func editDistance(_ left: String, _ right: String) -> Int {
         let a = Array(left), b = Array(right)
