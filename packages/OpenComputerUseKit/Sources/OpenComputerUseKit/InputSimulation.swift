@@ -207,6 +207,7 @@ enum InputSimulation {
 
     static func typeText(_ text: String, pid: pid_t, authenticated: Bool = false) throws {
         for chunk in keyboardUnicodeChunks(for: text) {
+            try RequestCancellation.check()
             try requireUsableComputerUseSession()
             var mutableChunk = chunk
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),

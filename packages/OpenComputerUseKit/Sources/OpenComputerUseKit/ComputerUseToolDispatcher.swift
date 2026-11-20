@@ -45,6 +45,8 @@ public final class ComputerUseToolDispatcher {
     /// notes (a dialog that opened, a Cancel press) reach the batch reply. `notesInResult: false` keeps them out of
     /// the result text: the batch writes them itself, and a note in the text would also be read as the step's error line.
     func callTool(name: String, arguments rawArguments: [String: Any], log: SmartLog, notesInResult: Bool = true) throws -> ToolCallResult {
+        // The workflow tools shape cancellation into their partial receipts.
+        if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check() }
         // Every call (single, or a batch step) is forgiven first: wrong names, types and key spellings
         // are corrected, and a missing app is taken from the last one used. Still-missing required
         // arguments answer with one corrective line instead of reaching the app.
@@ -668,6 +670,7 @@ public final class ComputerUseToolDispatcher {
               (BrowserCallBudget.activeRemaining ?? .infinity) > 0
         else { return nil }
 
+        try RequestCancellation.check()
         let x = min(size.width - 1, (fraction.x * size.width).rounded())
         let y = min(size.height - 1, (fraction.y * size.height).rounded())
         let clicked = try service.click(

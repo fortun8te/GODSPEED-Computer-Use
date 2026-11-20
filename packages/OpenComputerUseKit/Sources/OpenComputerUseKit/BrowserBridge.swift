@@ -34,6 +34,7 @@ struct BrowserRequestContext: Sendable {
     }
 
     static func validateCurrent() throws {
+        try RequestCancellation.check()
         try current?.validate?()
     }
 
@@ -613,7 +614,7 @@ private final class PeekResults: @unchecked Sendable {
 }
 
 /// Newline-delimited JSON-RPC responses from `obu mcp`, keyed by request id.
-private final class BrowserBridgeResponses: @unchecked Sendable {
+final class BrowserBridgeResponses: @unchecked Sendable {
     private let condition = NSCondition()
     private var pending = Data()
     private var messages: [Int: [String: Any]] = [:]
@@ -653,10 +654,11 @@ private final class BrowserBridgeResponses: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         defer { condition.unlock() }
-        while messages[id] == nil, !closed {
-            if !condition.wait(until: deadline) { break }
+        while messages[id] == nil, !closed, !RequestCancellation.requested, Date() < deadline {
+            _ = condition.wait(until: min(deadline, Date().addingTimeInterval(0.05)))
         }
-        return messages.removeValue(forKey: id)
+        let message = messages.removeValue(forKey: id)
+        return RequestCancellation.requested ? nil : message
     }
 }
 

@@ -50,7 +50,7 @@ enum WindowSettle {
         Thread.sleep(forTimeInterval: floor)
         var previous = sample()
         var matches = 0
-        while TimingLog.now() - start < cap {
+        while !RequestCancellation.requested && TimingLog.now() - start < cap {
             Thread.sleep(forTimeInterval: min(sampleInterval, max(0, cap - (TimingLog.now() - start))))
             guard let current = sample() else {
                 previous = nil
@@ -133,7 +133,7 @@ enum WindowSettle {
         busy: () throws -> Bool
     ) rethrows -> Bool {
         let deadline = now() + timeout
-        while try busy() {
+        while !RequestCancellation.requested, try busy() {
             guard now() + interval < deadline else { return false }
             sleep(interval)
         }

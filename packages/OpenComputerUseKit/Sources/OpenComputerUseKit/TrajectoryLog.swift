@@ -517,6 +517,7 @@ final class TrajectoryLog: @unchecked Sendable {
         enum Stop: String {
             case stepFailure = "step_failure"
             case timeBudget = "time_budget"
+            case cancelled
             case windowChanged = "window_changed"
             case recipeVerification = "recipe_verification"
         }

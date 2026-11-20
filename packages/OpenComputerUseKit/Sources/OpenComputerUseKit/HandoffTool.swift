@@ -415,7 +415,7 @@ enum HandoffTool {
     }
 
     struct Outcome {
-        enum Kind { case done, stuck, escalate, budget, failed }
+        enum Kind { case done, stuck, escalate, budget, failed, cancelled }
         let kind: Kind
         let reason: String
         let steps: [String]
@@ -436,11 +436,12 @@ enum HandoffTool {
             case .escalate: lines.append("Needs you: \(reason)")
             case .budget: lines.append("Stopped: \(reason)")
             case .failed: lines.append("Failed: \(reason)")
+            case .cancelled: lines.append("Stopped: \(reason)")
             }
             if steps.isEmpty {
                 lines.append("Steps: none")
             } else {
-                let shown = steps.count > 10 ? ["..."] + steps.suffix(10) : steps
+                let shown = steps.count > 10 && kind != .cancelled ? ["..."] + steps.suffix(10) : steps
                 lines.append("Steps (\(steps.count)): " + shown.joined(separator: "; "))
             }
             if let changes, !changes.isEmpty { lines.append("Changes: " + changes) }
@@ -471,13 +472,14 @@ enum HandoffTool {
         var now: () -> TimeInterval
     }
 
-    enum Replay { case verified, incomplete, uncertain }
+    enum Replay: Equatable { case verified, incomplete, uncertain, cancelled(String) }
 
     static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
         func hasTime() -> Bool { deps.now() < deadline }
         func readState() -> String? {
-            guard hasTime(), let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
+            guard !RequestCancellation.requested, hasTime(),
+                  let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
             return state
         }
         var steps: [String] = []
@@ -506,10 +508,15 @@ enum HandoffTool {
                            screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet)
         }
 
+        func cancelled() -> Outcome {
+            finish(.cancelled, "request cancelled. Inspect any in-flight action before retrying.", initial: nil, latest: nil)
+        }
+        guard !RequestCancellation.requested else { return cancelled() }
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: nil, latest: nil)
         }
         guard var state = readState() else {
+            if RequestCancellation.requested { return cancelled() }
             let target = request.windowID.map { "\(request.app) window \($0)" } ?? request.app
             return finish(.failed, "could not read \(target)", initial: nil, latest: nil)
         }
@@ -522,8 +529,14 @@ enum HandoffTool {
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: initial, latest: state)
         }
+        if RequestCancellation.requested { return cancelled() }
         if request.windowID == nil, let replayed = deps.replay(state) {
+            if case .cancelled(let receipt) = replayed {
+                steps.append(receipt)
+                return cancelled()
+            }
             steps.append("replayed the saved recipe")
+            if RequestCancellation.requested { return cancelled() }
             if replayed == .verified { return Outcome(kind: .done, reason: "\(doneSummary) (saved recipe)", steps: steps, changes: nil, options: []) }
             guard hasTime() else {
                 return finish(.budget, "the recipe may have partially run. Inspect its result before continuing.", initial: initial, latest: nil)
@@ -544,6 +557,7 @@ enum HandoffTool {
         }
 
         for number in 1...request.maxSteps {
+            if RequestCancellation.requested { return cancelled() }
             if !hasTime() {
                 return finish(.budget, "\(Int(request.timeBudget)) seconds used", initial: initial, latest: state)
             }
@@ -566,6 +580,7 @@ enum HandoffTool {
                 }
                 decision = decide(candidates: options, probabilities: probabilities)
             }
+            if RequestCancellation.requested { return cancelled() }
             switch decision {
             case .escalate(let reason):
                 let ranked = options.map { ($0.text, probabilities?[$0.id] ?? 0) }.sorted { $0.1 > $1.1 }
@@ -576,6 +591,10 @@ enum HandoffTool {
                 }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
+                if RequestCancellation.requested {
+                    steps.append("\(choice.text) (outcome unknown)")
+                    return cancelled()
+                }
                 if choice.kind == .setValue { typedAny = true }
                 if choice.kind == .scroll { scrolls += 1 }
                 if !hasTime(), result.observedState == nil {
@@ -605,6 +624,7 @@ enum HandoffTool {
                 steps.append(choice.text)
                 let actionState = result.observedState.flatMap { matchesWindow($0, windowID: request.windowID) ? $0 : nil }
                 guard let next = actionState ?? readState() else {
+                    if RequestCancellation.requested { return cancelled() }
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
                 if case .verified(let met) = verdict(next) {
@@ -631,6 +651,7 @@ enum HandoffTool {
                 }
             }
         }
+        if RequestCancellation.requested { return cancelled() }
         return finish(.budget, "\(request.maxSteps) steps used", initial: initial, latest: state)
     }
 }
@@ -709,11 +730,12 @@ extension ComputerUseToolDispatcher {
                 if let doneWhen = arguments["done_when"] { batchArguments["done_when"] = doneWhen }
                 guard let result = try? runBatch(arguments: batchArguments, inheritedDeadline: deadline,
                                                  validatedHandoffRecipe: recipe) else { return .uncertain }
+                if result.batchReceipt?.stop == .cancelled { return .cancelled(result.textContent) }
                 return HandoffTool.replayResult(result)
             },
             now: { clock.systemUptime }
         )
         let outcome = HandoffTool.run(request, deps, deadline: deadline)
-        return .text(outcome.reply(), isError: outcome.kind == .failed)
+        return .text(outcome.reply(), isError: outcome.kind == .failed || outcome.kind == .cancelled)
     }
 }
