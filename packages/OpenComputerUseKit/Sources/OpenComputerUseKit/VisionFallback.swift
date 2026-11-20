@@ -23,7 +23,17 @@ enum VisionFallback {
 
     static var isEnabled: Bool { baseURL != nil }
 
-    enum Evidence: Equatable { case ocr, model }
+    /// `zoom` is a second /locate on a zoomed crop around a model point (GroundingCascade step 5).
+    enum Evidence: Equatable { case ocr, model, zoom }
+
+    /// The learning-log name of an evidence kind.
+    static func evidenceName(_ evidence: Evidence) -> String {
+        switch evidence {
+        case .ocr: return "ocr"
+        case .model: return "model"
+        case .zoom: return "zoom"
+        }
+    }
 
     struct Candidate {
         let fraction: CGPoint
@@ -53,7 +63,7 @@ enum VisionFallback {
             query: query, crop_width: Double(crop.width), crop_height: Double(crop.height),
             point: candidate.map { [Double($0.fraction.x), Double($0.fraction.y)] },
             verified: verified, image: image,
-            evidence: candidate.map { $0.evidence == .ocr ? "ocr" : "model" }
+            evidence: candidate.map { evidenceName($0.evidence) }
         ))
     }
 

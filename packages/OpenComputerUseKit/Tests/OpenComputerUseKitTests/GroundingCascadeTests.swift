@@ -106,4 +106,48 @@ final class GroundingCascadeTests: XCTestCase {
         XCTAssertEqual(decision, .abstain("no close control"))
         XCTAssertFalse(asked)
     }
+
+    // Step 5: one zoomed second look at a vision point, accepted only when its hit-test name matches.
+
+    func testZoomRectIsHalfTheWindowCenteredAndKeptInside() {
+        XCTAssertEqual(GroundingCascade.zoomRect(around: CGPoint(x: 0.5, y: 0.5)), CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5))
+        XCTAssertEqual(GroundingCascade.zoomRect(around: CGPoint(x: 0, y: 0)), CGRect(x: 0, y: 0, width: 0.5, height: 0.5))
+        XCTAssertEqual(GroundingCascade.zoomRect(around: CGPoint(x: 1, y: 0.9)), CGRect(x: 0.5, y: 0.5, width: 0.5, height: 0.5))
+    }
+
+    func testZoomSecondLookMapsThePointBackAndAcceptsAMatchingHit() {
+        var locatedRects: [CGRect] = []
+        let point = GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5), locate: { rect in
+            locatedRects.append(rect)
+            return CGPoint(x: 0.5, y: 0.5)  // the centre of the zoomed crop
+        }, verify: { _ in true })
+        XCTAssertEqual(point, CGPoint(x: 0.5, y: 0.5))
+        XCTAssertEqual(locatedRects, [CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)])
+    }
+
+    func testZoomSecondLookRefusesAMismatchedHit() {
+        var verified = 0
+        let point = GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5), locate: { _ in CGPoint(x: 0.2, y: 0.8) }, verify: { _ in
+            verified += 1
+            return false
+        })
+        XCTAssertNil(point)
+        XCTAssertEqual(verified, 1)
+    }
+
+    func testZoomSecondLookDoesNothingWithoutAFreshPoint() {
+        var verified = 0
+        XCTAssertNil(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5), locate: { _ in nil }, verify: { _ in
+            verified += 1
+            return true
+        }))
+        XCTAssertNil(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5), locate: { _ in CGPoint(x: 1.5, y: 0.5) }, verify: { _ in true }))
+        XCTAssertEqual(verified, 0)
+    }
+
+    func testZoomProvenanceIsNamedInTheLearningLog() {
+        XCTAssertEqual(VisionFallback.evidenceName(.ocr), "ocr")
+        XCTAssertEqual(VisionFallback.evidenceName(.model), "model")
+        XCTAssertEqual(VisionFallback.evidenceName(.zoom), "zoom")
+    }
 }
