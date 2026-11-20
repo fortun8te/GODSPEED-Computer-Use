@@ -320,7 +320,7 @@ enum SmartSteps {
         return value as? [AXUIElement] ?? []
     }
 
-    private static func axText(_ attribute: String, of node: AXUIElement) -> String? {
+    static func axText(_ attribute: String, of node: AXUIElement) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(node, attribute as CFString, &value) == .success else { return nil }
         return value as? String

@@ -735,8 +735,17 @@ extension ComputerUseToolDispatcher {
                 let budgetCut = limit < Double(wait.timeoutMs) / 1000
                 var met = false
                 var observed = false
+                // Shallow checks can defer an expensive read. Only full state
+                // can satisfy the original wait predicate or bind its window.
+                var readGate = BatchEffects.WaitReadGate(nextFullRead: waitStart + BatchEffects.WaitReadGate.fallbackInterval)
                 while clock.systemUptime - waitStart < limit {
-                    if let read = readWatch(app, settleMs: 0, optionalEffect: false) {
+                    let shouldRead = readGate.shouldRead(at: clock.systemUptime) {
+                        TimingLog.measure("batch.wait_readiness") {
+                            BatchEffects.waitMayBeReady(wait.kind, app: app, windowID: pinnedWindow)
+                        }
+                    }
+                    if shouldRead, clock.systemUptime - waitStart < limit,
+                       let read = readWatch(app, settleMs: 0, optionalEffect: false) {
                         observed = true
                         if wait.isMet(state: read.text, id: read.sig.id) {
                             met = true

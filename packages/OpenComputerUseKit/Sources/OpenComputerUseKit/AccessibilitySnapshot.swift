@@ -2739,8 +2739,10 @@ extension SnapshotBuilder {
     ]
 
     /// Use one bounded traversal so every app has the same visibility and match rules.
-    static func targetedSearch(_ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext) throws -> TargetedAX.SearchResult {
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
+    static func targetedSearch(
+        _ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext, timeout: TimeInterval = 2
+    ) throws -> TargetedAX.SearchResult {
+        let deadline = TimingLog.now() + timeout
         let expired = { ProcessInfo.processInfo.systemUptime >= deadline }
         var scans: [AXSearchNode: NodeScan] = [:]
         var records: [AXSearchNode: ElementRecord] = [:]
