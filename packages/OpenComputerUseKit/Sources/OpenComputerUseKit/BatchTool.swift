@@ -667,9 +667,7 @@ extension ComputerUseToolDispatcher {
         func windowID(_ app: String) -> UInt32? {
             (try? AppDiscovery.resolveRunning(app)).flatMap { ElementNumbering.forApp(pid: $0.pid).currentWindowID }
         }
-        func readWatch(_ app: String, settleMs: Int, optionalEffect: Bool = true) -> (
-            text: String, sig: BatchEffects.WindowSig, result: ToolCallResult
-        )? {
+        func readWatch(_ app: String, settleMs: Int, optionalEffect: Bool = true) -> BatchEffects.Watch? {
             if optionalEffect, effectBudget.exhausted || clock.systemUptime >= actionDeadline { return nil }
             let began = clock.systemUptime
             var readArguments: [String: Any] = ["app": app, "include_screenshot": NSNumber(value: false)]
@@ -684,7 +682,7 @@ extension ComputerUseToolDispatcher {
                 }
             }
             guard let text else { return nil }
-            return (text, BatchEffects.windowSig(state: text, id: windowID(app)), read)
+            return .init(text: text, sig: BatchEffects.windowSig(state: text, id: windowID(app)), result: read)
         }
         /// Effect and window lines for a step that took `before` to `after`; follows a dialog, remembers a move.
         /// `noEffect` is true when the step should have changed something and nothing visible did: the step
@@ -928,7 +926,10 @@ extension ComputerUseToolDispatcher {
             if effectsOn, !effectBudget.exhausted, isMutating, let app = stepApp, watchApp == app, let before = watchState {
                 if isLastStep {
                     pendingLastEffect = (app, before, lines.count, stepLineIndex, step.tool)
-                } else if let read = readWatch(app, settleMs: 600) {
+                } else if let read = BatchEffects.Watch.afterAction(
+                    snapshot: stepLog.afterActionSnapshot, before: before, tool: step.tool,
+                    fallback: { readWatch(app, settleMs: 600) }
+                ) {
                     let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool)
                     if effect.noEffect {
                         lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen)
@@ -949,16 +950,17 @@ extension ComputerUseToolDispatcher {
                 movedTo = nil
             }
 
-            // A final action may already have read the window back. Menu and keyboard
+            // Smart steps may have a newer observation than the action reply. Menu and keyboard
             // shortcuts still use the final settle path because they can open a delayed dialog.
             if step.tool == "get_app_state" || isPageRead {
                 trailingObservation = result
             } else if isLastStep, !hasPinnedSteps, stepApp != nil,
                       ["click", "type_text", "set_value", "scroll"].contains(step.tool),
-                      let state = LeanOutput.stateText(of: result),
-                      !state.contains(SnapshotObservationOptions.accessibilityOmittedNote),
+                      let snapshot = stepLog.afterActionSnapshot, snapshot.observedWindowID != nil,
+                      DoneCheck.supportsAbsenceCheck(snapshot.renderedText),
+                      !snapshot.renderedText.contains("the app hides its web content"),
                       !wantsScreenshot {
-                trailingObservation = .text(state)
+                trailingObservation = LeanOutput.condensed(.text(snapshot.renderedText))
             }
             if let stop = recipeRun.verify(number: number, total: steps.count, lines: lines) {
                 lines.append(stop)
@@ -1146,7 +1148,8 @@ extension ComputerUseToolDispatcher {
                         return evidence.isEmpty ? nil : evidence
                     }
                     guard let state = LeanOutput.stateText(of: result),
-                          !state.contains(SnapshotObservationOptions.accessibilityOmittedNote) else { return nil }
+                          DoneCheck.supportsAbsenceCheck(state),
+                          !state.contains("the app hides its web content") else { return nil }
                     if let verificationWindow {
                         let header = state.split(separator: "\n").prefix(3)
                         guard header.count == 3,

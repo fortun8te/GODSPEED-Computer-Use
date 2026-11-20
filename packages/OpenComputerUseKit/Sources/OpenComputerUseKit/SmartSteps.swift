@@ -870,6 +870,8 @@ final class NativeActionObservation: @unchecked Sendable {
 
 /// Notes one call collects while it runs: healing notes go before the reply, a dialog line after it.
 final class SmartLog {
+    // Internal evidence for the batch that owns this step log.
+    var afterActionSnapshot: AppSnapshot?
     private var leading: [String] = []
     private var trailing: [String] = []
 
