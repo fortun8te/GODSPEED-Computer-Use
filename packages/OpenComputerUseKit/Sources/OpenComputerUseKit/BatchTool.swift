@@ -1058,6 +1058,20 @@ extension ComputerUseToolDispatcher {
             let result = DoneCheck.check(doneConditions, evidence: .init(screenText: nil, pageURL: pageURL))
             if case .verified = result { earlyCompletion = result }
         }
+        // When the caller only asked for a verified receipt, files and exact
+        // native fields can prove completion even without a final tree.
+        if (arguments["return_state"] as? Bool) == false,
+           !failed, !stoppedForTime, !wantsScreenshot, trailingObservation == nil,
+           pendingLastEffect == nil, lastAttemptedStep?.tool != "browser", clock.systemUptime < deadline {
+            earlyCompletion = TimingLog.measure("batch.final_direct_check") {
+                DoneCheck.directCompletion(doneConditions) { label in
+                    guard clock.systemUptime < deadline, let lastApp,
+                          let app = try? AppDiscovery.resolveRunning(lastApp),
+                          let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: verificationWindow) else { return nil }
+                    return SnapshotBuilder.directFieldValue(label, in: context)
+                }
+            }
+        }
         var observation = trailingObservation
         if !unconfirmedOpen, earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool == "browser" {
             if unconfirmedFinalClick, let condition = doneConditions.first {

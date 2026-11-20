@@ -28,6 +28,24 @@ final class DoneCheckTests: XCTestCase {
 
     // MARK: - Parsing
 
+    func testDirectCompletionReadsFileAndExactFieldWithoutScreenState() {
+        let conditions: [DoneCheck.Condition] = [.fileExists("/test/file"), .field(label: "Title", equals: "Ready")]
+        var files: [String] = []
+        var fields: [String] = []
+        let result = DoneCheck.directCompletion(conditions, fileExists: {
+            files.append($0)
+            return true
+        }, fieldValue: {
+            fields.append($0)
+            return "Ready"
+        })
+        XCTAssertEqual(result, .verified(met: conditions.map(\.summary)))
+        XCTAssertEqual(files, ["/test/file"])
+        XCTAssertEqual(fields, ["Title"])
+        XCTAssertNil(DoneCheck.directCompletion(conditions, fileExists: { _ in true }, fieldValue: { _ in nil }))
+        XCTAssertNil(DoneCheck.directCompletion([.text("Ready")], fieldValue: { _ in XCTFail("Text requires an observation"); return nil }))
+    }
+
     func testDoneWhenAndWaitAcceptCommonSpellings() throws {
         XCTAssertEqual(try DoneCheck.parse(["contains": "Saved"]), [.text("Saved")])
         XCTAssertEqual(try DoneCheck.parse(["url": "/thanks"]), [.urlContains("/thanks")])

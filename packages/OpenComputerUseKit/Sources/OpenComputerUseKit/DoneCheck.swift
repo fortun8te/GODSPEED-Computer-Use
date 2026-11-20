@@ -153,6 +153,34 @@ enum DoneCheck {
         }
     }
 
+    /// Verifies only conditions with an independent source. Missing or
+    /// ambiguous evidence goes through the normal recovery observation.
+    static func directCompletion(
+        _ conditions: [Condition],
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        fieldValue: (String) -> String?
+    ) -> Result? {
+        guard !conditions.isEmpty, conditions.allSatisfy({
+            switch $0 {
+            case .fileExists, .field: return true
+            case .text, .gone, .urlContains: return false
+            }
+        }) else { return nil }
+        func normalized(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespaces).lowercased()
+        }
+        for condition in conditions {
+            switch condition {
+            case .fileExists(let path):
+                guard fileExists(path) else { return nil }
+            case .field(let label, let expected):
+                guard let actual = fieldValue(label), normalized(actual) == normalized(expected) else { return nil }
+            default: return nil
+            }
+        }
+        return .verified(met: conditions.map(\.summary))
+    }
+
     static func supportsAbsenceCheck(_ text: String) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         // Browser snapshots cap both controls and text. A missing label in that reply does not
