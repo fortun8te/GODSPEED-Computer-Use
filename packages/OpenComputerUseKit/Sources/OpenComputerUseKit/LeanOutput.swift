@@ -15,6 +15,10 @@ enum LeanOutput {
 
     static var condenses: Bool { flag("OPEN_COMPUTER_USE_CONDENSE") }
     static var diffsBatchReads: Bool { flag("OPEN_COMPUTER_USE_BATCH_DIFF") }
+    /// `OPEN_COMPUTER_USE_SEMANTIC_REPLIES=0` sends change-only replies exactly as before (no `Changes:` line).
+    static var semanticReplies: Bool { flag("OPEN_COMPUTER_USE_SEMANTIC_REPLIES") }
+    /// Change-only replies shorter than this keep every line; longer ones may drop unnumbered lines.
+    static let semanticTrimMinLength = 600
 
     private static func flag(_ key: String) -> Bool {
         let value = GodspeedSettings.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
@@ -62,12 +66,36 @@ enum LeanOutput {
             // Keep the header line so the model still sees which app and window this is.
             // App, window and the legend line ([w=settable]).
             let header = text.split(separator: "\n", maxSplits: 3).prefix(3).joined(separator: "\n")
-            let compact = header + "\n" + summary
+            let compact = semanticReplies
+                ? semanticDiffReply(header: header, diff: summary, before: previous, after: text)
+                : header + "\n" + summary
             guard compact.utf8.count < text.utf8.count else { return item }
             replaced = true
             return .text(compact)
         }
         return replaced ? observation.replacingContent(content) : observation
+    }
+
+    /// The change-only reply with a one-line `Changes:` summary from `SemanticChanges` under the header.
+    /// When the summary names every change (one to three events) and the reply is long, unnumbered
+    /// changed lines are dropped: the summary and the numbered lines are what the model acts on.
+    /// Kept: the diff's first line (it says indexes are current), numbered `+`/`-` lines, the
+    /// "more lines removed" count and the "Unchanged" footer. Secret values are redacted by SemanticChanges.
+    static func semanticDiffReply(header: String, diff: String, before: String, after: String) -> String {
+        guard let summary = SemanticChanges.summary(before: before, after: after) else {
+            return header + "\n" + diff
+        }
+        let eventCount = SemanticChanges.events(before: before, after: after, limit: 4).count
+        let full = header + "\nChanges: " + summary + "\n" + diff
+        guard (1...3).contains(eventCount), full.utf8.count > semanticTrimMinLength else { return full }
+
+        let lines = diff.split(separator: "\n", omittingEmptySubsequences: false)
+        let kept = lines.enumerated().filter { offset, line in
+            if offset == 0 || line.hasPrefix("Unchanged:") || line.hasPrefix("- (") { return true }
+            guard line.hasPrefix("+ ") || line.hasPrefix("- ") else { return false }
+            return leadingIndex(String(line.dropFirst(2))) != nil
+        }.map(\.element)
+        return header + "\nChanges: " + summary + "\n" + kept.joined(separator: "\n")
     }
 
     /// Only the state's header (app, window, window ID), with a pointer to the full read.
