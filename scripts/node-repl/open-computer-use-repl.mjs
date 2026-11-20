@@ -10,6 +10,9 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { inspectConfig } from "./ocu-config.mjs";
+import { createBrowserPage } from "./page-api.mjs";
+import { dragSteps, dwellMs, gestureKind, holdMs, invalid, nativeClickArgs, nonEmpty, scrollArgs,
+  selectionArgs, verifyArgs, waitCondition, waitTimeout, SCROLL_DIRECTIONS } from "./precise-actions.mjs";
 
 const require = createRequire(import.meta.url);
 // The js call whose code is running. Timers and promises carry it, so a callback
@@ -336,12 +339,52 @@ function elementTargetArgs(target) {
   return { ref: target.ref };
 }
 
-function optionsToClickArgs(options = {}) {
-  const args = optionsToWindowArgs(options);
+function optionsToClickArgs(options = {}, { coordinates = false } = {}) {
+  const args = { ...optionsToWindowArgs(options), ...nativeClickArgs(options, { coordinates }) };
   if (options.mouseButton !== undefined) args.mouse_button = options.mouseButton;
-  if (options.clickCount !== undefined) args.click_count = options.clickCount;
   if (options.clickMethod !== undefined) args.click_method = options.clickMethod;
   return args;
+}
+
+// A visible label, or an element number, or { ref }. A digit string stays an element number, as before.
+function labelOrElementArgs(target) {
+  if (typeof target === "string" && target.trim() && !/^\d+$/u.test(target)) return { label: target };
+  return elementTargetArgs(target);
+}
+
+// A drag endpoint: [x, y] screenshot coordinates, a visible label, or an element number.
+function dragEndpointArgs(point, prefix) {
+  if (Array.isArray(point)) {
+    if (point.length !== 2 || !point.every(Number.isFinite)) throw invalid(`drag ${prefix} coordinates must be [x, y]`);
+    return { [`${prefix}_x`]: point[0], [`${prefix}_y`]: point[1] };
+  }
+  if (typeof point === "string" && point.trim()) return { [`${prefix}_label`]: point };
+  if (Number.isSafeInteger(point) && point >= 0) return { [`${prefix}_index`]: point };
+  throw invalid(`drag ${prefix} takes [x, y] coordinates, a label, or an element number`);
+}
+
+// The selectText target: a { label } object, an element number, or { ref }.
+function selectTextTarget(target) {
+  if (isPlainObject(target) && Object.hasOwn(target, "label")) {
+    if (Object.keys(target).length !== 1 || typeof target.label !== "string" || !target.label.trim()) {
+      throw new Error("Use { label } as the only element target.");
+    }
+    return { label: target.label };
+  }
+  const targetArgs = elementTargetArgs(target);
+  if (!targetArgs.ref) {
+    const index = typeof target === "string" && /^(0|[1-9]\d*)$/u.test(target) ? Number(target) : target;
+    if (!Number.isSafeInteger(index) || index < 0) throw new Error("selectText requires a non-negative integer element index");
+  }
+  return targetArgs;
+}
+
+// Refuses any option a precise native call does not take, before the call is sent.
+function checkKeys(method, options, allowed) {
+  if (!isPlainObject(options)) throw invalid(`${method} expects an options object`);
+  for (const key of Object.keys(options)) {
+    if (!allowed.includes(key)) throw invalid(`${method} option "${key}" is not supported`);
+  }
 }
 
 function optionsToKeyArgs(options = {}) {
@@ -442,39 +485,75 @@ export function createCuaApi(native, activeOutput) {
         await emitImages(images, options);
         return images[0] ? { state, screenshot: Buffer.from(images[0].data, "base64") } : { state };
       },
+      // click(target, { button, clickCount, anchor, offset, modifiers }): target is a label, an element number,
+      // { ref } or [x, y]. Anchor and offset need a control, not coordinates.
       async click(target, options = {}) {
-        const targetArgs = Array.isArray(target) ? { x: target[0], y: target[1] } : elementTargetArgs(target);
-        await call("click", { app, ...targetArgs, ...optionsToClickArgs(options) });
+        const coordinates = Array.isArray(target);
+        const targetArgs = coordinates ? { x: target[0], y: target[1] } : labelOrElementArgs(target);
+        await call("click", { app, ...targetArgs, ...optionsToClickArgs(options, { coordinates }) });
       },
       async hover(target, options = {}) {
-        await call("hover", { app, ...elementTargetArgs(target), ...optionsToWindowArgs(options) });
+        const dwell = options.dwellMs === undefined ? {} : { dwell_ms: dwellMs(options.dwellMs) };
+        await call("hover", { app, ...labelOrElementArgs(target), ...dwell, ...optionsToWindowArgs(options) });
       },
+      // drag(from, to, { steps, holdMs, verify, modifiers }): each end is [x, y], a label or an element number.
       async drag(from, to, options = {}) {
-        await call("drag", {
-          app, from_x: from[0], from_y: from[1], to_x: to[0], to_y: to[1],
-          ...(options.modifiers === undefined ? {} : { modifiers: options.modifiers }),
-          ...optionsToWindowArgs(options),
-        });
+        const args = { app, ...dragEndpointArgs(from, "from"), ...dragEndpointArgs(to, "to") };
+        if (options.modifiers !== undefined) args.modifiers = options.modifiers;
+        if (options.steps !== undefined) args.drag_steps = dragSteps(options.steps);
+        if (options.holdMs !== undefined) args.hold_ms = holdMs(options.holdMs);
+        if (options.verify !== undefined) args.verify = verifyArgs(options.verify);
+        await call("drag", { ...args, ...optionsToWindowArgs(options) });
       },
-      async pressKey(key, options = {}) { await call("press_key", { app, key, ...optionsToKeyArgs(options) }); },
+      async pressKey(key, options = {}) {
+        const hold = options.holdMs === undefined ? {} : { hold_ms: holdMs(options.holdMs) };
+        await call("press_key", { app, key, ...hold, ...optionsToKeyArgs(options) });
+      },
+      // gesture(name, { target, menuPath }): a zoom or rotate control, or an app command path.
+      async gesture(name, options = {}) {
+        checkKeys("gesture", options, ["target", "menuPath", "windowId", "strictBackground"]);
+        const args = { app, kind: gestureKind(name) };
+        if (options.target !== undefined) Object.assign(args, labelOrElementArgs(options.target));
+        if (options.menuPath !== undefined) args.menu_path = nonEmpty(options.menuPath, "menuPath");
+        if (args.label === undefined && args.element_index === undefined && args.menu_path === undefined) {
+          throw invalid("gesture needs a target or a menuPath");
+        }
+        await call("gesture", { ...args, ...optionsToWindowArgs(options) });
+      },
+      // waitFor(label, { condition, timeout, fromValue }): timeout is in seconds, 1 to 30. Returns the reply text.
+      async waitFor(label, options = {}) {
+        checkKeys("waitFor", options, ["condition", "timeout", "fromValue", "windowId", "strictBackground"]);
+        const condition = waitCondition(options.condition);
+        const args = { app, label: nonEmpty(label, "waitFor label"), condition };
+        if (options.timeout !== undefined) args.timeout = waitTimeout(options.timeout);
+        if (options.fromValue !== undefined) {
+          if (condition !== "value_changed") throw invalid("fromValue only applies to condition value_changed");
+          if (typeof options.fromValue !== "string") throw invalid("fromValue must be a string");
+          args.from_value = options.fromValue;
+        }
+        return toolResultText(await call("wait_for", { ...args, ...optionsToWindowArgs(options) }));
+      },
       async pressMenu(path, options = {}) {
         if (typeof path !== "string" || !path.trim()) throw new Error("pressMenu requires a menu path such as \"File > Save As…\"");
         await call("press_menu", { app, path, ...strictBackgroundArgs(options) });
       },
+      // scroll({ direction, unit, amount, maxSteps, untilVisible, target }), or the older scroll(target, direction, pages).
       async scroll(target, direction, pages = 1, options = {}) {
+        if (isPlainObject(target) && Object.hasOwn(target, "direction")) {
+          checkKeys("scroll", target, ["direction", "unit", "amount", "maxSteps", "untilVisible", "target", "windowId", "strictBackground"]);
+          const area = target.target === undefined ? {} : labelOrElementArgs(target.target);
+          await call("scroll", { app, ...area, ...scrollArgs(target, SCROLL_DIRECTIONS), ...optionsToWindowArgs(target) });
+          return;
+        }
         if (Array.isArray(target)) throw new Error("coordinate scroll is not supported by this Open Computer Use runtime");
         await call("scroll", { app, ...elementTargetArgs(target), direction, pages, ...strictBackgroundArgs(options) });
       },
       async setValue(target, value, options = {}) {
         await call("set_value", { app, ...elementTargetArgs(target), value, ...strictBackgroundArgs(options) });
       },
+      // selectText(target, text, options), or selectText(target, { start, length } | { text, prefix, suffix }, options).
       async selectText(target, text, options = {}) {
-        const targetArgs = elementTargetArgs(target);
-        if (!targetArgs.ref) {
-          const index = typeof target === "string" && /^(0|[1-9]\d*)$/u.test(target) ? Number(target) : target;
-          if (!Number.isSafeInteger(index) || index < 0) throw new Error("selectText requires a non-negative integer element index");
-        }
-        if (typeof text !== "string" || !text.length) throw new Error("selectText requires non-empty text");
+        const targetArgs = selectTextTarget(target);
         if (!isPlainObject(options)) throw new Error("selectText expects an options object");
         for (const key of Object.keys(options)) {
           if (!["prefix", "suffix", "selection", "strictBackground"].includes(key)) throw new Error(`Unknown selectText option: ${key}`);
@@ -485,8 +564,15 @@ export function createCuaApi(native, activeOutput) {
         if (options.selection !== undefined && !["text", "cursor_before", "cursor_after"].includes(options.selection)) {
           throw new Error("selection must be text, cursor_before or cursor_after");
         }
-        await call("select_text", { app, ...targetArgs, text,
-          prefix: options.prefix, suffix: options.suffix, selection: options.selection, ...strictBackgroundArgs(options) });
+        let range;
+        if (isPlainObject(text)) {
+          if (options.prefix !== undefined || options.suffix !== undefined) throw invalid("put prefix and suffix inside the selection object");
+          range = selectionArgs(text);
+        } else {
+          if (typeof text !== "string" || !text.length) throw new Error("selectText requires non-empty text");
+          range = { text, prefix: options.prefix, suffix: options.suffix };
+        }
+        await call("select_text", { app, ...targetArgs, ...range, selection: options.selection, ...strictBackgroundArgs(options) });
       },
       async typeText(text, options = {}) { await call("type_text", { app, text, ...optionsToKeyArgs(options) }); },
       async performSecondaryAction(target, action, options = {}) {
@@ -545,6 +631,11 @@ export function createCuaApi(native, activeOutput) {
       if (options.emit !== false) activeOutput().write(state.apps, "cua.state");
       return state.apps;
     },
+    // cua.app(name): the same bindings as getApp, without the initial state read.
+    app(name) {
+      if (typeof name !== "string" || !name.trim()) throw new Error("app requires an app name or bundle ID");
+      return appBinding(name);
+    },
     async getApp(app, options = {}) {
       if (typeof app !== "string" || !app.trim()) throw new Error("getApp requires an app name or bundle ID");
       if (!isPlainObject(options) || (options.initialState !== undefined && typeof options.initialState !== "boolean")) throw new Error("initialState must be true or false");
@@ -557,6 +648,8 @@ export function createCuaApi(native, activeOutput) {
     },
     async rewriteDocumentation() { activeOutput().write(computerUseGuidance(), "cua.core"); },
   };
+  // cua.browser.page(tabId?, options?): Playwright-style subset over the same browser action.
+  api.browser.page = (tabId, options) => createBrowserPage(api.browser, tabId, options);
   return Object.freeze(api);
 }
 
