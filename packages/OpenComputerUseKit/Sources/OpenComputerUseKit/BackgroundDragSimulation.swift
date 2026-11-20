@@ -293,7 +293,7 @@ enum BackgroundDragDispatcher {
             if try io.needsFocus(target.pid) {
                 try validateSession()
                 guard io.focusCapability.isAvailable else {
-                    throw ComputerUseError.backgroundUnsupported("This app needs synthetic window focus for background drag.")
+                    throw ComputerUseError.backgroundUnsupported("background drag is unavailable: \(io.focusCapability.unavailableReason)")
                 }
                 let context = try io.beginFocus(target)
                 focus = context

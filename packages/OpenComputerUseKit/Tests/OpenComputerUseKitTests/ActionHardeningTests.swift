@@ -29,6 +29,39 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertEqual(web.first?.tool, "browser")
     }
 
+    func testControlWaitUsesAnExplicitValueAndNeverConfirmsAnUnreadableAbsence() throws {
+        let changed = try XCTUnwrap(ControlWait(["label": "Volume", "condition": "value_changed", "from_value": "20"]))
+        XCTAssertEqual(try changed.run { .value(42, "22") }, "Volume changed value.")
+
+        let gone = try XCTUnwrap(ControlWait(["label": "Loading", "condition": "disappears", "timeout": 1]))
+        var time: TimeInterval = 0
+        var probes = 0
+        XCTAssertThrowsError(try gone.run(now: { time }, pause: { time += $0 }) { () -> ControlWait.Sample<Int> in
+            probes += 1
+            return .unreadable
+        })
+        XCTAssertEqual(time, 1)
+        XCTAssertGreaterThan(probes, 0)
+        XCTAssertLessThan(probes, 10)
+        XCTAssertEqual(try gone.run { () -> ControlWait.Sample<Int> in .absent }, "Loading is absent.")
+
+        let steps = try BatchTool.parseSteps([
+            ["tool": "wait_for", "label": "Ready", "condition": "appears"],
+            ["tool": "wait_for", "web": true, "label": "Ready", "condition": "appears"],
+        ], defaultApp: "Fixture")
+        XCTAssertEqual(steps.map(\.tool), ["wait_for", "browser"])
+        XCTAssertTrue(steps.allSatisfy(\.isReadOnly))
+    }
+
+    func testValueWaitRejectsAReplacementWithTheSameLabel() throws {
+        let wait = try XCTUnwrap(ControlWait(["label": "Volume", "condition": "value_changed"]))
+        var samples: [ControlWait.Sample<Int>] = [.value(1, "20"), .value(2, "22")]
+        XCTAssertThrowsError(try wait.run(pause: { _ in }) { samples.removeFirst() }) {
+            XCTAssertTrue($0.localizedDescription.contains("identity"))
+        }
+        XCTAssertTrue(samples.isEmpty)
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

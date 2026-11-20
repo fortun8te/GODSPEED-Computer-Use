@@ -2713,7 +2713,7 @@ extension SnapshotBuilder {
 
     /// Use one bounded traversal so every app has the same visibility and match rules.
     static func targetedSearch(_ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext) throws -> TargetedAX.SearchResult {
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        let deadline = ProcessInfo.processInfo.systemUptime + min(2, BrowserCallBudget.activeRemaining ?? 2)
         let expired = { ProcessInfo.processInfo.systemUptime >= deadline }
         var scans: [AXSearchNode: NodeScan] = [:]
         var records: [AXSearchNode: ElementRecord] = [:]

@@ -6,7 +6,7 @@ enum ActionOptions {
     // These actions have their own delivery checks. Skip legacy vision, retargeting and focus borrowing.
     static func usesStrictRoute(_ tool: String, _ args: [String: Any]) -> Bool {
         switch tool {
-        case "scroll_into_view": return true
+        case "scroll_into_view", "wait_for": return true
         case "drag": return DragOptions.isRequested(args)
         case "scroll": return ScrollChunks.isRequested(args)
         case "click": return ClickPlacement.isRequested(args) || args["modifiers"] != nil
@@ -163,5 +163,66 @@ struct DragOptions {
         if index != nil, x == nil, y == nil { return }
         if index == nil, let x, let y, x.isFinite, y.isFinite { return }
         throw ComputerUseError.invalidArguments("Drag \(name) needs one control or both coordinates.")
+    }
+}
+
+
+struct ControlWait {
+    enum Condition: String, CaseIterable { case appears, disappears, valueChanged = "value_changed" }
+
+    let label: String
+    let condition: Condition
+    let timeout: TimeInterval
+    let fromValue: String?
+
+    init?(_ args: [String: Any]) throws {
+        guard let condition = (args["condition"] as? String).flatMap(Condition.init(rawValue:)) else { return nil }
+        guard let label = try ActionOptions.string("label", in: args),
+              ["text", "url_contains", "index", "element_index"].allSatisfy({ args[$0] == nil }) else {
+            throw ComputerUseError.invalidArguments("This wait needs one exact label.")
+        }
+        self.label = label
+        self.condition = condition
+        timeout = try Double(ActionOptions.integer("timeout", in: args, range: 1...30) ?? 10)
+        let baseline = args["from_value"] as? String
+        guard args["from_value"] == nil || (condition == .valueChanged && baseline != nil) else {
+            throw ComputerUseError.invalidArguments("from_value needs a string and condition value_changed.")
+        }
+        fromValue = baseline
+    }
+
+    enum Sample<ID: Equatable> {
+        case absent, present, value(ID, String), unreadable
+    }
+
+    func run<ID: Equatable>(now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                            pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+                            read: () throws -> Sample<ID>) throws -> String {
+        let deadline = now() + min(timeout, max(0, BrowserCallBudget.activeRemaining ?? timeout))
+        var baseline: (id: ID, value: String)?
+        return try BrowserCallBudget.withDeadline(deadline) {
+            while now() < deadline {
+                let sample = try read()
+                if now() >= deadline { break }
+                switch (condition, sample) {
+                case (.appears, .present), (.appears, .value):
+                    return "\(label) appeared."
+                case (.disappears, .absent):
+                    return "\(label) is absent."
+                case (.valueChanged, .value(let id, let value)):
+                    if let baseline, baseline.id != id {
+                        throw ComputerUseError.stateUnavailable("The control changed identity during the wait.")
+                    }
+                    if let previous = baseline?.value ?? fromValue, previous != value {
+                        return "\(label) changed value."
+                    }
+                    baseline = (id, value)
+                default:
+                    break
+                }
+                pause(min(0.15, max(0, deadline - now())))
+            }
+            throw ComputerUseError.stateUnavailable("Timed out waiting for \(label) to satisfy \(condition.rawValue).")
+        }
     }
 }

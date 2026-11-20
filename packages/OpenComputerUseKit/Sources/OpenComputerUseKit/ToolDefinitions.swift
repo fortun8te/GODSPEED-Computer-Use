@@ -156,7 +156,8 @@ public enum ToolDefinitions {
                     "step_size": integerProperty(description: "Units per scroll chunk. One for pages."),
                     "max_steps": integerProperty(description: "Scroll chunk limit, up to 20."),
                     "until_visible": stringProperty(description: "Stop scrolling when this exact label is in view."),
-                    "condition": stringProperty(description: "wait_for with a label: require this control state.", enumValues: ["visible", "enabled", "checked", "unchecked"]),
+                    "condition": stringProperty(description: "wait_for with a label: require this control state.", enumValues: ["visible", "enabled", "checked", "unchecked", "appears", "disappears", "value_changed"]),
+                    "from_value": stringProperty(description: "Previous value for a value_changed wait."),
                     "url_contains": stringProperty(description: "wait_for: wait until the actual tab URL contains this text and the page is ready."),
                     "timeout": ["type": "number", "description": "wait_for, wait: seconds, max 30"],
                     "key": stringProperty(description: "key: Enter, Tab, Escape, ArrowDown, or Cmd+A"),
@@ -357,6 +358,19 @@ public enum ToolDefinitions {
                 ],
                 required: ["app"]
             )
+        ),
+        ToolDefinition(
+            name: "wait_for",
+            description: "Use to wait for an exact control label or a value change in the observed window.",
+            annotations: readOnlyAnnotations(),
+            inputSchema: objectSchema(properties: [
+                "app": stringProperty(description: "App name or bundle identifier"),
+                "window_id": observedWindowIDProperty(),
+                "label": stringProperty(description: "Exact control label."),
+                "condition": stringProperty(description: "What to verify.", enumValues: ControlWait.Condition.allCases.map(\.rawValue)),
+                "from_value": stringProperty(description: "Previous value for value_changed. Defaults to the first sample."),
+                "timeout": integerProperty(description: "Seconds, 1 to 30. Default 10."),
+            ], required: ["app", "label", "condition"])
         ),
         ToolDefinition(
             name: "query",

@@ -466,6 +466,11 @@ public final class ComputerUseToolDispatcher {
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
             )
+        case "wait_for":
+            guard let wait = try ControlWait(arguments) else {
+                throw ComputerUseError.invalidArguments("wait_for requires appears, disappears or value_changed.")
+            }
+            return try service.waitForControl(app: requireString("app", in: arguments), wait: wait)
         case "scroll_into_view":
             let app = try requireString("app", in: arguments)
             return try service.scrollIntoView(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments))

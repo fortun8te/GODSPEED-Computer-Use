@@ -680,7 +680,10 @@ final class BrowserPage {
             throw ComputerUseError.message("browser: could not reach the page's document; browser wait, then try again")
         }
         let payload = try cdp("Accessibility.queryAXTree", ["objectId": objectID, "accessibleName": label])
-        return Self.nodes(of: payload)
+        guard let nodes = payload["nodes"] as? [[String: Any]] else {
+            throw ComputerUseError.stateUnavailable("Chrome did not return accessibility search results.")
+        }
+        return nodes
     }
 
     static func namedCandidates(_ raw: [[String: Any]]) -> [BrowserNode] {
@@ -1797,6 +1800,41 @@ final class BrowserPage {
     """
 
     /// Waits for the text to appear on the page, or for a labelled element to exist. False when the time runs out.
+    func waitForControl(_ wait: ControlWait) throws -> String {
+        let startingDocument = wait.condition == .valueChanged ? try documentIdentity() : nil
+        if wait.condition == .valueChanged, startingDocument == nil {
+            throw ComputerUseError.stateUnavailable("Could not bind the value wait to the current document.")
+        }
+        return try wait.run { () -> ControlWait.Sample<Int> in
+            try BrowserRequestContext.validateCurrent()
+            if let startingDocument, try documentIdentity() != startingDocument {
+                throw ComputerUseError.stateUnavailable("The document changed during the value wait.")
+            }
+            let named = try queryNamedAny(wait.label).filter {
+                Self.normalize(Self.axValue($0["name"]) ?? "") == Self.normalize(wait.label)
+            }
+            guard !named.isEmpty else { return .absent }
+            guard wait.condition == .valueChanged else { return .present }
+            let matches = Self.namedCandidates(named)
+            guard Set(matches.map(\.backendNodeID)).count == 1, let node = matches.first,
+                  let value = try observedControlValue(node) else { return .unreadable }
+            return .value(node.backendNodeID, value)
+        }
+    }
+
+    private func observedControlValue(_ node: BrowserNode) throws -> String? {
+        try callOnNode(node, """
+        function(){
+          if(!this.isConnected||this.type==='password')return null;
+          if(this.type==='checkbox'||this.type==='radio')return String(this.checked);
+          if(typeof this.value==='string')return this.value;
+          if(this.isContentEditable)return this.innerText;
+          const value=this.getAttribute('aria-valuenow')??this.getAttribute('aria-checked');
+          return value===null?null:String(value);
+        }
+        """) as? String
+    }
+
     func waitFor(text: String?, label: String?, urlContains: String? = nil, controlCondition: ControlCondition? = nil, timeout: TimeInterval) -> Bool {
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining()))
