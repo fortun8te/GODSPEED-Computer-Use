@@ -91,7 +91,7 @@ public enum ToolDefinitions {
                     "done_when": ["type": ["object", "array"], "description": "How the reply knows the goal is done, checked directly: {\"text\": \"Message sent\"} (on screen), {\"field\": \"Volume\", \"equals\": \"40\"}, {\"gone\": \"Loading\"} (native, requires an untruncated read), {\"file_exists\": \"~/Desktop/out.pdf\"}, {\"url_contains\": \"/thanks\"}. One object or a list. Met: the reply says \"Done: verified\"."],
                     "foreground": ["type": "boolean", "default": false, "description": "Last resort only: bring the app forward (skipped while the user is using the Mac). Steps, dialogs included, normally work in the background."],
                     "remember": ["type": "boolean", "default": false, "description": "Save these steps as the recipe for goal once they all succeed."],
-                    "return_state": ["type": "boolean", "default": true, "description": "False skips the final browser snapshot when a URL-only completion check already passed. Recovery still includes state."],
+                    "return_state": ["type": "boolean", "default": true, "description": "False can skip the final state after a verified URL, file, or exact native field check. Recovery still includes state."],
                     "compact": ["type": "boolean", "description": "Smaller final observation. Default: on when done_when is given (a verified goal replies in a few lines)."],
                     "effects": ["type": "boolean", "default": true, "description": "False skips per-step effect reads. Use a pinned window and a final completion check for known sequences."],
                     "screenshot": ["type": "boolean", "default": false, "description": "Also return a screenshot."],

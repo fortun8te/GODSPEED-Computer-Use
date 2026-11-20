@@ -2643,6 +2643,17 @@ extension SnapshotBuilder {
         )
     }
 
+    static func directFieldValue(_ label: String, in context: TargetedAX.WindowContext) -> String? {
+        let criteria = TargetedAX.Criteria(text: label, exact: true, role: nil, limit: 2, maxNodes: 120)
+        guard let scan = try? targetedSearch(criteria, in: context, timeout: 0.15), !scan.truncated,
+              scan.records.count == 1, let field = scan.records.first,
+              field.title?.caseInsensitiveCompare(label) == .orderedSame,
+              ComputerUseService.typingRoles.contains(SmartSteps.roleKey(field.role)),
+              let element = field.element, belongsToWindow(element, window: context.windowElement),
+              let value = field.value else { return nil }
+        return value
+    }
+
     /// Current window bounds and element frame for a queried control, so an action
     /// lands correctly even if the window moved after the query.
     static func currentGeometry(of record: ElementRecord, in context: TargetedAX.WindowContext,
