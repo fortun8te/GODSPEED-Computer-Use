@@ -888,6 +888,10 @@ extension ComputerUseToolDispatcher {
             guard let direction = BrowserRules.scrollDirection(raw) else {
                 throw ComputerUseError.invalidArguments("browser scroll direction must be up, down, left, right, top or bottom")
             }
+            if let chunks = try ScrollChunks(arguments) {
+                let node = try (label != nil || index != nil) ? target() : nil
+                return .text(try page.scroll(node, direction: direction, chunks: chunks))
+            }
             let amount = Self.browserTabID(arguments["amount"])
             if label != nil || index != nil {
                 return .text(try page.scrollElement(try target(), direction: direction, amount: amount))

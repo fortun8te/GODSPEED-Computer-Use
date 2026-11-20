@@ -210,6 +210,14 @@ While the Mac is unlocked, up to four different MCP clients can make read-only b
 
 If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.
 
+## Verified scroll chunks
+
+Use `scroll` in a Mac window or Chrome tab. Pass `unit` with `lines`, `points`, or `pages`. Set `step_size` for lines or points. A page is one viewport chunk. For a longer search, set `until_visible` to the exact label and `max_steps` to a limit of 20 or less. Godspeed stops when the control is in view or the scroll position stops changing. The reply reports the number of chunks that moved.
+
+In a Mac app, target an AX scroll area with a readable scroll bar. Whole pages use the app's AX page action. Lines and points use the specified wheel units. The app controls the resulting distance. In Chrome, a point is one CSS pixel and a line is 40 CSS pixels. Omit the scroll area's label to scroll the whole page. Chrome checks whether the label can be reached in the viewport.
+
+Use `scroll_into_view` when you already know the control. Mac apps need to expose its AX scroll-to-visible action. In a batch, add `web: true` for Chrome. The original Mac `pages` and Chrome `amount` arguments still work on their own.
+
 ## Browser drag
 
 Open or select a tab and read its controls. For example, use `{"action":"drag","label":"Card A","to_label":"Drop zone"}` when both controls are visible in the same page. Read the tab after delivery to verify the drop. Apps can interpret pointer gestures differently.

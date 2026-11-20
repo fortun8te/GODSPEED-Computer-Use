@@ -1472,6 +1472,72 @@ final class BrowserPage {
         return "\"\(node.name)\": " + BrowserRules.scrollSummary(direction: direction, top: top, bottom: bottom)
     }
 
+    func scroll(_ node: BrowserNode?, direction: String, chunks: ScrollChunks) throws -> String {
+        guard ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("Scroll chunks need up, down, left or right.")
+        }
+        guard let document = try documentIdentity() else {
+            throw ComputerUseError.stateUnavailable("Could not bind the scroll to this document.")
+        }
+        func validate() throws {
+            guard try documentIdentity() == document else {
+                throw ComputerUseError.stateUnavailable("The document changed during scroll. Read the tab before continuing.")
+            }
+        }
+        let outcome = try chunks.run(visible: {
+            try validate()
+            guard let label = chunks.untilVisible else { return false }
+            let matches = try queryNamed(label).filter { Self.normalize($0.name) == Self.normalize(label) }
+            let unique = Dictionary(grouping: matches, by: \.backendNodeID)
+            guard unique.count == 1, let match = matches.first else { return false }
+            return try isInViewport(match)
+        }, advance: {
+            try validate()
+            let args: [Any] = [direction, chunks.unit.rawValue, chunks.size]
+            let result: Any?
+            if let node {
+                result = try callOnNode(node, Self.scrollChunkJS, arguments: args, feedback: "scroll")
+            } else {
+                result = try evaluate("(\(Self.scrollChunkJS)).call(document.scrollingElement,"
+                    + "\(BrowserRules.jsLiteral(direction)),\(BrowserRules.jsLiteral(chunks.unit.rawValue)),\(chunks.size))",
+                    feedback: "scroll")
+            }
+            guard let moved = result as? Bool else {
+                throw ComputerUseError.backgroundUnsupported("Choose the page or a scrollable control in its current document.")
+            }
+            return moved
+        })
+        return try outcome.reply(label: chunks.untilVisible)
+    }
+
+    private static let scrollChunkJS = """
+    function(direction,unit,count) {
+        if (!this?.isConnected) return null;
+        const horizontal = direction === 'left' || direction === 'right';
+        const canScroll = e => {
+            if (e === document.scrollingElement) return true;
+            const overflow = getComputedStyle(e)[horizontal ? 'overflowX' : 'overflowY'];
+            return /^(auto|scroll|overlay)$/.test(overflow) &&
+                (horizontal ? e.scrollWidth > e.clientWidth : e.scrollHeight > e.clientHeight);
+        };
+        let area = this;
+        while (area && !canScroll(area)) area = area.parentElement;
+        if (!area) return null;
+        const property = horizontal ? 'scrollLeft' : 'scrollTop';
+        const before = area[property];
+        const size = unit === 'pages' ? (horizontal ? area.clientWidth : area.clientHeight)
+            : unit === 'lines' ? count * 40 : count;
+        const delta = direction === 'left' || direction === 'up' ? -size : size;
+        area.scrollBy({left:horizontal ? delta : 0,top:horizontal ? 0 : delta,behavior:'instant'});
+        return area[property] !== before;
+    }
+    """
+
+    private func isInViewport(_ node: BrowserNode) throws -> Bool {
+        guard let result = try callOnNode(node, Self.clickProbeJS) as? [Any] else { return false }
+        return (result.first as? String) == "ok"
+    }
+
     /// Back, forward or reload in this tab, waiting for the page to load again.
     func history(_ operation: String) throws -> String {
         if operation == "reload" {

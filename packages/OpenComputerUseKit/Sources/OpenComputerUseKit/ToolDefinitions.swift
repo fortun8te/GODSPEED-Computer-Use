@@ -144,7 +144,11 @@ public enum ToolDefinitions {
                     "replace": ["type": "boolean", "default": false, "description": "type: true replaces the field's value"],
                     "option": stringProperty(description: "select: option text or value, e.g. Canada"),
                     "direction": stringProperty(description: "scroll: default down", enumValues: ["up", "down", "left", "right", "top", "bottom"]),
-                    "amount": ["type": "number", "description": "scroll: pixels. Default most of a screen"],
+                    "amount": ["type": "number", "description": "Legacy scroll in pixels."],
+                    "unit": stringProperty(description: "Scroll chunk unit.", enumValues: ["lines", "pages", "points"]),
+                    "step_size": integerProperty(description: "Units per scroll chunk. One for pages."),
+                    "max_steps": integerProperty(description: "Scroll chunk limit, up to 20."),
+                    "until_visible": stringProperty(description: "Stop scrolling when this exact label is in view."),
                     "condition": stringProperty(description: "wait_for with a label: require this control state.", enumValues: ["visible", "enabled", "checked", "unchecked"]),
                     "url_contains": stringProperty(description: "wait_for: wait until the actual tab URL contains this text and the page is ready."),
                     "timeout": ["type": "number", "description": "wait_for, wait: seconds, max 30"],
@@ -311,7 +315,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "scroll",
-            description: "Use to scroll a list or page by pages; not to find one control (use query). Example: {\"app\": \"Notes\", \"direction\": \"down\", \"label\": \"Body\"}.",
+            description: "Use to scroll an app area. Explicit chunks stop when movement stops or an exact label comes into view.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -320,9 +324,27 @@ public enum ToolDefinitions {
                     "direction": stringProperty(description: "Scroll direction: up, down, left, or right"),
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element identifier"),
-                    "pages": numberProperty(description: "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
+                    "pages": numberProperty(description: "Legacy page estimate. Defaults to 1."),
+                    "unit": stringProperty(description: "Verified chunk unit.", enumValues: ["lines", "pages", "points"]),
+                    "step_size": integerProperty(description: "Units per chunk. One for pages."),
+                    "max_steps": integerProperty(description: "Chunk limit, up to 20."),
+                    "until_visible": stringProperty(description: "Exact label inside this scroll area."),
                 ],
                 required: ["app", "direction"]
+            )
+        ),
+        ToolDefinition(
+            name: "scroll_into_view",
+            description: "Use to reveal a known Mac control through its accessibility action.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "element_index": stringProperty(description: "Element number"),
+                    "label": labelProperty(),
+                    "window_id": observedWindowIDProperty(),
+                ],
+                required: ["app"]
             )
         ),
         ToolDefinition(
