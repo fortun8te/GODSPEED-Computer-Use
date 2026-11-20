@@ -825,6 +825,131 @@ def learning_episodes(folder):
             dropped["incomplete"] += 1
     return episodes, dropped
 
+CONFIRM_WORDS = {"send", "pay", "payment", "purchase", "buy", "checkout", "delete", "remove", "trash", "erase", "transfer"}
+SLOT_WORDS = (("recipient", {"recipient", "to", "cc", "bcc"}), ("email", {"email", "mail"}),
+              ("path", {"path", "folder", "directory"}), ("number", {"number", "quantity", "amount"}))
+GOAL_SLOTS = (
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "{{email}}"),
+    (re.compile(r'"[^"]*"|“[^”]*”'), "{{text}}"),
+    (re.compile(r"\b\d+(?:[.,:/]\d+)*\b"), "{{number}}"),
+)
+EXAMPLES = 3
+
+
+def slot_kind(label):
+    """A slot's kind from its field label only. Typed values are never logged, so they cannot be inspected."""
+    found = set(words(label))
+    for kind, marks in SLOT_WORDS:
+        if found & marks:
+            return kind
+    return "text"
+
+
+def goal_template(goal):
+    text = goal or ""
+    for pattern, slot in GOAL_SLOTS:
+        text = pattern.sub(slot, text)
+    return text.strip()
+
+
+def episode_problem(episode):
+    """Why an episode can never become a candidate, or None. Secure and redacted fields exclude the whole episode."""
+    steps = episode["steps"]
+    if not steps:
+        return "no_steps"
+    if len({row.get("app") for row in steps if row.get("app")}) > 1:
+        return "mixed_app"
+    if secure_text(episode["goal"]):
+        return "secure_or_redacted"
+    for row in steps:
+        if secure_text(row.get("target_role")) or secure_text(row.get("target_label")):
+            return "secure_or_redacted"
+        if row.get("tool") in TYPING_TOOLS and not row.get("target_label"):
+            return "unlabelled_typing"
+    return None
+
+
+def step_signature(row):
+    """Tool plus target role and label. Typed values are not part of it, so they never split a sequence."""
+    return (row.get("tool") or "", row.get("target_role") or "", row.get("target_label") or "")
+
+
+def verified_episode(episode):
+    return episode["steps"][-1].get("done_when") == "verified"
+
+
+def recipe_candidate(members, verified, app, template, signatures):
+    """A BatchRecipes-shaped recipe. It stays unverified: a reviewed done_when has to be added before it can replay."""
+    sample = verified[0]
+    steps, params, kinds = [], {}, {}
+    sensitive = False
+    for (tool, _role, label) in signatures:
+        item = {"tool": tool}
+        if label:
+            item["label"] = label
+        if tool in TYPING_TOOLS:
+            name = "_".join(words(label)[:3]) or "text"
+            unique, number = name, 2
+            while unique in params:
+                unique, number = f"{name}_{number}", number + 1
+            params[unique] = ""
+            kinds[unique] = slot_kind(label)
+            item[TYPING_TOOLS[tool]] = "{{" + unique + "}}"
+        if set(words(label)) & CONFIRM_WORDS:
+            item["requiresConfirmation"] = True
+            sensitive = True
+        steps.append(item)
+    examples = [{"file": e["file"], "run_id": e["run_id"], "ts": e["ts"]} for e in verified[:EXAMPLES]]
+    return {
+        "app": app, "goal": template, "steps": steps, "uses": 0, "failures": 0,
+        "params": params, "slot_kinds": kinds, "done_when": [], "done_when_missing": True,
+        "verified": False, "champion": False, "version": None, "status": "unverified",
+        "requiresConfirmation": sensitive, "support": len(verified), "episodes_total": len(members),
+        "examples": examples,
+    }
+
+
+def mine_recipes(folder, min_support=3):
+    """Repeated step sequences (same app, goal template and steps) that ended in a verified done_when.
+
+    A sequence is kept only when it verified at least min_support times and every time it ran. A sequence that
+    verified only sometimes is dropped. Typed values are never read: the log does not hold them."""
+    if min_support < 1:
+        raise ValueError("min_support must be at least 1")
+    episodes, dropped = learning_episodes(Path(folder))
+    groups = {}
+    for episode in episodes:
+        reason = episode_problem(episode)
+        if reason:
+            dropped[reason] += 1
+            continue
+        app = next((row.get("app") for row in episode["steps"] if row.get("app")), episode["app"])
+        template = goal_template(episode["goal"])
+        key = (app.lower(), " ".join(words(template)), tuple(step_signature(row) for row in episode["steps"]))
+        groups.setdefault(key, []).append((app, template, episode))
+    candidates = []
+    for key, members in sorted(groups.items()):
+        verified = [item[2] for item in members if verified_episode(item[2])]
+        if len(verified) < min_support:
+            dropped["groups_low_support"] += 1
+        elif len(verified) < len(members):
+            dropped["groups_sometimes_verified"] += 1
+        else:
+            app, template, _ = members[0]
+            candidates.append(recipe_candidate(members, verified, app, template, key[2]))
+    candidates.sort(key=lambda item: (-item["support"], item["goal"], item["app"]))
+    return candidates, dict(sorted(dropped.items()))
+
+
+def mine_command(args):
+    candidates, dropped = mine_recipes(args.learning_dir, args.min_support)
+    destination = writable(args.out)
+    with destination.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(candidates, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    print(json.dumps({"candidates": len(candidates), "min_support": args.min_support, "dropped": dropped,
+                      "all_unverified": True}, indent=2, sort_keys=True))
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     commands = cli.add_subparsers(dest="command", required=True)
@@ -857,12 +982,18 @@ def main():
     pick.add_argument("--n", required=True, type=int)
     pick.add_argument("--out", required=True, type=Path, help="Output JSONL with a reason per row (new file)")
     pick.add_argument("--family-cap-percent", type=int, default=40)
+    mine = commands.add_parser("mine-recipes", help="Propose unverified recipe candidates from repeated verified LearningLog sequences")
+    mine.add_argument("learning_dir", type=Path)
+    mine.add_argument("--min-support", type=int, default=3)
+    mine.add_argument("--out", required=True, type=Path, help="Output candidates JSON (new file)")
     args = cli.parse_args()
     try:
         if args.command == "package":
             print(json.dumps(package(args.fixtures, args.output), indent=2))
         elif args.command == "export-learning":
             print(json.dumps(export_learning(args.dir, args.out), sort_keys=True))
+        elif args.command == "mine-recipes":
+            mine_command(args)
         elif args.command == "counts":
             print(json.dumps(metadata_counts(read_rows(args.metadata.read_bytes())), sort_keys=True))
         elif args.command == "calibrate":
