@@ -17,12 +17,14 @@ final class CursorHideTimerTests: XCTestCase {
         XCTAssertEqual(visualCursorIdleSwayTimeout(), 6)
     }
 
-    func testMoveSchedulesItsOwnFallbackHide() {
+    func testMoveAloneReturnsToTheConfiguredIdleDelay() throws {
         SoftwareCursorOverlay.reset()
         defer { SoftwareCursorOverlay.reset() }
         SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 260, y: 360), in: nil)
         SoftwareCursorOverlay.waitUntilIdleForTesting()
-        XCTAssertNotNil(SoftwareCursorOverlay.hideTimer, "a move with no following settle/pulse must still hide")
+        let hide = try XCTUnwrap(SoftwareCursorOverlay.hideTimer)
+        XCTAssertLessThanOrEqual(hide.fireDate.timeIntervalSinceNow, VisualCursorSupport.settings.idleHideDelay + 0.1,
+                                 "a completed move must use the normal idle delay")
     }
 
     func testResetDuringHideFadeLetsTheNextActionStayPresented() {
@@ -76,5 +78,38 @@ final class CursorHideTimerTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.6))
         XCTAssertEqual(panel?.isVisible, false, "the cursor must fade out once its window is gone")
         XCTAssertEqual(panel?.alphaValue, 1, "a hidden cursor must leave the panel fully opaque for the next action")
+    }
+
+    func testCursorDoesNotPresentForTargetThatAlreadyLeftTheScreen() {
+        SoftwareCursorOverlay.reset()
+        defer { SoftwareCursorOverlay.reset() }
+        let target = NSWindow(
+            contentRect: CGRect(x: 200, y: 200, width: 240, height: 160),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        target.isReleasedWhenClosed = false
+        defer { target.close() }
+        target.orderFront(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        let window = CursorTargetWindow(windowID: CGWindowID(target.windowNumber), layer: 0)
+        target.orderOut(nil)
+        func isOnScreen() -> Bool {
+            let rows = CGWindowListCopyWindowInfo([.optionIncludingWindow], window.windowID) as? [[String: Any]]
+            return rows?.contains {
+                ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == window.windowID
+                    && $0[kCGWindowIsOnscreen as String] as? Bool == true
+            } ?? false
+        }
+        let deadline = Date().addingTimeInterval(1.5)
+        while isOnScreen(), Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertFalse(isOnScreen(), "the fixture must leave WindowServer's onscreen list")
+        SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 280, y: 260), in: window)
+        SoftwareCursorOverlay.pulseClick(at: CGPoint(x: 280, y: 260), clickCount: 1, mouseButton: .left, in: window)
+        XCTAssertFalse(SoftwareCursorOverlay.overlayPanelForTesting?.isVisible ?? false)
+        SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 390, y: 390), in: nil)
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
+        XCTAssertTrue(SoftwareCursorOverlay.overlayPanelForTesting?.isVisible ?? false)
     }
 }

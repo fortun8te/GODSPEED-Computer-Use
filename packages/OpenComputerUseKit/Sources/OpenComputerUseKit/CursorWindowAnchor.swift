@@ -67,11 +67,15 @@ struct CursorRestingAnchor: Equatable, Sendable {
 /// must not replace a good frame with the window list's stale origin.
 enum CursorWindowFrameTracker {
     private final class Source: @unchecked Sendable {
-        let windowID: CGWindowID
         let element: AXUIElement?
-        init(windowID: CGWindowID, element: AXUIElement?) {
-            self.windowID = windowID
+        var owners: Set<String>
+        var frame: CGRect?
+        var nextRefresh: TimeInterval = 0
+        var waiting = false
+
+        init(element: AXUIElement?, owners: Set<String>) {
             self.element = element
+            self.owners = owners
         }
     }
 
@@ -79,12 +83,10 @@ enum CursorWindowFrameTracker {
     /// and the overlay's main-thread pump alike.
     private final class State: @unchecked Sendable {
         let lock = NSLock()
-        // Only one software cursor is displayed. Do not retain every window
-        // ever observed by a long-lived App Agent.
-        var source: Source?
-        var frame: CGRect?
-        var nextRefresh: TimeInterval = 0
-        var refreshing = false
+        // Retain only the windows an active cursor is following.
+        var sources: [CGWindowID: Source] = [:]
+        var pending: [CGWindowID] = []
+        var draining = false
         /// Test seam: consulted before any real lookup.
         var override: ((CGWindowID) -> CGRect?)?
         var reader: (@Sendable (CGWindowID) -> CGRect?)?
@@ -94,39 +96,44 @@ enum CursorWindowFrameTracker {
     private static let queue = DispatchQueue(label: "com.ifuryst.ocu.cursor-frame", qos: .userInitiated)
     private static let refreshInterval: TimeInterval = 1 / 30
 
-    static func register(windowID: CGWindowID?, element: AXUIElement?) {
+    static func register(windowID: CGWindowID?, element: AXUIElement?, owner: String = "") {
         guard let windowID else {
             return
         }
 
         state.lock.lock()
         defer { state.lock.unlock() }
-        if let existing = state.source, existing.windowID == windowID {
+        if let existing = state.sources[windowID] {
+            existing.owners.insert(owner)
             switch (existing.element, element) {
             case let (lhs?, rhs?) where CFEqual(lhs, rhs): return
-            case (nil, nil): return
+            case (_, nil): return
             default: break
             }
+            let replacement = Source(element: element, owners: existing.owners)
+            replacement.frame = existing.frame
+            state.sources[windowID] = replacement
+        } else {
+            state.sources[windowID] = Source(element: element, owners: [owner])
         }
-        state.source = Source(windowID: windowID, element: element)
-        state.frame = nil
-        state.nextRefresh = 0
     }
 
-    static func forget(windowID: CGWindowID) {
+    static func forget(windowID: CGWindowID, owner: String) {
         state.lock.lock()
         defer { state.lock.unlock() }
-        if state.source?.windowID == windowID {
-            state.source = nil
-            state.frame = nil
+        guard let source = state.sources[windowID] else { return }
+        source.owners.remove(owner)
+        if source.owners.isEmpty {
+            state.sources[windowID] = nil
+            state.pending.removeAll { $0 == windowID }
         }
     }
 
     static func forgetAll() {
         state.lock.lock()
         defer { state.lock.unlock() }
-        state.source = nil
-        state.frame = nil
+        state.sources.removeAll()
+        state.pending.removeAll()
         // An in-flight IPC read cannot be cancelled safely. Keep its slot busy
         // until it returns; its result will be discarded by source identity.
     }
@@ -149,36 +156,54 @@ enum CursorWindowFrameTracker {
             state.lock.unlock()
             return body(windowID)
         }
-        guard let source = state.source, source.windowID == windowID else {
+        guard let source = state.sources[windowID] else {
             state.lock.unlock()
             return nil
         }
-        let frame = state.frame
+        let frame = source.frame
         let now = ProcessInfo.processInfo.systemUptime
-        let refresh = !state.refreshing && now >= state.nextRefresh
-        let reader = state.reader
-        if refresh {
-            state.refreshing = true
-            state.nextRefresh = now + refreshInterval
+        var startWorker = false
+        if !source.waiting && now >= source.nextRefresh {
+            source.waiting = true
+            if !state.pending.contains(windowID) { state.pending.append(windowID) }
+            startWorker = !state.draining
+            state.draining = true
         }
         state.lock.unlock()
-        if refresh {
-            queue.async {
-                // Accessibility can block on an unresponsive app. It must not
-                // run on the render thread or accumulate a queue of requests.
-                let observed: CGRect?
-                if let reader { observed = reader(source.windowID) }
-                else if let element = source.element { observed = accessibilityFrame(element) }
-                else { observed = windowListFrame(for: source.windowID) }
-                state.lock.lock()
-                if state.source === source, let observed, CursorRestingAnchor.isUsable(observed) {
-                    state.frame = observed
-                }
-                state.refreshing = false
-                state.lock.unlock()
-            }
-        }
+        if startWorker { queue.async { drainPendingFrames() } }
         return frame
+    }
+
+    private static func drainPendingFrames() {
+        while true {
+            state.lock.lock()
+            guard !state.pending.isEmpty else {
+                state.draining = false
+                state.lock.unlock()
+                return
+            }
+            let windowID = state.pending.removeFirst()
+            let source = state.sources[windowID]
+            let reader = state.reader
+            if let source { source.waiting = true }
+            state.lock.unlock()
+            guard let source else { continue }
+
+            // Only one AX call runs at a time. Each active window owns at
+            // most one queued read, so slow apps never block cursor drawing.
+            let observed: CGRect?
+            if let reader { observed = reader(windowID) }
+            else if let element = source.element { observed = accessibilityFrame(element) }
+            else { observed = windowListFrame(for: windowID) }
+
+            state.lock.lock()
+            if state.sources[windowID] === source, let observed, CursorRestingAnchor.isUsable(observed) {
+                source.frame = observed
+            }
+            source.waiting = false
+            source.nextRefresh = ProcessInfo.processInfo.systemUptime + refreshInterval
+            state.lock.unlock()
+        }
     }
 
     /// Frame read from the registered accessibility element, which reflects a

@@ -11,6 +11,11 @@ public func withBrowserRequestEnvironment<T>(
     )
 }
 
+/// Require an available desktop at each transport boundary of a serialized GUI request.
+public func withBrowserDesktopValidation<T>(_ body: () throws -> T) rethrows -> T {
+    try BrowserRequestContext.withDesktopValidation(body)
+}
+
 struct BrowserRequestContext: Sendable {
     let environment: [String: String]
     let validate: (@Sendable () throws -> Void)?
@@ -30,6 +35,17 @@ struct BrowserRequestContext: Sendable {
 
     static func validateCurrent() throws {
         try current?.validate?()
+    }
+
+    static func withDesktopValidation<T>(
+        session: @escaping @Sendable () -> LockedUseSession = LockedUseSession.current,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let existing = current
+        return try withContext(.init(
+            environment: existing?.environment ?? GodspeedSettings.environment,
+            validate: existing?.validate ?? { try requireUsableComputerUseSession(session()) }
+        ), body)
     }
 }
 

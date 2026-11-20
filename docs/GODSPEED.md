@@ -174,6 +174,10 @@ Finder file copies go to the same private clipboard. Paste them into Finder or s
 
 Screenshots are available for controls that the accessibility tree misses. The optional decision helper is for ambiguous, goal-directed work. Routine reads and explicit completion checks can use the current observation directly.
 
+The visible cursor is feedback. Godspeed resolves and checks the target independently, keeps each agent's window anchor separate, and plays cursor motion on the display clock. If a path crosses a gap with no screen, it reappears beside the next target. The app never needs to move your physical pointer with the default background settings.
+
+Vercel's agent-desktop scopes references to the observed window and keeps cursor travel out of the window interaction lock. [Snapshot guide](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/apps/docs/content/docs/snapshots-and-refs.mdx) · [Cursor delivery](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/crates/core/src/cursor_overlay/submit.rs)
+
 ## Parallel browser reads
 
 To inspect a known native window directly, pass its ID to `get_app_state`. This read does not move the window or use app-wide settle. For an exact native action target, take a fresh app observation and use its reported `Window ID` as `window_id` on a supported action or a single-app batch. Godspeed stops if the observed window or required focus no longer matches. Refresh the observation before trying again. In the JavaScript REPL, use `app.batch(steps, { windowId, doneWhen })` to execute a sequence and check the final state in one call. The reply includes a `receipt` with each step's status, the number of steps left and the completion verdict. Acknowledged actions and verified outcomes are reported separately.
@@ -228,6 +232,12 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 See [training fixtures](training-fixtures.md) for reviewed vision annotations and verified decision labels.
 
 See the [macOS capability audit](macos-capabilities.md) for the boundary between Godspeed tools, app workflows, and other macOS interfaces.
+
+### When macOS is locked
+
+The public Godspeed package requires a signed-in, unlocked desktop for app controls, browser tools and screenshots. Its MCP connection can still answer `ping` and `tools/list` while the Mac is awake and the agent is running. For jobs that can run outside the desktop, use the app's supported API or command-line tools. After an interrupted desktop batch, unlock normally, read the current app state and resume from the last confirmed result.
+
+The local `OpenComputerUse locked-use status --json` command reports `not-packaged` on this build. Apple Screen Sharing provides authenticated remote desktop access when it is enabled in System Settings. [Apple Screen Sharing guide](https://support.apple.com/en-sg/guide/mac-help/mh14066/mac)
 
 ### Browser feedback and parallel jobs
 

@@ -124,12 +124,20 @@ func screenStatePointToAppKitGlobalPoint(
     fromScreenStatePoint point: CGPoint,
     screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings()
 ) -> CGPoint {
-    guard let mapping = screenMappings.first(where: { $0.screenStateFrame.contains(point) }) else {
+    guard point.x.isFinite, point.y.isFinite else { return point }
+    func distance(to mapping: VisualCursorScreenMapping) -> CGFloat {
+        let frame = mapping.screenStateFrame
+        let dx = point.x - point.x.clamped(to: frame.minX...frame.maxX)
+        let dy = point.y - point.y.clamped(to: frame.minY...frame.maxY)
+        return hypot(dx, dy)
+    }
+    guard let mapping = screenMappings.first(where: { $0.screenStateFrame.contains(point) })
+        ?? screenMappings.min(by: { distance(to: $0) < distance(to: $1) }) else {
         return point
     }
 
-    let localX = point.x - mapping.screenStateFrame.minX
-    let localY = point.y - mapping.screenStateFrame.minY
+    let localX = (point.x - mapping.screenStateFrame.minX).clamped(to: 0...mapping.screenStateFrame.width)
+    let localY = (point.y - mapping.screenStateFrame.minY).clamped(to: 0...mapping.screenStateFrame.height)
 
     return CGPoint(
         x: mapping.appKitFrame.minX + localX,

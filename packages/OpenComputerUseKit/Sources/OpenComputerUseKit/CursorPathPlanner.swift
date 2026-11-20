@@ -1,6 +1,55 @@
 import CoreGraphics
 
 enum CursorPathPlanner {
+    /// A direct trip is safe only if the line is covered by real display
+    /// rectangles. A union bounding box also includes the gaps between them.
+    static func isVisibleTrip(from start: CGPoint, to end: CGPoint, displays: [CGRect]) -> Bool {
+        var covered: CGFloat = 0
+        let spans = displays.compactMap { span(from: start, to: end, inside: $0) }
+            .sorted { $0.lowerBound < $1.lowerBound }
+        for span in spans {
+            guard span.lowerBound <= covered + 1e-8 else { return false }
+            covered = max(covered, span.upperBound)
+            if covered >= 1 { return true }
+        }
+        return false
+    }
+
+    private static func span(from start: CGPoint, to end: CGPoint, inside rect: CGRect) -> ClosedRange<CGFloat>? {
+        func axis(_ start: CGFloat, _ end: CGFloat, _ min: CGFloat, _ max: CGFloat) -> ClosedRange<CGFloat>? {
+            let delta = end - start
+            guard delta != 0 else { return (min...max).contains(start) ? 0...1 : nil }
+            let a = (min - start) / delta
+            let b = (max - start) / delta
+            return Swift.min(a, b)...Swift.max(a, b)
+        }
+        guard let horizontal = axis(start.x, end.x, rect.minX, rect.maxX),
+              let vertical = axis(start.y, end.y, rect.minY, rect.maxY) else { return nil }
+        let entry = max(0, horizontal.lowerBound, vertical.lowerBound)
+        let exit = min(1, horizontal.upperBound, vertical.upperBound)
+        return entry <= exit ? entry...exit : nil
+    }
+
+    /// For offset adjacent displays, connect the two in-display legs at the
+    /// closest point on their shared edge. Displays with a real gap return nil.
+    static func crossing(from start: CGPoint, to end: CGPoint, between first: CGRect, and second: CGRect) -> CGPoint? {
+        if first.maxX == second.minX || second.maxX == first.minX {
+            let low = max(first.minY, second.minY)
+            let high = min(first.maxY, second.maxY)
+            guard low < high else { return nil }
+            let x = first.maxX == second.minX ? first.maxX : first.minX
+            return CGPoint(x: x, y: ((start.y + end.y) / 2).clamped(to: low...high))
+        }
+        if first.maxY == second.minY || second.maxY == first.minY {
+            let low = max(first.minX, second.minX)
+            let high = min(first.maxX, second.maxX)
+            guard low < high else { return nil }
+            let y = first.maxY == second.minY ? first.maxY : first.minY
+            return CGPoint(x: ((start.x + end.x) / 2).clamped(to: low...high), y: y)
+        }
+        return nil
+    }
+
     static func plan(start: CGPoint, end: CGPoint, bounds: CGRect?, startForward: CGVector, restForward: CGVector)
         -> (path: CursorMotionPath, length: CGFloat) {
         let dx = end.x - start.x
