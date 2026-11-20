@@ -382,6 +382,7 @@ final class BrowserBridge: @unchecked Sendable {
                 try send(["jsonrpc": "2.0", "id": id, "method": "tools/call",
                           "params": ["name": "cdp", "arguments": args]])
             }
+            TimingLog.count("browser.hint_commands", requests.count)
             return requests.map { id in
                 guard let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
                       let result = message["result"] as? [String: Any],

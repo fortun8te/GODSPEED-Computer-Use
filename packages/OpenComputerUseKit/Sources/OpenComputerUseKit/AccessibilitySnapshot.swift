@@ -775,7 +775,9 @@ private struct WindowCapture {
 
     func screenshotResult() -> ScreenshotEncodingResult {
         guard let image else { return ScreenshotEncodingResult(data: nil, note: nil) }
-        return encodeScreenshot(for: image, config: imageConfig)
+        return TimingLog.measure("snapshot.screenshot_encode") {
+            encodeScreenshot(for: image, config: imageConfig)
+        }
     }
 
 }

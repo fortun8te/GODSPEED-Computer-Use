@@ -777,8 +777,10 @@ public final class ComputerUseService {
         }
 
         let options = SnapshotObservationOptions(includeAX: true, includeScreenshot: false)
-        let snapshot = try refresh?(options)
-            ?? refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: options)
+        let snapshot = try TimingLog.measure("action.native_readback") {
+            try refresh?(options)
+                ?? refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: options)
+        }
         Self.actionObservation?.record(snapshot)
         return snapshotResult(for: snapshot, style: .actionResult)
     }
@@ -2285,7 +2287,7 @@ public final class ComputerUseService {
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
         observation: SnapshotObservationOptions = .defaults
     ) throws -> AppSnapshot {
-        let app = try AppDiscovery.resolve(query)
+        let app = try TimingLog.measure("snapshot.resolve_app") { try AppDiscovery.resolve(query) }
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
@@ -3687,10 +3689,14 @@ public final class ComputerUseService {
     }
 
     private func snapshotResult(for snapshot: AppSnapshot, style: SnapshotTextStyle) -> ToolCallResult {
-        var content = [ToolResultContentItem.text(snapshot.renderedText(style: style))]
+        let text = TimingLog.measure("snapshot.render_text") { snapshot.renderedText(style: style) }
+        TimingLog.count("snapshot.ax_elements", snapshot.elements.count)
+        TimingLog.count("snapshot.text_bytes", text.utf8.count)
+        TimingLog.count("snapshot.image_bytes", snapshot.screenshotData?.count ?? 0)
+        var content = [ToolResultContentItem.text(text)]
         if let note = snapshot.screenshotNote { content.append(.text(note)) }
         if let screenshotData = snapshot.screenshotData {
-            content.append(.screenshotImage(screenshotData))
+            content.append(TimingLog.measure("snapshot.base64_encode") { .screenshotImage(screenshotData) })
         }
         return ToolCallResult(content: content)
     }

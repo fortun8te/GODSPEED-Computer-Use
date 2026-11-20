@@ -673,7 +673,9 @@ extension ComputerUseToolDispatcher {
             var readArguments: [String: Any] = ["app": app, "include_screenshot": NSNumber(value: false)]
             if let pinnedWindow, app == defaultApp { readArguments["window_id"] = pinnedWindow }
             if settleMs > 0 { readArguments["settle_ms"] = settleMs }
-            let read = callToolAsResult(name: "get_app_state", arguments: readArguments)
+            let read = TimingLog.measure(optionalEffect ? "batch.effect_read" : "batch.wait_read") {
+                callToolAsResult(name: "get_app_state", arguments: readArguments)
+            }
             let text = read.isError ? nil : LeanOutput.stateText(of: read)
             if optionalEffect {
                 effectBudget.record(seconds: clock.systemUptime - began, settleMs: settleMs, observed: text != nil)
@@ -1095,7 +1097,9 @@ extension ComputerUseToolDispatcher {
             } else {
                 readArguments["settle_ms"] = LeanDefaults.batchSettleMs
             }
-            observation = callToolAsResult(name: "get_app_state", arguments: readArguments)
+            observation = TimingLog.measure("batch.final_native_read") {
+                callToolAsResult(name: "get_app_state", arguments: readArguments)
+            }
         }
 
         // The final read is taken: give focus back before anything slower (done checks, the checker model).
@@ -1197,7 +1201,7 @@ extension ComputerUseToolDispatcher {
                     supportsAbsence: lastAttemptedStep?.tool != "browser"
                 ))
             }
-            var doneResult = earlyCompletion ?? checkConditions()
+            var doneResult = earlyCompletion ?? TimingLog.measure("batch.final_check", checkConditions)
             if (!failed || ambiguousFinalClick), finalClickChecksPage, case .missing(let unmet) = doneResult,
                let pending = doneConditions.first(where: { unmet.contains($0.summary) }),
                waitForBrowserEvidence(pending) {

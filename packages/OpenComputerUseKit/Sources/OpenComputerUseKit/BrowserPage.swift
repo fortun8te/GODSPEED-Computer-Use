@@ -257,7 +257,7 @@ final class BrowserPage {
     private func addHints(to parse: inout BrowserAXParse, find: String, generation: Int) {
         let positions = Self.hintCandidates(in: parse, find: find)
         guard !positions.isEmpty else { return }
-        let deadline = BrowserCallBudget.deadline(after: Self.hintBudget)
+        let deadline = BrowserCallBudget.deadline(after: min(Self.hintBudget, BrowserCallBudget.remaining()))
         let hints = Self.readHints(positions.map { parse.controls[$0].backendNodeID }) { commands in
             (try? bridge.hintCommands(tab: tab, commands: commands, generation: generation, deadline: deadline)) ?? []
         }
@@ -1987,7 +1987,7 @@ final class BrowserPage {
     private func cdpOnce(_ method: String, _ params: [String: Any], feedback: String?) throws -> [String: Any] {
         Self.trace("\(method) \((params["type"] as? String) ?? "")")
         do {
-            return try cdpSend(method, params, feedback: feedback)
+            return try TimingLog.measure("browser.cdp") { try cdpSend(method, params, feedback: feedback) }
         } catch {
             Self.trace("  FAILED \(method): \(String(describing: error).prefix(120))")
             throw error
@@ -2010,6 +2010,7 @@ final class BrowserPage {
         let commandWait = min(isQuery ? 2 : 10, transportWait - 0.5)
         arguments["timeout_ms"] = Int(commandWait * 1_000)
         let reply = try bridge.callTool("cdp", arguments: arguments, timeout: transportWait, referenceGeneration: indexedGeneration)
+        TimingLog.count("browser.cdp_reply_bytes", reply.text.utf8.count)
         if reply.isError {
             if Self.linkDropped(reply.text) { throw BrowserLinkDropped(text: reply.text) }
             throw ComputerUseError.message("browser: \(BrowserReply.explain(reply.text))")
