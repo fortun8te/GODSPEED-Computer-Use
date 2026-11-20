@@ -118,23 +118,41 @@ extension BrowserPage {
         return (id, addresses)
     }
 
+    /// A frame's focus step: the focused element, or a frame owner whose own document holds the focus.
+    enum FocusStep {
+        case element(objectID: String)
+        case frameOwner(objectID: String)
+    }
+
+    /// Follows focus through nested frames to the focused element. Each frame is its own document, so the
+    /// caller reads its focus there. Gives up with a denial instead of guessing.
+    static func focusedPolicyElement<Context>(start: Context, maxDepth: Int = 8,
+                                              focus: (Context) throws -> FocusStep,
+                                              enter: (String) throws -> Context) throws -> String {
+        var context = start
+        for _ in 0...maxDepth {
+            switch try focus(context) {
+            case .element(let objectID): return objectID
+            case .frameOwner(let objectID): context = try enter(objectID)
+            }
+        }
+        throw ComputerUseError.actionDenied("The browser could not confirm the focused control for the action policy.")
+    }
+
     func policyTarget(node: BrowserNode?, keyboard: Bool, point: CGPoint? = nil) throws -> (target: ActionPolicy.Target, destination: String?) {
         let frame = try policyFrames()
         let world = try cdp("Page.createIsolatedWorld", ["frameId": frame.id, "worldName": "Godspeed Action Policy"])
         guard let contextID = world["executionContextId"] as? Int else {
             throw ComputerUseError.actionDenied("The browser could not inspect the control for the action policy.")
         }
-        let function = Self.policyTargetFunction
-        let payload: [String: Any]
+        let denied = ComputerUseError.actionDenied("The browser could not confirm the control for the action policy.")
+        let objectID: String
         if let node {
             let resolved = try cdp("DOM.resolveNode", ["backendNodeId": node.backendNodeID, "executionContextId": contextID])
-            guard let object = resolved["object"] as? [String: Any], let objectID = object["objectId"] as? String else {
-                throw ComputerUseError.actionDenied("The browser could not confirm the control for the action policy.")
+            guard let object = resolved["object"] as? [String: Any], let id = object["objectId"] as? String else {
+                throw denied
             }
-            payload = try cdp("Runtime.callFunctionOn", [
-                "objectId": objectID, "functionDeclaration": function,
-                "arguments": [["value": keyboard]], "returnByValue": true,
-            ])
+            objectID = id
         } else if let point {
             // A coordinate drop lands on whatever is under the point. Frames are not classified from here,
             // so a point inside one fails closed rather than being checked against the wrong document.
@@ -145,37 +163,55 @@ extension BrowserPage {
                 "contextId": contextID, "returnByValue": false,
                 "expression": "document.elementFromPoint(\(point.x), \(point.y))",
             ])
-            guard let result = found["result"] as? [String: Any], let objectID = result["objectId"] as? String else {
+            guard let result = found["result"] as? [String: Any], let id = result["objectId"] as? String else {
                 throw ComputerUseError.actionDenied("The browser could not confirm the drop target for the action policy.")
             }
-            let described = try cdp("DOM.describeNode", ["objectId": objectID])
-            if let owner = described["node"] as? [String: Any], owner["frameId"] != nil {
+            if Self.isFrameOwner(try cdp("DOM.describeNode", ["objectId": id])) {
                 throw ComputerUseError.actionDenied("A drop inside a frame cannot be checked by the action policy. Drop onto a labelled control instead.")
             }
-            payload = try cdp("Runtime.callFunctionOn", [
-                "objectId": objectID, "functionDeclaration": function,
-                "arguments": [["value": keyboard]], "returnByValue": true,
-            ])
+            objectID = id
         } else {
-            payload = try cdp("Runtime.evaluate", [
-                "contextId": contextID, "returnByValue": true,
-                "expression": """
-                (() => {
-                    let el = document.activeElement;
-                    while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
-                    return (\(function)).call(el, \(keyboard ? "true" : "false"));
-                })()
-                """,
-            ])
+            // Keyboard input goes to the focused element of the focused frame, which can be nested.
+            objectID = try Self.focusedPolicyElement(start: (frame: frame.id, context: contextID), focus: { current in
+                let evaluated = try cdp("Runtime.evaluate", [
+                    "contextId": current.context, "returnByValue": false,
+                    "expression": Self.deepestActiveElementJS,
+                ])
+                guard let result = evaluated["result"] as? [String: Any], let id = result["objectId"] as? String else {
+                    throw denied
+                }
+                let described = try cdp("DOM.describeNode", ["objectId": id])
+                return Self.isFrameOwner(described) ? .frameOwner(objectID: id) : .element(objectID: id)
+            }, enter: { owner in
+                let described = try cdp("DOM.describeNode", ["objectId": owner])
+                guard let childFrame = (described["node"] as? [String: Any])?["frameId"] as? String else { throw denied }
+                let world = try cdp("Page.createIsolatedWorld", ["frameId": childFrame, "worldName": "Godspeed Action Policy"])
+                guard let childContext = world["executionContextId"] as? Int else { throw denied }
+                return (frame: childFrame, context: childContext)
+            })
         }
+        let payload = try cdp("Runtime.callFunctionOn", [
+            "objectId": objectID, "functionDeclaration": Self.policyTargetFunction,
+            "arguments": [["value": keyboard]], "returnByValue": true,
+        ])
         guard let result = payload["result"] as? [String: Any],
               let facts = result["value"] as? [String: Any],
               let secure = facts["secure"] as? Bool, let submits = facts["submits"] as? Bool else {
-            throw ComputerUseError.actionDenied("The browser could not confirm the control for the action policy.")
+            throw denied
         }
         return (ActionPolicy.Target(title: node?.name, identifier: facts["id"] as? String, role: node?.role,
                                     secureField: secure, submitsForm: submits), facts["destination"] as? String)
     }
+
+    /// Only a frame owner (iframe, frame, object, embed) reports a frame ID for its node.
+    private static func isFrameOwner(_ described: [String: Any]) -> Bool {
+        (described["node"] as? [String: Any])?["frameId"] != nil
+    }
+
+    /// The focused element, looking through open shadow roots.
+    private static let deepestActiveElementJS = """
+    (() => { let el = document.activeElement; while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement; return el; })()
+    """
 
     private static let policyTargetFunction = """
     function(keyboard) {
