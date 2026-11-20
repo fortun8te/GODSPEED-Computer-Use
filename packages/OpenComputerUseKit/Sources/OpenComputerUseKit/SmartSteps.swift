@@ -738,9 +738,6 @@ enum SmartSteps {
             return .text("Opened \(link).")
 
         case .url(let url):
-            guard BrowserBridge.isAvailable else {
-                throw ComputerUseError.message("Opening a web address needs the browser tool (Chrome with Open Browser Use).")
-            }
             let reply = try browser(["action": "open", "url": url])
             return ToolCallResult(content: [.text("Opened \(url).")] + reply.content, isError: reply.isError)
 

@@ -1473,7 +1473,7 @@ final class BrowserPage {
     }
 
     /// Back, forward or reload in this tab, waiting for the page to load again.
-    func history(_ operation: String) throws -> String {
+    func history(_ operation: String, authorizeDestination: (String) throws -> Void = { _ in }) throws -> String {
         if operation == "reload" {
             guard let before = try evaluate("performance.timeOrigin") as? NSNumber else {
                 throw ComputerUseError.stateUnavailable("browser: could not identify the current document before reloading.")
@@ -1496,6 +1496,10 @@ final class BrowserPage {
         else {
             throw ComputerUseError.invalidArguments("browser: there is no page \(operation) in this tab; use browser go with a URL")
         }
+        guard let url = entries[target]["url"] as? String else {
+            throw ComputerUseError.stateUnavailable("browser: could not confirm the history destination.")
+        }
+        try authorizeDestination(url)
         _ = try cdp("Page.navigateToHistoryEntry", ["entryId": entryID])
         let place = try waitForHistoryResult {
             let history = try self.cdp("Page.getNavigationHistory")
@@ -1802,7 +1806,7 @@ final class BrowserPage {
     }
 
     @discardableResult
-    private func cdp(_ method: String, _ params: [String: Any] = [:], feedback: String? = nil) throws -> [String: Any] {
+    func cdp(_ method: String, _ params: [String: Any] = [:], feedback: String? = nil) throws -> [String: Any] {
         if let indexedGeneration, indexedGeneration != bridge.referenceGeneration {
             throw Self.staleIndex
         }
@@ -2363,10 +2367,18 @@ enum BrowserReply {
     }
 
     /// "12 Title — https://…" lines for a tab listing.
-    static func tabLines(in text: String, limit: Int) -> [String] {
+    static func tabURL(in text: String, id: Int) -> String? {
+        var found: String?
+        walk(json(text)) { object in
+            if object["id"] as? Int == id, let url = object["url"] as? String { found = url }
+        }
+        return found
+    }
+
+    static func tabLines(in text: String, limit: Int, include: (String) -> Bool = { _ in true }) -> [String] {
         var lines: [String] = []
         walk(json(text)) { object in
-            guard lines.count < limit, let id = object["id"] as? Int, let url = object["url"] as? String else { return }
+            guard lines.count < limit, let id = object["id"] as? Int, let url = object["url"] as? String, include(url) else { return }
             let title = (object["title"] as? String) ?? ""
             lines.append("\(id) \(title.isEmpty ? "" : title + " — ")\(url)")
         }
