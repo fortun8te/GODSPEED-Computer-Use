@@ -1,11 +1,11 @@
 import Foundation
 
 let computerUseServerInstructions = """
-Use Godspeed for Mac apps and Chrome. Keep actions in the background.
+Use Godspeed for Mac apps and Chrome.
 
 - Mac: compact get_app_state, then batch known actions with an observable done_when. For one step, use its tool. Use unique labels or fresh indexes.
 - Web: browser in its own tab. Use interactive or find to narrow a read. Request screenshots for visual targets that need them.
-- Verify against the result. Model hints are advisory. After a partial failure, read fresh state before retrying uncertain steps. Use receipt.recovery to resume.
+- Verify against the result. Model hints are advisory. After a partial failure, read fresh state before retrying uncertain steps.
 - Use handoff for bounded subtasks and remember only verified reusable batches. Use the private clipboard across apps. Ask before sending, deleting, or purchasing.
 """
 

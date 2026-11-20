@@ -57,7 +57,7 @@ public enum ToolDefinitions {
             }
             properties["strict_background"] = [
                 "type": "boolean",
-                "description": "Require background delivery without app activation, borrowed focus or physical pointer movement. Inherited by nested steps."
+                "description": "Background only: no app activation, borrowed focus or pointer movement. Nested steps inherit it."
             ]
             schema["properties"] = properties
             return ToolDefinition(name: tool.name, description: tool.description, annotations: tool.annotations, inputSchema: schema)
@@ -195,7 +195,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "get_app_state",
-            description: "Use to read a Mac app's key window as a numbered element list, starting its session if needed; not for finding one control (use query). Call it first for an app you have not read this turn. A batch reply already ends with this state. Add include_screenshot only when the list is not enough.",
+            description: "Use to read a Mac app's key window as a numbered element list, starting its session if needed; not for one control (use query). Call first for an app not read this turn. A batch reply already ends with this state. Add include_screenshot only if the list is not enough.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -221,7 +221,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "click",
-            description: "Use to press a control by label (visible name) or element_index; x and y pixels only when it has no name. Not for typing (type_text) or fields (set_value). Example: {\"app\": \"Notes\", \"label\": \"Send\"}.",
+            description: "Use to press a control by label (visible name) or element_index; x and y pixels only when it has no name. Not for typing (type_text) or fields (set_value).",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -263,7 +263,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "type_text",
-            description: "Use to type literal text into the focused field; to set a field's whole value use set_value. Click the field first. replace: true selects the focused field's text first (search boxes, chat inputs set_value cannot write). Example: {\"app\": \"Notes\", \"text\": \"hello\"}.",
+            description: "Use to type literal text into the focused field; to set a field's whole value use set_value. Click the field first. replace: true selects the focused field's text first (search boxes, chat inputs set_value cannot write).",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -278,7 +278,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "press_key",
-            description: "Use for a key or shortcut, not for menu commands (use press_menu). Press a key or combination: \"Return\", \"Escape\", \"Tab\", \"Down\", \"cmd+s\" (modifiers: cmd, shift, alt, ctrl). Example: {\"app\": \"Notes\", \"key\": \"cmd+s\"}.",
+            description: "Use for a key or shortcut, not for menu commands (use press_menu). Press a key or combination: \"Return\", \"Escape\", \"Tab\", \"Down\", \"cmd+s\" (modifiers: cmd, shift, alt, ctrl).",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -321,7 +321,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: SmartSteps.saveAsName,
-            description: "Use to save the front document under a new name; not for a plain Save (press_menu). It does File > Save As… (Save… for an untitled one), then the folder, the name and Save, inside one focus borrow. The reply gives the saved path once the file is on disk; otherwise it gives the reason and any dialog that is open. Example: {\"app\": \"TextEdit\", \"path\": \"~/Desktop/notes.txt\"}.",
+            description: "Use to save the front document under a new name; not for a plain Save (press_menu). It does File > Save As… (Save… for an untitled one), then the folder, the name and Save, inside one focus borrow. The reply gives the saved path once the file is on disk; otherwise it gives the reason and any dialog that is open.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -333,7 +333,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: SmartSteps.openName,
-            description: "Use to open a file, a web address or an app; not to click through Finder or a dialog. Opens a file in its default app (or app), a web address in the browser tool (url), or launches an app (app alone). Nothing is brought to the front. The reply says what opened. Examples: {\"path\": \"~/Downloads/report.pdf\"}, {\"url\": \"example.com\"}, {\"app\": \"Notes\"}.",
+            description: "Use to open a file, a web address or an app; not to click through Finder or a dialog. Opens a file in its default app (or app), a web address in the browser tool (url), or launches an app (app alone). Nothing is brought to the front. The reply says what opened.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -516,12 +516,12 @@ public enum ToolDefinitions {
 private func observedWindowIDProperty() -> [String: Any] {
     [
         "type": "integer", "minimum": 1, "maximum": UInt32.max,
-        "description": "Require the native window ID from get_app_state or query. Refuses the action if its observed target changed."
+        "description": "Window ID from get_app_state or query; refuses if the target changed."
     ]
 }
 
 private func nativeElementRefProperty() -> [String: Any] {
-    stringProperty(description: "Exact element ref from the latest get_app_state with include_refs. Use instead of a label, index or pixels.")
+    stringProperty(description: "Exact ref from get_app_state with include_refs. Use instead of label, index or pixels.")
 }
 
 private func dropVerificationProperty() -> [String: Any] {
