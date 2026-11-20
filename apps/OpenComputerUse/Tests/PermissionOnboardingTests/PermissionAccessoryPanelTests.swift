@@ -152,7 +152,7 @@ final class PermissionAccessoryPanelTests: XCTestCase {
         func assertFullPanel(expectedWidth: CGFloat = 530, file: StaticString = #filePath, line: UInt = #line) {
             XCTAssertTrue(panel.isVisible, file: file, line: line)
             XCTAssertEqual(panel.frame.width, expectedWidth, accuracy: 0.01, file: file, line: line)
-            XCTAssertEqual(panel.frame.height, 109, accuracy: 0.01, file: file, line: line)
+            XCTAssertEqual(panel.frame.height, 124, accuracy: 0.01, file: file, line: line)
             XCTAssertEqual(panel.alphaValue, 1, accuracy: 0.001, file: file, line: line)
             let content = panel.contentView!
             content.layoutSubtreeIfNeeded()

@@ -27,6 +27,9 @@ struct BrowserNode: Sendable {
     var isNew = false
     var linkURL: String? = nil
     var observedStates: [String] = []
+    /// What tells this control apart when it has no label or shares one: its title, icon, image, a stable
+    /// attribute or its row ("icon:trash; in:Invoice 12"). Display only; not part of the fingerprint.
+    var hint = ""
 
     /// The line a model reads: "3 textbox Email = sam@x.com"; "3*" when new since the last read.
     var line: String { renderedLine(numbered: true) }
@@ -38,7 +41,9 @@ struct BrowserNode: Sendable {
         let clipped = !name.dropFirst(100).isEmpty || !value.dropFirst(80).isEmpty
         let clippingNote = clipped ? " " + DoneCheck.clippedFieldNote : ""
         let destination = includeLinkURL ? (linkURL.map { " → " + String($0.prefix(240)) } ?? "") : ""
-        return "\(prefix)\(role) \(name.prefix(100))\(statePart)\(clippingNote)\(valuePart)\(destination)"
+        let shownName = name.isEmpty ? (hint.isEmpty ? "(no label)" : "") : String(name.prefix(100))
+        let hintPart = hint.isEmpty ? "" : (shownName.isEmpty ? "(\(hint))" : " (\(hint))")
+        return "\(prefix)\(role) \(shownName)\(hintPart)\(statePart)\(clippingNote)\(valuePart)\(destination)"
     }
 }
 
@@ -86,6 +91,8 @@ struct BrowserAXParse: Sendable {
     var texts: [String] = []
     var droppedControls = 0
     var framedControls = 0
+    /// Icon-only controls kept so far (capped by `BrowserPage.maxUnnamedControls`).
+    var unnamedControls = 0
     /// Controls marked new since the last read (see `BrowserRules.markNew`).
     var newControls = 0
 }
@@ -119,6 +126,11 @@ final class BrowserPage {
     static let clickableRoles: Set<String> = ["button", "link", "menuitem", "tab", "checkbox", "radio", "switch", "option"]
     /// Most numbered controls kept for one page.
     static let maxElements = 400
+    /// Most icon-only (unnamed) controls kept per page, and most controls given a hint per read.
+    static let maxUnnamedControls = 40
+    static let maxHintedControls = 24
+    /// Time one read may spend asking Chrome for hints.
+    static let hintBudget: TimeInterval = 0.35
     /// Characters one `read` may spend on control lines and on text lines.
     static let controlBudget = 7_000
     static let textBudget = 2_500
@@ -161,6 +173,7 @@ final class BrowserPage {
             : Self.parseAX(raw, controlBudget: .max, textBudget: interactive ? 0 : .max, maxControls: .max,
                            includeLinkURLs: includeLinkURLs)
         var parse = parsed
+        addHints(to: &parse)
         let context = try? readContext(texts: parse.texts)
         let place = context?.location ?? (try? location())
         if let context { parse.texts = context.texts }
@@ -215,6 +228,52 @@ final class BrowserPage {
         }
         return (text, url, evidence)
     }
+
+    /// Labels the controls a model could not otherwise tell apart: those with no name and those that share
+    /// their role and name with another (three "Edit" buttons). Unnamed ones first, then duplicates, in page
+    /// order, within a small time budget, so a read never slows down noticeably.
+    private func addHints(to parse: inout BrowserAXParse) {
+        var counts: [String: Int] = [:]
+        for control in parse.controls { counts["\(control.role)\u{1}\(control.name)", default: 0] += 1 }
+        let candidates = parse.controls.indices.filter { position in
+            let control = parse.controls[position]
+            guard !control.inFrame, Self.clickableRoles.contains(control.role) || Self.fieldRoles.contains(control.role) else { return false }
+            return control.name.isEmpty || counts["\(control.role)\u{1}\(control.name)", default: 0] > 1
+        }
+        guard !candidates.isEmpty else { return }
+        let ordered = candidates.filter { parse.controls[$0].name.isEmpty } + candidates.filter { !parse.controls[$0].name.isEmpty }
+        let deadline = Date().addingTimeInterval(Self.hintBudget)
+        for position in ordered.prefix(Self.maxHintedControls) {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0.02 else { break }
+            let control = parse.controls[position]
+            let value = BrowserCallBudget.withDeadline(BrowserCallBudget.deadline(after: remaining)) {
+                try? callOnNode(control, Self.hintJS) as? String
+            }
+            if let value, !value.isEmpty { parse.controls[position].hint = value }
+        }
+    }
+
+    /// A control's title, icon, image, stable attribute and row, as "icon:trash; testid:delete; in:Invoice 12".
+    /// After agent-browser's control hints (Apache-2.0), extended with title, tooltip and image alt text.
+    static let hintJS = #"""
+    function(){const tail=(s,sep)=>(s||'').split(sep).pop();
+    const use=this.querySelector('svg use');const svg=this.querySelector('svg[id], svg[data-icon]');
+    const mark=this.querySelector('svg[class], i[class], span[class*=icon]');
+    const img=this.querySelector('img[src]:not([src^="data:"])');
+    const icon=use?tail(use.getAttribute('href')||use.getAttribute('xlink:href'),'#'):svg?(svg.id||svg.dataset.icon):
+    mark?String(mark.getAttribute('class')||'').split(/\s+/).filter((c)=>/^(lucide|fa|bi|mdi|ri|ti|icon|material)-/i.test(c)||/icon/i.test(c)).slice(0,2).join(' '):'';
+    const file=img?tail(img.getAttribute('src').split(/[?#]/)[0],'/').replace(/\.\w+$/,''):'';
+    const alt=img&&img.getAttribute('alt')||'';
+    const title=this.getAttribute('title')||this.getAttribute('aria-description')||this.getAttribute('data-tooltip')||'';
+    const key=['data-testid','data-test','name','id'].find((k)=>/^(?!.*\d{3})[a-z][\w-]*$/i.test(this.getAttribute(k)||''));
+    const row=this.closest('tr, li, article, [role=row], [role=listitem], [role=gridcell]');
+    const own=(this.innerText||'').trim();
+    const near=row?String(row.innerText||'').replace(own,'').replace(/\s+/g,' ').trim():'';
+    return [title&&'title:'+title,icon&&'icon:'+icon,alt&&'img:'+alt,!alt&&file&&'img:'+file,
+    key&&key.replace(/^data-/,'')+':'+this.getAttribute(key),near&&'in:'+near]
+    .filter(Boolean).map((s)=>s.replace(/\s+/g,' ').slice(0,48)).slice(0,3).join('; ');}
+    """#
 
     /// The parse narrowed to controls and text lines that contain `find`, ignoring case.
     static func filtered(_ parse: BrowserAXParse, find: String) -> BrowserAXParse {
@@ -387,9 +446,13 @@ final class BrowserPage {
 
             if interactiveRoles.contains(role) {
                 let value = collapse(axValue(node["value"]) ?? "")
+                // An icon-only control (trash, close, menu) has no name but is often the one a task needs. It is
+                // kept, up to a cap, and labelled by a hint after the parse (see `addHints`).
+                let unnamedClickable = name.isEmpty && clickableRoles.contains(role) && result.unnamedControls < maxUnnamedControls
                 guard let backend = (node["backendDOMNodeId"] as? NSNumber)?.intValue,
-                      !name.isEmpty || fieldRoles.contains(role)
+                      !name.isEmpty || fieldRoles.contains(role) || unnamedClickable
                 else { continue }
+                if unnamedClickable { result.unnamedControls += 1 }
                 let frame = node["frameId"] as? String
                 let inFrame = mainFrame != nil && frame != nil && frame != mainFrame
                 var enclosing = 0
@@ -515,6 +578,15 @@ final class BrowserPage {
         if let named = try? queryNamed(label), let hit = Self.pickNamed(named, wanted: wanted) {
             return hit
         }
+        // A hint from the last read ("icon:trash", "trash", "in:Invoice 12") names an icon-only control.
+        if let tabID, let document = try? documentIdentity(),
+           let observation = BrowserPageMemory.shared.observation(bridge: bridge, tab: tabID, document: document) {
+            let matches = observation.nodes.filter { Self.hint($0.hint, matches: wanted) }
+            if matches.count == 1, let node = matches.first {
+                indexedGeneration = observation.generation
+                return try verified(node, index: node.index)
+            }
+        }
         let raw = try fullTree()
         let nodes = Self.parseAX(raw, controlBudget: Int.max, textBudget: 0, maxControls: .max).controls
         if let hit = try Self.pickFuzzy(nodes, label: label) { return hit }
@@ -522,6 +594,17 @@ final class BrowserPage {
         throw ComputerUseError.invalidArguments(
             "browser: no element labelled '\(label)'. Visible: \(names). Use the exact text, or browser read for indexes"
         )
+    }
+
+    /// True when `wanted` (normalized) is one of the hint's parts, with or without its "icon:" style prefix.
+    static func hint(_ hint: String, matches wanted: String) -> Bool {
+        guard !hint.isEmpty, !wanted.isEmpty else { return false }
+        for part in hint.components(separatedBy: "; ") {
+            let whole = normalize(part)
+            if whole == wanted { return true }
+            if let colon = part.firstIndex(of: ":"), normalize(String(part[part.index(after: colon)...])) == wanted { return true }
+        }
+        return false
     }
 
     /// A page that re-rendered can reuse an element for other content, so a number from an earlier read is
@@ -783,8 +866,12 @@ final class BrowserPage {
     private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false) throws -> CGPoint {
         func probe() -> [Any] {
             let remaining = BrowserCallBudget.remaining()
-            guard remaining > 1 else { return [] }
-            let deadline = BrowserCallBudget.deadline(after: min(3, remaining - 0.5))
+            // Resolving the node and hit-testing it are separate Chrome calls.
+            // Reserve time for the press and release after the probe.
+            // With little time left, probe briefly instead of refusing a click that would still fit.
+            guard remaining > 1.5 else { return [] }
+            let reserve = remaining > 4 ? 3 : 0.8
+            let deadline = BrowserCallBudget.deadline(after: min(8, remaining - reserve))
             return BrowserCallBudget.withDeadline(deadline) {
                 ((try? callOnNode(node, Self.clickProbeJS)) as? [Any]) ?? []
             }
@@ -2231,6 +2318,22 @@ enum BrowserReply {
               let tabs = envelope["result"] as? [[String: Any]] else { return nil }
         let ids = tabs.compactMap { $0["id"] as? Int }
         return ids.count == tabs.count ? ids : nil
+    }
+
+    static func completedTab(in text: String, id: Int, expectedURL: String) -> Bool {
+        guard let envelope = json(text) as? [String: Any], envelope["error"] == nil,
+              let tabs = envelope["result"] as? [[String: Any]],
+              let tab = tabs.first(where: { $0["id"] as? Int == id }),
+              tab["status"] as? String == "complete",
+              let url = tab["url"] as? String else { return false }
+        return BrowserRules.sameAddress(url, expectedURL)
+    }
+
+    static func acceptedInitialNavigation(in text: String) -> Bool {
+        guard let envelope = json(text) as? [String: Any], envelope["error"] == nil,
+              let result = envelope["result"] as? [String: Any],
+              let tab = result["tab"] as? [String: Any] else { return false }
+        return tab["initialNavigationAccepted"] as? Bool == true
     }
 
     /// Reads the exact create response for ownership. Navigation data cannot confer ownership.

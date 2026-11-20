@@ -287,11 +287,33 @@ enum BatchEffects {
             self.timeoutMs = timeoutMs
         }
 
-        init(arguments: [String: Any]) throws {
+        /// Spellings models use for the wait keys, mapped to the real key.
+        static let keyAliases: [String: String] = [
+            "for_window": "window", "dialog": "window", "sheet": "window",
+            "until": "text", "for_text": "text", "appears": "text", "contains": "text", "visible": "text",
+            "disappears": "gone", "until_gone": "gone", "absent": "gone", "not_visible": "gone",
+            "ms": "timeout_ms", "duration_ms": "timeout_ms", "milliseconds": "timeout_ms", "max_ms": "timeout_ms",
+        ]
+
+        init(arguments rawArguments: [String: Any]) throws {
+            var arguments = rawArguments
+            for (alias, key) in Self.keyAliases where arguments[key] == nil {
+                if let value = arguments[alias] { arguments[key] = value }
+            }
+            // Seconds given as timeout_s / timeout_seconds / timeout (a small number is seconds).
+            if arguments["timeout_ms"] == nil {
+                let seconds = ["timeout_s", "timeout_seconds", "timeout"].lazy.compactMap { key -> Double? in
+                    (arguments[key] as? NSNumber)?.doubleValue ?? Double((arguments[key] as? String) ?? "")
+                }.first
+                if let seconds { arguments["timeout_ms"] = seconds <= 60 ? Int(seconds * 1000) : Int(seconds) }
+            }
             func text(_ key: String) -> String? {
                 (arguments[key] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
             }
-            let settle = (arguments["settle"] as? Bool) ?? ((arguments["settle"] as? String)?.lowercased() == "true")
+            let settleRaw = arguments["settle"]
+            let settle = (settleRaw as? Bool)
+                ?? (settleRaw as? NSNumber).map { $0.intValue != 0 }
+                ?? ["true", "yes", "1", "on"].contains(((settleRaw as? String) ?? "").lowercased())
             if let window = text("window") {
                 kind = .window(window)
             } else if let wanted = text("text") {

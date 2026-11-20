@@ -16,6 +16,26 @@ final class TargetedQuerySafetyTests: XCTestCase {
         XCTAssertTrue(result.primaryText?.contains("window_id") == true)
     }
 
+    func testWindowBoundBatchAcceptsTextWaitsAndNamesRefusedSteps() {
+        let dispatcher = ComputerUseToolDispatcher()
+        func run(_ step: [String: Any]) -> String {
+            dispatcher.callToolAsResult(name: "batch", arguments: [
+                "app": "NoSuchReviewApp", "window_id": 4242,
+                "steps": [["tool": "click", "label": "One"], step],
+            ]).primaryText ?? ""
+        }
+        let textWait = run(["tool": "wait", "text": "Done", "timeout_ms": 100])
+        XCTAssertFalse(textWait.contains("window-bound batch accepts"), textWait)
+        let windowWait = run(["tool": "wait", "window": "Export"])
+        XCTAssertTrue(windowWait.contains("cannot wait for another window"), windowWait)
+        let aliasWindow = run(["tool": "wait", "dialog": "Export"])
+        XCTAssertTrue(aliasWindow.contains("cannot wait for another window"), aliasWindow)
+        let otherApp = run(["tool": "wait", "text": "Done", "app": "Finder"])
+        XCTAssertTrue(otherApp.contains("reads its own app"), otherApp)
+        let menu = run(["tool": "press_menu", "path": "File > New"])
+        XCTAssertTrue(menu.contains("accepts press_menu only as one of"), menu)
+    }
+
     func testQueryStringsAndExactRejectSilentCoercion() throws {
         XCTAssertEqual(try validatedQueryString("Send", key: "text"), "Send")
         XCTAssertThrowsError(try validatedQueryString(3, key: "text"))

@@ -21,6 +21,7 @@ final class CursorHideTimerTests: XCTestCase {
         SoftwareCursorOverlay.reset()
         defer { SoftwareCursorOverlay.reset() }
         SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 260, y: 360), in: nil)
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
         XCTAssertNotNil(SoftwareCursorOverlay.hideTimer, "a move with no following settle/pulse must still hide")
     }
 
@@ -29,6 +30,7 @@ final class CursorHideTimerTests: XCTestCase {
         defer { SoftwareCursorOverlay.reset() }
         // Create and present the panel with a real move.
         SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 250, y: 350), in: nil)
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
         let panel = SoftwareCursorOverlay.overlayPanelForTesting
         XCTAssertNotNil(panel, "the overlay panel should exist after a move")
 
@@ -40,6 +42,7 @@ final class CursorHideTimerTests: XCTestCase {
         SoftwareCursorOverlay.reset()
         // A new action arrives while the fade is still running.
         SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 300, y: 400), in: nil)
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
         RunLoop.main.run(until: Date().addingTimeInterval(0.25))
 
         // If the fade were not aborted, finishHide would have ordered the panel
@@ -62,6 +65,7 @@ final class CursorHideTimerTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         let targetWindow = CursorTargetWindow(windowID: CGWindowID(target.windowNumber), layer: 0)
         SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 280, y: 260), in: targetWindow)
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
         RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         let panel = SoftwareCursorOverlay.overlayPanelForTesting
         XCTAssertEqual(panel?.isVisible, true, "the cursor should be shown while its window is open")

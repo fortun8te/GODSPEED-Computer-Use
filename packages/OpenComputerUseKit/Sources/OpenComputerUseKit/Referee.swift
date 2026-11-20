@@ -47,6 +47,31 @@ enum Referee {
 
     static var isEnabled: Bool { baseURL != nil }
 
+    private static let warmLock = NSLock()
+    nonisolated(unsafe) private static var lastWarm: TimeInterval?
+
+    /// Loads the decision model in the background, so the hint at the end of this batch is not lost to a
+    /// cold load (about 2.3 s, longer than the hint timeout). Fire and forget, at most once a minute; the
+    /// helper unloads it again after 3 idle minutes. Starts the helper when it is down.
+    static func warmInBackground(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard let baseURL else { return }
+        warmLock.lock()
+        let due = lastWarm.map { now - $0 >= 60 } ?? true
+        if due { lastWarm = now }
+        warmLock.unlock()
+        guard due, var parts = URLComponents(url: baseURL.appendingPathComponent("warm"), resolvingAgainstBaseURL: false)
+        else { return }
+        parts.queryItems = [URLQueryItem(name: "models", value: "d1")]
+        guard let url = parts.url else { return }
+        var request = URLRequest(url: url, timeoutInterval: 1)
+        request.httpMethod = "GET"
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if error != nil || (response as? HTTPURLResponse)?.statusCode != 202 {
+                HelperAutoStarter.shared.helperUnreachable(baseURL)
+            }
+        }.resume()
+    }
+
     // Completion hints are experimental. Without independent calibration, use
     // deterministic checks for task completion and keep the model for recovery.
     static var allowsCompletionHints: Bool {
@@ -321,10 +346,14 @@ public struct AgentIdleTimer: Sendable {
         if connectedClients == 0 { idleSince = now }
     }
 
+    public func nextExitDelay(now: TimeInterval) -> TimeInterval? {
+        guard !isExiting, idleLimit > 0, let idleSince else { return nil }
+        return max(0, idleLimit - (now - idleSince))
+    }
+
     /// True once, when the agent has been idle for the whole limit. A limit of 0 never exits.
     public mutating func shouldExit(now: TimeInterval) -> Bool {
-        guard !isExiting, idleLimit > 0, connectedClients == 0, let idleSince else { return false }
-        guard now - idleSince >= idleLimit else { return false }
+        guard nextExitDelay(now: now) == 0 else { return false }
         isExiting = true
         return true
     }

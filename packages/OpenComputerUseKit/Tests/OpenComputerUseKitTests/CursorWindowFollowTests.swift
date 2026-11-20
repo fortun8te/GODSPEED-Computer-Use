@@ -57,6 +57,7 @@ final class CursorWindowFollowTests: XCTestCase {
             RunLoop.main.add(timer, forMode: .common)
             defer { timer.invalidate() }
             SoftwareCursorOverlay.moveCursor(to: target, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let final = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             let actual = try XCTUnwrap(final.tipPosition)
             XCTAssertEqual(actual.x, target.x, accuracy: 0.5)
@@ -134,6 +135,7 @@ final class CursorWindowFollowTests: XCTestCase {
         // second as it did upstream (OCU Fast's default is 80 to 180 ms).
         setenv("OPEN_COMPUTER_USE_CURSOR_SPEED", "0.4", 1)
         SoftwareCursorOverlay.moveCursor(to: defaultVisualCursorInitialTipPosition(), in: nil)
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
         SoftwareCursorOverlay.reset()
         defer {
             SoftwareCursorOverlay.reset()
@@ -192,6 +194,7 @@ final class CursorWindowFollowTests: XCTestCase {
             RunLoop.main.add(second, forMode: .common)
             defer { first.invalidate(); second.invalidate() }
             SoftwareCursorOverlay.pulseClick(at: point(original), clickCount: 2, mouseButton: .left, in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             try assertPosition(file, frame: live.value)
         }
     }
@@ -205,6 +208,7 @@ final class CursorWindowFollowTests: XCTestCase {
             RunLoop.main.add(timer, forMode: .common)
             defer { timer.invalidate() }
             SoftwareCursorOverlay.moveCursor(to: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             try assertPosition(file, frame: live.value)
             // The next pipeline stage must not restore the snapshot's old point.
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
@@ -231,6 +235,7 @@ final class CursorWindowFollowTests: XCTestCase {
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in original }
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
             SoftwareCursorOverlay.pulseClick(at: point(original), clickCount: 1, mouseButton: .left, in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             SoftwareCursorOverlay.reset()
             RunLoop.main.run(until: Date().addingTimeInterval(0.08))
             let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
@@ -247,6 +252,7 @@ final class CursorWindowFollowTests: XCTestCase {
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in moved }
             let start = ProcessInfo.processInfo.systemUptime
             SoftwareCursorOverlay.moveCursor(to: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             XCTAssertGreaterThan(ProcessInfo.processInfo.systemUptime - start, 0.5)
         }
     }
@@ -344,6 +350,7 @@ final class CursorWindowFollowTests: XCTestCase {
             RunLoop.main.add(move, forMode: .common)
             defer { move.invalidate() }
             SoftwareCursorOverlay.moveCursor(to: point(initial), in: nil, anchor: targetAnchor)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let afterTravel = try awaitFrame { abs($0.minX - (initial.minX + 200)) < 1 }
             try assertPosition(file, frame: afterTravel)
             SoftwareCursorOverlay.settle(at: point(initial), in: nil, anchor: targetAnchor)
@@ -356,6 +363,7 @@ final class CursorWindowFollowTests: XCTestCase {
             RunLoop.main.add(duringPulse, forMode: .common)
             defer { duringPulse.invalidate() }
             SoftwareCursorOverlay.pulseClick(at: point(initial), clickCount: 2, mouseButton: .left, in: nil, anchor: targetAnchor)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let afterPulse = try awaitFrame { abs($0.minX - (initial.minX + 260)) < 1 }
             try assertPosition(file, frame: afterPulse)
             for offset in [CGPoint(x: 220, y: 60), CGPoint(x: 100, y: 140), .zero] {

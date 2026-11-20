@@ -6,6 +6,9 @@ import Foundation
 final class TrajectoryLog: @unchecked Sendable {
     static let enabledVariable = "OPEN_COMPUTER_USE_TRAJECTORY_LOG"
     static let contentVariable = "OPEN_COMPUTER_USE_TRAJECTORY_CONTENT"
+    /// Opt-in diagnostic detail. Error text may mention an app, filename, or control.
+    static let failureDetailVariable = "OPEN_COMPUTER_USE_TRAJECTORY_FAILURES"
+    static let failureTextLimit = 700
     static let runIDVariable = "OPEN_COMPUTER_USE_RUN_ID"
     static let resultTextLimit = 6_000
     static let defaultMaxBytes: UInt64 = 20 * 1024 * 1024
@@ -36,6 +39,7 @@ final class TrajectoryLog: @unchecked Sendable {
 
     let isEnabled: Bool
     private let capturesContent: Bool
+    private let capturesFailures: Bool
     private let driverVersion: String?
     let sessionID: String
     let runID: String?
@@ -64,6 +68,9 @@ final class TrajectoryLog: @unchecked Sendable {
         driverVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
         capturesContent = ["1", "true", "yes", "on"].contains(
             environment[Self.contentVariable]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
+        capturesFailures = ["1", "true", "yes", "on"].contains(
+            environment[Self.failureDetailVariable]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         )
         let run = environment[Self.runIDVariable].map(Self.safeFileComponent).flatMap { $0.isEmpty ? nil : $0 }
         runID = run
@@ -105,6 +112,7 @@ final class TrajectoryLog: @unchecked Sendable {
             admissionMs: admissionMs,
             receipts: receipts,
             batchReceipt: result.batchReceipt,
+            failureText: result.isError ? primary : nil,
             failureCode: result.isError
                 ? result.batchReceipt?.failureCode ?? result.failureCode ?? Self.failureCode(message: primary) : nil,
             visionUsed: primary.hasPrefix("No accessibility element is labelled ") && primary.contains("found it on screen and clicked at")
@@ -128,6 +136,7 @@ final class TrajectoryLog: @unchecked Sendable {
             screenshotReturned: false,
             startedAt: startedAt,
             admissionMs: admissionMs,
+            failureText: message,
             failureCode: Self.failureCode(error: error, message: message)
         )
     }
@@ -176,6 +185,7 @@ final class TrajectoryLog: @unchecked Sendable {
         admissionTimedOut: Bool = false,
         receipts: Receipts? = nil,
         batchReceipt: BatchReceipt? = nil,
+        failureText: String? = nil,
         failureCode: FailureCode? = nil,
         visionUsed: Bool = false
     ) {
@@ -211,6 +221,9 @@ final class TrajectoryLog: @unchecked Sendable {
             object["batch_not_run"] = batchReceipt.totalSteps - batchReceipt.steps.count
             object["batch_observation"] = batchReceipt.observation.rawValue
             object["batch_done_check"] = batchReceipt.doneCheck.rawValue
+        }
+        if capturesFailures, !capturesContent, isError, name != "clipboard" {
+            object["failure_detail"] = Self.sanitize(Self.failureDetail(text: failureText ?? "", arguments: arguments))
         }
         if capturesContent {
             object["arguments"] = Self.sanitize(arguments)
@@ -386,6 +399,66 @@ final class TrajectoryLog: @unchecked Sendable {
     }
 
     /// Result lines about a secure field keep their name but lose the value shown after ` Value: ` or ` = `.
+    /// Argument keys whose values describe the call, not the user's content; kept in failure detail.
+    static let shapeKeys: Set<String> = [
+        "tool", "action", "role", "element_role", "subrole", "key", "key_method", "click_method", "mouse_button", "button",
+        "direction", "selection", "app", "window_id", "element_index", "index", "remember", "include_screenshot",
+    ]
+
+    /// What a failure needs to be understood later, without the user's content: the first lines of Godspeed's own
+    /// message with every quoted label masked and every value from the call blanked, and the arguments reduced to
+    /// their shape (descriptive keys kept, every other string replaced by its length).
+    static func failureDetail(text: String, arguments: [String: Any]) -> [String: Any] {
+        var message = redactSecureLines(text)
+        for value in stringValues(in: arguments) where value.count >= 3 {
+            message = message.replacingOccurrences(of: value, with: "…")
+        }
+        message = maskQuoted(message)
+        // The reply often continues with the app's state; the reason is in its first lines.
+        let head = message.split(separator: "\n", omittingEmptySubsequences: true).prefix(4).joined(separator: " | ")
+        let limited = head.count > failureTextLimit ? String(head.prefix(failureTextLimit)) + "…" : head
+        return ["message": limited, "arguments": shapeOnly(arguments)]
+    }
+
+    /// Quoted text in a message is usually a label from the screen: "…" and '…' keep the sentence readable.
+    static func maskQuoted(_ text: String) -> String {
+        var output = text
+        for pattern in [#""[^"\n]{1,200}""#, #"“[^”\n]{1,200}”"#, #"(?<![\w])'[^'\n]{1,200}'(?![\w])"#] {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let quote = pattern.hasPrefix("“") ? "“…”" : (pattern.contains("'") ? "'…'" : "\"…\"")
+            output = regex.stringByReplacingMatches(in: output, range: NSRange(output.startIndex..., in: output), withTemplate: quote)
+        }
+        return output
+    }
+
+    private static func stringValues(in value: Any) -> [String] {
+        if let text = value as? String { return [text] }
+        if let dictionary = value as? [String: Any] { return dictionary.values.flatMap(stringValues(in:)) }
+        if let list = value as? [Any] { return list.flatMap(stringValues(in:)) }
+        return []
+    }
+
+    /// Arguments reduced to their shape: descriptive keys keep short values, other strings become their length.
+    static func shapeOnly(_ value: [String: Any]) -> [String: Any] {
+        var output: [String: Any] = [:]
+        for (key, item) in value {
+            if let nested = item as? [String: Any] {
+                output[key] = shapeOnly(nested)
+            } else if let list = item as? [Any] {
+                output[key] = list.prefix(20).map { element -> Any in
+                    if let dictionary = element as? [String: Any] { return shapeOnly(dictionary) }
+                    if let text = element as? String { return "<\(text.count) chars>" }
+                    return element
+                }
+            } else if let text = item as? String {
+                output[key] = shapeKeys.contains(key) && !valueKeys.contains(key) ? String(text.prefix(60)) : "<\(text.count) chars>"
+            } else {
+                output[key] = item
+            }
+        }
+        return output
+    }
+
     static func redactSecureLines(_ text: String) -> String {
         text.split(separator: "\n", omittingEmptySubsequences: false).map { substring -> String in
             let line = String(substring)

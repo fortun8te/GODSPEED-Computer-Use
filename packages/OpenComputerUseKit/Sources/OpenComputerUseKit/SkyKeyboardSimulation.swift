@@ -462,6 +462,24 @@ enum SkyKeyboardDispatcher {
         return nil
     }
 
+    /// A command named without its menu ("Make Plain Text" for "Format > Make Plain Text"): the one item
+    /// with that title anywhere under the menu bar. Two or more matches: nil, so the caller lists the menus.
+    static func uniqueMenuItemAnywhere(in menuBar: AXUIElement, title: String) -> AXUIElement? {
+        var matches: [AXUIElement] = []
+        func walk(_ element: AXUIElement, levels: Int) {
+            guard levels > 0, matches.count < 2 else { return }
+            for child in copyValue(element, kAXChildrenAttribute) as? [AXUIElement] ?? [] {
+                if isMenuItem(child), menuTitleMatches(title, copyValue(child, kAXTitleAttribute) as? String) {
+                    matches.append(child)
+                }
+                walk(child, levels: levels - 1)
+            }
+        }
+        // Menu bar > title > menu > item > submenu > item: eight levels covers two submenu levels.
+        walk(menuBar, levels: 8)
+        return matches.count == 1 ? matches[0] : nil
+    }
+
     // MARK: - Menu paths
 
     /// `press_menu`: press the item at `path` (["Format", "Font", "Show Fonts"]) through
@@ -479,9 +497,11 @@ enum SkyKeyboardDispatcher {
             let menu = item
             guard let next = firstMenuItem(in: menu, levels: 2, where: {
                 isMenuItem($0) && menuTitleMatches(title, copyValue($0, kAXTitleAttribute) as? String)
-            }) else {
+            }) ?? (depth == 0 ? uniqueMenuItemAnywhere(in: menu, title: title) : nil) else {
                 try requireAnswering(menu)
-                let place = depth == 0 ? "the menu bar" : path[..<depth].joined(separator: " > ")
+                let place = depth > 0 ? path[..<depth].joined(separator: " > ")
+                    : path.count == 1 ? "any menu (a toggled item, like Make Plain Text vs Make Rich Text, shows only its current title)"
+                    : "the menu bar"
                 throw ComputerUseError.message(
                     "No menu item '\(title)' in \(place). Items: \(menuItemTitles(in: menu).joined(separator: ", "))"
                 )

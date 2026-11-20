@@ -288,12 +288,13 @@ final class OpenComputerUseKitTests: XCTestCase {
     }
 
     func testToolDefinitionCount() {
-        XCTAssertEqual(ToolDefinitions.all.filter { $0.name != "browser" }.count, 17)
+        XCTAssertEqual(ToolDefinitions.all.filter { $0.name != "browser" }.count, 18)
         XCTAssertEqual(
             ToolDefinitions.all.filter { $0.name != "browser" }.map(\.name).sorted(),
             [
                 "batch",
                 "click",
+                "clipboard",
                 "drag",
                 "get_app_state", "handoff", "hover",
                 "list_apps",

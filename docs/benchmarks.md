@@ -1,6 +1,17 @@
 # Benchmarks
 
-Godspeed's current package passes macOS source checks and an MCP handshake. A fresh comparison on real workflows is pending.
+## Release checks
+
+These runs measure the UTF-8 text passed back to the agent. Input token counts depend on the host model and how it serializes tool results.
+
+| Synthetic window | Earlier reply | Current reply | Text reduction |
+| --- | ---: | ---: | ---: |
+| One changed control in a small window | 184 B | 71 B | 61% |
+| 80 controls after a verified batch, full versus compact | 1,959 B | 105 B | 95% |
+
+Run `swift test --filter CompactVerifiedReplyTests` to reproduce the reply checks. The first case selects the smaller of the state and its diff. The second uses `compact: true` and an explicit passing check. A later read still returns information the client has yet to see.
+
+The app agent used to check for idle exit every five seconds. It now arms a single deadline after the last client disconnects. `swift test --filter LifecycleTests` covers deadline changes as clients connect and disconnect. Whole-machine CPU, GPU and power measurements are pending.
 
 ## Earlier runs
 
@@ -13,6 +24,8 @@ These recorded runs used GPT-6 Luna at low reasoning. A task checker scored the 
 | Godspeed with local helpers | 150 | 256 |
 
 The sets included different tasks and repeated attempts. Three Godspeed-only runs also recorded native computer-use calls. Use these numbers as history. A matched comparison is needed to estimate the effect of the helpers or compare tools.
+
+An isolated Chrome trial on November 18 verified three outcomes in 21 Godspeed calls and 109 seconds. Six calls returned errors that required a correction or a readback. It identified partial typing, ambiguous action delivery, and tab-close verification as targets for the next pass. The two attempted native comparison sessions both timed out during startup, so the trial produced no matched ranking.
 
 ## A fair comparison
 

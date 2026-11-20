@@ -56,6 +56,15 @@ enum DoneCheck {
     }
 
     /// Parses the `done_when` argument. Nil or missing means no conditions. Any malformed entry throws.
+    /// Spellings models use for done_when keys, mapped to the real key.
+    static let keyAliases: [String: String] = [
+        "contains": "text", "on_screen": "text", "visible": "text", "shows": "text", "screen_contains": "text",
+        "url": "url_contains", "url_includes": "url_contains", "url_has": "url_contains",
+        "file": "file_exists", "exists": "file_exists", "path_exists": "file_exists",
+        "absent": "gone", "not_visible": "gone", "disappears": "gone", "not_on_screen": "gone",
+        "is": "equals", "value": "equals",
+    ]
+
     static func parse(_ raw: Any?) throws -> [Condition] {
         guard let raw, !(raw is NSNull) else { return [] }
         let entries: [Any]
@@ -68,10 +77,13 @@ enum DoneCheck {
             throw ComputerUseError.invalidArguments("done_when allows at most 8 conditions")
         }
         return try entries.map { entry in
-            guard let object = entry as? [String: Any] else {
+            guard var object = entry as? [String: Any] else {
                 throw ComputerUseError.invalidArguments(
                     "done_when entries are objects like {\"text\": \"Message sent\"} or {\"file_exists\": \"~/x.pdf\"}"
                 )
+            }
+            for (alias, key) in Self.keyAliases where object[key] == nil {
+                if let value = object[alias] { object[key] = value }
             }
             if let path = object["file_exists"] as? String, !path.isEmpty {
                 return .fileExists((path as NSString).expandingTildeInPath)
@@ -109,7 +121,10 @@ enum DoneCheck {
             case .fileExists(let path):
                 ok = evidence.fileExists(path)
             case .text(let text):
-                ok = evidence.screenText.map { contains($0, text) } ?? false
+                // A plain number must match a whole number on screen: "12" is not met by "120".
+                ok = evidence.screenText.map {
+                    isPlainNumber(text) ? containsNumber($0, text) : (contains($0, text) || containsLabeledNumber($0, text))
+                } ?? false
             case .field(let label, let value):
                 ok = evidence.screenText.map { fieldEquals($0, label: label, value: value) } ?? false
             case .urlContains(let part):
@@ -180,8 +195,101 @@ enum DoneCheck {
         return false
     }
 
-    private static func contains(_ haystack: String, _ needle: String) -> Bool {
-        haystack.range(of: needle, options: .caseInsensitive) != nil
+    /// A plain number like "1641" or "0.25" also matches how the Mac's region writes it on screen:
+    /// "1.641", "1,641", "1 641" or "0,25". Only whole numbers on screen count, so "16,41" never matches "1641".
+    static func isPlainNumber(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespaces)
+            .range(of: #"^[-−]?\d+([.,'\x{00A0}\x{202F}]\d+)*$"#, options: .regularExpression) != nil
+    }
+
+    static func containsNumber(_ haystack: String, _ needle: String) -> Bool {
+        let trimmed = needle.trimmingCharacters(in: .whitespaces)
+        guard isPlainNumber(trimmed) else { return false }
+        // The agent writes numbers the English way ("0.25"), so read the target only that way.
+        let wanted = numberReadings(trimmed, conventions: 1)
+        // Not one number ("19.11.2026", "192.168.1.1", "0,25"): match the text as written, digit-bounded.
+        guard !wanted.isEmpty else { return contains(haystack, trimmed) }
+        // Space grouping counts only as the no-break spaces macOS uses ("1 641"), not a plain space ("Step 1 641").
+        let patterns = [
+            #"(?<!\d)(?<!\d[.,'])(?:(?<![\w])[-−])?\d+(?:[.,'\x{00A0}\x{202F}]\d+)*(?!\d)"#,
+        ]
+        // State lines start with an element number ("12 button 9") and name the window ("Window ID: 12573").
+        // Those are not on-screen numbers: "12" must not be met by element 12.
+        let visible = haystack
+            .replacingOccurrences(of: #"(?m)^[ \t]*\d+(?= )"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?m)^Window ID: \d+.*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?mi)^App=.*\(pid \d+\)[ \t]*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?mi)^(?:CGWindowID|window_id|pid)[ \t]*[:=][ \t]*\d+[ \t]*$"#, with: "", options: .regularExpression)
+        let ns = visible as NSString
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            for match in regex.matches(in: visible, range: NSRange(location: 0, length: ns.length)) {
+                if !numberReadings(ns.substring(with: match.range)).isDisjoint(with: wanted) { return true }
+            }
+        }
+        return false
+    }
+
+    /// "Edit field 6958" is also met by "Edit field 6.958" (the region's grouping): text ending in a plain number
+    /// matches when the words before it appear on screen followed by that number as the region writes it.
+    static func containsLabeledNumber(_ haystack: String, _ needle: String) -> Bool {
+        let trimmed = needle.trimmingCharacters(in: .whitespaces)
+        guard let match = trimmed.range(of: #"\s[-−]?\d+(?:[.,]\d+)*$"#, options: .regularExpression) else { return false }
+        let prefix = String(trimmed[..<match.lowerBound])
+        let number = String(trimmed[match]).trimmingCharacters(in: .whitespaces)
+        guard !prefix.isEmpty, prefix.last?.isNumber == false, isPlainNumber(number) else { return false }
+        let wanted = numberReadings(number, conventions: 1)
+        guard !wanted.isEmpty else { return false }
+        let pattern = NSRegularExpression.escapedPattern(for: prefix)
+            + #"[ \t\x{00A0}]+([-−]?\d+(?:[.,'\x{00A0}\x{202F}]\d+)*)(?!\d)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return false }
+        let ns = haystack as NSString
+        for found in regex.matches(in: haystack, range: NSRange(location: 0, length: ns.length)) {
+            if !numberReadings(ns.substring(with: found.range(at: 1))).isDisjoint(with: wanted) { return true }
+        }
+        return false
+    }
+
+    /// Every value a written number can mean, as a canonical "-1234.5" string, trying both
+    /// dot-decimal and comma-decimal conventions. Grouping must be in threes to count as grouping.
+    static func numberReadings(_ raw: String, conventions: Int = 2) -> Set<String> {
+        var text = raw.replacingOccurrences(of: "−", with: "-")
+        let negative = text.hasPrefix("-")
+        if negative { text.removeFirst() }
+        var readings = Set<String>()
+        for (group, decimal) in [(Set<Character>([",", "'", " ", "\u{00A0}", "\u{202F}"]), Character(".")),
+                                 (Set<Character>([".", "'", " ", "\u{00A0}", "\u{202F}"]), Character(","))].prefix(conventions) {
+            var intPart = text
+            var fraction = ""
+            if let last = text.lastIndex(of: decimal) {
+                intPart = String(text[..<last])
+                fraction = String(text[text.index(after: last)...])
+                guard !fraction.isEmpty, fraction.allSatisfy(\.isNumber) else { continue }
+            }
+            let groups = intPart.split(omittingEmptySubsequences: false, whereSeparator: { group.contains($0) })
+            guard !groups.isEmpty, groups.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else { continue }
+            if groups.count > 1 {
+                guard groups[0].count <= 3, groups.dropFirst().allSatisfy({ $0.count == 3 }) else { continue }
+            }
+            // Leading zeros stay significant: "05" is not "5".
+            let digits = groups.joined()
+            let frac = fraction.reversed().drop(while: { $0 == "0" }).reversed()
+            let value = String(digits) + (frac.isEmpty ? "" : "." + String(frac))
+            readings.insert((negative && value != "0" ? "-" : "") + value)
+        }
+        return readings
+    }
+
+    /// Case-insensitive. A target that starts or ends with a digit must not run into more digits on screen:
+    /// "Edit field 12" is not met by "Edit field 120".
+    static func contains(_ haystack: String, _ needle: String) -> Bool {
+        guard let first = needle.first, let last = needle.last, first.isNumber || last.isNumber else {
+            return haystack.range(of: needle, options: .caseInsensitive) != nil
+        }
+        let pattern = (first.isNumber ? #"(?<![0-9])"# : "")
+            + NSRegularExpression.escapedPattern(for: needle)
+            + (last.isNumber ? #"(?![0-9])"# : "")
+        return haystack.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
     }
 }
 
