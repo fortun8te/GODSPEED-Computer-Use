@@ -1201,7 +1201,7 @@ final class BrowserPage {
         try ActionOptions.requireTime(for: hold + 3)
         let deadline = BrowserCallBudget.deadline(after: BrowserCallBudget.remaining())
         do {
-            try BrowserCallBudget.withDeadline(deadline - 1.5, press)
+            try BrowserCallBudget.withDeadline(deadline - hold - 1.5, press)
         } catch {
             try? BrowserCallBudget.withDeadline(deadline, release)
             throw ComputerUseError.stateUnavailable("The held key may have reached the tab. Inspect it before repeating.")
@@ -1620,13 +1620,25 @@ final class BrowserPage {
                 throw ComputerUseError.stateUnavailable("The document changed during scroll. Read the tab before continuing.")
             }
         }
+        let visibilityScope = if chunks.untilVisible != nil, let node { try nodeObjectID(node) } else { "" }
+        let horizontal = direction == "left" || direction == "right"
         let outcome = try chunks.run(visible: {
             try validate()
             guard let label = chunks.untilVisible else { return false }
-            let matches = try queryNamed(label).filter { Self.normalize($0.name) == Self.normalize(label) }
-            let unique = Dictionary(grouping: matches, by: \.backendNodeID)
-            guard unique.count == 1, let match = matches.first else { return false }
-            return try isInViewport(match)
+            let matches = Self.scrollLabelCandidates(try queryNamedAny(label), label: label)
+            var found = false
+            for match in matches {
+                if !visibilityScope.isEmpty {
+                    let inside = try callOnNode(match, Self.scrollScopeJS, arguments: [horizontal],
+                                                objectArguments: [visibilityScope]) as? Bool
+                    if inside != true { continue }
+                }
+                if try isInViewport(match) {
+                    if found { return false }
+                    found = true
+                }
+            }
+            return found
         }, advance: {
             try validate()
             let args: [Any] = [direction, chunks.unit.rawValue, chunks.size]
@@ -1646,18 +1658,43 @@ final class BrowserPage {
         return try outcome.reply(label: chunks.untilVisible)
     }
 
+    static func scrollLabelCandidates(_ raw: [[String: Any]], label: String) -> [BrowserNode] {
+        var seen: Set<Int> = []
+        return raw.compactMap { item in
+            guard (item["ignored"] as? Bool) != true, let name = axValue(item["name"]),
+                  normalize(name) == normalize(label),
+                  let id = (item["backendDOMNodeId"] as? NSNumber)?.intValue, seen.insert(id).inserted else { return nil }
+            return BrowserNode(index: 0, role: axValue(item["role"]) ?? "", name: name, value: "", backendNodeID: id)
+        }
+    }
+
+    // Scope a label match to the same axis-specific scroller used for movement.
+    private static let scrollScopeJS = """
+    function(horizontal,target){
+      \(findScrollAreaJS)
+      const area=findArea(target);
+      return Boolean(this.isConnected&&target.isConnected&&area?.contains(this));
+    }
+    """
+
+    private static let findScrollAreaJS = """
+    const findArea = target => {
+      for(let e=target;e;e=e.parentElement){
+        if(e===e.ownerDocument.scrollingElement)return e;
+        const overflow=getComputedStyle(e)[horizontal?'overflowX':'overflowY'];
+        if(/^(auto|scroll|overlay)$/.test(overflow)&&
+           (horizontal?e.scrollWidth>e.clientWidth:e.scrollHeight>e.clientHeight))return e;
+      }
+      return null;
+    };
+    """
+
     private static let scrollChunkJS = """
     function(direction,unit,count) {
         if (!this?.isConnected) return null;
         const horizontal = direction === 'left' || direction === 'right';
-        const canScroll = e => {
-            if (e === document.scrollingElement) return true;
-            const overflow = getComputedStyle(e)[horizontal ? 'overflowX' : 'overflowY'];
-            return /^(auto|scroll|overlay)$/.test(overflow) &&
-                (horizontal ? e.scrollWidth > e.clientWidth : e.scrollHeight > e.clientHeight);
-        };
-        let area = this;
-        while (area && !canScroll(area)) area = area.parentElement;
+        \(findScrollAreaJS)
+        const area = findArea(this);
         if (!area) return null;
         const property = horizontal ? 'scrollLeft' : 'scrollTop';
         const before = area[property];
@@ -1670,11 +1707,32 @@ final class BrowserPage {
     """
 
     private func isInViewport(_ node: BrowserNode) throws -> Bool {
-        guard let result = try callOnNode(node, Self.clickProbeJS) as? [Any] else { return false }
-        return (result.first as? String) == "ok"
+        try callOnNode(node, """
+        function(){
+          if(!this.isConnected||window!==window.top)return false;
+          const text=this.nodeType===3, element=text?this.parentElement:this;
+          if(!element?.getBoundingClientRect)return false;
+          let bounds;
+          if(text){
+            const range=document.createRange();
+            range.selectNodeContents(this);
+            bounds=range.getBoundingClientRect();
+          }else bounds=element.getBoundingClientRect();
+          const left=Math.max(0,bounds.left), right=Math.min(innerWidth,bounds.right);
+          const top=Math.max(0,bounds.top), bottom=Math.min(innerHeight,bounds.bottom);
+          if(right<=left||bottom<=top)return false;
+          for(const fraction of [0.5,0.25,0.75]){
+            let hit=document.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2);
+            for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2))&&next!==hit;)hit=next;
+            for(let current=hit;current;current=current.parentNode||current.host)
+              if(current===element)return true;
+          }
+          return false;
+        }
+        """) as? Bool == true
     }
 
-    /// Back, forward or reload in this tab, waiting for the page to load again.
+    /// Change the tab scale once and verify the reported scale in the same document.
     func zoom(_ gesture: GestureAction) throws -> String {
         guard gesture.zoomIncreases != nil else {
             throw ComputerUseError.backgroundUnsupported("Chrome has no background equivalent for this gesture.")
@@ -1713,6 +1771,7 @@ final class BrowserPage {
         throw ComputerUseError.stateUnavailable("Zoom command delivered. The tab did not report the requested scale.")
     }
 
+    /// Back, forward or reload in this tab, waiting for the page to load again.
     func history(_ operation: String) throws -> String {
         if operation == "reload" {
             guard let before = try evaluate("performance.timeOrigin") as? NSNumber else {
@@ -2008,15 +2067,20 @@ final class BrowserPage {
     // MARK: CDP plumbing
 
     /// Calls a JavaScript function with `this` set to the element. Returns the function's JSON value.
-    func callOnNode(_ node: BrowserNode, _ function: String, arguments: [Any] = [], feedback: String? = nil) throws -> Any? {
+    private func nodeObjectID(_ node: BrowserNode) throws -> String {
         let resolved = try cdp("DOM.resolveNode", ["backendNodeId": node.backendNodeID])
         guard let object = resolved["object"] as? [String: Any], let objectID = object["objectId"] as? String else {
             throw ComputerUseError.message("browser: \"\(node.name)\" is gone from the page; browser read again")
         }
+        return objectID
+    }
+
+    func callOnNode(_ node: BrowserNode, _ function: String, arguments: [Any] = [],
+                    objectArguments: [String] = [], feedback: String? = nil) throws -> Any? {
         let payload = try cdp("Runtime.callFunctionOn", [
-            "objectId": objectID,
+            "objectId": nodeObjectID(node),
             "functionDeclaration": function,
-            "arguments": arguments.map { ["value": $0] },
+            "arguments": arguments.map { ["value": $0] } + objectArguments.map { ["objectId": $0] },
             "returnByValue": true,
         ], feedback: feedback)
         if payload["exceptionDetails"] != nil {
