@@ -188,6 +188,8 @@ To inspect a known native window directly, pass its ID to `get_app_state`. This 
 
 Pass `include_refs: true` to `get_app_state` for exact native element refs. The reply lists refs beside their element numbers. Send a ref as `ref` on an element action in place of a label, index or pixel target. Ref clicks use the exact accessibility control and run in the background. A new observation of the app expires its previous refs. `STALE_REF` means to read the intended app again with `include_refs: true`. `WINDOW_CHANGED` means to confirm the intended window before acting. Both errors mean nothing was sent.
 
+In the JavaScript REPL, use `app.getAXState({ includeRefs: true })` and pass `{ ref }` as the target. A failed action exposes its code on `error.code`.
+
 For a known workflow, use `app.batch(steps, { windowId, doneWhen, compact: true, effects: false })`. Compact mode trims surplus plain text from the final reply after the checks run. Failed or incomplete batches keep their normal detail. Disabling effects skips per-step observation reads, so use it when the sequence needs only a final check.
 
 For a browser batch whose final success is a known URL, set `return_state: false` with a URL-only `done_when` (REPL option `returnState`). Godspeed reads the tab's address directly. A passing check can return the receipt without fetching the page snapshot. A failed check keeps the normal recovery read.
