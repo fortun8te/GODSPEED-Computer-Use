@@ -134,3 +134,130 @@ public enum RelayAuthorityPublicKey {
         RelayBase64URL.encode(try store.signingKey().publicKey.rawRepresentation)
     }
 }
+
+/// Process identity the relay checks on the socket peer: PID, effective UID and kernel start time.
+public struct RelayPeer: Equatable, Sendable {
+    public let pid: Int32
+    public let uid: UInt32
+    /// `seconds:microseconds` from `kern.proc.pid` `p_starttime`, the same text the host derives on macOS.
+    public let startTime: String
+
+    public init(pid: Int32, uid: UInt32, startTime: String) {
+        self.pid = pid
+        self.uid = uid
+        self.startTime = startTime
+    }
+
+    /// Reads a live process through `sysctl(KERN_PROC_PID)`. Throws when the process is gone.
+    public static func process(pid: pid_t) throws -> RelayPeer {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0,
+              size >= MemoryLayout<kinfo_proc>.stride, info.kp_proc.p_pid == pid else {
+            throw RelayGrantError.processUnavailable(pid)
+        }
+        let start = info.kp_proc.p_starttime
+        return RelayPeer(
+            pid: pid,
+            uid: info.kp_eproc.e_ucred.cr_uid,
+            startTime: "\(start.tv_sec):\(start.tv_usec)"
+        )
+    }
+}
+
+public enum RelayGrantError: Error, LocalizedError, Equatable {
+    case processUnavailable(pid_t)
+    case invalidLifetime(Int64)
+    case emptySession
+
+    public var errorDescription: String? {
+        switch self {
+        case .processUnavailable(let pid):
+            return "Chrome helper process \(pid) is not running, so no relay grant can be issued."
+        case .invalidLifetime(let seconds):
+            return "A relay grant lasts at most \(RelayGrantIssuer.maximumLifetimeSeconds) seconds; \(seconds) was requested."
+        case .emptySession:
+            return "A relay grant needs the helper's session id."
+        }
+    }
+}
+
+/// A signed grant as the helper sends it: `base64url(payload).base64url(signature)`.
+public struct RelayGrant: Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let token: String
+    public let issuedAt: Int64
+    public let expiresAt: Int64
+
+    /// Never print the token: it is a bearer credential for the relay.
+    public var description: String {
+        "RelayGrant(iat: \(issuedAt), exp: \(expiresAt), token: <redacted>)"
+    }
+
+    public var debugDescription: String { description }
+}
+
+/// The JSON the Go verifier reads (`internal/host/auth.go`). Keys are written sorted; the Go side decodes by name.
+struct RelayGrantPayload: Encodable, Equatable {
+    let aud: String
+    let pid: Int32
+    let uid: UInt32
+    let startTime: String
+    let sessionId: String
+    let methods: [String]
+    let iat: Int64
+    let exp: Int64
+}
+
+/// Signs grants for helpers. The signing key stays in this process; helpers only receive their own grant.
+public struct RelayGrantIssuer {
+    public static let audience = "godspeed-chrome-relay-v1"
+    public static let maximumLifetimeSeconds: Int64 = 900
+    /// Browser RPC methods the bridge reaches through OBU: tabs, open/navigate, user tabs and claim, CDP,
+    /// file chooser, tab cleanup, turn end and `getInfo` for profile selection. Clipboard and user history are
+    /// not used by the bridge (clipboard is private and local), so they are not granted.
+    public static let bridgeMethods = [
+        "getInfo", "getTabs", "createTab", "navigateTab", "getUserTabs", "claimUserTab", "executeCdp",
+        "waitForFileChooser", "setFileChooserFiles", "finalizeTabs", "turnEnded",
+    ]
+
+    private let key: Curve25519.Signing.PrivateKey
+
+    public init(store: RelayAuthorityKeyStore) throws {
+        key = try store.signingKey()
+    }
+
+    public func publicKeyBase64URL() -> String {
+        RelayBase64URL.encode(key.publicKey.rawRepresentation)
+    }
+
+    public func issue(
+        peer: RelayPeer,
+        sessionID: String,
+        methods: [String] = RelayGrantIssuer.bridgeMethods,
+        now: Date = Date(),
+        lifetimeSeconds: Int64 = RelayGrantIssuer.maximumLifetimeSeconds
+    ) throws -> RelayGrant {
+        guard lifetimeSeconds > 0, lifetimeSeconds <= Self.maximumLifetimeSeconds else {
+            throw RelayGrantError.invalidLifetime(lifetimeSeconds)
+        }
+        guard !sessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RelayGrantError.emptySession
+        }
+        let issuedAt = Int64(now.timeIntervalSince1970.rounded(.down))
+        let payload = RelayGrantPayload(
+            aud: Self.audience, pid: peer.pid, uid: peer.uid, startTime: peer.startTime,
+            sessionId: sessionID, methods: methods, iat: issuedAt, exp: issuedAt + lifetimeSeconds
+        )
+        let encoder = JSONEncoder()
+        // Sorted keys make the signed bytes deterministic across OS releases (Swift does not promise key order).
+        encoder.outputFormatting = [.sortedKeys]
+        let bytes = try encoder.encode(payload)
+        let signature = try key.signature(for: bytes)
+        return RelayGrant(
+            token: RelayBase64URL.encode(bytes) + "." + RelayBase64URL.encode(signature),
+            issuedAt: issuedAt,
+            expiresAt: issuedAt + lifetimeSeconds
+        )
+    }
+}
