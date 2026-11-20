@@ -65,7 +65,9 @@ Set `OPEN_COMPUTER_USE_FOCUS_BORROW=0` to turn it off. Steps then run in the bac
 
 ## Settings
 
-Two places, one rule: **an environment variable that is set always wins**. Otherwise the value from `~/.godspeed/settings.json` is used, and otherwise the default. The file is re-read when it changes. Cursor settings apply on the next action. The others are read once per process, so they apply from the next start. PURE's Settings > GODSPEED writes the file.
+Two places, one rule: **an environment variable that is set always wins**. Otherwise the value from `~/.godspeed/settings.json` is used, and otherwise the default. The file is checked for changes as requests read settings. Each app-agent call uses its own options. PURE's Settings > GODSPEED writes the file.
+
+The app agent snapshots its launch environment. Each request overlays the caller's `OPEN_COMPUTER_USE_*` options. Image, virtual display and browser options that the caller omits use their defaults or settings files. Socket selection, admission limits, the idle timer, package discovery and the cursor renderer style and namespace belong to the host process. The proxy keeps the client identity and trajectory settings for the connection.
 
 ### `~/.godspeed/settings.json`
 
@@ -247,4 +249,4 @@ The local `OpenComputerUse locked-use status --json` command reports `not-packag
 
 The fork's page cursor reacts to acknowledged browser movement, press, drag, drop, click, text insertion and scroll. Feedback is sent only to an active matching tab and never delays the input reply. Intermediate moves can be coalesced. Hidden pages suppress the overlay. Near a display or viewport edge, the cursor follows a straight eased path to the action point. The web renderer shares interaction meanings with the Mac cursor.
 
-Use independent browser connections for concurrent reads. Browser writes and native input retain exclusive admission while the app agent applies process-wide settings. A shared budget caps active preview loads, and each helper has one rescheduled idle timer. Compare end-to-end fixture timings and slow runs before promoting the candidate.
+Use independent browser connections for concurrent reads. Browser writes and native input retain exclusive admission. A shared budget caps active preview loads, and each helper has one rescheduled idle timer. Compare end-to-end fixture timings and slow runs before promoting the candidate.
