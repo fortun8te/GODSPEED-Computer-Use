@@ -12,6 +12,9 @@ struct OperationJournal: Sendable {
         let tool: String
         /// The app the operation targeted, if any. Never arguments, labels or reply text.
         let app: String?
+        /// The 1-based step of a batch and the batch's goal, so a restart notice can say where it stopped.
+        var step: Int? = nil
+        var goal: String? = nil
         let phase: Phase
         let state: DeliveryState
         let time: Date
@@ -26,6 +29,27 @@ struct OperationJournal: Sendable {
     enum Flush: Sendable, Equatable { case fullSync, fsync, directory }
 
     @TaskLocal private static var recording: Recording?
+
+    /// The batch running on this task: its goal, and the step about to be sent.
+    final class BatchCursor: @unchecked Sendable {
+        let goal: String?
+        var step: Int?
+        init(goal: String?) { self.goal = goal }
+    }
+
+    @TaskLocal private static var batchCursor: BatchCursor?
+
+    /// Runs a batch body so each journaled step records its batch goal and step number.
+    static func withBatchGoal<T>(_ goal: String, _ body: () throws -> T) rethrows -> T {
+        let trimmed = goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cursor = BatchCursor(goal: trimmed.isEmpty ? nil : String(trimmed.prefix(80)))
+        return try $batchCursor.withValue(cursor, operation: body)
+    }
+
+    /// Called before each batch step is sent. Outside a batch this does nothing.
+    static func markBatchStep(_ number: Int) {
+        batchCursor?.step = number
+    }
 
     static let shared = OperationJournal(directory: FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".godspeed/journal", isDirectory: true))
@@ -45,7 +69,8 @@ struct OperationJournal: Sendable {
         tool: String, arguments: [String: Any], _ body: () throws -> ToolCallResult
     ) throws -> ToolCallResult {
         guard let recording, mustRecord(tool: tool, arguments: arguments) else { return try body() }
-        return try recording.journal.record(tool: tool, requestID: recording.requestID, app: appName(arguments), body)
+        return try recording.journal.record(tool: tool, requestID: recording.requestID, app: appName(arguments),
+                                            step: batchCursor?.step, goal: batchCursor?.goal, body)
     }
 
     private static func appName(_ arguments: [String: Any]) -> String? {
@@ -72,9 +97,10 @@ struct OperationJournal: Sendable {
         return !BatchTool.Step(tool: tool, arguments: arguments).isReadOnly
     }
 
-    func record(tool: String, requestID: UUID, app: String? = nil, _ body: () throws -> ToolCallResult) throws -> ToolCallResult {
+    func record(tool: String, requestID: UUID, app: String? = nil, step: Int? = nil, goal: String? = nil,
+                _ body: () throws -> ToolCallResult) throws -> ToolCallResult {
         let intent: Entry
-        do { intent = try begin(tool: tool, requestID: requestID, app: app) }
+        do { intent = try begin(tool: tool, requestID: requestID, app: app, step: step, goal: goal) }
         catch {
             throw ComputerUseError.notSent("The operation journal could not save the intent. No input was sent.")
         }
@@ -98,18 +124,19 @@ struct OperationJournal: Sendable {
         return result
     }
 
-    func begin(tool: String, requestID: UUID, app: String? = nil) throws -> Entry {
+    func begin(tool: String, requestID: UUID, app: String? = nil, step: Int? = nil, goal: String? = nil) throws -> Entry {
         // Keep the journal free of request payloads, target labels and reply text.
         guard ToolDefinitions.isKnown(tool) else { throw CocoaError(.fileWriteUnknown) }
-        let entry = Entry(operationID: UUID(), requestID: requestID, tool: tool, app: app, phase: .intent,
-                          state: .outcomeUnknown, time: Date())
+        let entry = Entry(operationID: UUID(), requestID: requestID, tool: tool, app: app, step: step, goal: goal,
+                          phase: .intent, state: .outcomeUnknown, time: Date())
         try append(entry)
         return entry
     }
 
     func finish(_ intent: Entry, state: DeliveryState) throws {
         try append(Entry(operationID: intent.operationID, requestID: intent.requestID, tool: intent.tool,
-                         app: intent.app, phase: .outcome, state: state, time: Date()))
+                         app: intent.app, step: intent.step, goal: intent.goal,
+                         phase: .outcome, state: state, time: Date()))
     }
 
     /// Intents with no outcome and no report yet. Recovery never replays them.
@@ -120,7 +147,8 @@ struct OperationJournal: Sendable {
     func markReported(_ entries: [Entry]) throws {
         for entry in entries {
             try append(Entry(operationID: entry.operationID, requestID: entry.requestID, tool: entry.tool,
-                             app: entry.app, phase: .reported, state: entry.state, time: Date()))
+                             app: entry.app, step: entry.step, goal: entry.goal,
+                             phase: .reported, state: entry.state, time: Date()))
         }
     }
 
@@ -280,7 +308,11 @@ final class RestartNoticeState: @unchecked Sendable {
             delivered = true
             // Even when the mark fails, the model hears about these once. The next start may repeat it.
             try? journal.markReported(entries)
-            let names = entries.map { entry in entry.app.map { "\(entry.tool) in \($0)" } ?? entry.tool }
+            let names = entries.map { entry -> String in
+                var name = entry.app.map { "\(entry.tool) in \($0)" } ?? entry.tool
+                if let step = entry.step, let goal = entry.goal { name += " (step \(step) of '\(goal)')" }
+                return name
+            }
             let shown = names.prefix(3).joined(separator: ", ") + (names.count > 3 ? " and \(names.count - 3) more" : "")
             return "After a restart: \(shown) may or may not have happened. Read the app before repeating it."
         }

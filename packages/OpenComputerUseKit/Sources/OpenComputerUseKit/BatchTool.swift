@@ -557,6 +557,40 @@ extension ComputerUseToolDispatcher {
 
     func runBatch(arguments: [String: Any], inheritedDeadline: TimeInterval? = nil,
                   validatedHandoffRecipe: BatchRecipes.Recipe? = nil) throws -> ToolCallResult {
+        guard let token = arguments["resume"] as? String else {
+            return try runBatchPlan(arguments: arguments, inheritedDeadline: inheritedDeadline,
+                                    validatedHandoffRecipe: validatedHandoffRecipe)
+        }
+        // A resumed batch keeps the stopped batch's goal, done_when and window pin, and runs only the steps
+        // that never ran. A step that may have been sent is never included (see BatchResume).
+        guard arguments["steps"] == nil, arguments["app"] == nil, arguments["window_id"] == nil else {
+            throw ComputerUseError.invalidArguments("A resume takes its steps, app and window from the stopped batch. Send only resume, plus values if the batch needs them.")
+        }
+        let record = try BatchResume.load(token)
+        let live = BatchResume.liveState(app: record.app, windowID: record.windowID)
+        try BatchResume.check(record, now: Date(), liveProcessID: live.processID, liveWindowID: live.windowID)
+        let steps = try BatchResume.steps(of: record, values: arguments["values"] as? [String: Any] ?? [:])
+        // A fresh read before anything is sent. A failed read keeps the token for another try.
+        var readArguments: [String: Any] = ["include_screenshot": false]
+        if let app = record.app { readArguments["app"] = app }
+        if let windowID = record.windowID { readArguments["window_id"] = NSNumber(value: windowID) }
+        let read = callToolAsResult(name: "get_app_state", arguments: readArguments)
+        if read.isError { return read }
+        BatchResume.discard(token)
+        var planArguments: [String: Any] = ["goal": record.goal, "remember": false]
+        if let app = record.app { planArguments["app"] = app }
+        if let windowID = record.windowID { planArguments["window_id"] = NSNumber(value: windowID) }
+        if let doneWhen = record.doneWhen { planArguments["done_when"] = try? JSONSerialization.jsonObject(with: doneWhen, options: [.fragmentsAllowed]) }
+        for key in ["screenshot", "compact", "effects", "return_state"] { planArguments[key] = arguments[key] }
+        return try OperationJournal.withBatchGoal(record.goal) {
+            try runBatchPlan(arguments: planArguments, inheritedDeadline: inheritedDeadline,
+                             resumed: (record, steps))
+        }
+    }
+
+    private func runBatchPlan(arguments: [String: Any], inheritedDeadline: TimeInterval? = nil,
+                              validatedHandoffRecipe: BatchRecipes.Recipe? = nil,
+                              resumed: (record: BatchResume.Record, steps: [BatchTool.Step])? = nil) throws -> ToolCallResult {
         let clock = ProcessInfo.processInfo
         let startedAt = clock.systemUptime
         let startedOnDisk = Date()
@@ -579,6 +613,9 @@ extension ComputerUseToolDispatcher {
         var doneConditions = try DoneCheck.parse(arguments["done_when"])
 
         var lines: [String] = []
+        if let resumed {
+            lines.append("Resumed for \"\(resumed.record.goal)\": steps \(BatchResume.ranges(resumed.record.pending.map(\.number))) of \(resumed.record.total).")
+        }
         // Focus borrowed for this batch: whole-batch (foreground: true) or per dialog step (see FocusBorrow).
         let focus = FocusBorrowSession()
         defer { focus.close() }
@@ -597,7 +634,7 @@ extension ComputerUseToolDispatcher {
         // A goal with no steps replays the recipe saved for it.
         var rawSteps = arguments["steps"]
         var replayed: BatchRecipes.Recipe?
-        if (rawSteps == nil || (rawSteps as? [Any])?.isEmpty == true), !goal.isEmpty, BatchRecipes.isEnabled {
+        if resumed == nil, (rawSteps == nil || (rawSteps as? [Any])?.isEmpty == true), !goal.isEmpty, BatchRecipes.isEnabled {
             // Both entry points check the current window, version and slots before loading steps.
             let lookup = recipeRun.lookup(app: defaultApp)
             if let recipeReadRefusal { return recipeReadRefusal }
@@ -637,7 +674,8 @@ extension ComputerUseToolDispatcher {
             }
         }
         recipeRun.doneWhen = doneConditions
-        let parsedSteps = try BatchTool.parseSteps(rawSteps, defaultApp: defaultApp)
+        let parsedSteps: [BatchTool.Step]
+        if let resumed { parsedSteps = resumed.steps } else { parsedSteps = try BatchTool.parseSteps(rawSteps, defaultApp: defaultApp) }
         if replayed != nil, let defaultApp, !parsedSteps.allSatisfy({ HandoffTool.isSafeRecipeStep($0, app: defaultApp) }) {
             throw ComputerUseError.invalidArguments("Some saved steps need fresh instructions. Read the app and provide explicit steps.")
         }
@@ -742,6 +780,18 @@ extension ComputerUseToolDispatcher {
         }
 
         // Preserve existing step rows and report the first step that never ran.
+        // A batch that stopped with steps left keeps them under a resume token (see BatchResume).
+        var resumeAppended = false
+        func appendResumeToken() {
+            guard !resumeAppended, let stop = receipt.stop,
+                  [.stepFailure, .timeBudget, .cancelled, .windowChanged].contains(stop) else { return }
+            resumeAppended = true
+            let processID = BatchResume.liveState(app: defaultApp ?? lastApp, windowID: nil).processID
+            guard let record = BatchResume.record(steps: steps, receipt: receipt, goal: goal, doneWhen: arguments["done_when"],
+                                                  app: defaultApp ?? lastApp, windowID: pinnedWindow, processID: processID) else { return }
+            do { try BatchResume.save(record) } catch { return }
+            lines += BatchResume.replyLines(for: record)
+        }
         func stopIfCancelled() -> Bool {
             guard RequestCancellation.requested else { return false }
             if receipt.stop != .cancelled {
@@ -870,6 +920,7 @@ extension ComputerUseToolDispatcher {
         for (offset, plannedStep) in steps.enumerated() {
             let number = offset + 1
             if stopIfCancelled() || stopIfOutOfTime(before: number) { break }
+            OperationJournal.markBatchStep(number)
             if plannedStep.tool == BatchTool.waitName {
                 let step = plannedStep
                 lastAttemptedStep = step
@@ -1205,6 +1256,7 @@ extension ComputerUseToolDispatcher {
         }
 
         if stopIfCancelled() {
+            appendResumeToken()
             return ToolCallResult(content: [.text(lines.joined(separator: "\n"))], isError: true, batchReceipt: receipt, deliveryState: receipt.deliveryState)
         }
 
@@ -1544,6 +1596,7 @@ extension ComputerUseToolDispatcher {
         }
 
         if stopIfCancelled() {
+            appendResumeToken()
             return ToolCallResult(content: [.text(lines.joined(separator: "\n"))], isError: true, batchReceipt: receipt, deliveryState: receipt.deliveryState)
         }
 
@@ -1557,6 +1610,7 @@ extension ComputerUseToolDispatcher {
         // The final read is taken; hand focus back now rather than after the reply is composed.
         focus.close()
 
+        appendResumeToken()
         let compactVerified = compactReply && verifiedDone && !failed && !stoppedForTime
         var replyLines = compactVerified ? BatchTool.compactVerifiedLines(lines) : lines
         // A foreground batch that failed with borrowing off says what it needed, in the sentence the caller can act on.
