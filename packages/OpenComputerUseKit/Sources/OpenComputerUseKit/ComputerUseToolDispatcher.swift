@@ -730,12 +730,22 @@ public final class ComputerUseToolDispatcher {
 
     func callStepAsResult(name: String, arguments: [String: Any], log: SmartLog, notesInResult: Bool = true,
                           beforeNativeDispatch: (() -> Void)? = nil) -> ToolCallResult {
+        let result: ToolCallResult
         do {
-            return try callTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult,
-                                beforeNativeDispatch: beforeNativeDispatch)
+            result = try callTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult,
+                                  beforeNativeDispatch: beforeNativeDispatch)
         } catch {
-            return .failure(error)
+            result = .failure(error)
         }
+        // A Save, Export or save chord that failed in the background with borrowing off: say it needs focus borrowing.
+        guard result.isError, !FocusBorrow.isEnabled, name == "press_menu" || name == "press_key",
+              let app = arguments["app"] as? String, let pid = (try? AppDiscovery.resolveRunning(app))?.pid else {
+            return result
+        }
+        return FocusBorrow.dialogStepReply(
+            result, opensDialog: opensDialog(tool: name, arguments: arguments, pid: pid),
+            appIsFrontmost: NSWorkspace.shared.frontmostApplication?.processIdentifier == pid, enabled: false
+        )
     }
 
     private func requireString(_ key: String, in arguments: [String: Any], allowEmpty: Bool = false) throws -> String {
