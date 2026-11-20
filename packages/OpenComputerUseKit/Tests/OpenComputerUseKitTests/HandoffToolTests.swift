@@ -155,6 +155,7 @@ final class HandoffToolTests: XCTestCase {
     /// A tiny fake app: typing sets Name, Save shows "Saved".
     private final class FakeApp {
         var name = ""
+        var email = ""
         var saved = false
         var clock: TimeInterval = 0
         var acts: [String] = []
@@ -166,8 +167,10 @@ final class HandoffToolTests: XCTestCase {
             App=x
             Window: "w"
             \t1 text field Name = \(name) (w:str)
+            \t2 text field Email = \(email) (w:str)
             \t3 button Save
             \t5 button Delete contact
+            \t6 button Next
             \(saved ? "\t9 static text Saved" : "")
             """
         }
@@ -180,7 +183,10 @@ final class HandoffToolTests: XCTestCase {
                     self.acts.append(candidate.text)
                     self.clock += stepSeconds
                     if changes {
-                        if candidate.kind == .setValue { self.name = candidate.arguments["value"] as! String }
+                        if candidate.kind == .setValue, let value = candidate.arguments["value"] as? String {
+                            if candidate.arguments["element_index"] as? String == "2" { self.email = value }
+                            else { self.name = value }
+                        }
                         if candidate.text == "click \"Save\"" { self.saved = true }
                     }
                     return HandoffTool.ActResult(ok: true, message: "")
@@ -190,7 +196,7 @@ final class HandoffToolTests: XCTestCase {
                 check: { state in
                     DoneCheck.check([.text("Saved")], evidence: DoneCheck.Evidence(screenText: state, pageURL: { nil }))
                 },
-                replay: { replay },
+                replay: { _ in replay.map { $0 ? .verified : .incomplete } },
                 now: { self.clock }
             )
         }
@@ -221,8 +227,118 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(outcome.kind, .done)
         XCTAssertEqual(app.acts, ["type \"Ann\" into \"Name\"", "click \"Save\""])
         XCTAssertEqual(outcome.steps.count, 2)
+        XCTAssertEqual(app.chooseCalls, 2, "ambiguous steps have one local scoring request each")
         XCTAssertTrue(outcome.reply().hasPrefix("Done:"))
         XCTAssertTrue(outcome.reply().contains("Changes:"))
+    }
+
+    func testFillsAnExplicitTwoFieldGoalWithoutCallingTheLocalChecker() {
+        let app = FakeApp()
+        let conditions: [DoneCheck.Condition] = [.field(label: "Name", equals: "Ann"), .field(label: "Email", equals: "a@example.test")]
+        let request = HandoffTool.Request(app: "x", goal: "Fill contact fields", doneWhen: conditions,
+                                          values: [("Name", "Ann"), ("Email", "a@example.test")],
+                                          maxSteps: 5, timeBudget: 10)
+        var deps = app.deps(choose: { _ in nil })
+        deps.check = { HandoffTool.check(conditions, screen: $0) }
+        let result = HandoffTool.run(request, deps)
+        XCTAssertEqual(result.kind, .done)
+        XCTAssertEqual(app.acts.count, 2)
+        XCTAssertEqual(app.chooseCalls, 0)
+        XCTAssertEqual(app.reads, 3)
+    }
+
+    func testExactFieldCheckCannotBeSatisfiedByAnotherFieldOrDuplicate() {
+        let condition = DoneCheck.Condition.field(label: "Name", equals: "Ann")
+        XCTAssertEqual(HandoffTool.check([condition], screen: "1 text field Display Name = Ann"), .missing(unmet: [condition.summary]))
+        XCTAssertEqual(HandoffTool.check([condition], screen: "1 text field Name = Ann\n2 text field Name = Bob"), .missing(unmet: [condition.summary]))
+    }
+
+    func testExactFieldFillRequiresUniqueEmptyNativeTextField() {
+        let request = HandoffTool.Request(app: "x", goal: "Fill name", doneWhen: [.field(label: "Name", equals: "Ann")],
+                                          values: [("Name", "Ann")], maxSteps: 5, timeBudget: 10)
+        for state in ["1 text field Name = Bob", "1 text field Name =\n2 text field Name =",
+                      "1 secure text field Name =", "1 text field (disabled) Name ="] {
+            let controls = HandoffTool.parseControls(state)
+            XCTAssertNil(HandoffTool.exactFieldFill(request: request, controls: controls,
+                                                    candidates: build(state: controls)), state)
+        }
+    }
+
+    func testPinnedHandoffCannotUseEvidenceFromAnotherWindow() throws {
+        let app = FakeApp()
+        let request = try HandoffTool.parse(["app": "x", "window_id": 31, "goal": "Save", "done_when": ["text": "Saved"]])
+        XCTAssertThrowsError(try HandoffTool.parse(["app": "x", "window_id": true, "goal": "Save", "done_when": ["text": "Saved"]]))
+        XCTAssertEqual(HandoffTool.run(request, app.deps(choose: { _ in nil })).kind, .failed)
+        XCTAssertTrue(app.acts.isEmpty)
+        XCTAssertEqual(app.chooseCalls, 0)
+    }
+
+    func testPinnedHandoffRefreshesWrongActionReadbackAndSkipsReplay() throws {
+        let app = FakeApp()
+        let request = try HandoffTool.parse(["app": "x", "window_id": 31, "goal": "Save", "done_when": ["text": "Saved"]])
+        var deps = app.deps(choose: pick(["Save"]))
+        var reads = 0
+        deps.readState = {
+            reads += 1
+            return "App=x\nWindow: \"right\"\nWindow ID: 31\n3 button Save"
+        }
+        deps.act = { _, _ in
+            HandoffTool.ActResult(ok: true, message: "", observedState: "App=x\nWindow: \"wrong\"\nWindow ID: 32\nSaved")
+        }
+        deps.replay = { _ in XCTFail("no replay in pinned window"); return .verified }
+        let result = HandoffTool.run(request, deps)
+        XCTAssertNotEqual(result.kind, .done)
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testUnknownDeliveryReadsOnceAndNeverRepeats() {
+        let app = FakeApp()
+        var deps = app.deps(choose: pick(["type"]))
+        deps.act = { candidate, _ in
+            app.acts.append(candidate.text)
+            return HandoffTool.ActResult(ok: false, message: "transport interrupted")
+        }
+        XCTAssertEqual(HandoffTool.run(request(), deps).kind, .escalate)
+        XCTAssertEqual(app.acts.count, 1)
+        XCTAssertEqual(app.reads, 2)
+        XCTAssertEqual(app.chooseCalls, 1)
+    }
+
+    func testUncertainRecipeReadsBackWithoutTryingAnotherAction() {
+        let app = FakeApp()
+        var deps = app.deps(choose: pick(["type"]))
+        deps.replay = { _ in .uncertain }
+        XCTAssertEqual(HandoffTool.run(request(), deps).kind, .escalate)
+        XCTAssertEqual(app.reads, 2)
+        XCTAssertTrue(app.acts.isEmpty)
+        XCTAssertEqual(app.chooseCalls, 0)
+    }
+
+    func testUnattendedRecipesRejectImplicitFocusAndRiskyTargets() throws {
+        let cases: [[String: Any]] = [
+            ["tool": "press_key", "key": "Return"],
+            ["tool": "type_text", "text": "Hello"],
+            ["tool": "click", "target": "Delete"],
+            ["tool": "click", "label": "Save", "app": "Other"],
+            ["tool": "click", "label": "Save", "click_method": "global"],
+            ["tool": "click", "label": "Save", "click_count": 2],
+            ["tool": "click", "label": "Save", "x": 20, "y": 20],
+            ["tool": "set_value", "label": "Password", "value": "fixture"],
+        ]
+        let steps = try BatchTool.parseSteps(cases, defaultApp: "Example")
+        XCTAssertTrue(steps.allSatisfy { !HandoffTool.isSafeRecipeStep($0, app: "Example") })
+    }
+
+    func testRecipeMutationBindsOneExactEnabledControlInObservedWindow() throws {
+        let step = BatchTool.Step(tool: "click", arguments: ["app": "Example", "label": "Save"])
+        let state = "App=x\nWindow: w\nWindow ID: 501\n3 button Save"
+        let bound = try XCTUnwrap(HandoffTool.bindRecipeStep(step, app: "Example", state: state))
+        XCTAssertEqual(bound.arguments["window_id"] as? UInt32, 501)
+        XCTAssertEqual(bound.arguments["element_index"] as? String, "3")
+        XCTAssertEqual(bound.arguments["click_method"] as? String, "accessibility")
+        XCTAssertNil(bound.arguments["label"])
+        XCTAssertNil(HandoffTool.bindRecipeStep(step, app: "Example", state: state + "\n4 button Save"))
+        XCTAssertNil(HandoffTool.bindRecipeStep(step, app: "Example", state: "App=x\nWindow: w\n3 button Save"))
     }
 
     func testAlreadyDoneTakesNoSteps() {
@@ -271,7 +387,7 @@ final class HandoffToolTests: XCTestCase {
 
     func testStuckFromCheckerModel() {
         let app = FakeApp()
-        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["type", "Return"]), stuck: true))
+        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["type", "Next"]), stuck: true))
         XCTAssertEqual(outcome.kind, .stuck)
         XCTAssertEqual(app.acts.count, 2, "the checker is asked from the second step")
     }
@@ -291,7 +407,7 @@ final class HandoffToolTests: XCTestCase {
     func testSpentReplayBudgetDoesNotStartNewReadOrAction() {
         let app = FakeApp()
         var deps = app.deps(choose: pick(["type"]))
-        deps.replay = { app.clock += 5; return false }
+        deps.replay = { _ in app.clock += 5; return .incomplete }
         let outcome = HandoffTool.run(request(budget: 5), deps)
         XCTAssertEqual(outcome.kind, .budget)
         XCTAssertEqual(app.reads, 1)

@@ -358,6 +358,7 @@ extension BatchRecipes {
 
         /// The recipe's steps with values put in; locators and effects are kept for the replay.
         func replaySteps(_ recipe: Recipe) -> [Any] {
+            self.recipe = recipe
             for (i, item) in recipe.steps.enumerated() {
                 guard let dict = item as? [String: Any] else { continue }
                 replayMeta[i + 1] = Meta(locator: RecipeLocator.Locator(dictionary: dict["_loc"]), effect: dict["_fx"] as? String)

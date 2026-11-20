@@ -4,6 +4,8 @@ Default Godspeed logs record tool latency, typed failure categories, per-step de
 
 ## Decision and harness data
 
+Set `OPEN_COMPUTER_USE_RUN_ID` to a short label for each fixture run. Use `python3 scripts/godspeed-trace-summary.py --run-id <label>` to review response bytes, checks, and failure categories without replaying private text. For mixed logs, add `--driver-build` with the build from the receipt. Reply byte counts exclude tool schemas and the model's own messages.
+
 Record initial state, the task, actions, and the postconditions that a separate checker verifies. Keep source streams and check results paired by run ID and SHA-256. A decision hint or a model's final answer is insufficient evidence for a completion label. Separate unfinished turns and keep entire workflow families in one train, validation, or test split.
 
 ## Vision data

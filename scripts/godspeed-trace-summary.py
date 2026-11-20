@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report tool counts and timing from local Godspeed JSONL without exporting UI content."""
+"""Report counts, timing and reply size from local Godspeed metadata."""
 
 import argparse
 from collections import Counter
@@ -18,7 +18,7 @@ BATCH_OBSERVATIONS = ("returned", "failed", "unavailable")
 DONE_CHECKS = ("not_requested", "skipped", "verified", "unmet")
 
 
-def summarize(directory):
+def summarize(directory, run_id=None, driver_build=None):
     counts = Counter()
     failures = Counter()
     batch_stops = Counter()
@@ -27,6 +27,7 @@ def summarize(directory):
     done_checks = Counter()
     durations = []
     admissions = []
+    reply_sizes = []
     for path in sorted(directory.glob("*.jsonl")):
         with path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
@@ -38,6 +39,10 @@ def summarize(directory):
                     counts["malformed_rows"] += 1
                     continue
                 if row.get("event") != "tool_call":
+                    continue
+                if run_id is not None and row.get("run_id") != run_id:
+                    continue
+                if driver_build is not None and row.get("driver_build") != driver_build:
                     continue
                 counts["calls"] += 1
                 counts["tool_errors"] += row.get("is_error") is True
@@ -78,6 +83,9 @@ def summarize(directory):
                 value = row.get("duration_ms")
                 if row.get("admission_timed_out") is not True and type(value) in (int, float) and math.isfinite(value) and value >= 0:
                     durations.append(value)
+                reply_size = row.get("reply_text_bytes")
+                if type(reply_size) is int and reply_size >= 0:
+                    reply_sizes.append(reply_size)
     durations.sort()
     admissions.sort()
     out = {key: counts[key] for key in (
@@ -97,13 +105,21 @@ def summarize(directory):
         out["admission_samples"] = len(admissions)
         for percentile in (50, 95):
             out[f"p{percentile}_admission_ms"] = admissions[math.ceil(len(admissions) * percentile / 100) - 1]
+    if reply_sizes:
+        reply_sizes.sort()
+        out["reply_size_samples"] = len(reply_sizes)
+        out["reply_text_bytes_total"] = sum(reply_sizes)
+        for percentile in (50, 95):
+            out[f"p{percentile}_reply_text_bytes"] = reply_sizes[math.ceil(len(reply_sizes) * percentile / 100) - 1]
     return out
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", nargs="?", type=Path, default=Path.home() / ".godspeed" / "trajectories")
+    parser.add_argument("--run-id", help="only count calls from this run")
+    parser.add_argument("--driver-build", help="only count calls from this driver build")
     args = parser.parse_args()
     if not args.directory.is_dir():
         parser.error("trajectory directory does not exist")
-    print(json.dumps(summarize(args.directory), indent=2))
+    print(json.dumps(summarize(args.directory, args.run_id, args.driver_build), indent=2))
