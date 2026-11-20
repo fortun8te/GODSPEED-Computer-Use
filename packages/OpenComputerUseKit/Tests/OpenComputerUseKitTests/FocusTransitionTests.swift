@@ -24,4 +24,26 @@ final class FocusTransitionTests: XCTestCase {
         XCTAssertEqual(FocusTransition.predictedFocusAfter(action: .openSaveDialog), "Name")
         XCTAssertEqual(FocusTransition.predictedFocusAfter(action: .tab(currentLabel: "Name", orderedLabels: ["Name", "Tags"])), "Tags")
     }
+
+    func testExpectedDialogAbsentIsUnknownNeverOK() {
+        let target = FocusTarget(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: "Save")
+        let matching = ObservedFocus(windowID: 4, elementRole: "TextField", label: "Name")
+        XCTAssertEqual(FocusTransition.check(target: target, observed: matching), .unknown)
+        let wrongElement = ObservedFocus(windowID: 4, elementRole: "Button", label: "Send")
+        XCTAssertEqual(FocusTransition.check(target: target, observed: wrongElement), .unknown)
+    }
+
+    func testDialogInFrontThatTargetDoesNotNameIsUnexpected() {
+        let target = FocusTarget(windowID: 4, elementRole: "TextField", label: "Name")
+        let sheet = ObservedFocus(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: "Confirm Delete")
+        XCTAssertEqual(FocusTransition.check(target: target, observed: sheet), .unexpectedDialog(title: "Confirm Delete"))
+    }
+
+    func testDifferentDialogThanNamedIsUnexpectedAndNamedDialogIsOK() {
+        let target = FocusTarget(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: "Save")
+        let other = ObservedFocus(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: "Replace")
+        XCTAssertEqual(FocusTransition.check(target: target, observed: other), .unexpectedDialog(title: "Replace"))
+        let named = ObservedFocus(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: " save ")
+        XCTAssertEqual(FocusTransition.check(target: target, observed: named), .ok)
+    }
 }
