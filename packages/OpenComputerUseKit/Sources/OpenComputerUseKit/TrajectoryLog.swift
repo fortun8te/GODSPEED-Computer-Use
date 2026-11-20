@@ -481,6 +481,13 @@ final class TrajectoryLog: @unchecked Sendable {
         case appNotFound = "app_not_found"
         case permissionDenied = "permission_denied"
         case stateUnavailable = "state_unavailable"
+        case backgroundUnsupported = "BACKGROUND_UNSUPPORTED"
+        case approvalRequired = "APPROVAL_REQUIRED"
+        case actionDenied = "ACTION_DENIED"
+
+        var isActionRefusal: Bool {
+            self == .backgroundUnsupported || self == .approvalRequired || self == .actionDenied
+        }
         case staleState = "stale_state"
         case timeout
         case cancelled
@@ -499,6 +506,9 @@ final class TrajectoryLog: @unchecked Sendable {
         case .appNotFound: return .appNotFound
         case .permissionDenied: return .permissionDenied
         case .stateUnavailable: return .stateUnavailable
+        case .backgroundUnsupported: return .backgroundUnsupported
+        case .approvalRequired: return .approvalRequired
+        case .actionDenied: return .actionDenied
         case .message: return failureCode(message: message)
         }
     }

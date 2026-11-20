@@ -9,6 +9,9 @@ public enum ComputerUseError: Error, LocalizedError {
     case appNotFound(String)
     case permissionDenied(String)
     case stateUnavailable(String)
+    case backgroundUnsupported(String)
+    case approvalRequired(String)
+    case actionDenied(String)
 
     public var errorDescription: String? {
         switch self {
@@ -22,6 +25,12 @@ public enum ComputerUseError: Error, LocalizedError {
             return "appNotFound(\"\(app)\")"
         case .permissionDenied(let message):
             return message
+        case .backgroundUnsupported(let message):
+            return "BACKGROUND_UNSUPPORTED: \(message)"
+        case .approvalRequired(let message):
+            return "APPROVAL_REQUIRED: \(message)"
+        case .actionDenied(let message):
+            return "ACTION_DENIED: \(message)"
         case .stateUnavailable(let message):
             return message
         }
