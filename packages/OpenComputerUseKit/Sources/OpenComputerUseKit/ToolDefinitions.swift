@@ -124,7 +124,7 @@ public enum ToolDefinitions {
                 properties: [
                     "action": stringProperty(
                         description: "What to do",
-                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "select_text", "check", "uncheck", "scroll", "scroll_into_view", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
+                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "select_text", "check", "uncheck", "scroll", "scroll_into_view", "gesture", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
                     ),
                     "label": stringProperty(description: "Visible text of the target, e.g. \"Sign in\""),
                     "find": stringProperty(description: "read: only controls and text that mention these words"),
@@ -141,6 +141,7 @@ public enum ToolDefinitions {
                     "offset_y": numberProperty(description: "Click offset down from the anchor."),
                     "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
                                   "description": "click or drag: optional modifier keys."],
+                    "kind": stringProperty(description: "Gesture equivalent.", enumValues: GestureAction.allCases.map(\.rawValue)),
                     "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
                     "hold_ms": integerProperty(description: "Drag or key hold, up to 1000 ms."),
                     "drag_steps": integerProperty(description: "Drag movement steps, 2 to 30."),
@@ -365,6 +366,19 @@ public enum ToolDefinitions {
                 ],
                 required: ["app"]
             )
+        ),
+        ToolDefinition(
+            name: "gesture",
+            description: "Use for an app gesture equivalent. Give a zoom control or an explicit menu path.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(properties: [
+                "app": stringProperty(description: "App name or bundle identifier"),
+                "window_id": observedWindowIDProperty(),
+                "kind": stringProperty(description: "Gesture equivalent.", enumValues: GestureAction.allCases.map(\.rawValue)),
+                "label": labelProperty(),
+                "element_index": stringProperty(description: "Control number."),
+                "menu_path": stringProperty(description: "App command path, e.g. View > Zoom In."),
+            ], required: ["app", "kind"])
         ),
         ToolDefinition(
             name: "wait_for",

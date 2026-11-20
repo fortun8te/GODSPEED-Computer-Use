@@ -470,6 +470,23 @@ public final class ComputerUseToolDispatcher {
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
             )
+        case "gesture":
+            let app = try requireString("app", in: arguments)
+            let gesture = try GestureAction(arguments: arguments)
+            if arguments["menu_path"] != nil {
+                guard ComputerUseService.requiredWindowID == nil else {
+                    throw ComputerUseError.backgroundUnsupported("An app-level gesture menu command cannot be pinned to a window.")
+                }
+                guard labelArguments(in: arguments) == nil, optionalElementIndex(in: arguments) == nil else {
+                    throw ComputerUseError.invalidArguments("Use a menu command or a control for the gesture.")
+                }
+                return try service.pressMenu(app: app, titles: menuPathArgument(arguments["menu_path"]))
+            }
+            guard let increase = gesture.zoomIncreases,
+                  let index = try strictActionIndex(app: app, arguments: arguments) else {
+                throw ComputerUseError.backgroundUnsupported("This gesture needs an exposed app menu command or zoom control.")
+            }
+            return try service.zoomControl(app: app, elementIndex: index, increase: increase)
         case "wait_for":
             guard let wait = try ControlWait(arguments) else {
                 throw ComputerUseError.invalidArguments("wait_for requires appears, disappears or value_changed.")

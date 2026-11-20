@@ -1366,6 +1366,36 @@ public final class ComputerUseService {
         return .text(try outcome.reply(label: chunks.untilVisible))
     }
 
+    func zoomControl(app query: String, elementIndex: String, increase: Bool) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        try refuseDisabledControl(record, elementIndex: elementIndex)
+        let action = increase ? kAXIncrementAction : kAXDecrementAction
+        guard let element = record.element, let id = snapshot.targetWindowID, let window = snapshot.windowElement,
+              let before = nativeObservedValue(element), let value = Double(before), value.isFinite,
+              let raw = matchingAction(requested: action, record: record) else {
+            throw ComputerUseError.backgroundUnsupported("This zoom control has no readable value or matching accessibility action.")
+        }
+        let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+        guard CFEqual(live.windowElement, window), SnapshotBuilder.belongsToWindow(element, window: window) else {
+            throw windowBindingError(id)
+        }
+        try requireUsableComputerUseSession()
+        let outcome = AXUIElementPerformAction(element, raw as CFString)
+        guard outcome == .success else {
+            throw ComputerUseError.stateUnavailable("The zoom control returned \(outcome.rawValue). Inspect its value before repeating.")
+        }
+        let deadline = BrowserCallBudget.deadline(after: min(0.4, BrowserCallBudget.remaining()))
+        repeat {
+            if let after = nativeObservedValue(element), let next = Double(after), next.isFinite,
+               increase ? next > value : next < value {
+                return .text("Zoom control changed to \(after).")
+            }
+            Thread.sleep(forTimeInterval: min(0.04, max(0, deadline - ProcessInfo.processInfo.systemUptime)))
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        throw ComputerUseError.stateUnavailable("Zoom action delivered. The control did not report the expected change.")
+    }
+
     func waitForControl(app query: String, wait: ControlWait) throws -> ToolCallResult {
         let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
         guard let id = snapshot.targetWindowID, let window = snapshot.windowElement else {

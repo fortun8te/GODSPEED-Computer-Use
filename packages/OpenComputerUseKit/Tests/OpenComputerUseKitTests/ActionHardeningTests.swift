@@ -123,6 +123,25 @@ final class ActionHardeningTests: XCTestCase {
                        [chord.modifiers[0].keyCode, chord.keyCode, chord.keyCode, chord.modifiers[0].keyCode].map(Int64.init))
     }
 
+    func testGestureUsesBoundedZoomAndTabScopedHistoryOrRefuses() throws {
+        XCTAssertEqual(try GestureAction(arguments: ["kind": "pinch_out"]).zoomTarget(from: 2), 2.5)
+        XCTAssertEqual(GestureAction.pinchIn.zoomTarget(from: 1), 1)
+        XCTAssertEqual(GestureAction.zoomIn.zoomTarget(from: 4.8), 5)
+        XCTAssertTrue(GestureAction.zoomWasVerified(before: 2, target: 2.5, after: 2.499))
+        XCTAssertFalse(GestureAction.zoomWasVerified(before: 2, target: 2.5, after: 2))
+        XCTAssertNil(GestureAction.rotateLeft.zoomTarget(from: 2))
+        XCTAssertEqual(GestureAction.swipeBack.historyOperation, "back")
+        XCTAssertThrowsError(try GestureAction(arguments: ["kind": "swipe"]))
+
+        let steps = try BatchTool.parseSteps([
+            ["tool": "gesture", "kind": "rotate_left"],
+            ["tool": "gesture", "web": true, "kind": "swipe_back"],
+        ], defaultApp: "Fixture")
+        XCTAssertEqual(steps.map(\.tool), ["gesture", "browser"])
+        let result = ComputerUseToolDispatcher().callToolAsResult(name: "gesture", arguments: steps[0].arguments)
+        XCTAssertEqual(result.failureCode, .backgroundUnsupported)
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

@@ -6,7 +6,7 @@ enum ActionOptions {
     // These actions have their own delivery checks. Skip legacy vision, retargeting and focus borrowing.
     static func usesStrictRoute(_ tool: String, _ args: [String: Any]) -> Bool {
         switch tool {
-        case "scroll_into_view", "wait_for": return true
+        case "scroll_into_view", "wait_for", "gesture": return true
         case "drag": return DragOptions.isRequested(args)
         case "press_key": return args["hold_ms"] != nil
         case "hover": return args["dwell_ms"] != nil
@@ -259,5 +259,50 @@ struct TextRangeRequest {
         }
         self.start = start
         self.length = length
+    }
+}
+
+
+enum GestureAction: String, CaseIterable {
+    case pinchIn = "pinch_in"
+    case pinchOut = "pinch_out"
+    case zoomIn = "zoom_in"
+    case zoomOut = "zoom_out"
+    case smartZoom = "smart_zoom"
+    case rotateLeft = "rotate_left"
+    case rotateRight = "rotate_right"
+    case swipeBack = "swipe_back"
+    case swipeForward = "swipe_forward"
+
+    init(arguments: [String: Any]) throws {
+        guard let raw = try ActionOptions.string("kind", in: arguments), let kind = Self(rawValue: raw) else {
+            throw ComputerUseError.invalidArguments("Choose pinch_in, pinch_out, zoom_in, zoom_out, smart_zoom, rotate_left, rotate_right, swipe_back or swipe_forward.")
+        }
+        self = kind
+    }
+
+    var zoomIncreases: Bool? {
+        switch self {
+        case .zoomIn, .pinchOut: return true
+        case .zoomOut, .pinchIn: return false
+        default: return nil
+        }
+    }
+
+    var historyOperation: String? {
+        switch self {
+        case .swipeBack: return "back"
+        case .swipeForward: return "forward"
+        default: return nil
+        }
+    }
+
+    func zoomTarget(from current: Double) -> Double? {
+        guard let zoomIncreases, current.isFinite, current > 0 else { return nil }
+        return zoomIncreases ? max(current, min(5, current * 1.25)) : min(current, max(1, current * 0.8))
+    }
+
+    static func zoomWasVerified(before: Double, target: Double, after: Double) -> Bool {
+        after.isFinite && abs(after - target) < 0.01 && abs(after - before) > 0.001
     }
 }
