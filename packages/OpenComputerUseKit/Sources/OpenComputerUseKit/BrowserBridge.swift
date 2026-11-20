@@ -413,6 +413,10 @@ final class BrowserBridge: @unchecked Sendable {
             // Claiming changes OBU's origin for this tab to "user", even if a later part of the request fails.
             if name == "claim_tab", let id = arguments["tab_id"] as? Int { openedTabs.remove(id) }
             let reply = try requestTool(name, arguments: arguments, timeout: timeout)
+            // The relay refused the helper's grant before forwarding anything: a typed, unsent failure.
+            if reply.isError, RelayGrantRenewal.typedError(for: ComputerUseError.message(reply.text)) as? RelayGrantError == .helperNeedsRelayKey {
+                throw ComputerUseError.notSent(RelayGrantError.helperNeedsRelayKey.errorDescription ?? "Chrome helper needs the Godspeed relay key.")
+            }
             if name == "open_tab", !reply.isError, let id = BrowserReply.createdTabID(in: reply.text) {
                 openedTabs.insert(id)
             }
