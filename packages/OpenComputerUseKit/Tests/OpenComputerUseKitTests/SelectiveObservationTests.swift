@@ -17,6 +17,25 @@ final class SelectiveObservationTests: XCTestCase {
         return SnapshotBuilder.buildFixtureSnapshot(app: app(pid: pid, name: name), state: state, observation: options)
     }
 
+    func testNativeActionReadbackRequestsOneAXReadAndZeroScreenshots() throws {
+        var reads = 0
+        var captures = 0
+        let result = try ComputerUseService().actionResult(for: "ObservationFixture") { options in
+            reads += 1
+            if options.includeScreenshot { captures += 1 }
+            return self.snapshot(options: options)
+        }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(captures, 0)
+        XCTAssertEqual(result.content.filter { $0.dictionary["type"] as? String == "image" }.count, 0)
+        XCTAssertTrue(result.textContent.contains("Input"))
+    }
+
+    func testFrameSamplingRequiresAnExplicitOptIn() {
+        XCTAssertFalse(WindowSettle.frameSamplingEnabled(environment: [:]))
+        XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "1"]))
+    }
+
     func testEmptyObservationFailsBeforeResolvingApp() {
         XCTAssertThrowsError(try ComputerUseService().getAppState(app: "missing-test-app",
             observation: .init(includeAX: false, includeScreenshot: false))) {

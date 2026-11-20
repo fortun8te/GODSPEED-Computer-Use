@@ -767,12 +767,18 @@ public final class ComputerUseService {
 
     /// The result an action returns: the after-action snapshot, or a short status
     /// when read-back is off.
-    private func actionResult(for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ToolCallResult {
+    func actionResult(
+        for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+        refresh: ((SnapshotObservationOptions) throws -> AppSnapshot)? = nil
+    ) throws -> ToolCallResult {
         guard Self.requiredWindowID == nil, actionReadBack else {
             return .text("ok")
         }
 
-        return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
+        let options = SnapshotObservationOptions(includeAX: true, includeScreenshot: false)
+        let snapshot = try refresh?(options)
+            ?? refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: options)
+        return snapshotResult(for: snapshot, style: .actionResult)
     }
 
     public func listApps() -> ToolCallResult {

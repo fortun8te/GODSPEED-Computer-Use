@@ -52,6 +52,8 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
 - **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
 
+Native actions read back accessibility text. Use `get_app_state` with `include_screenshot: true` or set `screenshot: true` on a batch when you need an image.
+
 ### Works only with focus borrowing
 
 Focus borrowing brings one app to the front for a moment, then gives focus back to the app that had it. The pointer does not move. It is used only where background delivery cannot work:
@@ -90,12 +92,12 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 |---|---|---|
 | `OPEN_COMPUTER_USE_CONDENSE` | on | Condense state text (`AXTreeCondenser`). |
 | `OPEN_COMPUTER_USE_BATCH_DIFF` | on | Change-only final read in batch replies. |
-| `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT` | off | Screenshot with every read (settings key `screenshots_by_default`). |
+| `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT` | off | Screenshot with explicit app-state reads (settings key `screenshots_by_default`). |
 | `OPEN_COMPUTER_USE_AX_COMPACT` | on | Short role spellings in the tree. `0` = older long spellings. |
 | `OPEN_COMPUTER_USE_AX_INDENTATION` | `level` | `tab4` for four-space indent (opt-in). |
 | `OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS` | 20 | Visible rows kept per list, table or outline. |
 | `OPEN_COMPUTER_USE_ACTION_READ_BACK` | on | Read the window back after an action. |
-| `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | on | Stop waiting when the window stops changing. |
+| `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | off | Sample window images during action readback to detect the end of animations. |
 | `OPEN_COMPUTER_USE_BACKGROUND_ONLY` | off | Never raise or activate an app. Opt-in for when the user keeps working. |
 | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` | off | Allow moving the real pointer. Off means never. |
 | `OPEN_COMPUTER_USE_FOCUS_BORROW` | on | Focus borrowing (see above). |
