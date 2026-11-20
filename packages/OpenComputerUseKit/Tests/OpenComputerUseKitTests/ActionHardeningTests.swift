@@ -62,6 +62,40 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertTrue(samples.isEmpty)
     }
 
+    func testExplicitTextRangePreservesUTF16BoundariesAndBatchRouting() throws {
+        let value = "A😀B"
+        let target = try TextSelectionResolver.resolve(value: value, start: 1, length: 2)
+        XCTAssertEqual(target.location, 1)
+        XCTAssertEqual(target.length, 2)
+        XCTAssertEqual(try TextSelectionResolver.resolve(value: value, start: 4, length: 0).location, 4)
+        XCTAssertThrowsError(try TextSelectionResolver.resolve(value: value, start: 1, length: 1))
+        XCTAssertThrowsError(try TextSelectionResolver.resolve(value: value, start: 2, length: 1))
+        XCTAssertThrowsError(try TextSelectionResolver.resolve(value: value, start: 1, length: Int.max))
+        XCTAssertThrowsError(try TextRangeRequest(["start": 0, "length": 1, "text": "A"]))
+
+        let steps = try BatchTool.parseSteps([
+            ["tool": "select_text", "label": "Body", "start": 1, "length": 2],
+            ["tool": "select_text", "web": true, "label": "Body", "start": 1, "length": 2],
+        ], defaultApp: "Fixture")
+        XCTAssertEqual(steps.map(\.tool), ["select_text", "browser"])
+        let command = FixtureCommand(kind: "select_text", identifier: "fixture-input", rangeStart: 1, rangeLength: 2)
+        let roundTrip = try JSONDecoder().decode(FixtureCommand.self, from: JSONEncoder().encode(command))
+        XCTAssertEqual(roundTrip.rangeStart, 1)
+        XCTAssertEqual(roundTrip.rangeLength, 2)
+        let legacy = try JSONDecoder().decode(FixtureCommand.self, from: Data(#"{"kind":"select_text","identifier":"fixture-input","value":"B"}"#.utf8))
+        XCTAssertNil(legacy.rangeLength)
+    }
+
+    func testHoverDwellUsesBoundedMillisecondsAndStrictRouting() throws {
+        XCTAssertEqual(try ActionOptions.duration("dwell_ms", in: ["dwell_ms": 750], maxMs: 2000), 0.75)
+        XCTAssertThrowsError(try ActionOptions.duration("dwell_ms", in: ["dwell_ms": 2001], maxMs: 2000))
+        XCTAssertTrue(ActionOptions.usesStrictRoute("hover", ["dwell_ms": 750]))
+        XCTAssertFalse(ActionOptions.usesStrictRoute("hover", [:]))
+        XCTAssertThrowsError(try BrowserCallBudget.withDeadline(BrowserCallBudget.deadline(after: 0.1)) {
+            try ActionOptions.requireTime(for: 0.75)
+        })
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

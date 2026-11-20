@@ -311,13 +311,14 @@ final class FixtureAppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDele
             window.makeFirstResponder(inputField)
             if let editor = inputField.currentEditor() {
                 let mode = command.selection.flatMap(TextSelectionMode.init(rawValue:)) ?? .text
-                if let target = try? TextSelectionResolver.resolve(
-                    value: inputField.stringValue,
-                    text: command.value ?? "",
-                    prefix: command.prefix,
-                    suffix: command.suffix,
-                    selection: mode
-                ) {
+                let target: TextSelectionTarget?
+                if let start = command.rangeStart, let length = command.rangeLength {
+                    target = try? TextSelectionResolver.resolve(value: inputField.stringValue, start: start, length: length)
+                } else {
+                    target = try? TextSelectionResolver.resolve(value: inputField.stringValue,
+                        text: command.value ?? "", prefix: command.prefix, suffix: command.suffix, selection: mode)
+                }
+                if let target {
                     editor.selectedRange = NSRange(location: target.location, length: target.length)
                 }
             }

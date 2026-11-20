@@ -8,6 +8,8 @@ enum ActionOptions {
         switch tool {
         case "scroll_into_view", "wait_for": return true
         case "drag": return DragOptions.isRequested(args)
+        case "hover": return args["dwell_ms"] != nil
+        case "select_text": return TextRangeRequest.isRequested(args)
         case "scroll": return ScrollChunks.isRequested(args)
         case "click": return ClickPlacement.isRequested(args) || args["modifiers"] != nil
             || (args["click_count"] as? NSNumber)?.intValue == 3 && args["click_method"] == nil
@@ -22,6 +24,17 @@ enum ActionOptions {
             throw ComputerUseError.invalidArguments("\(key) must be an integer from \(range.lowerBound) to \(range.upperBound)")
         }
         return value
+    }
+
+    static func duration(_ key: String, in args: [String: Any], maxMs: Int) throws -> TimeInterval? {
+        guard let milliseconds = try integer(key, in: args, range: 0...maxMs) else { return nil }
+        return Double(milliseconds) / 1000
+    }
+
+    static func requireTime(for seconds: TimeInterval) throws {
+        guard BrowserCallBudget.remaining() > seconds else {
+            throw ComputerUseError.stateUnavailable("Too little time remained for this action. Nothing was sent.")
+        }
     }
 
     static func string(_ key: String, in args: [String: Any]) throws -> String? {
@@ -224,5 +237,26 @@ struct ControlWait {
             }
             throw ComputerUseError.stateUnavailable("Timed out waiting for \(label) to satisfy \(condition.rawValue).")
         }
+    }
+}
+
+
+struct TextRangeRequest {
+    let start: Int
+    let length: Int
+
+    static func isRequested(_ args: [String: Any]) -> Bool {
+        args["start"] != nil || args["length"] != nil
+    }
+
+    init?(_ args: [String: Any]) throws {
+        guard Self.isRequested(args) else { return nil }
+        guard let start = try ActionOptions.integer("start", in: args, range: 0...Int.max),
+              let length = try ActionOptions.integer("length", in: args, range: 0...Int.max),
+              ["text", "prefix", "suffix", "selection"].allSatisfy({ args[$0] == nil }) else {
+            throw ComputerUseError.invalidArguments("Give start and length, or use text with optional context.")
+        }
+        self.start = start
+        self.length = length
     }
 }

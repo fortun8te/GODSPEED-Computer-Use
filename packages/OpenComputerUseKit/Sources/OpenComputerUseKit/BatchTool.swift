@@ -210,7 +210,7 @@ enum BatchTool {
             // Hover with an app belongs to the native tool.
             let browserOnly: Set<String> = ["select", "check", "uncheck", "go", "goto", "navigate", "back",
                                             "forward", "reload", "tabs", "use_tab", "close_tab", "upload", "peek", "outline", "frames"]
-            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "drag", "scroll", "scroll_into_view", "wait", "wait_for", "open", "screenshot"]
+            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "drag", "scroll", "scroll_into_view", "select_text", "wait", "wait_for", "open", "screenshot"]
             let isWeb = (arguments["web"] as? Bool) == true || (arguments["web"] as? String)?.lowercased() == "true"
             // With "web": true, the native names a model reaches for mean the browser action of the same job. Without
             // this, {"tool": "type_text", "web": true} would type into the app named, which may be the user's own Chrome.

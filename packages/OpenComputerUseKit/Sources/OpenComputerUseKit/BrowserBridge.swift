@@ -870,9 +870,22 @@ extension ComputerUseToolDispatcher {
             return .text("pressed \(key); \(change.line)")
 
         case "hover":
-            let node = try target()
-            try page.hover(node)
-            return .text("hovered \(node.role) \"\(node.name)\"")
+            let dwell = try ActionOptions.duration("dwell_ms", in: arguments, maxMs: 2000)
+            let node = try dwell == nil ? target() : page.resolveExact(label: label, index: index)
+            try page.hover(node, dwell: dwell)
+            let change = dwell.map { " for \(Int(($0 * 1000).rounded())) ms. \(page.settle().line)" } ?? ""
+            return .text("Hovered \(node.role) \"\(node.name)\"\(change)")
+
+        case "select_text":
+            let range = try TextRangeRequest(arguments)
+            let options = try (selectionString("text", in: arguments), selectionString("prefix", in: arguments),
+                               selectionString("suffix", in: arguments), parseSelectionMode(selectionString("selection", in: arguments)))
+            guard range != nil || options.0?.isEmpty == false else {
+                throw ComputerUseError.invalidArguments("select_text needs text or a UTF-16 range.")
+            }
+            let node = try page.resolveExact(label: label, index: index)
+            return .text(try page.selectText(node, range: range, text: options.0 ?? "", prefix: options.1,
+                                             suffix: options.2, mode: options.3))
 
         case "select", "choose":
             let node = try target()

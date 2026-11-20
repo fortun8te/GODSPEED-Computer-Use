@@ -272,3 +272,11 @@ Use `mouse_button: "right"` to open a context menu. Read the resulting state, th
 Use `wait_for` with a label, a timeout of 1 to 30 seconds, and `condition` set to `appears`, `disappears` or `value_changed`. Use the same step names in Mac and web batches. The label is checked in the window or tab's accessibility tree. An incomplete read cannot confirm absence.
 
 For `value_changed`, give `from_value` to compare against a value you read before the previous action. Without it, the wait starts from the first value it reads. Secure fields are excluded. Set a separate completion check if a specific value matters.
+
+## Select text
+
+Use `select_text` with exact `text`. Add `prefix` or `suffix` for repeats. For an exact range, supply `start` and `length` in UTF-16 units. A zero-length range places the cursor. Give a control label or reference. Godspeed checks the field value and reads back the selected range.
+
+Mac apps need a writable accessibility text range. Chrome supports plain inputs and text areas that expose a selection range. A password field or a custom editor can refuse this action.
+
+Use `hover` with `dwell_ms` up to 2000 for a delayed tooltip or hover menu. Read the result or wait for the expected control. Some Mac apps only show tooltips under the real pointer.

@@ -825,10 +825,13 @@ final class BrowserPage {
         }
     }
 
-    func hover(_ node: BrowserNode) throws {
+    func hover(_ node: BrowserNode, dwell: TimeInterval? = nil) throws {
         restoreSetup()
         reveal(node)
-        try mouse("mouseMoved", try clickPoint(of: node), buttons: 0, clickCount: 0)
+        let point = try clickPoint(of: node)
+        if let dwell { try ActionOptions.requireTime(for: dwell + 1) }
+        try mouse("mouseMoved", point, buttons: 0, clickCount: 0)
+        if let dwell, dwell > 0 { Thread.sleep(forTimeInterval: dwell) }
     }
 
     /// A pointer gesture within one viewport, using live hit testing at both ends.
@@ -1386,6 +1389,40 @@ final class BrowserPage {
         return zip(rows, expected).allSatisfy { row, file in
             row.count == 2 && row[0] as? String == file.name && row[1] as? Int == file.size
         }
+    }
+
+    func selectText(_ node: BrowserNode, range: TextRangeRequest?, text: String,
+                    prefix: String?, suffix: String?, mode: TextSelectionMode) throws -> String {
+        let value = try callOnNode(node, """
+        function(){
+          if(!this.isConnected||this.type==='password'||this.disabled||typeof this.selectionStart!=='number')return null;
+          return typeof this.value==='string'?this.value:null;
+        }
+        """) as? String
+        guard let value else {
+            throw ComputerUseError.backgroundUnsupported("This control does not expose a plain text range.")
+        }
+        let target: TextSelectionTarget
+        if let range {
+            target = try TextSelectionResolver.resolve(value: value, start: range.start, length: range.length)
+        } else {
+            do {
+                target = try TextSelectionResolver.resolve(value: value, text: text, prefix: prefix, suffix: suffix, selection: mode)
+            } catch let error as TextSelectionResolverError {
+                throw ComputerUseError.invalidArguments(selectTextErrorMessage(error, elementIndex: node.name))
+            }
+        }
+        let outcome = try callOnNode(node, """
+        function(start,end,expected){
+          if(!this.isConnected||this.type==='password'||this.disabled||this.value!==expected)return false;
+          this.setSelectionRange(start,end);
+          return this.selectionStart===start&&this.selectionEnd===end&&this.value===expected;
+        }
+        """, arguments: [target.location, target.location + target.length, value])
+        guard outcome as? Bool == true else {
+            throw ComputerUseError.stateUnavailable("Could not verify the selected range on the same field value.")
+        }
+        return "Selected range \(target.location), length \(target.length)."
     }
 
     func fieldText(_ node: BrowserNode) throws -> String? {
