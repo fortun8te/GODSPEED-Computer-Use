@@ -11,20 +11,20 @@ import ImageIO
 /// Contract: request {"image_base64": str, "query": str}; reply {"found": bool, "x": 0-1, "y": 0-1,
 /// "ms": int}, where x and y are fractions of the image width and height.
 enum VisionFallback {
-    static let baseURL: URL? = {
+    static var baseURL: URL? {
         guard let raw = GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
               ["http", "https"].contains(scheme), let host = url.host, !host.isEmpty else { return nil }
         return url
-    }()
+    }
 
     /// Default 8 s: one answer takes about 2.3 s warm, more on the first call after the model unloaded.
-    static let timeout: TimeInterval = {
+    static var timeout: TimeInterval {
         let configured = GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_TIMEOUT_MS"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let milliseconds = configured.flatMap(Double.init).flatMap { (0...30_000).contains($0) ? $0 : nil } ?? 8_000
         return max(500, milliseconds) / 1000
-    }()
+    }
 
     static var isEnabled: Bool { baseURL != nil }
 

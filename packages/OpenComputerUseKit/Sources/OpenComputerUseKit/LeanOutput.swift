@@ -13,8 +13,8 @@ enum LeanOutput {
         case compactBatch
     }
 
-    static let condenses: Bool = flag("OPEN_COMPUTER_USE_CONDENSE")
-    static let diffsBatchReads: Bool = flag("OPEN_COMPUTER_USE_BATCH_DIFF")
+    static var condenses: Bool { flag("OPEN_COMPUTER_USE_CONDENSE") }
+    static var diffsBatchReads: Bool { flag("OPEN_COMPUTER_USE_BATCH_DIFF") }
 
     private static func flag(_ key: String) -> Bool {
         let value = GodspeedSettings.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"

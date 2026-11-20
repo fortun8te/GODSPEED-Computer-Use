@@ -558,7 +558,7 @@ private final class AppAgentConnection: @unchecked Sendable {
             try? AppAgentAdmission.shared.withAdmission(.exclusive) {
                 ClientScope.with(client) {
                     if let browserEnvironment {
-                        withBrowserRequestEnvironment(browserEnvironment) { server?.endSession() }
+                        AppAgentEnvironment.withConfiguration(browserEnvironment) { server?.endSession() }
                     } else {
                         server?.endSession()
                     }
@@ -630,7 +630,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                         let response = try AppAgentAdmission.shared.withAdmission(.browserRead(client: ClientScope.sanitized(client))) {
                             try ClientScope.with(client) { [lockedUse] in
                                 try lockedUse.performParallelBrowserRead {
-                                    try withBrowserRequestEnvironment(
+                                    try AppAgentEnvironment.withConfiguration(
                                         browserEnvironment,
                                         validate: { try lockedUse.validateParallelBrowserRead() }
                                     ) {
@@ -856,7 +856,7 @@ enum AppAgentBrowserRead {
     }
 }
 
-private enum AppAgentEnvironment {
+enum AppAgentEnvironment {
     private static let requestEnvironmentKeys = OCUConfiguration.environmentKeys.union([
         "OPEN_COMPUTER_USE_BROWSER", "OPEN_COMPUTER_USE_OBU_BIN",
         "OPEN_COMPUTER_USE_BROWSER_SESSION", "OPEN_COMPUTER_USE_BROWSER_PROFILE",
@@ -866,42 +866,27 @@ private enum AppAgentEnvironment {
     static func withOverrides<T>(_ overrides: [String: String], client: String? = nil, _ body: () throws -> T) throws -> T {
         try AppAgentAdmission.shared.withAdmission(.exclusive) {
             try ClientScope.with(client ?? overrides[clientEnvironmentKey]) {
-                try withBrowserRequestEnvironment(effectiveEnvironment(overrides)) {
-                    try applying(overrides, body)
-                }
+                try withConfiguration(effectiveEnvironment(overrides), body)
             }
+        }
+    }
+
+    static func withConfiguration<T>(
+        _ environment: [String: String],
+        validate: (@Sendable () throws -> Void)? = nil,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        try RequestConfiguration.withEnvironment(environment) {
+            try withBrowserRequestEnvironment(environment, validate: validate, body)
         }
     }
 
     static func effectiveEnvironment(_ overrides: [String: String]) -> [String: String] {
         var environment = appAgentLaunchEnvironment
         for key in requestEnvironmentKeys { environment[key] = nil }
-        return environment.merging(overrides) { _, request in request }
+        return environment.merging(overrides.filter { $0.key.hasPrefix("OPEN_COMPUTER_USE_") }) { _, request in request }
     }
 
-    private static func applying<T>(_ overrides: [String: String], _ body: () throws -> T) rethrows -> T {
-
-        let keys = Set(overrides.keys).union(requestEnvironmentKeys)
-        let previousValues = Dictionary(uniqueKeysWithValues: keys.map { key in
-            (key, getenv(key).map { String(cString: $0) })
-        })
-        for key in requestEnvironmentKeys where overrides[key] == nil { unsetenv(key) }
-        for (key, value) in overrides {
-            setenv(key, value, 1)
-        }
-
-        defer {
-            for (key, previousValue) in previousValues {
-                if let previousValue {
-                    setenv(key, previousValue, 1)
-                } else {
-                    unsetenv(key)
-                }
-            }
-        }
-
-        return try body()
-    }
 }
 
 /// The app agent did not answer in time. The call is stopped; the agent and its other work are left running.

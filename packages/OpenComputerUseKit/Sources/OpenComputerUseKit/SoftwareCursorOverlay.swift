@@ -21,15 +21,14 @@ public enum VisualCursorSupport {
 
     public static var isEnabled: Bool { settings.enabled }
 
-    /// Every cursor setting for the current request. The app agent applies a caller's
-    /// OPEN_COMPUTER_USE_* variables only while that request runs, and queued animations
-    /// play after it returned, so they must use the values captured when they were queued.
+    /// Every cursor setting for the current request. Queued animations use the settings
+    /// captured from the request that scheduled them.
     static var settings: VisualCursorSettings {
         if let snapshot = Thread.current.threadDictionary[settingsSnapshotKey] as? VisualCursorSettings {
             return snapshot
         }
         // PURE's Settings > GODSPEED fill in whatever the environment does not set.
-        let environment = GodspeedSettings.merged(ProcessInfo.processInfo.environment)
+        let environment = GodspeedSettings.merged(RequestConfiguration.environment)
         var settings = VisualCursorSettings(environment: environment)
         let client = ClientScope.current
         if environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]?.lowercased() == "auto", client != "main" {
@@ -46,7 +45,7 @@ public enum VisualCursorSupport {
     /// OPEN_COMPUTER_USE_CURSOR_ASYNC (default on): cursor animations are queued on the main thread
     /// and play while the action runs, so the action never waits for them. Order is kept (move, then pulse).
     static var animatesAsync: Bool {
-        let raw = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_CURSOR_ASYNC"]?.lowercased() ?? "1"
+        let raw = RequestConfiguration.environment["OPEN_COMPUTER_USE_CURSOR_ASYNC"]?.lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(raw)
     }
 
@@ -78,9 +77,6 @@ public enum VisualCursorSupport {
     }
 
     static func performCursorAnimation(kind: AnimationKind = .other, _ body: @escaping @MainActor () -> Void) {
-        // The app agent temporarily overrides its environment per request. The
-        // main queue can run after those overrides are restored, so capture the
-        // request's cursor setting before dispatching any work.
         let captured = settings
         let client = ClientScope.current
         let perform: @MainActor () -> Void = {
@@ -276,7 +272,7 @@ let visualCursorDefaultSpeedSetting: Double = 4
 /// fast, 2 half as fast. There is no upper limit; `instant` (also `inf`, `max`) places the cursor
 /// on the target with no travel at all. Anything unreadable means the default.
 /// Returns the playback rate relative to the default timing (setting / 4).
-func visualCursorSpeed(environment: [String: String] = ProcessInfo.processInfo.environment) -> CGFloat {
+func visualCursorSpeed(environment: [String: String] = RequestConfiguration.environment) -> CGFloat {
     let raw = (environment["OPEN_COMPUTER_USE_CURSOR_SPEED"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if ["instant", "inf", "infinity", "max", "teleport"].contains(raw) { return .infinity }
     guard let value = Double(raw), !value.isNaN, value > 0 else { return 1 }
@@ -342,7 +338,7 @@ func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
     !frame.insetBy(dx: 36, dy: 36).contains(point)
 }
 
-func visualCursorFloats(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+func visualCursorFloats(environment: [String: String] = RequestConfiguration.environment) -> Bool {
     let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.lowercased() ?? "0"
     return ["1", "true", "yes", "on"].contains(raw)
 }
@@ -351,7 +347,7 @@ func visualCursorFloats(environment: [String: String] = ProcessInfo.processInfo.
 /// (OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS, default 3). Long enough that the next call of the
 /// same batch or turn continues from where it is, short enough that it is gone soon after the
 /// work stops. `turn-ended` still clears it at once.
-func visualCursorPostInteractionIdleTimeout(environment: [String: String] = ProcessInfo.processInfo.environment) -> TimeInterval {
+func visualCursorPostInteractionIdleTimeout(environment: [String: String] = RequestConfiguration.environment) -> TimeInterval {
     let raw = (environment["OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard let value = Double(raw), value.isFinite, value >= 0 else { return 3 }
     return max(value, 0.2)

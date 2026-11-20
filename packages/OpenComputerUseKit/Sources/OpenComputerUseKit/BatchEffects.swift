@@ -4,11 +4,11 @@ import Foundation
 /// window it started in, and the `wait` step's conditions. They read the state texts only (no accessibility
 /// calls), so they are cheap to test. Element numbers are stable across reads, so lines are matched by number.
 enum BatchEffects {
-    static let isEnabled: Bool = {
+    static var isEnabled: Bool {
         let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_BATCH_EFFECTS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     /// Most effect lines one step adds.
     static let maxEffectLines = 5

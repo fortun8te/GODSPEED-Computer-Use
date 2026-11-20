@@ -17,16 +17,15 @@ import Foundation
 ///       "browser": true                    -> OPEN_COMPUTER_USE_BROWSER
 ///     }
 ///
-/// The file is re-read when it changes. Cursor settings apply on the next action; the others are read
-/// once per GODSPEED process, so they apply from the next start.
+/// The file is checked for changes as requests read settings.
 enum GodspeedSettings {
     static var fileURL: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".godspeed/settings.json")
     }
 
-    /// The process environment with the settings file filled in underneath it.
+    /// The request environment with the settings file filled in underneath it.
     static var environment: [String: String] {
-        merged(ProcessInfo.processInfo.environment)
+        merged(RequestConfiguration.environment)
     }
 
     /// `base` with every setting from the file added where `base` does not already set that variable.

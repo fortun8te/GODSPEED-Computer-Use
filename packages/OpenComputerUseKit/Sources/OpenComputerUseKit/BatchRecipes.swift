@@ -15,11 +15,11 @@ import Foundation
 final class BatchRecipes: @unchecked Sendable {
     static let shared = BatchRecipes()
 
-    static let isEnabled: Bool = {
+    static var isEnabled: Bool {
         let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_RECIPES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     static let maxRecipes = 300
     /// Same bar as the referee's "done" hint, so a save suggestion never appears without that hint.

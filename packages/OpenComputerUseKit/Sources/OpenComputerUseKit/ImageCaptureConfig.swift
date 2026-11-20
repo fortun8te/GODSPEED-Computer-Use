@@ -1,6 +1,5 @@
 import Foundation
 import CoreGraphics
-import Darwin
 
 /// Shared path resolution for native calls and app-agent request forwarding.
 public enum OCUConfiguration {
@@ -14,10 +13,7 @@ public enum OCUConfiguration {
         "OPEN_COMPUTER_USE_IMAGE_DISCARD_BELOW_PIXEL_COUNT",
     ]
     public static var environment: [String: String] {
-        let keys = environmentKeys.union(["HOME", "XDG_CONFIG_HOME"])
-        return Dictionary(uniqueKeysWithValues: keys.compactMap { key in
-            getenv(key).map { (key, String(cString: $0)) }
-        })
+        RequestConfiguration.environment
     }
     public static func fileURL(environment: [String: String]) throws -> URL {
         if let override = environment["OPEN_COMPUTER_USE_CONFIG_FILE"], !override.isEmpty {
