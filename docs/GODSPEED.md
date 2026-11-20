@@ -229,6 +229,8 @@ Open or select a tab and read its controls. For example, use `{"action":"drag","
 
 ## Local traces
 
+Set `OPEN_COMPUTER_USE_DEBUG_TIMING=1` to record timings and counts for accessibility reads, screenshot encoding, Chrome calls and batch checks. These lines include byte counts without the contents.
+
 Tool logs at `~/.godspeed/trajectories` record queue time, tool duration, batch outcomes and verification. The default omits arguments, screen text and screenshots. Set `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0` to turn logging off. For a local fixture, `OPEN_COMPUTER_USE_TRAJECTORY_FAILURES=1` adds a short error and argument shape. Review it before sharing because errors can include app names, filenames or controls. `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` captures typed text and observations.
 
 Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper activity. A helper receipt records that the helper ran. Match verified fixture outcomes to exact run streams before using them as labels.

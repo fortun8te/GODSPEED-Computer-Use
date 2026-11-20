@@ -1,6 +1,6 @@
 import Foundation
 
-/// Millisecond timing for the background-input and window-placement paths.
+/// Stage timings and counts for native and browser calls.
 /// Enabled with `OPEN_COMPUTER_USE_DEBUG_TIMING=1`; lines go to stderr as
 /// `[open-computer-use] timing <label> <ms>ms` so a tool session can be
 /// profiled without changing tool output.
@@ -20,7 +20,17 @@ enum TimingLog {
         fputs(String(format: "[open-computer-use] timing %@ %.1fms\n", label, (now() - start) * 1000), stderr)
     }
 
+    static func counterLine(_ label: String, value: Int) -> String {
+        "[open-computer-use] count \(label) \(value)\n"
+    }
+
+    static func count(_ label: String, _ value: @autoclosure () -> Int) {
+        guard enabled else { return }
+        fputs(counterLine(label, value: value()), stderr)
+    }
+
     static func measure<T>(_ label: String, _ body: () throws -> T) rethrows -> T {
+        guard enabled else { return try body() }
         let start = now()
         defer { log(label, since: start) }
         return try body()
