@@ -181,13 +181,15 @@ struct ActionPolicy: Decodable, Sendable {
         case "save_as":
             // A new path can also become occupied while the save dialog is opening.
             result.insert(.fileOverwrite)
-        case "press_menu", "press_key", "click", "perform_secondary_action":
+        case "press_menu", "press_key", "click", "perform_secondary_action", "drag":
+            // For a drag, `target` is the drop destination, not the source.
             result.formUnion(namedRisks([target?.title, target?.identifier,
                                          tool == "press_menu" ? menuTitle : nil,
                                          arguments["action"] as? String,
-                                         arguments["label"] as? String]))
+                                         arguments["label"] as? String,
+                                         tool == "drag" ? arguments["to_label"] as? String : nil]))
             if key == "cmd+s" || key == "cmd+shift+s" { result.insert(.fileOverwrite) }
-            if ["click", "perform_secondary_action"].contains(tool),
+            if ["click", "perform_secondary_action", "drag"].contains(tool),
                target?.role.map(SmartSteps.roleKey).map({ ["textfield", "textarea", "searchfield"].contains($0) }) != true {
                 // AX has no effect metadata for an opaque button, custom action or pixel target.
                 result.formUnion([.send, .submit, .purchase, .delete, .fileOverwrite, .systemSettings])

@@ -39,7 +39,12 @@ extension ActionPolicy {
         return [id]
     }
 
-    static let nativeTargetTools: Set<String> = ["click", "set_value", "type_text", "press_key", "perform_secondary_action"]
+    static let nativeTargetTools: Set<String> = ["click", "set_value", "type_text", "press_key", "perform_secondary_action", "drag"]
+
+    /// A drag's risk comes from where it drops. The destination arguments name that element.
+    static func dropTargetArguments(_ arguments: [String: Any]) -> [String: Any] {
+        ["label": arguments["to_label"], "element_index": arguments["to_index"]].compactMapValues { $0 }
+    }
     static let nativeScopedTools: Set<String> = nativeTargetTools.union([
         "open", "query", "get_app_state", "press_menu", "save_as", "select_text", "scroll", "hover", "drag", HandoffTool.name,
         // L9 actions: a gesture can press an app menu command; the others act on or read one app's controls.
@@ -107,8 +112,9 @@ extension ComputerUseToolDispatcher {
     private func nativeRisks(name: String, arguments: [String: Any], bundleID: String?) -> Set<ActionPolicy.Risk> {
         let target: ActionPolicy.Target?
         if let app = arguments["app"] as? String, ActionPolicy.nativeTargetTools.contains(name) {
-            target = service.actionPolicyTarget(tool: name, app: app, index: optionalElementIndex(in: arguments),
-                                                labels: labelArguments(in: arguments))
+            let targetArguments = name == "drag" ? ActionPolicy.dropTargetArguments(arguments) : arguments
+            target = service.actionPolicyTarget(tool: name, app: app, index: optionalElementIndex(in: targetArguments),
+                                                labels: labelArguments(in: targetArguments))
         } else {
             target = nil
         }
