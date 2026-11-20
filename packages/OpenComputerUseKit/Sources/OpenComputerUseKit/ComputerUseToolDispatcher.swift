@@ -56,6 +56,15 @@ public final class ComputerUseToolDispatcher {
         if let problem = ArgumentNormalizer.problem(tool: name, arguments: arguments) {
             throw ComputerUseError.message(problem)
         }
+        // Journal logical steps here so standalone actions, batches and handoffs share the same boundary.
+        return try OperationJournal.recordStep(tool: name, arguments: arguments) {
+            try callNormalizedTool(name: name, arguments: arguments, log: log, notesInResult: notesInResult)
+        }
+    }
+
+    private func callNormalizedTool(
+        name: String, arguments: [String: Any], log: SmartLog, notesInResult: Bool
+    ) throws -> ToolCallResult {
         if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name,
            name != HandoffTool.name {
             guard ArgumentNormalizer.windowBoundTools.contains(name) else {
