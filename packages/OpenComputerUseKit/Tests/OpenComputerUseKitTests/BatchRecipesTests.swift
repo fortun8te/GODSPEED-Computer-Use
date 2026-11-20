@@ -17,12 +17,6 @@ final class BatchRecipesTests: XCTestCase {
         XCTAssertNotEqual(BatchRecipes.templateKey("Email Sam the report"), BatchRecipes.templateKey("Archive the report"))
     }
 
-    func testWindowShape() {
-        XCTAssertEqual(BatchRecipes.windowShape(title: "Q3 plan - Pages"), "pages")
-        XCTAssertEqual(BatchRecipes.windowShape(title: "Untitled"), "untitled")
-        XCTAssertEqual(BatchRecipes.windowShape(title: nil), "")
-    }
-
     // MARK: parameters
 
     func testParameterizeNamesFromLabelAndValues() {
@@ -51,16 +45,29 @@ final class BatchRecipesTests: XCTestCase {
         XCTAssertEqual(BatchRecipes.parameterize(steps, values: [:]).params, ["name": "A", "name_2": "B"])
     }
 
-    func testSubstituteUsesValuesThenDefaultsAndStripsMeta() {
+    func testSlotsBindOnlyExplicitMatchingValuesAndStripMeta() throws {
         let steps: [Any] = [["tool": "set_value", "label": "To", "value": "{{to}}", "_loc": ["label": "To"], "_fx": "changed"]]
-        let withValue = BatchRecipes.substitute(steps, params: ["to": "old@x.com"], values: ["to": "new@x.com", "extra": "1"])
-        let dict = withValue.steps[0] as? [String: Any]
-        XCTAssertEqual(dict?["value"] as? String, "new@x.com")
-        XCTAssertNil(dict?["_loc"])
-        XCTAssertNil(dict?["_fx"])
-        XCTAssertEqual(withValue.ignored, ["extra"])
-        let defaulted = BatchRecipes.substitute(steps, params: ["to": "old@x.com"], values: [:])
-        XCTAssertEqual((defaulted.steps[0] as? [String: Any])?["value"] as? String, "old@x.com")
+        let recipe = BatchRecipes.Recipe(app: "Mail", goal: "Fill the recipient", steps: steps, uses: 0, failures: 0,
+                                        params: ["to": "old@x.com"], slotKinds: ["to": .recipient])
+        XCTAssertThrowsError(try BatchRecipes.boundSteps(recipe, values: [:]))
+        XCTAssertThrowsError(try BatchRecipes.boundSteps(recipe, values: ["to": "new@x.com"]))
+        XCTAssertThrowsError(try BatchRecipes.boundSteps(recipe, values: ["to": "old@x.com", "extra": "1"]))
+        let bound = try BatchRecipes.boundSteps(recipe, values: ["to": "old@x.com"])
+        let step = try XCTUnwrap(bound.first as? [String: Any])
+        XCTAssertEqual(step["value"] as? String, "old@x.com")
+        XCTAssertNil(step["_loc"])
+        XCTAssertNil(step["_fx"])
+    }
+
+    func testSlotTypesFromFieldAndValue() {
+        let slots = ["To": "Alice", "Email": "a@example.test", "Quantity": "42.5", "Path": "/tmp/file", "Note": "A note"]
+        let result = BatchRecipes.parameterize(slots.map { ["tool": "set_value", "label": $0.key, "value": $0.value] }, values: [:])
+        XCTAssertEqual(result.kinds, ["to": .recipient, "email": .email, "quantity": .number, "path": .path, "note": .text])
+        XCTAssertFalse(BatchRecipes.SlotKind.recipient.accepts("Alice\nBob"))
+        XCTAssertFalse(BatchRecipes.SlotKind.email.accepts("not an address"))
+        XCTAssertFalse(BatchRecipes.SlotKind.number.accepts("many"))
+        XCTAssertFalse(BatchRecipes.SlotKind.path.accepts("relative/path"))
+        XCTAssertTrue(BatchRecipes.SlotKind.text.accepts("a\nline"))
     }
 
     // MARK: effects
@@ -97,34 +104,14 @@ final class BatchRecipesTests: XCTestCase {
         XCTAssertEqual(loc?.nearby, ["Attach", "Discard"])
     }
 
-    func testResolveKeepsLabelWhenStillThere() {
-        let loc = RecipeLocator.capture(label: "Send", in: state(compose))!
-        XCTAssertEqual(RecipeLocator.resolve(loc, label: "Send", in: state(compose)), .found)
-    }
-
-    func testResolveHealsRenamedButton() {
-        let loc = RecipeLocator.capture(label: "Send", in: state(compose))!
-        let renamed = state(compose.map { $0.replacingOccurrences(of: "Send", with: "Send now") })
-        // "Send" is contained in "Send now", so the label itself still resolves.
-        XCTAssertEqual(RecipeLocator.resolve(loc, label: "Send", in: renamed), .found)
-        let rewritten = state(compose.map { $0.replacingOccurrences(of: "Send", with: "Submit") })
-        guard case .healed(let label, let healed) = RecipeLocator.resolve(loc, label: "Send", in: rewritten) else {
-            return XCTFail("expected a healed locator")
-        }
-        XCTAssertEqual(label, "Submit")
-        XCTAssertEqual(healed.parent, "Actions")
-    }
-
-    func testResolveMissingWhenNothingFits() {
-        let loc = RecipeLocator.capture(label: "Send", in: state(compose))!
-        let other = state(["\t1 window Photos", "\t\t2 button Import", "\t\t3 text Library"])
-        XCTAssertEqual(RecipeLocator.resolve(loc, label: "Send", in: other), .missing)
-    }
-
-    func testResolveRefusesAmbiguousClues() {
-        let loc = RecipeLocator.Locator(role: "button", label: "Send", parent: "Actions", nearby: [])
-        let twins = state(["\t1 toolbar Actions", "\t\t2 button Alpha", "\t\t3 button Beta"])
-        XCTAssertEqual(RecipeLocator.resolve(loc, label: "Send", in: twins), .missing)
+    func testLocatorRequiresOriginalRoleAndParentAndExactUniqueLabel() throws {
+        let original = state(compose)
+        let loc = try XCTUnwrap(RecipeLocator.capture(label: "Send", in: original))
+        XCTAssertTrue(RecipeLocator.confirms(loc, label: "Send", in: original))
+        XCTAssertFalse(RecipeLocator.confirms(loc, label: "Send", in: original.replacingOccurrences(of: "Send", with: "Send now")))
+        XCTAssertFalse(RecipeLocator.confirms(loc, label: "Send", in: original.replacingOccurrences(of: "Actions", with: "Different account")))
+        XCTAssertFalse(RecipeLocator.confirms(loc, label: "Send", in: original.replacingOccurrences(of: "button Send", with: "menu item Send")))
+        XCTAssertFalse(RecipeLocator.confirms(loc, label: "Send", in: original + "\n\t\t\t6 button Send"))
     }
 
     func testLocatorRoundTrip() {

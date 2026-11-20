@@ -520,16 +520,37 @@ extension ComputerUseToolDispatcher {
         // Recipe bookkeeping for this batch (BatchRecipes.Run): values, locators, auto-save.
         let recipeRun = BatchRecipes.Run(goal: goal, values: arguments["values"], app: defaultApp) { [self] app in
             guard clock.systemUptime < actionDeadline else { return nil }
-            return LeanOutput.stateText(of: callToolAsResult(name: "get_app_state", arguments: [
+            let result = callToolAsResult(name: "get_app_state", arguments: [
                 "app": app, "include_screenshot": NSNumber(value: false),
-            ]))
+            ])
+            return result.isError ? nil : LeanOutput.stateText(of: result)
         }
         // A goal with no steps replays the recipe saved for it.
         var rawSteps = arguments["steps"]
         var replayed: BatchRecipes.Recipe?
-        let givenSteps = (rawSteps as? [Any]) ?? []
-        if givenSteps.isEmpty, !goal.isEmpty, BatchRecipes.isEnabled {
-            guard let recipe = validatedHandoffRecipe ?? recipeRun.find(app: defaultApp) else {
+        if (rawSteps == nil || (rawSteps as? [Any])?.isEmpty == true), !goal.isEmpty, BatchRecipes.isEnabled {
+            // Both entry points check the current window, version and slots before loading steps.
+            switch recipeRun.lookup(app: defaultApp) {
+            case .blocked(let reason):
+                throw ComputerUseError.invalidArguments(reason)
+            case .match(let recipe):
+                guard !foreground, defaultApp != nil,
+                      validatedHandoffRecipe == nil || validatedHandoffRecipe?.version == recipe.version,
+                      doneConditions.isEmpty || doneConditions == recipe.doneWhen else {
+                    throw ComputerUseError.invalidArguments("Confirm the original app, background mode and done_when, or provide fresh steps.")
+                }
+                doneConditions = recipe.doneWhen
+                if case .verified(let met) = HandoffTool.check(doneConditions, screen: recipeRun.startingState ?? "") {
+                    return ToolCallResult(
+                        content: [.text(DoneCheck.line(for: .verified(met: met)))],
+                        isError: false,
+                        batchReceipt: .init(totalSteps: 0, doneCheck: .verified)
+                    )
+                }
+                replayed = recipe
+                rawSteps = try recipeRun.replaySteps(recipe)
+                lines.append("Replaying the verified recipe for \"\(recipe.goal)\".")
+            case .missing:
                 // No steps and no recipe, but an app: the model wants to look. Read it instead of failing a turn.
                 if let app = defaultApp, clock.systemUptime < deadline {
                     let state = callToolAsResult(name: "get_app_state", arguments: ["app": app])
@@ -544,25 +565,15 @@ extension ComputerUseToolDispatcher {
                     )
                 }
                 throw ComputerUseError.invalidArguments(
-                    "no saved recipe for \"\(goal)\"; send the steps (add remember: true to save them once they work)"
+                    "No replay is available. Provide the app and fresh steps with a deterministic done_when."
                 )
             }
-            if doneConditions.isEmpty, !recipe.doneWhen.isEmpty {
-                let values = BatchRecipes.parseValues(arguments["values"])
-                guard !values.contains(where: { key, value in
-                    recipe.params[key].map { $0 != value } ?? false
-                }) else {
-                    throw ComputerUseError.invalidArguments("A replay with changed recipe values needs a fresh done_when.")
-                }
-                doneConditions = recipe.doneWhen
-            }
-            replayed = recipe
-            rawSteps = recipeRun.replaySteps(recipe)
-            lines.append("Replaying the saved recipe for \"\(recipe.goal)\" (\(recipe.steps.count) steps, used \(recipe.uses) times).")
         }
         recipeRun.doneWhen = doneConditions
-        let replayApp = replayed.flatMap { $0.app == "browser" ? nil : $0.app }
-        let parsedSteps = try BatchTool.parseSteps(rawSteps, defaultApp: defaultApp ?? replayApp)
+        let parsedSteps = try BatchTool.parseSteps(rawSteps, defaultApp: defaultApp)
+        if replayed != nil, let defaultApp, !parsedSteps.allSatisfy({ HandoffTool.isSafeRecipeStep($0, app: defaultApp) }) {
+            throw ComputerUseError.invalidArguments("Some saved steps need fresh instructions. Read the app and provide explicit steps.")
+        }
         let steps = try parsedSteps.map { step in
             guard let pinnedWindow, let defaultApp else { return step }
             var args = step.arguments
@@ -628,7 +639,7 @@ extension ComputerUseToolDispatcher {
             receipt.steps[receipt.steps.count - 1].observation = observation
         }
         var failed = false
-        var lastApp = defaultApp ?? replayApp
+        var lastApp = defaultApp
         var changedSomething = false
         var trailingObservation: ToolCallResult?
         var browserImages: [ToolResultContentItem] = []
@@ -673,7 +684,7 @@ extension ComputerUseToolDispatcher {
             if optionalEffect, effectBudget.exhausted || clock.systemUptime >= actionDeadline { return nil }
             let began = clock.systemUptime
             var readArguments: [String: Any] = ["app": app, "include_screenshot": NSNumber(value: false)]
-            if let pinnedWindow, app == defaultApp { readArguments["window_id"] = pinnedWindow }
+            if let pinnedWindow = pinnedWindow ?? replayed?.window?.id, app == defaultApp { readArguments["window_id"] = pinnedWindow }
             if settleMs > 0 { readArguments["settle_ms"] = settleMs }
             let read = callToolAsResult(name: "get_app_state", arguments: readArguments)
             let text = read.isError ? nil : LeanOutput.stateText(of: read)
@@ -738,7 +749,8 @@ extension ComputerUseToolDispatcher {
                 var met = false
                 var observed = false
                 while clock.systemUptime - waitStart < limit {
-                    if let read = readWatch(app, settleMs: 0, optionalEffect: false) {
+                    if let read = readWatch(app, settleMs: 0, optionalEffect: false),
+                       replayed == nil || BatchRecipes.Window(state: read.text) == replayed?.window {
                         observed = true
                         if wait.isMet(state: read.text, id: read.sig.id) {
                             met = true
@@ -787,7 +799,7 @@ extension ComputerUseToolDispatcher {
             let stepApp = (plannedStep.arguments["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             // The batch's numbers belong to the window it started in: stop before an element step that
             // would act on another window (a dialog the previous step opened itself is followed, not a stop).
-            if let title = movedTo, validatedHandoffRecipe != nil
+            if let title = movedTo, replayed != nil
                 || normalizedElementIndexArgument(plannedStep.arguments["element_index"]) != nil {
                 lines.append("window changed after \(offset) steps (now \"\(title)\"). Steps \(number)-\(steps.count) were not run; read the app with get_app_state and send them again.")
                 stoppedForTime = true
@@ -805,13 +817,10 @@ extension ComputerUseToolDispatcher {
                 }
             }
 
-            let observed = stepApp == watchApp ? watchState : nil
-            let prepared = recipeRun.prepared(
-                plannedStep, number: number, before: observed
-            )
-            let scoped = validatedHandoffRecipe == nil ? prepared : prepared.flatMap { step in
-                defaultApp.flatMap { HandoffTool.bindRecipeStep(step, app: $0, state: observed) }
-            }
+            // Optional effect reads may be disabled or stale. Replays need their own fresh binding.
+            let scoped = replayed != nil
+                ? recipeRun.prepareReplay(plannedStep, number: number)
+                : recipeRun.prepared(plannedStep, number: number, before: stepApp == watchApp ? watchState : nil)
             guard let step = scoped else {
                 lastAttemptedStep = plannedStep
                 lastBrowserContinuationTab = nil
@@ -832,7 +841,7 @@ extension ComputerUseToolDispatcher {
 
             // Bring the app forward for the whole batch (foreground: true), or from the first step that opens
             // a dialog or editor on. The borrow stays until the batch's final read (see FocusBorrowSession).
-            if validatedHandoffRecipe == nil, !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
+            if replayed == nil, !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
                let app = step.arguments["app"] as? String, !app.isEmpty,
                let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
                foreground || stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) {
@@ -960,7 +969,8 @@ extension ComputerUseToolDispatcher {
                       !wantsScreenshot {
                 trailingObservation = .text(state)
             }
-            if let stop = recipeRun.verify(number: number, total: steps.count, lines: lines) {
+            if let stop = recipeRun.verify(number: number, total: steps.count, lines: lines,
+                                           observation: receipt.steps.last?.observation) {
                 lines.append(stop)
                 failed = true
                 receipt.stop = .recipeVerification
@@ -976,7 +986,7 @@ extension ComputerUseToolDispatcher {
             if remaining > 0 { Thread.sleep(forTimeInterval: min(0.35, remaining)) }
         }
 
-        let verificationWindow = pinnedWindow ?? (try? validatedQueryWindowID(lastAttemptedStep?.arguments["window_id"]))
+        let verificationWindow = replayed?.window?.id ?? pinnedWindow ?? (try? validatedQueryWindowID(lastAttemptedStep?.arguments["window_id"]))
         // One fresh look at the app after the steps (reuse a get_app_state the batch ended with).
         let lastBrowserAction = (lastAttemptedStep?.arguments["action"] as? String)?
             .trimmingCharacters(in: .whitespaces).lowercased()
@@ -1147,12 +1157,17 @@ extension ComputerUseToolDispatcher {
                     }
                     guard let state = LeanOutput.stateText(of: result),
                           !state.contains(SnapshotObservationOptions.accessibilityOmittedNote) else { return nil }
+                    if let expectedWindow = replayed?.window, BatchRecipes.Window(state: state) != expectedWindow { return nil }
                     if let verificationWindow {
                         let header = state.split(separator: "\n").prefix(3)
                         guard header.count == 3,
                               header.last.map(String.init) == "Window ID: \(verificationWindow)" else { return nil }
                     }
                     return state
+                }
+                if replayed != nil {
+                    guard let finalScreen else { return .missing(unmet: doneConditions.map(\.summary)) }
+                    return HandoffTool.check(doneConditions, screen: finalScreen)
                 }
                 return DoneCheck.check(doneConditions, evidence: DoneCheck.Evidence(
                     screenText: finalScreen,
@@ -1223,9 +1238,12 @@ extension ComputerUseToolDispatcher {
             }
         }
 
-        // Recipes: save a verified clean run, record a replay, heal locators (BatchRecipes.Run).
-        lines += recipeRun.finish(app: defaultApp ?? lastApp ?? "browser", steps: steps, lines: lines, failed: failed, stopped: stoppedForTime,
-                                  remember: remember, verifiedDone: verifiedDone)
+        // Record the replay or save a completed explicit run.
+        let replayWindowChanged = replayed != nil && receipt.stop == .windowChanged
+        lines += recipeRun.finish(app: defaultApp ?? lastApp ?? "browser", steps: steps, lines: lines,
+                                  failed: failed || replayWindowChanged, stopped: stoppedForTime && !replayWindowChanged,
+                                  remember: remember, verifiedDone: verifiedDone,
+                                  finalState: observation.flatMap { $0.isError ? nil : LeanOutput.stateText(of: $0) })
 
         // The final read is taken; hand focus back now rather than after the reply is composed.
         focus.close()

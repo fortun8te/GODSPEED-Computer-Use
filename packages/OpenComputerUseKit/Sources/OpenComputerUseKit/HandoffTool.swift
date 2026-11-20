@@ -369,11 +369,16 @@ enum HandoffTool {
 
     /// An unattended replay cannot type into an unknown focus, send shortcuts, or operate another app.
     static func isSafeRecipeStep(_ step: BatchTool.Step, app: String) -> Bool {
-        if let stepApp = step.arguments["app"] as? String, BatchRecipes.normalize(app) != BatchRecipes.normalize(stepApp) {
+        if let stepApp = step.arguments["app"] as? String, !BatchRecipes.sameApp(app, stepApp) {
             return false
         }
+        guard step.arguments["window_id"] == nil else { return false }
         switch step.tool {
-        case "get_app_state", "query", "wait":
+        case "get_app_state", "query":
+            return true
+        case "wait":
+            guard let wait = try? BatchEffects.Wait(arguments: step.arguments) else { return false }
+            if case .window = wait.kind { return false }
             return true
         case "click", "set_value":
             let args = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
@@ -393,18 +398,19 @@ enum HandoffTool {
         }
     }
 
-    /// Bind the executable step to the control it actually found, even if a stored locator healed.
+    /// Bind the executable step to fresh evidence from the original window.
     static func bindRecipeStep(_ step: BatchTool.Step, app: String, state: String?) -> BatchTool.Step? {
-        guard isSafeRecipeStep(step, app: app) else { return nil }
-        if step.isReadOnly { return step }
+        guard isSafeRecipeStep(step, app: app), let state, let window = observedWindowID(in: state) else { return nil }
         var args = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
-        guard let state, let window = observedWindowID(in: state), let label = args["label"] as? String else { return nil }
+        args["app"] = app
+        args["window_id"] = window
+        if step.isReadOnly { return BatchTool.Step(tool: step.tool, arguments: args) }
+        guard let label = args["label"] as? String else { return nil }
         let roles = step.tool == "set_value" ? fieldRoles : clickRoles
         let matches = parseControls(state).filter { roles.contains($0.role) && sameLabel($0.label, label) }
         guard matches.count == 1, let control = matches.first, !control.disabled else { return nil }
         args["label"] = nil
         args["element_index"] = String(control.index)
-        args["window_id"] = window
         if step.tool == "click" { args["click_method"] = "accessibility" }
         return BatchTool.Step(tool: step.tool, arguments: args)
     }
@@ -489,7 +495,7 @@ enum HandoffTool {
         var now: () -> TimeInterval
     }
 
-    enum Replay { case verified, incomplete, uncertain }
+    enum Replay { case verified, incomplete, uncertain, blocked(String) }
 
     static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
@@ -543,6 +549,7 @@ enum HandoffTool {
         var initialControls = parseControls(state)
         var initialExact = exactAction(request: request, controls: initialControls, tried: tried)
         if initialExact == nil, request.windowID == nil, let replayed = deps.replay(state) {
+            if case .blocked(let reason) = replayed { return finish(.escalate, reason, initial: initial, latest: state) }
             steps.append("replayed the saved recipe")
             if case .verified = replayed { return Outcome(kind: .done, reason: "\(doneSummary) (saved recipe)", steps: steps, changes: nil, options: []) }
             guard hasTime() else {
@@ -721,15 +728,23 @@ extension ComputerUseToolDispatcher {
             },
             replay: { [self] state in
                 // Recipe variables are named after field labels ("Name" -> "name"); the handoff's value keys map to them.
+                guard BatchRecipes.isEnabled else { return nil }
                 var recipeValues: [String: String] = [:]
-                for (key, value) in request.values { recipeValues[BatchRecipes.variableName(label: key)] = value }
-                let shape = BatchRecipes.windowShape(title: BatchEffects.windowTitle(in: state))
-                guard BatchRecipes.isEnabled,
-                      let recipe = BatchRecipes.shared.find(app: app, goal: request.goal, values: recipeValues, shape: shape)
-                else { return nil }
-                let storedSteps = BatchRecipes.substitute(recipe.steps, params: recipe.params, values: recipeValues).steps
-                guard let steps = try? BatchTool.parseSteps(storedSteps, defaultApp: app),
-                      steps.allSatisfy({ HandoffTool.isSafeRecipeStep($0, app: app) }) else { return nil }
+                for (key, value) in request.values {
+                    let name = BatchRecipes.variableName(label: key)
+                    guard recipeValues.updateValue(value, forKey: name) == nil else {
+                        return .blocked("More than one value names the same recipe slot. Confirm the inputs.")
+                    }
+                }
+                let recipe: BatchRecipes.Recipe
+                switch BatchRecipes.shared.lookup(app: app, goal: request.goal, values: recipeValues, state: state) {
+                case .match(let match): recipe = match
+                case .blocked(let reason): return .blocked(reason)
+                case .missing: return nil
+                }
+                guard recipe.doneWhen == request.doneWhen else {
+                    return .blocked("The recipe's done_when changed. Confirm the check and provide fresh steps.")
+                }
                 var batchArguments: [String: Any] = ["app": app, "goal": request.goal]
                 if !recipeValues.isEmpty { batchArguments["values"] = recipeValues }
                 if let doneWhen = arguments["done_when"] { batchArguments["done_when"] = doneWhen }
