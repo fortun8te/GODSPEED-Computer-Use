@@ -19,6 +19,8 @@ enum LeanOutput {
     static var semanticReplies: Bool { flag("OPEN_COMPUTER_USE_SEMANTIC_REPLIES") }
     /// Change-only replies shorter than this keep every line; longer ones may drop unnumbered lines.
     static let semanticTrimMinLength = 600
+    /// Diffs up to this size are sent as they are: a summary line would cost more than it saves.
+    nonisolated(unsafe) static var semanticSummaryMinDiffLength = 400
 
     private static func flag(_ key: String) -> Bool {
         let value = GodspeedSettings.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
@@ -82,7 +84,9 @@ enum LeanOutput {
     /// Kept: the diff's first line (it says indexes are current), numbered `+`/`-` lines, the
     /// "more lines removed" count and the "Unchanged" footer. Secret values are redacted by SemanticChanges.
     static func semanticDiffReply(header: String, diff: String, before: String, after: String) -> String {
-        guard let summary = SemanticChanges.summary(before: before, after: after) else {
+        // A short diff is already cheap to read; the summary line would only add tokens there.
+        guard diff.utf8.count > semanticSummaryMinDiffLength,
+              let summary = SemanticChanges.summary(before: before, after: after) else {
             return header + "\n" + diff
         }
         let eventCount = SemanticChanges.events(before: before, after: after, limit: 4).count
