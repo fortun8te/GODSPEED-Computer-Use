@@ -1251,16 +1251,11 @@ final class BrowserPage {
         let (head, last) = keyEvents ? BrowserRules.splitForTyping(text) : (text, nil)
         let document = node != nil ? try? documentIdentity() : nil
         var expected = replace ? text : nil
-        // An append is confirmed only against the exact value the insert should produce, so the field is read
-        // before the text goes in (this also covers text that already appears in the field).
-        if !replace, let node, document != nil {
-            expected = (try? callOnNode(node, """
-                function (text) {
-                  if (!this.matches('input,textarea') || this.type === 'password' ||
-                      !Number.isInteger(this.selectionStart) || !Number.isInteger(this.selectionEnd)) return null;
-                  return this.value.slice(0,this.selectionStart) + text + this.value.slice(this.selectionEnd);
-                }
-                """, arguments: [text])) as? String
+        // An append is confirmed only against the exact value the insert should produce. The value and caret are
+        // captured before the text goes in, for the named field or the focused one (this covers text that already
+        // appears in the field, and a dropped repeat of it).
+        if !replace {
+            expected = appendExpectation(for: node, typed: text)
         }
         do {
             if !head.isEmpty { _ = try cdp("Input.insertText", ["text": head]) }
@@ -1301,13 +1296,46 @@ final class BrowserPage {
         if let actual, let expected, actual == expected {
             outcome.deliveryState = .verified
         }
-        if !replace, node != nil, outcome.note == nil,
+        if !replace, outcome.note == nil,
            let note = BrowserRules.appendNote(expected: expected, actual: actual) {
             outcome.note = note
         }
         if watchSuggestions { outcome.options = comboOptions() }
         return outcome
     }
+
+    /// Captures the value and caret of the named field (or the focused field) before an append is sent.
+    /// Nil for editors that do not expose a value and selection, so the append stays unverified.
+    private func appendExpectation(for node: BrowserNode?, typed: String) -> String? {
+        let captured: Any?
+        if let node {
+            captured = try? callOnNode(node, Self.appendFieldJS)
+        } else {
+            captured = try? evaluate(Self.appendFieldActiveJS)
+        }
+        guard let row = captured as? [Any], row.count == 3, let value = row[0] as? String,
+              let start = BrowserRules.number(row[1]).flatMap({ Int(exactly: $0) }),
+              let end = BrowserRules.number(row[2]).flatMap({ Int(exactly: $0) }) else { return nil }
+        return BrowserRules.appendExpectation(value: value, selectionStart: start, selectionEnd: end, typed: typed)
+    }
+
+    private static let appendFieldJS = """
+        function () {
+          if (!this.matches('input,textarea') || this.type === 'password' ||
+              !Number.isInteger(this.selectionStart) || !Number.isInteger(this.selectionEnd)) return null;
+          return [this.value, this.selectionStart, this.selectionEnd];
+        }
+        """
+
+    private static let appendFieldActiveJS = """
+        (() => {
+          let element = document.activeElement;
+          while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+          if (!element || !element.matches || !element.matches('input,textarea') || element.type === 'password' ||
+              !Number.isInteger(element.selectionStart) || !Number.isInteger(element.selectionEnd)) return null;
+          return [element.value, element.selectionStart, element.selectionEnd];
+        })()
+        """
 
     /// The last typed character as a real key event (keyDown carrying the text, then keyUp).
     private func sendTypedCharacter(_ character: Character) throws {
@@ -2660,6 +2688,16 @@ enum BrowserRules {
     static func fieldMatches(actual: String, typed: String, replaced: Bool) -> Bool {
         if replaced { return spaces(actual) == spaces(typed) }
         return spaces(actual).contains(spaces(typed))
+    }
+
+    /// ACT-07: the value an append must produce, from the field's value and selection captured before the text is
+    /// sent. Offsets are UTF-16 units, as Chrome reports them. Nil when the selection does not fit the value.
+    static func appendExpectation(value: String, selectionStart: Int, selectionEnd: Int, typed: String) -> String? {
+        let units = Array(value.utf16)
+        guard selectionStart >= 0, selectionStart <= selectionEnd, selectionEnd <= units.count else { return nil }
+        let head = String(decoding: units[..<selectionStart], as: UTF16.self)
+        let tail = String(decoding: units[selectionEnd...], as: UTF16.self)
+        return head + typed + tail
     }
 
     /// Note for an append whose result is not confirmed: `expected` is the field value the insert should have
