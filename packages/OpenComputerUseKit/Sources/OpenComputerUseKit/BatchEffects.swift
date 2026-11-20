@@ -196,6 +196,36 @@ enum BatchEffects {
         WindowSig(id: id, title: windowTitle(in: state), dialog: dialog(in: state))
     }
 
+    struct Watch {
+        let text: String
+        let sig: WindowSig
+        let result: ToolCallResult
+
+        /// Reuse only a complete read of the same app and exact window. An
+        /// unchanged read or dialog transition still needs the original check.
+        static func afterAction(
+            snapshot: AppSnapshot?, before: String, tool: String, fallback: () -> Watch?
+        ) -> Watch? {
+            guard ["click", "type_text", "set_value", "scroll"].contains(tool),
+                  let snapshot, let id = snapshot.observedWindowID else { return fallback() }
+            let result = LeanOutput.condensed(.text(snapshot.renderedText))
+            guard let text = LeanOutput.stateText(of: result),
+                  let sig = reusableSignature(before: before, after: text, id: id) else { return fallback() }
+            return Watch(text: text, sig: sig, result: result)
+        }
+
+        static func reusableSignature(before: String, after: String, id: UInt32) -> WindowSig? {
+            let head = before.split(separator: "\n", maxSplits: 3).prefix(3)
+            guard head.count == 3, head.last == "Window ID: \(id)",
+                  head.first == after.split(separator: "\n", maxSplits: 1).first,
+                  after != before, DoneCheck.supportsAbsenceCheck(before), DoneCheck.supportsAbsenceCheck(after),
+                  !before.contains("the app hides its web content"), !after.contains("the app hides its web content")
+            else { return nil }
+            let sig = BatchEffects.windowSig(state: after, id: id)
+            return sig.dialog == BatchEffects.dialog(in: before) ? sig : nil
+        }
+    }
+
     /// The title from `Window: "Untitled", App: Notes.`
     static func windowTitle(in state: String) -> String? {
         guard let line = state.split(separator: "\n", maxSplits: 4).first(where: { $0.hasPrefix("Window: ") }),

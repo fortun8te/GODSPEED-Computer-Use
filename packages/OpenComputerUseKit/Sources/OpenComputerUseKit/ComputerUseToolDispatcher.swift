@@ -259,6 +259,7 @@ public final class ComputerUseToolDispatcher {
             let snapshot = latest ?? actionObservation.read {
                 SmartSteps.freshSnapshot(app: app, service: service)
             }
+            log.afterActionSnapshot = snapshot
             if let snapshot, let line = SmartSteps.dialogLine(in: SmartSteps.nodes(of: snapshot)) {
                 log.tail(line)
             }

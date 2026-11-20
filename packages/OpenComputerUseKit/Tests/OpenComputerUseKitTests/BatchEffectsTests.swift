@@ -7,6 +7,18 @@ final class BatchEffectsTests: XCTestCase {
         (["App=com.example (pid 1)", "Window: \"\(title)\", App: Example.", "[legend]"] + rows).joined(separator: "\n")
     }
 
+    func testReusesChangedWindowEvidenceOnlyWithCompleteMatchingScope() {
+        let head = "App=test.app (pid 42)\nWindow: \"Editor\", App: Test.\nWindow ID: 17\n"
+        let before = head + "1 text field Title = old"
+        let after = head + "1 text field Title = new"
+        XCTAssertEqual(BatchEffects.Watch.reusableSignature(before: before, after: after, id: 17)?.id, 17)
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: before, id: 17))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after, id: 18))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after.replacingOccurrences(of: "42", with: "43"), id: 17))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after + "\n2 sheet Save", id: 17))
+        XCTAssertNil(BatchEffects.Watch.reusableSignature(before: before, after: after + "\n[Accessibility tree truncated: omitted]", id: 17))
+    }
+
     func testCheckboxChangeReadsAsOldToNew() {
         var gone = Set<Int>()
         let lines = BatchEffects.effectLines(
