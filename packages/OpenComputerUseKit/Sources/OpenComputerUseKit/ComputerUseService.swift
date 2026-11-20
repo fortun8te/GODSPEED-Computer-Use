@@ -1224,6 +1224,66 @@ public final class ComputerUseService {
         return try actionResult(for: query, recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod))
     }
 
+    func preciseClick(app query: String, elementIndex: String?, x: Double?, y: Double?, placement: ClickPlacement,
+                      hasPlacement: Bool, count: Int, buttonName: String, modifiers: [String]) throws -> ToolCallResult {
+        guard let button = MouseButtonKind(rawValue: buttonName.lowercased()), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Use left, right or middle. Multiple clicks need the left button.")
+        }
+        guard elementIndex != nil ? x == nil && y == nil : !hasPlacement && count == 1 && x != nil && y != nil else {
+            throw ComputerUseError.invalidArguments("Use a control for anchors, offsets or multiple clicks. A single click can use both screenshot coordinates.")
+        }
+        let flags = try dragModifierFlags(modifiers)
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        guard let windowID = snapshot.targetWindowID, let bounds = snapshot.windowBounds, snapshot.mode != .fixture else {
+            throw ComputerUseError.backgroundUnsupported("Precise clicks need a native target window.")
+        }
+        let record = try elementIndex.map { try lookupElement(snapshot: snapshot, index: $0) }
+        let point: CGPoint
+        if let record, let elementIndex {
+            try refuseDisabledControl(record, elementIndex: elementIndex)
+            guard let frame = record.localFrame else {
+                throw ComputerUseError.stateUnavailable("The control has no readable frame.")
+            }
+            point = try placement.point(in: frame)
+        } else if let x, let y, snapshot.observation.includeScreenshot {
+            point = try screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: CGPoint(x: x, y: y))
+        } else {
+            throw ComputerUseError.stateUnavailable("Read the target window with a screenshot before clicking by pixels.")
+        }
+        let screen = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
+        let location = inputEventPoint(fromScreenStatePoint: screen)
+        let target = BackgroundDragTarget(start: location, end: location, windowBounds: bounds,
+                                          windowID: windowID, pid: snapshot.app.pid)
+        let visual = makeVisualCursorTarget(at: screen, targetWindowID: windowID, targetWindowLayer: snapshot.targetWindowLayer)
+        moveVisualCursor(to: visual)
+        defer { settleVisualCursor(at: visual) }
+        try BackgroundDragDispatcher.click(target: target, button: button, count: count, flags: flags) {
+            if let record, let elementIndex {
+                try self.validatePointerTarget(record, index: elementIndex, point: point, snapshot: snapshot)
+            }
+        }
+        pulseVisualCursor(at: visual, clickCount: count, mouseButton: button)
+        let state = try actionResult(for: query, recoveryPolicy: .readOnly)
+        return ToolCallResult(content: [.text("Delivered \(count) click event pair(s).")] + state.content, isError: state.isError)
+    }
+
+    private func validatePointerTarget(_ record: ElementRecord, index: String, point: CGPoint, snapshot: AppSnapshot) throws {
+        _ = try keptRecord(record, index: index, snapshot: snapshot)
+        try refuseDisabledControl(record, elementIndex: index)
+        guard let element = record.element, let window = snapshot.windowElement,
+              SnapshotBuilder.belongsToWindow(element, window: window),
+              localFrame(of: element, windowBounds: snapshot.windowBounds) == record.localFrame,
+              var hit = try hitTestElement(at: point, in: snapshot)?.element else {
+            throw ComputerUseError.stateUnavailable("The control moved or its hit point could not be verified. Read the window again.")
+        }
+        for _ in 0..<24 {
+            if CFEqual(hit, element) { return }
+            guard let parent = copyParent(of: hit) else { break }
+            hit = parent
+        }
+        throw ComputerUseError.stateUnavailable("Another control covers the target point.")
+    }
+
     public func performSecondaryAction(app query: String, elementIndex: String, action: String) throws -> ToolCallResult {
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
@@ -1269,7 +1329,12 @@ public final class ComputerUseService {
     }
 
     public func hover(app query: String, elementIndex: String) throws -> ToolCallResult {
-        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        try hover(app: query, elementIndex: elementIndex, dwell: nil)
+    }
+
+    func hover(app query: String, elementIndex: String, dwell: TimeInterval?) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex,
+                                             recoveryPolicy: dwell == nil ? .allowActivation : .readOnly)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
         if Self.requiredRefGeneration != nil {
             guard let element = record.element, let frame = record.localFrame,
@@ -1282,6 +1347,10 @@ public final class ComputerUseService {
               let point = try globalPoint(for: record, snapshot: snapshot) else {
             throw ComputerUseError.stateUnavailable("Hover requires an element with a frame inside the observed Mac window.")
         }
+        if let dwell, let local = localCenter(for: record) {
+            try validatePointerTarget(record, index: elementIndex, point: local, snapshot: snapshot)
+            try ActionOptions.requireTime(for: dwell + 0.1)
+        }
         let location = inputEventPoint(fromScreenStatePoint: point)
         try BackgroundDragDispatcher.hover(target: BackgroundDragTarget(
             start: location, end: location, windowBounds: bounds, windowID: windowID, pid: snapshot.app.pid
@@ -1289,9 +1358,15 @@ public final class ComputerUseService {
         let visualTarget = visualCursorTarget(for: record, snapshot: snapshot)
         moveVisualCursor(to: visualTarget)
         settleVisualCursor(at: visualTarget)
-        pauseBeforeReadBack(0.1, windowID: windowID)
-        let state = try actionResult(for: query)
-        return ToolCallResult(content: [.text("Hover event delivered. Check the app state for the expected effect.")] + state.content,
+        if let dwell, dwell > 0 {
+            Thread.sleep(forTimeInterval: dwell)
+        } else {
+            pauseBeforeReadBack(0.1, windowID: windowID)
+        }
+        let state = try actionResult(for: query, recoveryPolicy: dwell == nil ? .allowActivation : .readOnly)
+        let note = dwell.map { "Hovered for \(Int(($0 * 1000).rounded())) ms. Check the resulting state." }
+            ?? "Hover event delivered. Check the app state for the expected effect."
+        return ToolCallResult(content: [.text(note)] + state.content,
                               isError: state.isError)
     }
 
@@ -1300,8 +1375,8 @@ public final class ComputerUseService {
         guard ["up", "down", "left", "right"].contains(normalized) else {
             throw ComputerUseError.message("Invalid scroll direction: \(direction)")
         }
-        guard pages.isFinite, pages > 0 else {
-            throw ComputerUseError.message("pages must be > 0")
+        guard pages.isFinite, pages > 0, pages <= 100 else {
+            throw ComputerUseError.invalidArguments("pages must be greater than 0 and at most 100")
         }
 
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
@@ -1364,6 +1439,214 @@ public final class ComputerUseService {
         return try actionResult(for: query)
     }
 
+    func scroll(app query: String, direction: String, elementIndex: String, chunks: ScrollChunks) throws -> ToolCallResult {
+        let direction = direction.lowercased()
+        guard ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("scroll direction must be up, down, left or right")
+        }
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        guard let bounds = snapshot.windowBounds, let window = snapshot.windowElement,
+              let id = snapshot.targetWindowID, let element = record.element,
+              let area = scrollAncestor(of: element, in: window, includingSelf: true) else {
+            throw ComputerUseError.backgroundUnsupported("Choose an accessibility scroll area in the observed window.")
+        }
+        let horizontal = direction == "left" || direction == "right"
+        let barAttribute = horizontal ? kAXHorizontalScrollBarAttribute : kAXVerticalScrollBarAttribute
+        func position() throws -> Double {
+            guard let bar = Self.elementAttribute(area, barAttribute), let value = nativeObservedValue(bar),
+                  let number = Double(value), number.isFinite else {
+                throw ComputerUseError.backgroundUnsupported("This scroll area has no readable scroll position.")
+            }
+            return number
+        }
+        func validate() throws -> TargetedAX.WindowContext {
+            try requireUsableComputerUseSession()
+            let context = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(context.windowElement, window), context.windowBounds == bounds,
+                  SnapshotBuilder.belongsToWindow(area, window: window) else {
+                throw ComputerUseError.stateUnavailable("The scroll window changed. Read it before continuing.")
+            }
+            return context
+        }
+        let outcome = try chunks.run(visible: {
+            let context = try validate()
+            guard let label = chunks.untilVisible else { return false }
+            let matches = try SnapshotBuilder.targetedSearch(
+                .init(text: label, exact: true, role: nil, limit: 20, maxNodes: 500), in: context
+            )
+            let visible = matches.records.filter { candidate in
+                guard let el = candidate.element,
+                      let ancestor = scrollAncestor(of: el, in: window),
+                      CFEqual(ancestor, area) else { return false }
+                return nativeFrameIsInView(el, snapshot: snapshot)
+            }
+            return visible.count == 1 && matches.stopReason == nil
+        }, advance: {
+            _ = try validate()
+            let before = try position()
+            if chunks.unit == .pages {
+                let requested = "AXScroll\(direction.capitalized)ByPage"
+                guard let action = copyActions(for: area)?.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) else {
+                    throw ComputerUseError.backgroundUnsupported("This area exposes no AX page scroll. Try unit points or lines.")
+                }
+                let status = AXUIElementPerformAction(area, action as CFString)
+                guard status == .success else {
+                    throw ComputerUseError.stateUnavailable("AX scroll returned \(status.rawValue). Check the position before trying another step.")
+                }
+            } else {
+                guard let frame = localFrame(of: area, windowBounds: bounds) else {
+                    throw ComputerUseError.stateUnavailable("The scroll area has no current frame.")
+                }
+                let viewport = frame.intersection(CGRect(origin: .zero, size: bounds.size))
+                guard !viewport.isEmpty else {
+                    throw ComputerUseError.stateUnavailable("The scroll area is outside the window.")
+                }
+                let point = try windowPointToGlobalPoint(snapshot: snapshot, point: CGPoint(x: viewport.midX, y: viewport.midY))
+                let location = inputEventPoint(fromScreenStatePoint: point)
+                try BackgroundDragDispatcher.scroll(target: .init(start: location, end: location, windowBounds: bounds, windowID: id, pid: snapshot.app.pid),
+                                                    direction: direction, unit: chunks.unit, size: chunks.size)
+            }
+            // Allow a short asynchronous AX update before treating this chunk as stalled.
+            for _ in 0..<3 {
+                Thread.sleep(forTimeInterval: 0.05)
+                _ = try validate()
+                if try position() != before { return true }
+            }
+            return false
+        })
+        return .text(try outcome.reply(label: chunks.untilVisible))
+    }
+
+    func zoomControl(app query: String, elementIndex: String, increase: Bool) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        try refuseDisabledControl(record, elementIndex: elementIndex)
+        let action = increase ? kAXIncrementAction : kAXDecrementAction
+        guard let element = record.element, let id = snapshot.targetWindowID, let window = snapshot.windowElement,
+              let before = nativeObservedValue(element), let value = Double(before), value.isFinite,
+              let raw = matchingAction(requested: action, record: record) else {
+            throw ComputerUseError.backgroundUnsupported("This zoom control has no readable value or matching accessibility action.")
+        }
+        let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+        guard CFEqual(live.windowElement, window), SnapshotBuilder.belongsToWindow(element, window: window) else {
+            throw windowBindingError(id)
+        }
+        try requireUsableComputerUseSession()
+        let outcome = AXUIElementPerformAction(element, raw as CFString)
+        guard outcome == .success else {
+            throw ComputerUseError.stateUnavailable("The zoom control returned \(outcome.rawValue). Inspect its value before repeating.")
+        }
+        let deadline = BrowserCallBudget.deadline(after: min(0.4, BrowserCallBudget.remaining()))
+        repeat {
+            if let after = nativeObservedValue(element), let next = Double(after), next.isFinite,
+               increase ? next > value : next < value {
+                return .text("Zoom control changed to \(after).")
+            }
+            Thread.sleep(forTimeInterval: min(0.04, max(0, deadline - ProcessInfo.processInfo.systemUptime)))
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        throw ComputerUseError.stateUnavailable("Zoom action delivered. The control did not report the expected change.")
+    }
+
+    func waitForControl(app query: String, wait: ControlWait) throws -> ToolCallResult {
+        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+        return .text(try waitForControl(in: snapshot, wait: wait))
+    }
+
+    private func waitForControl(in snapshot: AppSnapshot, wait: ControlWait) throws -> String {
+        guard let id = snapshot.targetWindowID, let window = snapshot.windowElement else {
+            throw ComputerUseError.backgroundUnsupported("This wait requires an observed native window.")
+        }
+        let reply = try wait.run { () -> ControlWait.Sample<AXWaitIdentity> in
+            try requireUsableComputerUseSession()
+            let context = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(context.windowElement, window) else {
+                throw ComputerUseError.stateUnavailable("The observed window changed during the wait.")
+            }
+            let search = try SnapshotBuilder.targetedSearch(
+                .init(text: wait.label, exact: true, role: nil, limit: 10, maxNodes: 1000), in: context
+            )
+            if search.records.isEmpty {
+                return search.truncated ? .unreadable : .absent
+            }
+            guard wait.condition == .valueChanged else { return .present }
+            guard !search.truncated, search.records.count == 1, let record = search.records.first,
+                  let element = record.element, let value = nativeObservedValue(element) else {
+                return .unreadable
+            }
+            return .value(AXWaitIdentity(element: element), value)
+        }
+        return reply
+    }
+
+    private struct AXWaitIdentity: Equatable {
+        let element: AXUIElement
+        static func == (lhs: Self, rhs: Self) -> Bool { CFEqual(lhs.element, rhs.element) }
+    }
+
+    func scrollIntoView(app query: String, elementIndex: String) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        guard let element = record.element, let window = snapshot.windowElement, let id = snapshot.targetWindowID else {
+            throw ComputerUseError.backgroundUnsupported("This control has no verifiable Mac window.")
+        }
+        func validateWindow() throws {
+            try requireUsableComputerUseSession()
+            let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(live.windowElement, window), live.windowBounds == snapshot.windowBounds,
+                  SnapshotBuilder.belongsToWindow(element, window: window) else {
+                throw ComputerUseError.stateUnavailable("The control or its window changed. Read it again.")
+            }
+        }
+        try validateWindow()
+        if nativeFrameIsInView(element, snapshot: snapshot) { return .text("Control already in view.") }
+        guard let action = matchingAction(requested: "AXScrollToVisible", record: record) else {
+            throw ComputerUseError.backgroundUnsupported("This control exposes no AXScrollToVisible action. Try scroll with until_visible.")
+        }
+        let result = AXUIElementPerformAction(element, action as CFString)
+        guard result == .success else {
+            throw ComputerUseError.stateUnavailable("AXScrollToVisible returned \(result.rawValue). Check the window before retrying.")
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+        try validateWindow()
+        guard nativeFrameIsInView(element, snapshot: snapshot) else {
+            throw ComputerUseError.stateUnavailable("The app accepted the scroll. The control could not be confirmed in view.")
+        }
+        return .text("Control scrolled into view.")
+    }
+
+    private func scrollAncestor(of element: AXUIElement, in window: AXUIElement, includingSelf: Bool = false) -> AXUIElement? {
+        var current: AXUIElement? = includingSelf ? element : copyParent(of: element)
+        for _ in 0..<24 {
+            guard let node = current, !CFEqual(node, window) else { break }
+            if stringValue(of: node, attribute: kAXRoleAttribute) == kAXScrollAreaRole as String { return node }
+            current = copyParent(of: node)
+        }
+        return nil
+    }
+
+    private func nativeFrameIsInView(_ element: AXUIElement, snapshot: AppSnapshot) -> Bool {
+        guard let bounds = snapshot.windowBounds, let window = snapshot.windowElement,
+              let frame = localFrame(of: element, windowBounds: bounds), !frame.isEmpty else { return false }
+        var visible = frame.intersection(CGRect(origin: .zero, size: bounds.size))
+        var current = element
+        for _ in 0..<16 {
+            guard !visible.isEmpty else { return false }
+            guard let area = scrollAncestor(of: current, in: window) else { return true }
+            guard let clip = localFrame(of: area, windowBounds: bounds) else { return false }
+            visible = visible.intersection(clip)
+            current = area
+        }
+        return false
+    }
+
+    private func nativeObservedValue(_ element: AXUIElement) -> String? {
+        guard !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) else { return nil }
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &raw) == .success else { return nil }
+        return (raw as? String) ?? (raw as? NSNumber)?.stringValue
+    }
+
     public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double, modifiers: [String] = []) throws -> ToolCallResult {
         guard [fromX, fromY, toX, toY].allSatisfy(\.isFinite) else {
             throw ComputerUseError.invalidArguments("drag requires finite coordinates")
@@ -1420,6 +1703,62 @@ public final class ComputerUseService {
             to: try actionResult(for: query, recoveryPolicy: recoveryPolicy),
             path: path
         )
+    }
+
+    func dragBetween(app query: String, sourceIndex: String?, destinationIndex: String?,
+                     fromX: Double?, fromY: Double?, toX: Double?, toY: Double?,
+                     modifiers: [String], options: DragOptions) throws -> ToolCallResult {
+        try DragOptions.validateEndpoint(index: sourceIndex, x: fromX, y: fromY, name: "source")
+        try DragOptions.validateEndpoint(index: destinationIndex, x: toX, y: toY, name: "destination")
+        let flags = try dragModifierFlags(modifiers)
+        let snapshot = try snapshotForAction(app: query,
+            elementIndex: sourceIndex == nil || destinationIndex == nil ? nil : sourceIndex, recoveryPolicy: .readOnly)
+        guard let id = snapshot.targetWindowID, let bounds = snapshot.windowBounds,
+              let window = snapshot.windowElement, snapshot.mode != .fixture else {
+            throw ComputerUseError.backgroundUnsupported("An element drag needs a readable native window.")
+        }
+        func endpoint(_ index: String?, _ x: Double?, _ y: Double?) throws -> (CGPoint, () throws -> Void) {
+            if let index {
+                let endpointSnapshot = try snapshotForAction(app: query, elementIndex: index, recoveryPolicy: .readOnly)
+                guard endpointSnapshot.targetWindowID == id, endpointSnapshot.windowBounds == bounds,
+                      let endpointWindow = endpointSnapshot.windowElement, CFEqual(endpointWindow, window) else {
+                    throw ComputerUseError.invalidArguments("Drag endpoints must be in the same observed window.")
+                }
+                let record = try lookupElement(snapshot: endpointSnapshot, index: index)
+                guard let local = localCenter(for: record) else {
+                    throw ComputerUseError.stateUnavailable("Drag control has no readable frame.")
+                }
+                return (try windowPointToGlobalPoint(snapshot: snapshot, point: local), {
+                    try self.validatePointerTarget(record, index: index, point: local, snapshot: endpointSnapshot)
+                })
+            }
+            guard let x, let y, snapshot.observation.includeScreenshot,
+                  let size = screenshotPixelSize(snapshot: snapshot),
+                  CGRect(origin: .zero, size: size).contains(CGPoint(x: x, y: y)) else {
+                throw ComputerUseError.stateUnavailable("Drag coordinates need an observed point inside the window screenshot.")
+            }
+            return (try screenshotToGlobalPoint(snapshot: snapshot, x: x, y: y), {})
+        }
+        let (start, checkStart) = try endpoint(sourceIndex, fromX, fromY)
+        let (end, checkEnd) = try endpoint(destinationIndex, toX, toY)
+        guard start != end else { throw ComputerUseError.invalidArguments("Drag endpoints must be distinct.") }
+        let target = BackgroundDragTarget(start: inputEventPoint(fromScreenStatePoint: start),
+            end: inputEventPoint(fromScreenStatePoint: end), windowBounds: bounds, windowID: id, pid: snapshot.app.pid)
+        let visual = makeVisualCursorTarget(at: start, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
+        let finish = makeVisualCursorTarget(at: end, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
+        try withVisualFeedback(.drag, at: visual, completingAt: finish) {
+            try BackgroundDragDispatcher.drag(target: target, flags: flags, steps: options.steps ?? 10, hold: options.hold,
+                validateEndpoints: {
+                    try checkStart()
+                    try checkEnd()
+                })
+        }
+        if let verified = try options.verifiedDrop({ try waitForControl(in: snapshot, wait: $0) }) {
+            return .text(verified)
+        }
+        let state = try actionResult(for: query, recoveryPolicy: .readOnly)
+        return ToolCallResult(content: [.text("Drag delivered. Use the resulting state to verify the drop.")] + state.content,
+                              isError: state.isError)
     }
 
     public func typeText(app query: String, text: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
@@ -1830,6 +2169,41 @@ public final class ComputerUseService {
         }
     }
 
+    func holdKey(app query: String, key: String, method: KeyMethod, hold: TimeInterval) throws -> ToolCallResult {
+        let parsed = try KeyPressParser.parse(key)
+        guard PrivateClipboard.Action(key: key) == nil else {
+            throw ComputerUseError.backgroundUnsupported("Clipboard shortcuts use the private clipboard and cannot be held.")
+        }
+        guard method == .auto else {
+            throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
+        }
+        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+        guard let id = snapshot.targetWindowID, let window = snapshot.windowElement, snapshot.mode != .fixture else {
+            throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
+        }
+        let io = BackgroundDragIO.system()
+        let validate = {
+            try requireUsableComputerUseSession()
+            guard !FocusBorrow.isBorrowed(pid: snapshot.app.pid), !(try io.needsFocus(snapshot.app.pid)) else {
+                throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
+            }
+            let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(window, live.windowElement), live.windowBounds == snapshot.windowBounds else {
+                throw self.windowBindingError(id)
+            }
+            try Self.$requiredWindowID.withValue(id) { try self.requireBoundFocusedWindow(in: snapshot) }
+        }
+        try ActionOptions.requireTime(for: hold + 0.3)
+        let pid = snapshot.app.pid
+        let launch = snapshot.app.runningApplication.launchDate
+        try InputSimulation.deliverHeldKey(parsed, hold: hold, validate: validate, post: { $0.postToPid(pid) }, release: { event in
+            if let process = NSRunningApplication(processIdentifier: pid), !process.isTerminated, process.launchDate == launch {
+                event.postToPid(pid)
+            }
+        })
+        return .text("Held \(key) for \(Int((hold * 1000).rounded())) ms and released.")
+    }
+
     public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
         let recoveryPolicy = backgroundOnlyMode() ? .readOnly : keyActionSnapshotRecoveryPolicy(for: keyMethod)
         let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: recoveryPolicy)
@@ -2050,7 +2424,25 @@ public final class ComputerUseService {
         suffix: String?,
         selection: TextSelectionMode
     ) throws -> ToolCallResult {
-        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        try selectText(app: query, elementIndex: elementIndex, text: text, prefix: prefix, suffix: suffix,
+                       selection: selection, range: nil)
+    }
+
+    func selectText(app query: String, elementIndex: String, text: String, prefix: String?, suffix: String?,
+                    selection: TextSelectionMode, range: TextRangeRequest?) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex,
+                                             recoveryPolicy: range == nil ? .allowActivation : .readOnly)
+        func resolve(in value: String) throws -> TextSelectionTarget {
+            if let range { return try TextSelectionResolver.resolve(value: value, start: range.start, length: range.length) }
+            return try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
+                                            selection: selection, elementIndex: elementIndex)
+        }
+        func verified(_ target: TextSelectionTarget) throws -> ToolCallResult {
+            let result = try actionResult(for: query, recoveryPolicy: .readOnly)
+            guard range != nil else { return result }
+            let note = "Selected range \(target.location), length \(target.length)."
+            return ToolCallResult(content: [.text(note)] + result.content, isError: result.isError)
+        }
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
 
         if snapshot.mode == .fixture {
@@ -2059,20 +2451,20 @@ public final class ComputerUseService {
                   let value = state.elements.first(where: { $0.identifier == identifier })?.value else {
                 throw ComputerUseError.invalidArguments("fixture select_text requires a readable input element")
             }
-            let target = try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
-                                                 selection: selection, elementIndex: elementIndex)
+            let target = try resolve(in: value)
             let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
             moveVisualCursor(to: cursorTarget)
             defer { settleVisualCursor(at: cursorTarget) }
             try FixtureBridge.post(FixtureCommand(kind: "select_text", identifier: identifier, value: text,
-                                                 selection: selection.rawValue, prefix: prefix, suffix: suffix))
+                                                 selection: selection.rawValue, prefix: prefix, suffix: suffix,
+                                                 rangeStart: range?.start, rangeLength: range?.length))
             let deadline = Date().addingTimeInterval(1)
             while Date() < deadline {
                 if let applied = try FixtureBridge.readState(), applied.focusedIdentifier == identifier,
                    applied.selectedRangeLocation == target.location, applied.selectedRangeLength == target.length,
                    let current = applied.elements.first(where: { $0.identifier == identifier })?.value,
                    current.utf16.elementsEqual(value.utf16) {
-                    return try actionResult(for: query, recoveryPolicy: .readOnly)
+                    return try verified(target)
                 }
                 Thread.sleep(forTimeInterval: 0.01)
             }
@@ -2083,11 +2475,11 @@ public final class ComputerUseService {
         guard let element = record.element else {
             throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
         }
-        guard let value = stringValue(of: element, attribute: kAXValueAttribute) else {
+        guard !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)),
+              let value = stringValue(of: element, attribute: kAXValueAttribute) else {
             throw ComputerUseError.message(selectTextUnreadableValueErrorMessage(elementIndex: elementIndex))
         }
-        let target = try resolveTextSelection(value: value, text: text, prefix: prefix, suffix: suffix,
-                                             selection: selection, elementIndex: elementIndex)
+        let target = try resolve(in: value)
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &settable) == .success,
               settable.boolValue else {
@@ -2103,7 +2495,7 @@ public final class ComputerUseService {
             writeRange: { try AccessibilityTextSelection.writeRange($0, to: element) },
             readRange: { AccessibilityTextSelection.readRange(of: element) }
         )
-        return try actionResult(for: query, recoveryPolicy: .readOnly)
+        return try verified(target)
     }
 
     private func resolveTextSelection(value: String, text: String, prefix: String?, suffix: String?,
@@ -2172,7 +2564,7 @@ public final class ComputerUseService {
     /// The snapshot an element action runs against. A queried index resolves to
     /// that control's own window context with no snapshot; any other index uses
     /// the normal current snapshot.
-    private func snapshotForAction(app query: String, elementIndex: String?) throws -> AppSnapshot {
+    private func snapshotForAction(app query: String, elementIndex: String?, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
         if Self.requiredRefGeneration == nil,
            let elementIndex, let index = Int(elementIndex), index > TargetedElementRegistry<TargetedElement>.indexBase {
             try requireUsableComputerUseSession()
@@ -2193,7 +2585,7 @@ public final class ComputerUseService {
                 throw error
             }
         }
-        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil)
+        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil, recoveryPolicy: recoveryPolicy)
     }
 
     private func registerTargetedElement(record source: ElementRecord, context: TargetedAX.WindowContext,
@@ -2308,7 +2700,7 @@ public final class ComputerUseService {
     /// in the app's current window. Clickable roles win over others; a partial match (3+ characters)
     /// is the last resort. A miss re-reads the window once, so an item that appeared after an earlier
     /// step (an opened menu) is found. Returns the record too, so callers can see role and value.
-    func resolveLabel(app query: String, labels: [String]) throws -> ElementRecord {
+    func resolveLabel(app query: String, labels: [String], strict: Bool = false) throws -> ElementRecord {
         // Compared without spaces, so "All Clear" matches the identifier "AllClear".
         func norm(_ s: String?) -> String {
             (s ?? "").replacingOccurrences(of: " External link", with: "").lowercased().filter { !$0.isWhitespace }
@@ -2379,6 +2771,12 @@ public final class ComputerUseService {
                 let t = norm(r.title)
                 return [t, norm(r.identifier), norm(r.identity?.name), t.isEmpty ? norm(r.value) : ""].filter { !$0.isEmpty }
             }
+            if strict {
+                for w in given {
+                    if let hit = try single(all.filter { names($0).contains(w) }, names: names) { return hit }
+                }
+                return nil
+            }
             let buttons = all.filter { clickable.contains(roleKey($0.role)) }
             for pool in [buttons, all] {
                 for w in given {
@@ -2428,6 +2826,15 @@ public final class ComputerUseService {
                 return try single(buttons.filter { names($0).contains(where: { $0.contains(w) }) }, names: names)
             }
             return nil
+        }
+
+        // The strict route preserves the current observation and never heals a missing target.
+        if strict {
+            let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+            guard let hit = try find(in: snapshot) else {
+                throw ComputerUseError.stateUnavailable("No exact control matches '\(labels[0])'. Read the window again.")
+            }
+            return hit
         }
 
         // A cached state may list controls that are gone, so an ambiguity there is checked against a fresh read.

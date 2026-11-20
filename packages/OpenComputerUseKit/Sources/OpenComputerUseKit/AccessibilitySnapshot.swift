@@ -2797,7 +2797,7 @@ extension SnapshotBuilder {
     static func targetedSearch(
         _ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext, timeout: TimeInterval = 2
     ) throws -> TargetedAX.SearchResult {
-        let deadline = TimingLog.now() + timeout
+        let deadline = TimingLog.now() + min(timeout, BrowserCallBudget.activeRemaining ?? timeout)
         let expired = { ProcessInfo.processInfo.systemUptime >= deadline }
         var scans: [AXSearchNode: NodeScan] = [:]
         var records: [AXSearchNode: ElementRecord] = [:]

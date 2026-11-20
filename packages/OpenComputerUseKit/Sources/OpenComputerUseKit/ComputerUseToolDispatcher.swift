@@ -141,6 +141,12 @@ public final class ComputerUseToolDispatcher {
         // encoded data stayed alive for the whole session.
         // Every state text the model sees is condensed (LeanOutput); indexes are kept.
         // A batch's state was already condensed when its own read went through here.
+        // Lane 9 actions take the checked route without automatic retargeting or focus borrowing.
+        if ActionOptions.usesStrictRoute(name, arguments) {
+            let result = try autoreleasepool { try dispatchTool(name: name, arguments: arguments, log: log) }
+            return notesInResult ? log.apply(to: LeanOutput.condensed(result)) : LeanOutput.condensed(result)
+        }
+
         // System Settings: a pane's name opens the pane by its link (its sidebar is often unreadable).
         if !StrictBackground.enabled(), ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
            let app = arguments["app"] as? String, SettingsPanes.isSettings(app),
@@ -499,6 +505,25 @@ public final class ComputerUseToolDispatcher {
                 windowID: try validatedQueryWindowID(arguments["window_id"])
             )
         case "click":
+            // Precise clicks use one window-addressed route and never fall back to vision.
+            if ActionOptions.usesStrictRoute(name, arguments) {
+                let app = try requireString("app", in: arguments)
+                let method = try parseClickMethod(optionalString("click_method", in: arguments))
+                guard method == .auto || method == .appPost else {
+                    throw ComputerUseError.backgroundUnsupported("Precise clicks use window-addressed delivery.")
+                }
+                let count = try ActionOptions.integer("click_count", in: arguments, range: 1...3) ?? 1
+                let button = optionalString("mouse_button", in: arguments) ?? "left"
+                let modifiers = arguments["modifiers"] as? [String]
+                guard arguments["modifiers"] == nil || modifiers != nil else {
+                    throw ComputerUseError.invalidArguments("modifiers must be an array of key names")
+                }
+                let index = try strictActionIndex(app: app, arguments: arguments)
+                return try service.preciseClick(app: app, elementIndex: index,
+                    x: optionalDouble("x", in: arguments), y: optionalDouble("y", in: arguments),
+                    placement: ClickPlacement(arguments), hasPlacement: ClickPlacement.isRequested(arguments),
+                    count: count, buttonName: button, modifiers: modifiers ?? [])
+            }
             let clickCount = try optionalPositiveInt("click_count", in: arguments) ?? 1
             guard clickCount <= 32 else {
                 throw ComputerUseError.invalidArguments("click_count must be between 1 and 32")
@@ -542,11 +567,57 @@ public final class ComputerUseToolDispatcher {
                 action: requireString("action", in: arguments)
             )
         case "hover":
+            if let dwell = try ActionOptions.duration("dwell_ms", in: arguments, maxMs: 2000) {
+                let app = try requireString("app", in: arguments)
+                return try service.hover(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments), dwell: dwell)
+            }
             return try service.hover(
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
             )
+        case "gesture":
+            let app = try requireString("app", in: arguments)
+            let gesture = try GestureAction(arguments: arguments)
+            if arguments["menu_path"] != nil {
+                guard ComputerUseService.requiredWindowID == nil else {
+                    throw ComputerUseError.backgroundUnsupported("An app-level gesture menu command cannot be pinned to a window.")
+                }
+                guard labelArguments(in: arguments) == nil, optionalElementIndex(in: arguments) == nil else {
+                    throw ComputerUseError.invalidArguments("Use a menu command or a control for the gesture.")
+                }
+                let path = try menuPathArgument(arguments["menu_path"])
+                guard path.count >= 2 else {
+                    throw ComputerUseError.invalidArguments("Give the menu and command, such as View > Zoom In.")
+                }
+                // A gesture stands in for zoom, rotate or history. A destructive command is never one.
+                if let title = path.last, MenuItemLookup.isDestructive(title) || ShortcutCache.isDestructive(title) {
+                    throw ComputerUseError.notSent("\(title) is not a gesture equivalent. Use press_menu if that is really what you want.")
+                }
+                return try service.pressMenu(app: app, titles: path)
+            }
+            guard let increase = gesture.zoomIncreases,
+                  let index = try strictActionIndex(app: app, arguments: arguments) else {
+                throw ComputerUseError.backgroundUnsupported("This gesture needs an exposed app menu command or zoom control.")
+            }
+            return try service.zoomControl(app: app, elementIndex: index, increase: increase)
+        case "wait_for":
+            guard let wait = try ControlWait(arguments) else {
+                throw ComputerUseError.invalidArguments("wait_for requires appears, disappears or value_changed.")
+            }
+            return try service.waitForControl(app: requireString("app", in: arguments), wait: wait)
+        case "scroll_into_view":
+            let app = try requireString("app", in: arguments)
+            return try service.scrollIntoView(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments))
         case "scroll":
+            // Explicit chunks use a pinned scroll area and verify progress after each input.
+            if let chunks = try ScrollChunks(arguments) {
+                let app = try requireString("app", in: arguments)
+                return try service.scroll(
+                    app: app, direction: requireString("direction", in: arguments),
+                    elementIndex: requireStrictActionIndex(app: app, arguments: arguments),
+                    chunks: chunks
+                )
+            }
             return try service.scroll(
                 app: requireString("app", in: arguments),
                 direction: requireString("direction", in: arguments),
@@ -557,6 +628,20 @@ public final class ComputerUseToolDispatcher {
             let modifiers = arguments["modifiers"] as? [String]
             guard arguments["modifiers"] == nil || modifiers != nil else {
                 throw ComputerUseError.invalidArguments("drag modifiers must be an array of strings")
+            }
+            // Extended drags resolve both endpoints before the only press.
+            if DragOptions.isRequested(arguments) {
+                let app = try requireString("app", in: arguments)
+                let options = try DragOptions(arguments)
+                let sourceArguments = ["label": arguments["from_label"] ?? arguments["label"],
+                                       "element_index": arguments["from_index"] ?? arguments["element_index"]]
+                let destinationArguments = ["label": arguments["to_label"], "element_index": arguments["to_index"]]
+                let source = try strictActionIndex(app: app, arguments: sourceArguments.compactMapValues { $0 })
+                let destination = try strictActionIndex(app: app, arguments: destinationArguments.compactMapValues { $0 })
+                return try service.dragBetween(app: app, sourceIndex: source, destinationIndex: destination,
+                    fromX: optionalDouble("from_x", in: arguments), fromY: optionalDouble("from_y", in: arguments),
+                    toX: optionalDouble("to_x", in: arguments), toY: optionalDouble("to_y", in: arguments),
+                    modifiers: modifiers ?? [], options: options)
             }
             return try service.drag(
                 app: requireString("app", in: arguments),
@@ -580,6 +665,10 @@ public final class ComputerUseToolDispatcher {
             }
             return try service.typeText(app: app, text: text, keyMethod: keyMethod)
         case "press_key":
+            if let hold = try ActionOptions.duration("hold_ms", in: arguments, maxMs: 1000) {
+                return try service.holdKey(app: requireString("app", in: arguments), key: requireString("key", in: arguments),
+                    method: parseKeyMethod(optionalString("key_method", in: arguments)), hold: hold)
+            }
             return try service.pressKey(
                 app: requireString("app", in: arguments),
                 key: requireString("key", in: arguments),
@@ -610,6 +699,12 @@ public final class ComputerUseToolDispatcher {
                 value: requireString("value", in: arguments, allowEmpty: true)
             )
         case "select_text":
+            // Explicit ranges need a named or observed control and verify the resulting AX range.
+            if let range = try TextRangeRequest(arguments) {
+                let app = try requireString("app", in: arguments)
+                return try service.selectText(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments),
+                    text: "", prefix: nil, suffix: nil, selection: .text, range: range)
+            }
             return try service.selectText(
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log),
@@ -699,7 +794,7 @@ public final class ComputerUseToolDispatcher {
         throw ComputerUseError.invalidArguments("path must be a string or an array of menu titles")
     }
 
-    private func selectionString(_ key: String, in arguments: [String: Any]) throws -> String? {
+    func selectionString(_ key: String, in arguments: [String: Any]) throws -> String? {
         guard let value = arguments[key] else { return nil }
         guard let string = value as? String else {
             throw ComputerUseError.invalidArguments("\(key) must be a string")
@@ -707,7 +802,7 @@ public final class ComputerUseToolDispatcher {
         return string
     }
 
-    private func parseSelectionMode(_ raw: String?) throws -> TextSelectionMode {
+    func parseSelectionMode(_ raw: String?) throws -> TextSelectionMode {
         guard let raw else { return .text }
 
         guard let mode = TextSelectionMode(rawValue: raw) else {
@@ -756,6 +851,20 @@ public final class ComputerUseToolDispatcher {
     }
 
     /// An element named by `label`/`labels` (its visible name) or by `element_index`, for actions that need one.
+    // New actions do not use label healing or a vision fallback.
+    private func strictActionIndex(app: String, arguments: [String: Any]) throws -> String? {
+        if let index = optionalElementIndex(in: arguments) { return index }
+        guard let labels = labelArguments(in: arguments) else { return nil }
+        return String(try service.resolveLabel(app: app, labels: labels, strict: true).index)
+    }
+
+    private func requireStrictActionIndex(app: String, arguments: [String: Any]) throws -> String {
+        guard let index = try strictActionIndex(app: app, arguments: arguments) else {
+            throw ComputerUseError.missingArgument("label or element_index")
+        }
+        return index
+    }
+
     private func labelledOrRequiredElementIndex(in arguments: [String: Any], log: SmartLog) throws -> String {
         try labelledElementIndex(in: arguments, log: log) ?? requireElementIndex(in: arguments)
     }

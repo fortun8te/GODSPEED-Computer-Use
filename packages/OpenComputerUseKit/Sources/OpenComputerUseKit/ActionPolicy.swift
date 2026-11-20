@@ -172,6 +172,12 @@ struct ActionPolicy: Decodable, Sendable {
             result.insert(.systemSettings)
         }
         switch tool {
+        case "gesture":
+            // A gesture equivalent given as an app menu command carries that command's risks (L9).
+            let gesturePath = (arguments["menu_path"] as? [String]) ?? (arguments["menu_path"] as? String)?.components(separatedBy: ">")
+            if let title = gesturePath?.last?.trimmingCharacters(in: .whitespaces) {
+                result.formUnion(namedRisks([title]))
+            }
         case "save_as":
             // A new path can also become occupied while the save dialog is opening.
             result.insert(.fileOverwrite)

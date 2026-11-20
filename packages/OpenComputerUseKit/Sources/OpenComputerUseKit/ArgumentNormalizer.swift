@@ -10,17 +10,17 @@ enum ArgumentNormalizer {
 
     /// Tools that act on one app window; they take `app`.
     static let appTools: Set<String> = [
-        "get_app_state", "query", "click", "hover", "perform_secondary_action", "scroll", "drag",
+        "get_app_state", "query", "wait_for", "gesture", "click", "hover", "perform_secondary_action", "scroll", "scroll_into_view", "drag",
         "type_text", "press_key", "press_menu", "set_value", "select_text",
     ]
 
     static let windowBoundTools: Set<String> = [
-        "click", "hover", "perform_secondary_action", "scroll", "drag", "type_text", "press_key",
-        "set_value", "select_text",
+        "click", "hover", "perform_secondary_action", "scroll", "scroll_into_view", "drag", "type_text", "press_key",
+        "set_value", "select_text", "wait_for", "gesture",
     ]
 
     /// Tools that act on one accessibility element, by `ref`, `element_index` or `label`.
-    static let elementTools: Set<String> = ["click", "hover", "perform_secondary_action", "scroll", "set_value", "select_text"]
+    static let elementTools: Set<String> = ["click", "hover", "perform_secondary_action", "scroll", "scroll_into_view", "set_value", "select_text", "gesture"]
 
     /// Spellings for `app` on every app tool and on batch.
     private static let appAliases = [
@@ -134,10 +134,10 @@ enum ArgumentNormalizer {
         )],
         "drag": [
             appNeed,
-            Need(keys: ["from_x"], text: "\"from_x\" (pixels)"),
-            Need(keys: ["from_y"], text: "\"from_y\" (pixels)"),
-            Need(keys: ["to_x"], text: "\"to_x\" (pixels)"),
-            Need(keys: ["to_y"], text: "\"to_y\" (pixels)"),
+            Need(keys: ["from_x", "from_label", "from_index", "label", "element_index", "files"], text: "a drag source"),
+            Need(keys: ["from_y", "from_label", "from_index", "label", "element_index", "files"], text: "a complete drag source"),
+            Need(keys: ["to_x", "to_label", "to_index", "files"], text: "a drag destination"),
+            Need(keys: ["to_y", "to_label", "to_index", "files"], text: "a complete drag destination"),
         ],
         "type_text": [appNeed, Need(keys: ["text"], text: "\"text\" (what to type)")],
         "press_key": [appNeed, Need(keys: ["key"], text: "\"key\", e.g. \"cmd+s\"")],
@@ -151,8 +151,11 @@ enum ArgumentNormalizer {
             Need(keys: ["direction"], text: "\"direction\" (up, down, left or right)"),
             elementNeed,
         ],
+        "gesture": [appNeed, Need(keys: ["kind"], text: "a gesture kind")],
+        "wait_for": [appNeed, Need(keys: ["label"], text: "an exact label"), Need(keys: ["condition"], text: "a wait condition")],
         "hover": [appNeed, elementNeed],
-        "select_text": [appNeed, Need(keys: ["text"], text: "\"text\", exactly as shown"), elementNeed],
+        "scroll_into_view": [appNeed, elementNeed],
+        "select_text": [appNeed, Need(keys: ["text", "start", "length"], text: "text or a UTF-16 range"), elementNeed],
         "perform_secondary_action": [
             appNeed,
             Need(keys: ["action"], text: "\"action\", e.g. \"AXShowMenu\""),
@@ -195,7 +198,7 @@ enum ArgumentNormalizer {
         }
         if tool == "click" { applyClickFlags(&args) }
         // select_text with only the words to select means the document's text: the window's one text area.
-        if tool == "select_text", args["ref"] == nil,
+        if tool == "select_text", args["ref"] == nil, !TextRangeRequest.isRequested(args),
            !["label", "labels", "element_index"].contains(where: { isPresent(args[$0], allowsEmpty: false) }) {
             args["label"] = "text entry area"
         }

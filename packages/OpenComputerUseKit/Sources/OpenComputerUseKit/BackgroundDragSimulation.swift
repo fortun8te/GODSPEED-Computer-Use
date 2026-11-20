@@ -114,7 +114,7 @@ enum BackgroundDragDispatcher {
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
-            throw ComputerUseError.stateUnavailable("Hover cannot address this window on this Mac.")
+            throw ComputerUseError.backgroundUnsupported("This Mac cannot address hover to the target window.")
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
@@ -135,16 +135,110 @@ enum BackgroundDragDispatcher {
         io.post(event, target.pid)
     }
 
-    static func drag(
-        target: BackgroundDragTarget,
-        flags: CGEventFlags = [],
-        io: BackgroundDragIO = .system(),
-        validateSession: () throws -> Void = { try requireUsableComputerUseSession() }
-    ) throws {
+    static func click(target: BackgroundDragTarget, button: MouseButtonKind, count: Int, flags: CGEventFlags,
+                      io: BackgroundDragIO = .system(),
+                      validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
+                      validateHit: () throws -> Void) throws {
+        try validateSession()
+        try target.validateGeometry()
+        guard (1...3).contains(count), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Multiple clicks need the left button and a count of 1 to 3.")
+        }
+        guard io.windowLocationCapability.isAvailable else {
+            throw ComputerUseError.backgroundUnsupported("This Mac cannot address click events to the target window.")
+        }
+        dispatchLock.lock()
+        defer { dispatchLock.unlock() }
+        try io.validateWindow(target)
+        func prepare(_ type: CGEventType, beat: Int, group: Int64?) throws -> CGEvent {
+            guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target.start, mouseButton: button.cgButton) else {
+                throw ComputerUseError.stateUnavailable("Could not prepare a window-addressed click.")
+            }
+            event.flags = flags
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(beat))
+            if let group { event.setIntegerValueField(.mouseEventNumber, value: group) }
+            event.setIntegerValueField(windowNumberField, value: Int64(target.windowID))
+            try io.setWindowLocation(event, CGPoint(x: target.start.x - target.windowBounds.minX,
+                                                    y: target.start.y - target.windowBounds.minY))
+            return event
+        }
+        let pairs = try (1...count).map { beat in
+            let group = InputSimulation.dragGestureEventNumber()
+            return try (prepare(button.downEvent, beat: beat, group: group), prepare(button.upEvent, beat: beat, group: group))
+        }
+        var sent = 0
+        do {
+            for (press, release) in pairs {
+                try validateSession()
+                try io.validateWindow(target)
+                try validateHit()
+                try validateSession()
+                try io.validateWindow(target)
+                press.timestamp = DispatchTime.now().uptimeNanoseconds
+                io.post(press, target.pid)
+                release.timestamp = DispatchTime.now().uptimeNanoseconds
+                io.release(release, target)
+                sent += 1
+                if sent < count { io.pause(0.05) }
+            }
+        } catch {
+            if sent > 0 {
+                throw ComputerUseError.stateUnavailable("Sent \(sent) of \(count) clicks. Inspect the window before repeating.")
+            }
+            throw error
+        }
+    }
+
+    static func scroll(target: BackgroundDragTarget, direction: String, unit: ScrollChunks.Unit, size: Int,
+                       io: BackgroundDragIO = .system(),
+                       validateSession: () throws -> Void = { try requireUsableComputerUseSession() }) throws {
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
-            throw ComputerUseError.message("drag window targeting is unavailable: \(io.windowLocationCapability.unavailableReason)")
+            throw ComputerUseError.backgroundUnsupported("Window-addressed scroll events are unavailable.")
+        }
+        let event = try scrollEvent(direction: direction, unit: unit, size: size)
+        event.location = target.start
+        event.setIntegerValueField(windowNumberField, value: Int64(target.windowID))
+        try io.setWindowLocation(event, CGPoint(x: target.start.x - target.windowBounds.minX,
+                                                y: target.start.y - target.windowBounds.minY))
+        try validateSession()
+        try io.validateWindow(target)
+        event.timestamp = DispatchTime.now().uptimeNanoseconds
+        io.post(event, target.pid)
+    }
+
+    static func scrollEvent(direction: String, unit: ScrollChunks.Unit, size: Int) throws -> CGEvent {
+        guard unit != .pages, (1...10_000).contains(size),
+              ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("Wheel events require a positive line or point count and a direction.")
+        }
+        let amount = Int32(size)
+        let y = direction == "up" ? amount : direction == "down" ? -amount : 0
+        let x = direction == "left" ? amount : direction == "right" ? -amount : 0
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: unit == .lines ? .line : .pixel,
+                                  wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else {
+            throw ComputerUseError.stateUnavailable("Could not create a scroll event.")
+        }
+        return event
+    }
+
+    static func drag(
+        target: BackgroundDragTarget,
+        flags: CGEventFlags = [],
+        steps stepCount: Int = 10,
+        hold: TimeInterval = 0,
+        io: BackgroundDragIO = .system(),
+        validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
+        validateEndpoints: () throws -> Void = {}
+    ) throws {
+        try validateSession()
+        try target.validateGeometry()
+        guard (2...30).contains(stepCount), (0...1).contains(hold) else {
+            throw ComputerUseError.invalidArguments("Drag timing is out of bounds.")
+        }
+        guard io.windowLocationCapability.isAvailable else {
+            throw ComputerUseError.backgroundUnsupported("Window-addressed drag is unavailable.")
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
@@ -172,8 +266,8 @@ enum BackgroundDragDispatcher {
         let down = try prepare(.leftMouseDown, at: target.start)
         var release = try prepare(.leftMouseUp, at: target.start)
         var previous = target.start
-        let steps = try (1...10).map { step -> (drag: CGEvent, up: CGEvent) in
-            let t = CGFloat(step) / 10
+        let steps = try (1...stepCount).map { step -> (drag: CGEvent, up: CGEvent) in
+            let t = CGFloat(step) / CGFloat(stepCount)
             let point = CGPoint(x: target.start.x + (target.end.x - target.start.x) * t,
                                 y: target.start.y + (target.end.y - target.start.y) * t)
             let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
@@ -201,7 +295,7 @@ enum BackgroundDragDispatcher {
             if try io.needsFocus(target.pid) {
                 try validateSession()
                 guard io.focusCapability.isAvailable else {
-                    throw ComputerUseError.message("background drag is unavailable: \(io.focusCapability.unavailableReason)")
+                    throw ComputerUseError.backgroundUnsupported("background drag is unavailable: \(io.focusCapability.unavailableReason)")
                 }
                 let context = try io.beginFocus(target)
                 focus = context
@@ -211,6 +305,7 @@ enum BackgroundDragDispatcher {
             }
             try send(move)
             io.pause(eventDelay)
+            try validateEndpoints()
             try InputSimulation.withPressedMouseButton(press: {
                 try send(down)
             }, release: {
@@ -218,7 +313,7 @@ enum BackgroundDragDispatcher {
                 io.release(release, target)
                 io.pause(eventDelay)
             }) {
-                io.pause(eventDelay)
+                io.pause(max(eventDelay, hold))
                 for step in steps {
                     try send(step.drag)
                     release = step.up

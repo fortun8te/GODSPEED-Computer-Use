@@ -42,6 +42,8 @@ extension ActionPolicy {
     static let nativeTargetTools: Set<String> = ["click", "set_value", "type_text", "press_key", "perform_secondary_action"]
     static let nativeScopedTools: Set<String> = nativeTargetTools.union([
         "open", "query", "get_app_state", "press_menu", "save_as", "select_text", "scroll", "hover", "drag", HandoffTool.name,
+        // L9 actions: a gesture can press an app menu command; the others act on or read one app's controls.
+        "gesture", "scroll_into_view", "wait_for",
     ])
 }
 

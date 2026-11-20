@@ -765,6 +765,27 @@ final class BrowserPage {
     """
 
     /// Chrome's own name search: fast, and it does not read the whole page.
+    func resolveExact(label: String?, index: Int?, allowPassive: Bool = false) throws -> BrowserNode {
+        if let index { return try resolve(label: nil, index: index) }
+        guard let label, !Self.normalize(label).isEmpty else {
+            throw ComputerUseError.invalidArguments("Give an exact label or a reference from browser read.")
+        }
+        let matches = Self.exactControls(in: try queryNamedRaw(label), label: label, allowPassive: allowPassive)
+        guard matches.count == 1, let node = matches.first else {
+            throw ComputerUseError.stateUnavailable("Expected one control named '\(label)'. Found \(matches.count). Read the tab for a reference.")
+        }
+        return node
+    }
+
+    static func exactControls(in raw: [[String: Any]], label: String, allowPassive: Bool) -> [BrowserNode] {
+        if allowPassive {
+            // Drop zones and scroll areas may have a name without an interactive role.
+            return scrollLabelCandidates(raw, label: label).filter { !$0.role.isEmpty && $0.role != "StaticText" && $0.role != "InlineTextBox" }
+        }
+        var seen: Set<Int> = []
+        return namedCandidates(raw).filter { normalize($0.name) == normalize(label) && seen.insert($0.backendNodeID).inserted }
+    }
+
     private func queryNamed(_ label: String) throws -> [BrowserNode] {
         Self.namedCandidates(try queryNamedRaw(label))
     }
@@ -777,7 +798,10 @@ final class BrowserPage {
             throw ComputerUseError.message("browser: could not reach the page's document; browser wait, then try again")
         }
         let payload = try cdp("Accessibility.queryAXTree", ["objectId": objectID, "accessibleName": label])
-        return Self.nodes(of: payload)
+        guard let nodes = payload["nodes"] as? [[String: Any]] else {
+            throw ComputerUseError.stateUnavailable("Chrome did not return accessibility search results.")
+        }
+        return nodes
     }
 
     static func exactControls(
@@ -887,14 +911,16 @@ final class BrowserPage {
         }
     }
 
-    func click(_ node: BrowserNode, button: PointerButton = .left, count: Int = 1, modifiers: Int = 0) throws {
-        guard (1...2).contains(count) else { throw ComputerUseError.invalidArguments("browser click count must be 1 or 2") }
+    func click(_ node: BrowserNode, button: PointerButton = .left, count: Int = 1, modifiers: Int = 0, placement: ClickPlacement? = nil) throws {
+        guard (1...3).contains(count), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Multiple clicks need the left button and a count of 1 to 3.")
+        }
         restoreSetup()
-        let document = count == 2 ? try documentIdentity() : nil
-        if count == 2, document == nil {
+        let document = count > 1 ? try documentIdentity() : nil
+        if count > 1, document == nil {
             throw ComputerUseError.stateUnavailable("browser: could not bind the double-click to the current document")
         }
-        let firstPoint = try clickPoint(of: node, beforeFirstAction: true)
+        let firstPoint = try clickPoint(of: node, beforeFirstAction: true, placement: placement)
         // The press already carries the verified point. A separate mouse-move can stall a
         // background tab before the click is sent. Explicit hover still delivers movement.
         let remaining = BrowserCallBudget.remaining()
@@ -907,7 +933,7 @@ final class BrowserPage {
                     guard try documentIdentity() == document else {
                         throw ComputerUseError.stateUnavailable("browser: the first click changed the document")
                     }
-                    point = try clickPoint(of: node)
+                    point = try clickPoint(of: node, placement: placement)
                 }
                 guard BrowserCallBudget.remaining() > 2 else {
                     throw ComputerUseError.stateUnavailable("browser click ran out of time before the next press")
@@ -931,14 +957,18 @@ final class BrowserPage {
         }
     }
 
-    func hover(_ node: BrowserNode) throws {
+    func hover(_ node: BrowserNode, dwell: TimeInterval? = nil) throws {
         restoreSetup()
         reveal(node)
-        try mouse("mouseMoved", try clickPoint(of: node), buttons: 0, clickCount: 0)
+        let point = try clickPoint(of: node)
+        if let dwell { try ActionOptions.requireTime(for: dwell + 1) }
+        try mouse("mouseMoved", point, buttons: 0, clickCount: 0)
+        if let dwell, dwell > 0 { Thread.sleep(forTimeInterval: dwell) }
     }
 
     /// A pointer gesture within one viewport, using live hit testing at both ends.
-    func drag(from source: BrowserNode, to destination: BrowserNode, modifiers: Int = 0) throws {
+    func drag(from source: BrowserNode, to destination: BrowserNode?, point: CGPoint? = nil, modifiers: Int = 0,
+              steps: Int = 5, hold: TimeInterval = 0) throws {
         restoreSetup()
         func visiblePoint(_ node: BrowserNode) throws -> CGPoint {
             guard let probe = try callOnNode(node, Self.clickProbeJS) as? [Any],
@@ -950,21 +980,33 @@ final class BrowserPage {
             return CGPoint(x: x, y: y)
         }
         let start = try visiblePoint(source)
-        let end = try visiblePoint(destination)
+        let end: CGPoint
+        if let destination {
+            end = try visiblePoint(destination)
+        } else if let point, point.x.isFinite, point.y.isFinite,
+                  try evaluate("Boolean(document.elementFromPoint(\(point.x),\(point.y)))") as? Bool == true {
+            end = point
+        } else {
+            throw ComputerUseError.invalidArguments("Drag destination must be inside the tab viewport.")
+        }
         guard hypot(end.x - start.x, end.y - start.y) >= 4 else {
             throw ComputerUseError.invalidArguments("browser drag needs two distinct visible positions")
         }
-        try Self.deliverDrag(from: start, to: end) { type, point, buttons, count in
+        try Self.deliverDrag(from: start, to: end, steps: steps, hold: hold) { type, point, buttons, count in
             try self.mouse(type, point, buttons: buttons, clickCount: count, modifiers: modifiers)
         }
     }
 
     static func deliverDrag(
-        from start: CGPoint, to end: CGPoint,
+        from start: CGPoint, to end: CGPoint, steps: Int = 5, hold: TimeInterval = 0,
+        pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         send: (String, CGPoint, Int, Int) throws -> Void
     ) throws {
         let remaining = BrowserCallBudget.remaining()
-        guard remaining > 4 else { throw ComputerUseError.timedOut("browser drag ran out of time before pressing", delivery: .notSent) }
+        guard (2...30).contains(steps), (0...1).contains(hold) else {
+            throw ComputerUseError.invalidArguments("Drag timing is out of bounds.")
+        }
+        guard remaining > 4 + hold else { throw ComputerUseError.timedOut("browser drag ran out of time before pressing", delivery: .notSent) }
         let releaseDeadline = BrowserCallBudget.deadline(after: remaining)
         let movementDeadline = releaseDeadline - 3
         try send("mouseMoved", start, 0, 0)
@@ -972,8 +1014,9 @@ final class BrowserPage {
         do {
             try BrowserCallBudget.withDeadline(movementDeadline) {
                 try send("mousePressed", start, 1, 1)
-                for step in 1...5 {
-                    let progress = Double(step) / 5
+                if hold > 0 { pause(hold) }
+                for step in 1...steps {
+                    let progress = Double(step) / Double(steps)
                     last = CGPoint(x: start.x + (end.x - start.x) * progress, y: start.y + (end.y - start.y) * progress)
                     try send("mouseMoved", last, 1, 0)
                 }
@@ -985,14 +1028,53 @@ final class BrowserPage {
             }
             throw ComputerUseError.stateUnavailable("browser drag was interrupted after starting. Read the tab before retrying.")
         }
-        try send("mouseReleased", end, 0, 1)
+        do {
+            try send("mouseReleased", end, 0, 1)
+        } catch {
+            throw ComputerUseError.stateUnavailable("The drop may have happened. Inspect the tab before repeating.")
+        }
+    }
+
+    private func precisePoint(of node: BrowserNode, placement: ClickPlacement) throws -> CGPoint {
+        let result = try callOnNode(node, """
+        function(fx,fy,dx,dy){
+          if(window!==window.top)return ['frame'];
+          if(!this.isConnected)return [];
+          const r=this.getBoundingClientRect(), ix=Math.min(1,r.width/2), iy=Math.min(1,r.height/2);
+          const x=r.left+ix+(r.width-2*ix)*fx+dx, y=r.top+iy+(r.height-2*iy)*fy+dy;
+          if(x<r.left||x>=r.right||y<r.top||y>=r.bottom)return ['offset'];
+          let hit=document.elementFromPoint(x,y);
+          for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(x,y))&&next!==hit;)hit=next;
+          for(let n=hit;n;n=n.parentNode||n.host){
+            if(n===this){
+              if(window.__gs){__gs.seen=__gs.mut;__gs.href=location.href;__gs.nav=false;}
+              return ['ok',x,y];
+            }
+          }
+          return [];
+        }
+        """, arguments: [placement.fraction.x, placement.fraction.y, placement.offset.x, placement.offset.y]) as? [Any]
+        if result?.first as? String == "frame" {
+            throw ComputerUseError.backgroundUnsupported("Precise hit testing is unavailable inside this frame.")
+        }
+        if result?.first as? String == "offset" {
+            throw ComputerUseError.invalidArguments("Click offsets place the point outside the control.")
+        }
+        guard let result, result.count == 3, result[0] as? String == "ok",
+              let x = BrowserRules.number(result[1]), let y = BrowserRules.number(result[2]) else {
+            throw ComputerUseError.stateUnavailable("The precise point is out of view or covered. Reveal the control before continuing.")
+        }
+        return CGPoint(x: x, y: y)
     }
 
     /// Where on the element to click: a point of its visible part that really reaches it (`elementFromPoint`
     /// hit-test). Says so when something else lies on top of every probed point (a banner, a dialog, a
     /// stretched link). For frames, use the browser's box geometry. In the main document
     /// a missing hit test is a refusal, since an unverified box could target another control.
-    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false) throws -> CGPoint {
+    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
+        if let placement {
+            return try precisePoint(of: node, placement: placement)
+        }
         func probe() -> [Any] {
             let remaining = BrowserCallBudget.remaining()
             // Resolving the node and hit-testing it are separate Chrome calls.
@@ -1212,26 +1294,26 @@ final class BrowserPage {
     """
 
     /// Presses a key or key combination ("Enter", "Cmd+A", "ctrl+shift+z"): keyDown then keyUp.
-    func pressKey(_ raw: String) throws {
+    func pressKey(_ raw: String, hold: TimeInterval? = nil) throws {
         guard let combo = BrowserKeyCombo.parse(raw) else {
             throw ComputerUseError.invalidArguments(
                 "browser: key \"\(raw)\" is not known; use Enter, Tab, Escape, Backspace, Delete, Space, arrows, Home, End, PageUp/PageDown, or a letter or digit with Cmd, Ctrl, Alt or Shift (e.g. Cmd+A)"
             )
         }
         restoreSetup()
-        try send(combo)
+        try send(combo, hold: hold)
     }
 
     /// A key press followed by the one change line (Enter often submits or navigates).
-    func pressKeyAndWatch(_ raw: String) throws -> BrowserChange {
-        guard BrowserKeyCombo.parse(raw) != nil else { try pressKey(raw); return .none }
+    func pressKeyAndWatch(_ raw: String, hold: TimeInterval? = nil) throws -> BrowserChange {
+        guard BrowserKeyCombo.parse(raw) != nil else { try pressKey(raw, hold: hold); return .none }
         restoreSetup()
         markBaseline()
-        try pressKey(raw)
+        try pressKey(raw, hold: hold)
         return settle()
     }
 
-    private func send(_ combo: BrowserKeyCombo) throws {
+    private func send(_ combo: BrowserKeyCombo, hold: TimeInterval? = nil) throws {
         var down: [String: Any] = [
             "type": "keyDown", "key": combo.key,
             "windowsVirtualKeyCode": combo.virtualKey, "modifiers": combo.modifiers,
@@ -1243,8 +1325,31 @@ final class BrowserPage {
         if !combo.code.isEmpty { down["code"] = combo.code; up["code"] = combo.code }
         if let text = combo.text { down["text"] = text }
         if !combo.commands.isEmpty { down["commands"] = combo.commands }
-        _ = try cdp("Input.dispatchKeyEvent", down)
-        _ = try cdp("Input.dispatchKeyEvent", up)
+        if let hold {
+            try Self.deliverHeldKey(hold: hold, press: { _ = try cdp("Input.dispatchKeyEvent", down) },
+                                   release: { _ = try cdp("Input.dispatchKeyEvent", up) })
+        } else {
+            _ = try cdp("Input.dispatchKeyEvent", down)
+            _ = try cdp("Input.dispatchKeyEvent", up)
+        }
+    }
+
+    static func deliverHeldKey(hold: TimeInterval, pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+                               press: () throws -> Void, release: () throws -> Void) throws {
+        try ActionOptions.requireTime(for: hold + 3)
+        let deadline = BrowserCallBudget.deadline(after: BrowserCallBudget.remaining())
+        do {
+            try BrowserCallBudget.withDeadline(deadline - hold - 1.5, press)
+        } catch {
+            try? BrowserCallBudget.withDeadline(deadline, release)
+            throw ComputerUseError.stateUnavailable("The held key may have reached the tab. Inspect it before repeating.")
+        }
+        if hold > 0 { pause(hold) }
+        do {
+            try BrowserCallBudget.withDeadline(deadline, release)
+        } catch {
+            throw ComputerUseError.stateUnavailable("Chrome did not confirm key release. Inspect the tab before repeating.")
+        }
     }
 
     /// Verify and select within the target's own document or shadow root.
@@ -1447,6 +1552,40 @@ final class BrowserPage {
         }
     }
 
+    func selectText(_ node: BrowserNode, range: TextRangeRequest?, text: String,
+                    prefix: String?, suffix: String?, mode: TextSelectionMode) throws -> String {
+        let value = try callOnNode(node, """
+        function(){
+          if(!this.isConnected||this.type==='password'||this.disabled||typeof this.selectionStart!=='number')return null;
+          return typeof this.value==='string'?this.value:null;
+        }
+        """) as? String
+        guard let value else {
+            throw ComputerUseError.backgroundUnsupported("This control does not expose a plain text range.")
+        }
+        let target: TextSelectionTarget
+        if let range {
+            target = try TextSelectionResolver.resolve(value: value, start: range.start, length: range.length)
+        } else {
+            do {
+                target = try TextSelectionResolver.resolve(value: value, text: text, prefix: prefix, suffix: suffix, selection: mode)
+            } catch let error as TextSelectionResolverError {
+                throw ComputerUseError.invalidArguments(selectTextErrorMessage(error, elementIndex: node.name))
+            }
+        }
+        let outcome = try callOnNode(node, """
+        function(start,end,expected){
+          if(!this.isConnected||this.type==='password'||this.disabled||this.value!==expected)return false;
+          this.setSelectionRange(start,end);
+          return this.selectionStart===start&&this.selectionEnd===end&&this.value===expected;
+        }
+        """, arguments: [target.location, target.location + target.length, value])
+        guard outcome as? Bool == true else {
+            throw ComputerUseError.stateUnavailable("Could not verify the selected range on the same field value.")
+        }
+        return "Selected range \(target.location), length \(target.length)."
+    }
+
     func fieldText(_ node: BrowserNode) throws -> String? {
         try callOnNode(node, "function(){if(this.type==='password')return null;if(this.tagName==='INPUT'||this.tagName==='TEXTAREA')return String(this.value);"
             + "if(this.isContentEditable)return this.innerText;return null;}") as? String
@@ -1605,6 +1744,169 @@ final class BrowserPage {
             throw ComputerUseError.invalidArguments("browser: \"\(node.name)\" does not scroll; leave out the label to scroll the page")
         }
         return "\"\(node.name)\": " + BrowserRules.scrollSummary(direction: direction, top: top, bottom: bottom)
+    }
+
+    func scroll(_ node: BrowserNode?, direction: String, chunks: ScrollChunks) throws -> String {
+        guard ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("Scroll chunks need up, down, left or right.")
+        }
+        guard let document = try documentIdentity() else {
+            throw ComputerUseError.stateUnavailable("Could not bind the scroll to this document.")
+        }
+        func validate() throws {
+            guard try documentIdentity() == document else {
+                throw ComputerUseError.stateUnavailable("The document changed during scroll. Read the tab before continuing.")
+            }
+        }
+        let visibilityScope = if chunks.untilVisible != nil, let node { try nodeObjectID(node) } else { "" }
+        let horizontal = direction == "left" || direction == "right"
+        let outcome = try chunks.run(visible: {
+            try validate()
+            guard let label = chunks.untilVisible else { return false }
+            let matches = Self.scrollLabelCandidates(try queryNamedAny(label), label: label)
+            var found = false
+            for match in matches {
+                if !visibilityScope.isEmpty {
+                    let inside = try callOnNode(match, Self.scrollScopeJS, arguments: [horizontal],
+                                                objectArguments: [visibilityScope]) as? Bool
+                    if inside != true { continue }
+                }
+                if try isInViewport(match) {
+                    if found { return false }
+                    found = true
+                }
+            }
+            return found
+        }, advance: {
+            try validate()
+            let args: [Any] = [direction, chunks.unit.rawValue, chunks.size]
+            let result: Any?
+            if let node {
+                result = try callOnNode(node, Self.scrollChunkJS, arguments: args, feedback: "scroll")
+            } else {
+                result = try evaluate("(\(Self.scrollChunkJS)).call(document.scrollingElement,"
+                    + "\(BrowserRules.jsLiteral(direction)),\(BrowserRules.jsLiteral(chunks.unit.rawValue)),\(chunks.size))",
+                    feedback: "scroll")
+            }
+            guard let moved = result as? Bool else {
+                throw ComputerUseError.backgroundUnsupported("Choose the page or a scrollable control in its current document.")
+            }
+            return moved
+        })
+        return try outcome.reply(label: chunks.untilVisible)
+    }
+
+    static func scrollLabelCandidates(_ raw: [[String: Any]], label: String) -> [BrowserNode] {
+        var seen: Set<Int> = []
+        return raw.compactMap { item in
+            guard (item["ignored"] as? Bool) != true, let name = axValue(item["name"]),
+                  normalize(name) == normalize(label),
+                  let id = (item["backendDOMNodeId"] as? NSNumber)?.intValue, seen.insert(id).inserted else { return nil }
+            return BrowserNode(index: 0, role: axValue(item["role"]) ?? "", name: name, value: "", backendNodeID: id)
+        }
+    }
+
+    // Scope a label match to the same axis-specific scroller used for movement.
+    private static let scrollScopeJS = """
+    function(horizontal,target){
+      \(findScrollAreaJS)
+      const area=findArea(target);
+      return Boolean(this.isConnected&&target.isConnected&&area?.contains(this));
+    }
+    """
+
+    private static let findScrollAreaJS = """
+    const findArea = target => {
+      for(let e=target;e;e=e.parentElement){
+        if(e===e.ownerDocument.scrollingElement)return e;
+        const overflow=getComputedStyle(e)[horizontal?'overflowX':'overflowY'];
+        if(/^(auto|scroll|overlay)$/.test(overflow)&&
+           (horizontal?e.scrollWidth>e.clientWidth:e.scrollHeight>e.clientHeight))return e;
+      }
+      return null;
+    };
+    """
+
+    private static let scrollChunkJS = """
+    function(direction,unit,count) {
+        if (!this?.isConnected) return null;
+        const horizontal = direction === 'left' || direction === 'right';
+        \(findScrollAreaJS)
+        const area = findArea(this);
+        if (!area) return null;
+        const property = horizontal ? 'scrollLeft' : 'scrollTop';
+        const before = area[property];
+        const size = unit === 'pages' ? (horizontal ? area.clientWidth : area.clientHeight)
+            : unit === 'lines' ? count * 40 : count;
+        const delta = direction === 'left' || direction === 'up' ? -size : size;
+        area.scrollBy({left:horizontal ? delta : 0,top:horizontal ? 0 : delta,behavior:'instant'});
+        return area[property] !== before;
+    }
+    """
+
+    private func isInViewport(_ node: BrowserNode) throws -> Bool {
+        try callOnNode(node, """
+        function(){
+          if(!this.isConnected||window!==window.top)return false;
+          const text=this.nodeType===3, element=text?this.parentElement:this;
+          if(!element?.getBoundingClientRect)return false;
+          let bounds;
+          if(text){
+            const range=document.createRange();
+            range.selectNodeContents(this);
+            bounds=range.getBoundingClientRect();
+          }else bounds=element.getBoundingClientRect();
+          const left=Math.max(0,bounds.left), right=Math.min(innerWidth,bounds.right);
+          const top=Math.max(0,bounds.top), bottom=Math.min(innerHeight,bounds.bottom);
+          if(right<=left||bottom<=top)return false;
+          for(const fraction of [0.5,0.25,0.75]){
+            let hit=document.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2);
+            for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2))&&next!==hit;)hit=next;
+            for(let current=hit;current;current=current.parentNode||current.host)
+              if(current===element)return true;
+          }
+          return false;
+        }
+        """) as? Bool == true
+    }
+
+    /// Change the tab scale once and verify the reported scale in the same document.
+    func zoom(_ gesture: GestureAction) throws -> String {
+        guard gesture.zoomIncreases != nil else {
+            throw ComputerUseError.backgroundUnsupported("Chrome has no background equivalent for this gesture.")
+        }
+        guard let document = try documentIdentity() else {
+            throw ComputerUseError.stateUnavailable("Could not bind zoom to the current tab document.")
+        }
+        func scale() throws -> Double {
+            guard let value = try evaluate("window.visualViewport?.scale") as? NSNumber,
+                  value.doubleValue.isFinite, value.doubleValue > 0 else {
+                throw ComputerUseError.backgroundUnsupported("The tab does not report a page scale.")
+            }
+            return value.doubleValue
+        }
+        let before = try scale()
+        guard let target = gesture.zoomTarget(from: before), try documentIdentity() == document else {
+            throw ComputerUseError.stateUnavailable("Tab document changed before zoom.")
+        }
+        guard abs(target - before) > 0.001 else { return "Page zoom is already at the limit." }
+        do {
+            try cdp("Emulation.setPageScaleFactor", ["pageScaleFactor": target])
+        } catch {
+            throw ComputerUseError.stateUnavailable("Could not confirm the zoom command. Inspect the tab before repeating.")
+        }
+        let deadline = BrowserCallBudget.deadline(after: min(0.4, BrowserCallBudget.remaining()))
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            guard try documentIdentity() == document else {
+                throw ComputerUseError.stateUnavailable("Tab document changed after zoom.")
+            }
+            if GestureAction.zoomWasVerified(before: before, target: target, after: try scale()) {
+                let percent = Int((target * 100).rounded())
+                return "Page scale changed to \(percent)%."
+            }
+            Thread.sleep(forTimeInterval: min(0.04, max(0, deadline - ProcessInfo.processInfo.systemUptime)))
+        }
+        throw ComputerUseError.stateUnavailable("Zoom command delivered. The tab did not report the requested scale.")
     }
 
     /// Back, forward or reload in this tab, waiting for the page to load again.
@@ -1797,6 +2099,41 @@ final class BrowserPage {
     """
 
     /// Waits for the text to appear on the page, or for a labelled element to exist. False when the time runs out.
+    func waitForControl(_ wait: ControlWait) throws -> String {
+        let startingDocument = wait.condition == .valueChanged ? try documentIdentity() : nil
+        if wait.condition == .valueChanged, startingDocument == nil {
+            throw ComputerUseError.stateUnavailable("Could not bind the value wait to the current document.")
+        }
+        return try wait.run { () -> ControlWait.Sample<Int> in
+            try BrowserRequestContext.validateCurrent()
+            if let startingDocument, try documentIdentity() != startingDocument {
+                throw ComputerUseError.stateUnavailable("The document changed during the value wait.")
+            }
+            let named = try queryNamedAny(wait.label).filter {
+                Self.normalize(Self.axValue($0["name"]) ?? "") == Self.normalize(wait.label)
+            }
+            guard !named.isEmpty else { return .absent }
+            guard wait.condition == .valueChanged else { return .present }
+            let matches = Self.namedCandidates(named)
+            guard Set(matches.map(\.backendNodeID)).count == 1, let node = matches.first,
+                  let value = try observedControlValue(node) else { return .unreadable }
+            return .value(node.backendNodeID, value)
+        }
+    }
+
+    private func observedControlValue(_ node: BrowserNode) throws -> String? {
+        try callOnNode(node, """
+        function(){
+          if(!this.isConnected||this.type==='password')return null;
+          if(this.type==='checkbox'||this.type==='radio')return String(this.checked);
+          if(typeof this.value==='string')return this.value;
+          if(this.isContentEditable)return this.innerText;
+          const value=this.getAttribute('aria-valuenow')??this.getAttribute('aria-checked');
+          return value===null?null:String(value);
+        }
+        """) as? String
+    }
+
     func waitFor(text: String?, label: String?, urlContains: String? = nil, controlCondition: ControlCondition? = nil, timeout: TimeInterval) -> Bool {
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining()))
@@ -1872,15 +2209,20 @@ final class BrowserPage {
     // MARK: CDP plumbing
 
     /// Calls a JavaScript function with `this` set to the element. Returns the function's JSON value.
-    func callOnNode(_ node: BrowserNode, _ function: String, arguments: [Any] = [], feedback: String? = nil) throws -> Any? {
+    private func nodeObjectID(_ node: BrowserNode) throws -> String {
         let resolved = try cdp("DOM.resolveNode", ["backendNodeId": node.backendNodeID])
         guard let object = resolved["object"] as? [String: Any], let objectID = object["objectId"] as? String else {
             throw ComputerUseError.message("browser: \"\(node.name)\" is gone from the page; browser read again")
         }
+        return objectID
+    }
+
+    func callOnNode(_ node: BrowserNode, _ function: String, arguments: [Any] = [],
+                    objectArguments: [String] = [], feedback: String? = nil) throws -> Any? {
         let payload = try cdp("Runtime.callFunctionOn", [
-            "objectId": objectID,
+            "objectId": nodeObjectID(node),
             "functionDeclaration": function,
-            "arguments": arguments.map { ["value": $0] },
+            "arguments": arguments.map { ["value": $0] } + objectArguments.map { ["objectId": $0] },
             "returnByValue": true,
         ], feedback: feedback)
         if payload["exceptionDetails"] != nil {

@@ -129,7 +129,7 @@ public enum ToolDefinitions {
                 properties: [
                     "action": stringProperty(
                         description: "What to do",
-                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "check", "uncheck", "scroll", "scroll_into_view", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
+                        enumValues: ["open", "go", "read", "screenshot", "click", "drag", "type", "fill_field", "copy", "cut", "paste", "key", "hover", "select", "select_text", "check", "uncheck", "scroll", "scroll_into_view", "gesture", "back", "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "wait", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "upload", "peek"]
                     ),
                     "label": stringProperty(description: "Visible text of the target, e.g. \"Sign in\""),
                     "find": stringProperty(description: "read: only controls and text that mention these words"),
@@ -141,17 +141,37 @@ public enum ToolDefinitions {
                     "interactive": ["type": "boolean", "default": false, "description": "read: show controls and their references without surrounding page text. Leave off to read or verify page text."],
                     "index": integerProperty(description: "Element number from read"),
                     "mouse_button": stringProperty(description: "click: pointer button, default left.", enumValues: ["left", "right", "middle"]),
-                    "click_count": integerProperty(description: "click: 1 by default, or 2 for a left double-click."),
+                    "click_count": integerProperty(description: "click: 1 by default. Left button also accepts 2 or 3."),
+                    "anchor": stringProperty(description: "Click point on a control.", enumValues: ["center", "left", "right", "top", "bottom"]),
+                    "offset_x": numberProperty(description: "Click offset right from the anchor."),
+                    "offset_y": numberProperty(description: "Click offset down from the anchor."),
                     "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
                                   "description": "click or drag: optional modifier keys."],
+                    "kind": stringProperty(description: "Gesture equivalent.", enumValues: GestureAction.allCases.map(\.rawValue)),
+                    "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
+                    "hold_ms": integerProperty(description: "Drag or key hold, up to 1000 ms."),
+                    "drag_steps": integerProperty(description: "Drag movement steps, 2 to 30."),
+                    "verify": dropVerificationProperty(),
+                    "to_x": numberProperty(description: "Drag destination viewport X from screenshot."),
+                    "to_y": numberProperty(description: "Drag destination viewport Y from screenshot."),
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
                     "to_index": integerProperty(description: "drag: destination element number from read"),
                     "text": stringProperty(description: "type: text to enter. wait_for: text to wait for"),
+                    "start": integerProperty(description: "select_text start in UTF-16 units."),
+                    "length": integerProperty(description: "select_text length in UTF-16 units."),
+                    "prefix": stringProperty(description: "Text immediately before a repeated selection."),
+                    "suffix": stringProperty(description: "Text immediately after a repeated selection."),
+                    "selection": stringProperty(description: "Select text or place the cursor.", enumValues: TextSelectionMode.allCases.map(\.rawValue)),
                     "replace": ["type": "boolean", "default": false, "description": "type: true replaces the field's value"],
                     "option": stringProperty(description: "select: option text or value, e.g. Canada"),
                     "direction": stringProperty(description: "scroll: default down", enumValues: ["up", "down", "left", "right", "top", "bottom"]),
-                    "amount": ["type": "number", "description": "scroll: pixels. Default most of a screen"],
-                    "condition": stringProperty(description: "wait_for with a label: require this control state.", enumValues: ["visible", "enabled", "checked", "unchecked"]),
+                    "amount": ["type": "number", "description": "Legacy scroll in pixels."],
+                    "unit": stringProperty(description: "Scroll chunk unit.", enumValues: ["lines", "pages", "points"]),
+                    "step_size": integerProperty(description: "Units per scroll chunk. One for pages."),
+                    "max_steps": integerProperty(description: "Scroll chunk limit, up to 20."),
+                    "until_visible": stringProperty(description: "Stop scrolling when this exact label is in view."),
+                    "condition": stringProperty(description: "wait_for with a label: require this control state.", enumValues: ["visible", "enabled", "checked", "unchecked", "appears", "disappears", "value_changed"]),
+                    "from_value": stringProperty(description: "Previous value for a value_changed wait."),
                     "url_contains": stringProperty(description: "wait_for: wait until the actual tab URL contains this text and the page is ready."),
                     "timeout": ["type": "number", "description": "wait_for, wait: seconds, max 30"],
                     "key": stringProperty(description: "key: Enter, Tab, Escape, ArrowDown, or Cmd+A"),
@@ -213,6 +233,10 @@ public enum ToolDefinitions {
                     "x": numberProperty(description: "X pixel from a screenshot"),
                     "y": numberProperty(description: "Y pixel from a screenshot"),
                     "click_count": integerProperty(description: "1 to 32, default 1. sky_click allows 1 or 2."),
+                    "anchor": stringProperty(description: "Click point on a control.", enumValues: ["center", "left", "right", "top", "bottom"]),
+                    "offset_x": numberProperty(description: "Click offset right from the anchor."),
+                    "offset_y": numberProperty(description: "Click offset down from the anchor."),
+                    "modifiers": ["type": "array", "items": ["type": "string"], "description": "Click with cmd, shift, alt or ctrl."],
                     "mouse_button": stringProperty(
                         description: "Default left.",
                         enumValues: ["left", "right", "middle"]
@@ -261,6 +285,7 @@ public enum ToolDefinitions {
                     "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "key": stringProperty(description: "Key or combination, e.g. \"cmd+s\""),
+                    "hold_ms": integerProperty(description: "Hold for up to 1000 ms in the already focused window."),
                     "key_method": keyMethodProperty(),
                 ],
                 required: ["app", "key"]
@@ -321,7 +346,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "scroll",
-            description: "Use to scroll a list or page by pages; not to find one control (use query). Example: {\"app\": \"Notes\", \"direction\": \"down\", \"label\": \"Body\"}.",
+            description: "Use to scroll an app area. Explicit chunks stop when movement stops or an exact label comes into view.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -331,10 +356,54 @@ public enum ToolDefinitions {
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element identifier"),
                     "ref": nativeElementRefProperty(),
-                    "pages": numberProperty(description: "Number of pages to scroll. Fractional values are supported. Defaults to 1"),
+                    "pages": numberProperty(description: "Legacy page estimate. Defaults to 1."),
+                    "unit": stringProperty(description: "Verified chunk unit.", enumValues: ["lines", "pages", "points"]),
+                    "step_size": integerProperty(description: "Units per chunk. One for pages."),
+                    "max_steps": integerProperty(description: "Chunk limit, up to 20."),
+                    "until_visible": stringProperty(description: "Exact label inside this scroll area."),
                 ],
                 required: ["app", "direction"]
             )
+        ),
+        ToolDefinition(
+            name: "scroll_into_view",
+            description: "Use to reveal a known Mac control through its accessibility action.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(
+                properties: [
+                    "app": stringProperty(description: "App name or bundle identifier"),
+                    "element_index": stringProperty(description: "Element number"),
+                    "label": labelProperty(),
+                    "window_id": observedWindowIDProperty(),
+                ],
+                required: ["app"]
+            )
+        ),
+        ToolDefinition(
+            name: "gesture",
+            description: "Use for an app gesture equivalent. Give a zoom control or an explicit menu path.",
+            annotations: defaultAnnotations(),
+            inputSchema: objectSchema(properties: [
+                "app": stringProperty(description: "App name or bundle identifier"),
+                "window_id": observedWindowIDProperty(),
+                "kind": stringProperty(description: "Gesture equivalent.", enumValues: GestureAction.allCases.map(\.rawValue)),
+                "label": labelProperty(),
+                "element_index": stringProperty(description: "Control number."),
+                "menu_path": stringProperty(description: "App command path, e.g. View > Zoom In."),
+            ], required: ["app", "kind"])
+        ),
+        ToolDefinition(
+            name: "wait_for",
+            description: "Use to wait for an exact control label or a value change in the observed window.",
+            annotations: readOnlyAnnotations(),
+            inputSchema: objectSchema(properties: [
+                "app": stringProperty(description: "App name or bundle identifier"),
+                "window_id": observedWindowIDProperty(),
+                "label": stringProperty(description: "Exact control label."),
+                "condition": stringProperty(description: "What to verify.", enumValues: ControlWait.Condition.allCases.map(\.rawValue)),
+                "from_value": stringProperty(description: "Previous value for value_changed. Defaults to the first sample."),
+                "timeout": integerProperty(description: "Seconds, 1 to 30. Default 10."),
+            ], required: ["app", "label", "condition"])
         ),
         ToolDefinition(
             name: "query",
@@ -361,7 +430,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "select_text",
-            description: "Use to select text inside a text element, or place the cursor before or after it; not to replace a field's value (use set_value). text must match the accessibility tree exactly. If not unique, add prefix or suffix. Give label (or element_index).",
+            description: "Use to select text in a field by exact text or UTF-16 range. Add prefix or suffix for repeated text.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -370,6 +439,8 @@ public enum ToolDefinitions {
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Text element identifier"),
                     "ref": nativeElementRefProperty(),
+                    "start": integerProperty(description: "Start in UTF-16 units."),
+                    "length": integerProperty(description: "Length in UTF-16 units. Zero places the cursor."),
                     "text": stringProperty(description: "Target text as shown in the accessibility tree"),
                     "prefix": stringProperty(description: "Optional text immediately before the target, used to disambiguate repeated matches"),
                     "suffix": stringProperty(description: "Optional text immediately after the target, used to disambiguate repeated matches"),
@@ -378,7 +449,7 @@ public enum ToolDefinitions {
                         enumValues: TextSelectionMode.allCases.map(\.rawValue)
                     ),
                 ],
-                required: ["app", "text"]
+                required: ["app"]
             )
         ),
         ToolDefinition(
@@ -399,7 +470,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "hover",
-            description: "Use hover over an observed Mac control to reveal a tooltip or hover state. Deliver to its window without moving the user's pointer. Check the returned state. For Chrome use browser hover.",
+            description: "Use to hover over a control and read its tooltip or hover state. Set dwell_ms for delayed menus.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -408,18 +479,26 @@ public enum ToolDefinitions {
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
                     "ref": nativeElementRefProperty(),
+                    "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
                 ],
                 required: ["app"]
             )
         ),
         ToolDefinition(
             name: "drag",
-            description: "Use to drag between two pixel points only when no other tool does it (not for scrolling or selecting text). Both points must be inside the app's window. Delivery does not verify the UI result; window moves or Finder drag-and-drop are not guaranteed. Global pointer use is off unless the user has enabled it.",
+            description: "Use to drag controls or screenshot points inside one window. Add a batch check to verify the drop.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
+                    "from_label": stringProperty(description: "Source control label."),
+                    "from_index": integerProperty(description: "Source control reference."),
+                    "to_label": stringProperty(description: "Destination control label."),
+                    "to_index": integerProperty(description: "Destination control reference."),
+                    "hold_ms": integerProperty(description: "Hold before moving, up to 1000 ms."),
+                    "drag_steps": integerProperty(description: "Movement steps, 2 to 30."),
+                    "verify": dropVerificationProperty(),
                     "from_x": numberProperty(description: "Start X coordinate"),
                     "from_y": numberProperty(description: "Start Y coordinate"),
                     "to_x": numberProperty(description: "End X coordinate"),
@@ -427,7 +506,7 @@ public enum ToolDefinitions {
                     "modifiers": ["type": "array", "items": ["type": "string"],
                                   "description": "Optional shift, option, command, or control during the drag"],
                 ],
-                required: ["app", "from_x", "from_y", "to_x", "to_y"]
+                required: ["app"]
             )
         ),
     ]
@@ -443,6 +522,15 @@ private func observedWindowIDProperty() -> [String: Any] {
 
 private func nativeElementRefProperty() -> [String: Any] {
     stringProperty(description: "Exact element ref from the latest get_app_state with include_refs. Use instead of a label, index or pixels.")
+}
+
+private func dropVerificationProperty() -> [String: Any] {
+    objectSchema(properties: [
+        "label": stringProperty(description: "Expected control."),
+        "condition": stringProperty(description: "Drop check.", enumValues: ControlWait.Condition.allCases.map(\.rawValue)),
+        "from_value": stringProperty(description: "Previous value for value_changed."),
+        "timeout": integerProperty(description: "Seconds, up to 30."),
+    ], required: ["label", "condition"])
 }
 
 private func labelProperty() -> [String: Any] {

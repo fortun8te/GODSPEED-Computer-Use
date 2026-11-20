@@ -990,25 +990,37 @@ extension ComputerUseToolDispatcher {
             }
             let count = try Self.browserClickCount(arguments["click_count"], button: button)
             let modifiers = try Self.browserPointerModifiers(arguments["modifiers"])
-            let node = try target()
+            let placement = try ClickPlacement.isRequested(arguments) ? ClickPlacement(arguments) : nil
+            let precise = placement != nil || modifiers != 0 || count > 2
+            let node = try precise ? page.resolveExact(label: label, index: index) : target()
             try authorizeBrowserEffect(policy, action: action, arguments: arguments, page: page, node: node)
-            let click = try clickAndWatch(node, page: page, bridge: bridge, button: button, count: count, modifiers: modifiers, policy: policy)
+            let click = try clickAndWatch(node, page: page, bridge: bridge, button: button, count: count,
+                                          modifiers: modifiers, placement: placement, policy: policy)
             return ToolCallResult(content: [.text(click.text)], isError: false, browserContinuationTabID: click.tabID)
 
         case "drag":
             guard tab["tab_id"] != nil else {
                 throw ComputerUseError.invalidArguments("browser drag needs an open or explicitly selected tab")
             }
-            let destinationLabel = arguments["to_label"] as? String
+            let options = try DragOptions(arguments)
+            let destinationLabel = try ActionOptions.string("to_label", in: arguments)
             let destinationIndex = Self.browserTabID(arguments["to_index"])
-            guard destinationLabel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false || destinationIndex != nil else {
-                throw ComputerUseError.invalidArguments("browser drag needs to_label or to_index for the destination")
-            }
+            let x = BrowserRules.number(arguments["to_x"] ?? NSNull())
+            let y = BrowserRules.number(arguments["to_y"] ?? NSNull())
+            let hasControl = destinationLabel != nil || destinationIndex != nil
+            try DragOptions.validateEndpoint(index: hasControl ? "control" : nil, x: x, y: y, name: "destination")
             let modifiers = try Self.browserPointerModifiers(arguments["modifiers"])
-            let source = try target()
-            let destination = try page.resolve(label: destinationLabel, index: destinationIndex)
-            try page.drag(from: source, to: destination, modifiers: modifiers)
-            return .text("Drag delivered. Read the tab to verify the drop.")
+            let source = try page.resolveExact(label: arguments["from_label"] as? String ?? label,
+                                               index: Self.browserTabID(arguments["from_index"]) ?? index, allowPassive: true)
+            let destination = try hasControl
+                ? page.resolveExact(label: destinationLabel, index: destinationIndex, allowPassive: true) : nil
+            let point = x.flatMap { x in y.map { CGPoint(x: x, y: $0) } }
+            try page.drag(from: source, to: destination, point: point, modifiers: modifiers,
+                          steps: options.steps ?? 5, hold: options.hold)
+            if let verified = try options.verifiedDrop({ try page.waitForControl($0) }) {
+                return .text(verified)
+            }
+            return .text("Drag delivered. \(page.settle().line). Verify the drop from the resulting state.")
 
         case "type", "type_text", "fill", "fill_field":
             guard let text = arguments["text"] as? String else {
@@ -1031,17 +1043,35 @@ extension ComputerUseToolDispatcher {
             guard let key = arguments["key"] as? String, !key.isEmpty else {
                 throw ComputerUseError.invalidArguments("browser key needs key, e.g. Enter, Tab, Escape, ArrowDown, or a combination such as Cmd+A")
             }
+            let hold = try ActionOptions.duration("hold_ms", in: arguments, maxMs: 1000)
             if let operation = PrivateClipboard.Action(key: key, browser: true) {
+                guard hold == nil else {
+                    throw ComputerUseError.backgroundUnsupported("Clipboard shortcuts use the private clipboard and cannot be held.")
+                }
                 return try clipboardAction(operation)
             }
             try authorizeBrowserEffect(policy, action: action, arguments: arguments, page: page)
-            let change = try page.pressKeyAndWatch(key)
-            return .text("pressed \(key); \(change.line)")
+            let change = try page.pressKeyAndWatch(key, hold: hold)
+            let action = hold.map { "Held \(key) for \(Int(($0 * 1000).rounded())) ms and released." } ?? "Pressed \(key)."
+            return .text("\(action) \(change.line)")
 
         case "hover":
-            let node = try target()
-            try page.hover(node)
-            return .text("hovered \(node.role) \"\(node.name)\"")
+            let dwell = try ActionOptions.duration("dwell_ms", in: arguments, maxMs: 2000)
+            let node = try dwell == nil ? target() : page.resolveExact(label: label, index: index)
+            try page.hover(node, dwell: dwell)
+            let change = dwell.map { " for \(Int(($0 * 1000).rounded())) ms. \(page.settle().line)" } ?? ""
+            return .text("Hovered \(node.role) \"\(node.name)\"\(change)")
+
+        case "select_text":
+            let range = try TextRangeRequest(arguments)
+            let options = try (selectionString("text", in: arguments), selectionString("prefix", in: arguments),
+                               selectionString("suffix", in: arguments), parseSelectionMode(selectionString("selection", in: arguments)))
+            guard range != nil || options.0?.isEmpty == false else {
+                throw ComputerUseError.invalidArguments("select_text needs text or a UTF-16 range.")
+            }
+            let node = try page.resolveExact(label: label, index: index)
+            return .text(try page.selectText(node, range: range, text: options.0 ?? "", prefix: options.1,
+                                             suffix: options.2, mode: options.3))
 
         case "select", "choose":
             let node = try target()
@@ -1065,16 +1095,30 @@ extension ComputerUseToolDispatcher {
             guard let direction = BrowserRules.scrollDirection(raw) else {
                 throw ComputerUseError.invalidArguments("browser scroll direction must be up, down, left, right, top or bottom")
             }
+            if let chunks = try ScrollChunks(arguments) {
+                let node = try (label != nil || index != nil)
+                    ? page.resolveExact(label: label, index: index, allowPassive: true) : nil
+                return .text(try page.scroll(node, direction: direction, chunks: chunks))
+            }
             let amount = Self.browserTabID(arguments["amount"])
             if label != nil || index != nil {
                 return .text(try page.scrollElement(try target(), direction: direction, amount: amount))
             }
             return .text(try page.scrollPage(direction: direction, amount: amount))
 
+        case "gesture":
+            let gesture = try GestureAction(arguments: arguments)
+            guard arguments["menu_path"] == nil, label == nil, index == nil else {
+                throw ComputerUseError.invalidArguments("Chrome gesture equivalents act on the whole tab.")
+            }
+            if let operation = gesture.historyOperation { return .text(try page.history(operation)) }
+            return .text(try page.zoom(gesture))
+
         case "back", "forward", "reload":
             return .text(try page.history(action) { try Self.authorizeBrowserAddresses(policy, addresses: [$0]) })
 
         case "wait_for":
+            if let wait = try ControlWait(arguments) { return .text(try page.waitForControl(wait)) }
             let text = (arguments["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let wantedText = text.flatMap { $0.isEmpty ? nil : $0 }
             let urlPart = (arguments["url_contains"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1316,8 +1360,8 @@ extension ComputerUseToolDispatcher {
 
     private static func browserClickCount(_ raw: Any?, button: BrowserPage.PointerButton) throws -> Int {
         guard let raw else { return 1 }
-        guard let count = browserTabID(raw), count == 1 || (count == 2 && button == .left) else {
-            throw ComputerUseError.invalidArguments("browser click_count must be 1, or 2 for the left button")
+        guard let count = browserTabID(raw), count == 1 || ((2...3).contains(count) && button == .left) else {
+            throw ComputerUseError.invalidArguments("browser click_count must be 1, or 2 or 3 for the left button")
         }
         return count
     }
@@ -1343,11 +1387,12 @@ extension ComputerUseToolDispatcher {
     /// Clicks an element. A link is followed for a moment, so the reply says where it landed. A click that
     /// opens a new tab makes that tab the working tab, and the reply says so.
     private func clickAndWatch(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge,
-                               button: BrowserPage.PointerButton, count: Int, modifiers: Int, policy: ActionPolicy) throws -> (text: String, tabID: Int?) {
+                               button: BrowserPage.PointerButton, count: Int, modifiers: Int, placement: ClickPlacement?,
+                               policy: ActionPolicy) throws -> (text: String, tabID: Int?) {
         // Open an explicit new-tab destination in the background. If delivery is uncertain,
         // do not fall back to clicking the link and potentially open it twice.
         let link = node.role == "link" ? page.linkTarget(node) : nil
-        if button == .left, count == 1, modifiers == 0,
+        if button == .left, count == 1, modifiers == 0, placement == nil,
            let link, let url = BrowserRules.newTabLinkURL(href: link.href, target: link.target) {
             if StrictBackground.enabled() {
                 throw ComputerUseError.backgroundUnsupported("This link needs a new tab.")
@@ -1372,8 +1417,8 @@ extension ComputerUseToolDispatcher {
         // A link to another address is followed for a moment: the navigation starts a beat after the click.
         let hrefBefore = link.map { BrowserRules.leadsElsewhere(href: $0.href) } == true ? (try? page.location())?.href : nil
         let textBefore = Self.defersBrowserNavigationObservation ? nil : page.visibleTextLines()
-        try page.click(node, button: button, count: count, modifiers: modifiers)
-        let verb = count == 2 ? "double-clicked" : button == .left ? "clicked" : "\(button.rawValue)-clicked"
+        try page.click(node, button: button, count: count, modifiers: modifiers, placement: placement)
+        let verb = count == 3 ? "triple-clicked" : count == 2 ? "double-clicked" : button == .left ? "clicked" : "\(button.rawValue)-clicked"
         var message = "\(verb) \(node.role) \"\(node.name)\""
         if let hrefBefore, let place = page.followNavigation(from: hrefBefore) {
             try Self.authorizeBrowserPage(policy, page: page, afterDelivery: true)

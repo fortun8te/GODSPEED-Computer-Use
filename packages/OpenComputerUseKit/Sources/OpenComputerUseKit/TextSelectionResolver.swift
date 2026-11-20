@@ -26,6 +26,23 @@ public enum TextSelectionResolverError: Error, Equatable {
 }
 
 public enum TextSelectionResolver {
+    public static func resolve(value: String, start: Int, length: Int) throws -> TextSelectionTarget {
+        let units = value.utf16
+        guard (0...units.count).contains(start), length >= 0, length <= units.count - start else {
+            throw ComputerUseError.invalidArguments("The requested UTF-16 range is outside the field.")
+        }
+        let from = units.index(units.startIndex, offsetBy: start)
+        let to = units.index(from, offsetBy: length)
+        // Preserve valid UTF-16 even when a caller gives half of a surrogate pair.
+        func isBoundary(_ index: String.UTF16View.Index) -> Bool {
+            index == units.endIndex || !(0xDC00...0xDFFF).contains(units[index])
+        }
+        guard isBoundary(from), isBoundary(to) else {
+            throw ComputerUseError.invalidArguments("The range splits a UTF-16 surrogate pair.")
+        }
+        return TextSelectionTarget(location: start, length: length, matchedLocation: start, matchedLength: length, selectionMode: .text)
+    }
+
     /// Resolves `text` inside `value`, optionally disambiguated by the text immediately before
     /// (`prefix`) and after (`suffix`) it, into the range `select_text` should select.
     ///
