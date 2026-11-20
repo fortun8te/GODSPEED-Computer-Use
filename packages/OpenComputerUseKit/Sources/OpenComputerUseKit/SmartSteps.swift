@@ -433,13 +433,18 @@ enum SmartSteps {
         guard setFieldValue(panel.nameField, name), axText(kAXValueAttribute, of: panel.nameField) == name else {
             throw ComputerUseError.message("Could not type the file name into the save sheet of \(app), so nothing was saved. Read the app's state and fill it in with set_value.")
         }
-        Thread.sleep(forTimeInterval: 0.2)
-        guard let popup = wherePopup(in: panel.sheet) else {
+        guard let popup = ReadinessPoll.first(timeout: 0.2, read: {
+            wherePopup(in: panel.sheet).flatMap { popup in
+                axText(kAXValueAttribute, of: popup).map { _ in popup }
+            }
+        }) else {
             throw ComputerUseError.message("The save sheet of \(app) does not show its folder choice, so nothing was saved. Choose \(folder) in the sheet, then save again.")
         }
         if whereMatches(popupValue: axText(kAXValueAttribute, of: popup), folder: folder) { return }
         if pickWhereFolder(popup, folderName: (folder as NSString).lastPathComponent),
-           whereMatches(popupValue: axText(kAXValueAttribute, of: popup), folder: folder) {
+           ReadinessPoll.first(timeout: 0.3, read: {
+               whereMatches(popupValue: axText(kAXValueAttribute, of: popup), folder: folder) ? true : nil
+           }) == true {
             return
         }
         throw ComputerUseError.message("The save sheet of \(app) is set to \"\(axText(kAXValueAttribute, of: popup) ?? "another folder")\", and cannot be pointed at \(folder) through accessibility, so nothing was saved. Choose that folder in the sheet, then save again.")
@@ -474,16 +479,17 @@ enum SmartSteps {
     /// Opens the "Where" popup and presses the item named `folderName`. A menu that lacks it is closed again.
     private static func pickWhereFolder(_ popup: AXUIElement, folderName: String) -> Bool {
         guard AXUIElementPerformAction(popup, kAXPressAction as CFString) == .success else { return false }
-        Thread.sleep(forTimeInterval: 0.3)
-        let menus = axElements(kAXChildrenAttribute as String, of: popup)
-        for menu in menus {
-            for item in axElements(kAXChildrenAttribute as String, of: menu) where axText(kAXTitleAttribute, of: item) == folderName {
-                guard AXUIElementPerformAction(item, kAXPressAction as CFString) == .success else { return false }
-                Thread.sleep(forTimeInterval: 0.3)
-                return true
-            }
+        let item = ReadinessPoll.first(timeout: 0.3) {
+            axElements(kAXChildrenAttribute, of: popup).lazy
+                .flatMap { axElements(kAXChildrenAttribute, of: $0) }
+                .first { axText(kAXTitleAttribute, of: $0) == folderName }
         }
-        for menu in menus { _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString) }
+        if let item {
+            return AXUIElementPerformAction(item, kAXPressAction as CFString) == .success
+        }
+        for menu in axElements(kAXChildrenAttribute, of: popup) {
+            _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+        }
         return false
     }
 
@@ -498,26 +504,10 @@ enum SmartSteps {
         return nil
     }
 
-    /// Presses the first button titled `matches` within `sheets`. False when none was found or the press failed.
-    private static func pressButton(in sheets: [AXUIElement], matches: (String) -> Bool) -> Bool {
-        for sheet in sheets {
-            if let button = findButton(in: sheet, depth: 8, matches: matches) {
-                return AXUIElementPerformAction(button, kAXPressAction as CFString) == .success
-            }
+    static func waitForDialog(pid: pid_t, timeout: TimeInterval) {
+        TimingLog.measure("smart_steps.dialog_readiness") {
+            _ = ReadinessPoll.first(timeout: timeout) { sheetIsOpen(pid: pid) ? true : nil }
         }
-        return false
-    }
-
-    static func waitForDialog(app: String, service: ComputerUseService, timeout: TimeInterval) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        repeat {
-            if let snapshot = freshSnapshot(app: app, service: service),
-               dialogLine(in: nodes(of: snapshot)) != nil {
-                return true
-            }
-            Thread.sleep(forTimeInterval: 0.25)
-        } while Date() < deadline
-        return false
     }
 
     static func isEscapeKey(_ value: Any?) -> Bool {
@@ -644,72 +634,74 @@ enum SmartSteps {
         let fileManager = FileManager.default
         let modifiedBefore = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date
 
-        // First choice: the app's own scripting (TextEdit, Preview, Pages, Numbers, Keynote, Script Editor and
-        // others). It saves the front document straight to the path, as the type the extension names, with no
-        // dialog, no keys and no focus change. A sheet that is already open is closed by it as well.
-        if !sheetIsOpen(pid: descriptor.pid), let bundle = NSRunningApplication(processIdentifier: descriptor.pid)?.bundleIdentifier,
-           scriptedSave(bundle: bundle, path: full) {
-            let deadline = Date().addingTimeInterval(3)
-            while !fileManager.fileExists(atPath: full), Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
-            let modified = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date
-            if fileManager.fileExists(atPath: full), modifiedBefore == nil || modified != modifiedBefore {
-                return .text("Saved \(full).")
-            }
-        }
-
-        // No keys and no focus change: the sheet is driven through accessibility only (set the name field to the
-        // full path, press Save), so the user can keep working in another app. A save panel accepts a full path
-        // in its name field.
-        if savePanel(pid: descriptor.pid) == nil {
-            do {
-                _ = try service.pressMenu(app: app, titles: ["File", "Save As"])
-            } catch {
-                _ = try service.pressMenu(app: app, titles: ["File", "Save"])
-            }
-            let openDeadline = Date().addingTimeInterval(3)
-            while savePanel(pid: descriptor.pid) == nil, Date() < openDeadline {
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            guard savePanel(pid: descriptor.pid) != nil else {
-                throw ComputerUseError.message("The save sheet did not open, so nothing was saved. Check the app's state.")
-            }
-            Thread.sleep(forTimeInterval: 0.4)
-        }
-        // The panel is re-found from the app's sheets each time, so a background app's panel is still reached.
-        guard let panel = savePanel(pid: descriptor.pid) else {
-            throw ComputerUseError.message("Could not find the name field of the save sheet. Read the app's state and fill it in with set_value.")
-        }
-        try fillSavePanel(panel, folder: parts.folder, name: parts.name, full: full, app: app)
-        Thread.sleep(forTimeInterval: 0.2)
-        guard pressButton(in: [panel.sheet], matches: { $0 == "Save" }) else {
-            throw ComputerUseError.message("Could not find the Save button of the save sheet, so nothing was saved. Read the app's state.")
-        }
-        // A follow-up question is answered the way a save wants it: Replace, and the extension the path names
-        // (never another format's "Use .rtf").
-        let extensionName = (full as NSString).pathExtension.lowercased()
-        for _ in 0..<3 {
-            Thread.sleep(forTimeInterval: 0.6)
-            if fileManager.fileExists(atPath: full), !sheetIsOpen(pid: descriptor.pid) { break }
-            let answered = pressButton(in: sheetCandidates(pid: descriptor.pid)) { buttonTitle in
-                let lowered = buttonTitle.lowercased()
-                return lowered == "replace" || (!extensionName.isEmpty && lowered.hasPrefix("use") && lowered.contains(".\(extensionName)"))
-            }
-            if !answered { break }
-        }
-
-        // Saved means the file exists and was written just now (a Replace sheet leaves the old file in place).
-        let deadline = Date().addingTimeInterval(5)
         func isSaved() -> Bool {
             guard fileManager.fileExists(atPath: full) else { return false }
             let modified = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date
             return modifiedBefore == nil || modified != modifiedBefore
         }
-        while !isSaved(), Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.25)
+
+        // First choice: the app's own scripting (TextEdit, Preview, Pages, Numbers, Keynote, Script Editor and
+        // others). It saves the front document straight to the path, as the type the extension names, with no
+        // dialog, no keys and no focus change. A sheet that is already open is closed by it as well.
+        if !sheetIsOpen(pid: descriptor.pid), let bundle = NSRunningApplication(processIdentifier: descriptor.pid)?.bundleIdentifier,
+           scriptedSave(bundle: bundle, path: full) {
+            if ReadinessPoll.first(timeout: 3, read: { isSaved() ? true : nil }) == true {
+                return .text("Saved \(full).")
+            }
+            throw ComputerUseError.message("Save was sent, but the file write could not be confirmed. Check \(full) before repeating the save.")
         }
-        if isSaved() {
-            return .text("Saved \(full).")
+
+        // No keys and no focus change: the sheet is driven through accessibility only (set the name field to the
+        // full path, press Save), so the user can keep working in another app. A save panel accepts a full path
+        // in its name field.
+        let existingPanel = savePanel(pid: descriptor.pid)
+        if existingPanel == nil {
+            do {
+                _ = try service.pressMenu(app: app, titles: ["File", "Save As"])
+            } catch let error as ComputerUseError where messageText(error).hasPrefix("No menu item ") {
+                _ = try service.pressMenu(app: app, titles: ["File", "Save"])
+            }
         }
+        guard let panel = existingPanel ?? ReadinessPoll.first(timeout: 3, read: {
+            savePanel(pid: descriptor.pid)
+        }) else {
+            throw ComputerUseError.message("The save sheet did not expose its name field. Check the app's state.")
+        }
+        try fillSavePanel(panel, folder: parts.folder, name: parts.name, full: full, app: app)
+        guard let button = ReadinessPoll.first(timeout: 0.2, read: {
+            findButton(in: panel.sheet, depth: 8, matches: { $0 == "Save" })
+        }), AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+            throw ComputerUseError.message("The Save button press could not be confirmed. Read the app's state before retrying.")
+        }
+
+        // Poll for the disk write or a question attached to this save panel.
+        // Each observed confirmation button gets at most one press.
+        let extensionName = (full as NSString).pathExtension.lowercased()
+        var answered: [AXUIElement] = []
+        let saved = TimingLog.measure("smart_steps.save_confirmation") {
+            ReadinessPoll.first(timeout: 6.8, interval: 0.1) {
+                let sheets = sheetCandidates(pid: descriptor.pid).filter {
+                    SnapshotBuilder.belongsToWindow($0, window: panel.sheet)
+                }
+                if isSaved(), sheets.isEmpty { return true }
+                if answered.count < 3 {
+                    for sheet in sheets {
+                        let button = findButton(in: sheet, depth: 8) { title in
+                            let lowered = title.lowercased()
+                            return lowered == "replace"
+                                || (!extensionName.isEmpty && lowered.hasPrefix("use") && lowered.contains(".\(extensionName)"))
+                        }
+                        if let button, !answered.contains(where: { CFEqual($0, button) }) {
+                            answered.append(button)
+                            _ = AXUIElementPerformAction(button, kAXPressAction as CFString)
+                            break
+                        }
+                    }
+                }
+                return nil
+            }
+        }
+        if saved == true { return .text("Saved \(full).") }
         var reply = "Save was sent, but \(full) is not on disk."
         reply += sheetIsOpen(pid: descriptor.pid)
             ? " A sheet is still open in \(app) (a question such as Replace or a file format choice): read the app's state and click its answer by label."

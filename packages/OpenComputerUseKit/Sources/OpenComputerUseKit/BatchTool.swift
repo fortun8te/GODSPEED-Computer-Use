@@ -984,7 +984,13 @@ extension ComputerUseToolDispatcher {
         if !failed, !stoppedForTime, trailingObservation == nil, let last = lastAttemptedStep,
            last.tool == "press_menu" || (last.tool == "press_key" && ((last.arguments["key"] as? String) ?? "").lowercased().contains("+")) {
             let remaining = max(0, deadline - clock.systemUptime)
-            if remaining > 0 { Thread.sleep(forTimeInterval: min(0.35, remaining)) }
+            if remaining > 0, let app = lastApp, !hasPinnedSteps,
+               let pid = (try? AppDiscovery.resolveRunning(app))?.pid, stepOpensDialog(last, pid: pid) {
+                // Stop the dialog wait as soon as AX exposes a sheet.
+                SmartSteps.waitForDialog(pid: pid, timeout: min(0.35, remaining))
+            } else if remaining > 0 {
+                Thread.sleep(forTimeInterval: min(0.35, remaining))
+            }
         }
 
         let verificationWindow = pinnedWindow ?? (try? validatedQueryWindowID(lastAttemptedStep?.arguments["window_id"]))
