@@ -819,7 +819,9 @@ def learning_episodes(folder):
                 pending.append(row)
             elif row.get("kind") == "episode":
                 episodes.append({"file": file.name, "run_id": row.get("run_id"), "ts": row.get("ts"),
-                                 "goal": row.get("goal") or "", "app": row.get("app") or "", "steps": pending})
+                                 "goal": row.get("goal") or "", "app": row.get("app") or "", "steps": pending,
+                                 "done_when": row.get("done_when"), "done": row.get("done"),
+                                 "window": row.get("window")})
                 pending = []
         if pending:
             dropped["incomplete"] += 1
@@ -861,6 +863,9 @@ def episode_problem(episode):
         return "mixed_app"
     if secure_text(episode["goal"]):
         return "secure_or_redacted"
+    for condition in episode.get("done_when") or []:
+        if any(secure_text(value) for value in condition.values() if isinstance(value, str)):
+            return "secure_or_redacted"
     for row in steps:
         if secure_text(row.get("target_role")) or secure_text(row.get("target_label")):
             return "secure_or_redacted"
@@ -878,9 +883,41 @@ def verified_episode(episode):
     return episode["steps"][-1].get("done_when") == "verified"
 
 
+def generalized_conditions(conditions):
+    """done_when in its JSON form, with the same slot generalization as goal text. None when the row has none."""
+    if not isinstance(conditions, list) or not conditions:
+        return None
+    if not all(isinstance(condition, dict) for condition in conditions):
+        return None
+    return [{key: goal_template(value) if isinstance(value, str) else value for key, value in condition.items()}
+            for condition in conditions]
+
+
+def shared_identity(verified):
+    """(done_when, window, reason). Every supporting episode must share the same generalized done_when and the same
+    window. A candidate with a reason stays unverified; the reason says what was missing or different."""
+    checks = {json.dumps(generalized_conditions(e.get("done_when")), sort_keys=True) for e in verified}
+    if checks == {"null"}:
+        return None, None, "done_when missing"
+    if len(checks) > 1 or "null" in checks:
+        return None, None, "done_when differs"
+    windows = {json.dumps(e.get("window"), sort_keys=True) for e in verified}
+    if windows == {"null"}:
+        return None, None, "window missing"
+    if len(windows) > 1 or "null" in windows:
+        return None, None, "window differs"
+    done_when = generalized_conditions(verified[0].get("done_when"))
+    if "{{" in json.dumps(done_when):
+        # A placeholder in a condition has nothing to bind to on replay, so it cannot be verified yet.
+        return None, None, "done_when has slots"
+    return done_when, verified[0].get("window"), None
+
+
 def recipe_candidate(members, verified, app, template, signatures):
-    """A BatchRecipes-shaped recipe. It stays unverified: a reviewed done_when has to be added before it can replay."""
+    """A BatchRecipes-shaped recipe. It is verified only when the supporting episodes share done_when and window;
+    otherwise it stays unverified and says why."""
     sample = verified[0]
+    done_when, window, reason = shared_identity(verified)
     steps, params, kinds = [], {}, {}
     sensitive = False
     for (tool, _role, label) in signatures:
@@ -902,8 +939,9 @@ def recipe_candidate(members, verified, app, template, signatures):
     examples = [{"file": e["file"], "run_id": e["run_id"], "ts": e["ts"]} for e in verified[:EXAMPLES]]
     return {
         "app": app, "goal": template, "steps": steps, "uses": 0, "failures": 0,
-        "params": params, "slot_kinds": kinds, "done_when": [], "done_when_missing": True,
-        "verified": False, "champion": False, "version": None, "status": "unverified",
+        "params": params, "slot_kinds": kinds, "done_when": done_when or [], "done_when_missing": done_when is None,
+        "window": window, "verified": reason is None, "champion": False, "version": None,
+        "status": "unverified" if reason else "verified", "reason": reason,
         "requiresConfirmation": sensitive, "support": len(verified), "episodes_total": len(members),
         "examples": examples,
     }
