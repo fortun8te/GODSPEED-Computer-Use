@@ -205,7 +205,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
     case "snapshot":
         return """
         Usage:
-          open-computer-use snapshot [--include-ax true|false] [--include-screenshot true|false] [--text-limit <positive-int|max>] [--max-tree-nodes <positive-int>] [--max-tree-depth <positive-int>] <app>
+          open-computer-use snapshot [--include-ax true|false] [--include-screenshot true|false] [--include-menu-bar true|false] [--text-limit <positive-int|max>] [--max-tree-nodes <positive-int>] [--max-tree-depth <positive-int>] <app>
 
         Arguments:
           <app>                App name or bundle identifier to inspect.
@@ -213,6 +213,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         Options:
           --include-ax         Include AX/focus/selection (true by default). False invalidates prior indexes.
           --include-screenshot Include screenshot capture (true by default). At least one channel must be true.
+          --include-menu-bar   Add the menu bar to the AX list (false by default).
           --text-limit         Override the default 500 character text limit. Use `max` for full text.
           --max-tree-nodes     Override the default 1200 node accessibility tree budget.
           --max-tree-depth     Override the default 64 level accessibility tree depth.
@@ -343,13 +344,16 @@ private func parseSnapshot(arguments: [String]) throws -> OpenComputerUseCLIComm
     while index < arguments.count {
         let argument = arguments[index]
         switch argument {
-        case "--include-ax", "--include-screenshot":
+        case "--include-ax", "--include-screenshot", "--include-menu-bar":
             index += 1
             guard index < arguments.count, let value = Bool(arguments[index].lowercased()) else {
                 throw OpenComputerUseCLIError(message: "\(argument) requires true or false", helpCommand: "snapshot")
             }
-            if argument == "--include-ax" { observation.includeAX = value }
-            else { observation.includeScreenshot = value }
+            switch argument {
+            case "--include-ax": observation.includeAX = value
+            case "--include-menu-bar": observation.includeMenuBar = value
+            default: observation.includeScreenshot = value
+            }
         case "--text-limit":
             index += 1
             guard index < arguments.count else {

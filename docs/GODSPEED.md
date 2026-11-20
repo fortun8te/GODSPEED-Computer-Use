@@ -47,10 +47,23 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Fill**: `{"tool": "fill", "fields": {"To": "sam@x.com"}, "submit": "Send"}` becomes one `set_value` per field and a click. Add `"web": true` for a page.
 - **Goal**: `goal` is one sentence. The reply may add a `Check:` line (done, stuck, or still loading) from the referee. Treat it as a hint.
 - **Recipes**: send `remember: true` with a goal that reached it. Later, send only `goal` to replay the saved steps and their completion checks. Changed recipe values need a fresh check. Keep secrets out of completion conditions because saved recipes store them locally. Steps with element numbers or coordinates are never saved. A recipe that fails twice in a row is dropped.
+- **Verified receipts**. With `return_state: false`, a verified file, exact native field, or browser URL can finish the batch without a final tree. Missing evidence still gets a recovery read. Partial or clipped trees are for discovery. Completion needs an independent check or a complete observation.
+- **Wait steps**. Godspeed can check for a window, matching text, or busy indicator before taking a full read. The full read still confirms the wait. Busy checks make up to four accessibility reads at a time.
+- **Action readback**. The dialog check reuses the action’s window read when available. A verified field write can use the next scheduled read. Batch effect checks can reuse a complete read of the same window when it shows a change. A delayed result or a change of window can require another read.
 - **Change-only replies**: the final read is compared with what the model last saw for that app. Only changed lines are sent. If an element's number moved, the full state is sent instead. If nothing changed, the reply says so.
 - **Condensed trees**: long rows are collapsed, text is cut at 160 characters, and container noise is dropped. Every element number the model can act on stays the same.
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
-- **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
+- **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. A preview lane can reuse its own temporary tab and checks cleanup before returning. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
+
+Window reads skip the menu bar by default. Use `include_menu_bar: true` on `get_app_state` or `--include-menu-bar true` on a CLI snapshot to include it. `press_menu` takes the menu path directly.
+
+Native actions read back accessibility text. Use `get_app_state` with `include_screenshot: true` or set `screenshot: true` on a batch when you need an image.
+
+Save waits for the name field, folder choice and any confirmation to appear. It checks the disk for the new write.
+
+When a visible app is still preparing its web content, Godspeed checks for the web area before walking the full tree again.
+
+Browser `find` checks matching controls first and keeps icon-only controls eligible for hints. Chrome reads the selected hints together. Use `find_exact` to look up controls by their exact accessible name. Use a regular read for numbered controls and page verification.
 
 ### Strict background mode
 
@@ -107,12 +120,12 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 |---|---|---|
 | `OPEN_COMPUTER_USE_CONDENSE` | on | Condense state text (`AXTreeCondenser`). |
 | `OPEN_COMPUTER_USE_BATCH_DIFF` | on | Change-only final read in batch replies. |
-| `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT` | off | Screenshot with every read (settings key `screenshots_by_default`). |
+| `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT` | off | Screenshot with explicit app-state reads (settings key `screenshots_by_default`). |
 | `OPEN_COMPUTER_USE_AX_COMPACT` | on | Short role spellings in the tree. `0` = older long spellings. |
 | `OPEN_COMPUTER_USE_AX_INDENTATION` | `level` | `tab4` for four-space indent (opt-in). |
 | `OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS` | 20 | Visible rows kept per list, table or outline. |
 | `OPEN_COMPUTER_USE_ACTION_READ_BACK` | on | Read the window back after an action. |
-| `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | on | Stop waiting when the window stops changing. |
+| `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | off | Sample window images during action readback to detect the end of animations. |
 | `OPEN_COMPUTER_USE_BACKGROUND_ONLY` | off | Never raise or activate an app. Opt-in for when the user keeps working. |
 | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` | off | Allow moving the real pointer. Off means never. |
 | `OPEN_COMPUTER_USE_FOCUS_BORROW` | off | Allow focus borrowing when background-only and strict modes are off. |
@@ -266,6 +279,8 @@ If the Mac session changes mid-read, Godspeed stops issuing browser commands and
 Open or select a tab and read its controls. For example, use `{"action":"drag","label":"Card A","to_label":"Drop zone"}` when both controls are visible in the same page. Read the tab after delivery to verify the drop. Apps can interpret pointer gestures differently.
 
 ## Local traces
+
+Set `OPEN_COMPUTER_USE_DEBUG_TIMING=1` to record timings and counts for accessibility reads, screenshot encoding, Chrome calls and batch checks. These lines include byte counts without the contents.
 
 Tool logs at `~/.godspeed/trajectories` record queue time, tool duration, batch outcomes and verification. The default omits arguments, screen text and screenshots. Set `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0` to turn logging off. For a local fixture, `OPEN_COMPUTER_USE_TRAJECTORY_FAILURES=1` adds a short error and argument shape. Review it before sharing because errors can include app names, filenames or controls. `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` captures typed text and observations.
 

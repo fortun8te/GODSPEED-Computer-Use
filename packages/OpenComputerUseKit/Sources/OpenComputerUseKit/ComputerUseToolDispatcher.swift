@@ -255,11 +255,21 @@ public final class ComputerUseToolDispatcher {
             ? (before ?? (try? service.currentSnapshot(for: app, needScreenshot: false))?.treeLines)
             : nil
 
-        var result = try dispatchHealingStaleIndex(name: name, arguments: arguments, app: app, log: log)
+        // Use the service's post-action read for dialog detection and positive changes.
+        var actionObservation = NativeActionObservation()
+        func dispatchAction() throws -> ToolCallResult {
+            actionObservation = NativeActionObservation()
+            return try ComputerUseService.$actionObservation.withValue(actionObservation) {
+                try dispatchHealingStaleIndex(name: name, arguments: arguments, app: app, log: log)
+            }
+        }
+        var result = try dispatchAction()
         var latest: AppSnapshot?
 
         if let before, let pid = frontmostPID, !result.isError {
-            let after = SmartSteps.freshSnapshot(app: app, service: service)
+            let after = actionObservation.read(before: before) {
+                SmartSteps.freshSnapshot(app: app, service: service)
+            }
             latest = after
             let shouldRetry = SmartSteps.shouldRetryWithoutEffect(
                 actionSucceeded: true,
@@ -275,10 +285,12 @@ public final class ComputerUseToolDispatcher {
             // An uncertain or independently verified action is never repeated.
             if shouldRetry, result.deliveryState == .acknowledged, isSafeToRepeat(name: name, arguments: arguments, app: app, snapshot: after) {
                 result = try FocusBorrow.withBorrow(pid: pid) {
-                    try dispatchHealingStaleIndex(name: name, arguments: arguments, app: app, log: log)
+                    try dispatchAction()
                 }
                 log.note("No visible change in the background, so the step was retried once with the app in front; focus was given back.")
-                latest = SmartSteps.freshSnapshot(app: app, service: service)
+                latest = actionObservation.read(before: before) {
+                    SmartSteps.freshSnapshot(app: app, service: service)
+                }
             } else if shouldRetry, name == "click" || name == "perform_secondary_action" || name == "press_key" {
                 log.note("No visible change after this step. It was not repeated, in case it did work; if it had no effect, try another way (a label, a menu, set_value).")
             }
@@ -305,7 +317,10 @@ public final class ComputerUseToolDispatcher {
         }
 
         if !result.isError, SmartSteps.actionTools.contains(name) {
-            let snapshot = latest ?? SmartSteps.freshSnapshot(app: app, service: service)
+            let snapshot = latest ?? actionObservation.read {
+                SmartSteps.freshSnapshot(app: app, service: service)
+            }
+            log.afterActionSnapshot = snapshot
             if let snapshot, let line = SmartSteps.dialogLine(in: SmartSteps.nodes(of: snapshot)) {
                 log.tail(line)
             }
@@ -455,7 +470,9 @@ public final class ComputerUseToolDispatcher {
                     includeScreenshot: try strictObservationBool(
                         "include_screenshot", in: arguments, default: LeanDefaults.includeScreenshot
                     ),
-                    includeRefs: try strictObservationBool("include_refs", in: arguments, default: false)
+                    includeRefs: try strictObservationBool("include_refs", in: arguments, default: false),
+                    // The menu tree is separate from the window's controls.
+                    includeMenuBar: try strictObservationBool("include_menu_bar", in: arguments, default: false)
                 ),
                 settleMs: try optionalSettleMs(in: arguments),
                 compact: try strictObservationBool("compact", in: arguments, default: false),

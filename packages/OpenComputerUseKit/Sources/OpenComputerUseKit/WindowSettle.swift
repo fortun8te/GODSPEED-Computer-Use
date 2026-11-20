@@ -7,8 +7,10 @@ import Foundation
 enum WindowSettle {
     // MARK: Still: frame-driven settle for action read-back
 
-    static var enabled: Bool {
-        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_SETTLE_BY_FRAME"]?
+    static var enabled: Bool { frameSamplingEnabled(environment: RequestConfiguration.environment) }
+
+    static func frameSamplingEnabled(environment: [String: String]) -> Bool {
+        let value = environment["OPEN_COMPUTER_USE_SETTLE_BY_FRAME"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
     }
@@ -92,24 +94,26 @@ enum WindowSettle {
         let loaded: Bool?
     }
 
-    /// Whether the window under `root` shows a busy sign, breadth first to `scanNodes` nodes and `scanDepth`
-    /// levels. When the walk has read every node it queued, it reads all newly queued ones in one `read` call
-    /// (in order), so it visits the same nodes in the same order, with the same answer, as reading one at a time.
-    static func busy<Element>(from root: Element, read: ([Element]) -> [Signs<Element>?]) -> Bool {
+    /// Bounded breadth-first scan. For a settle decision, unread branches veto quiescence.
+    static func busy<Element>(from root: Element, requireComplete: Bool = false,
+                              read: ([Element]) -> [Signs<Element>?]) -> Bool {
         var nodes: [(element: Element, depth: Int)] = [(root, 0)]
         var signs: [Signs<Element>?] = []
         var next = 0
         while next < nodes.count {
             if next == signs.count { signs += read(nodes[next...].map(\.element)) }
             let depth = nodes[next].depth
-            next += 1
-            guard let node = signs[next - 1] else { continue }
+            defer { next += 1 }
+            guard next < signs.count, let node = signs[next] else {
+                if requireComplete { return true }
+                continue
+            }
             if node.role == kAXBusyIndicatorRole || (node.role == "AXWebArea" && node.loaded == false) || node.busy == true {
                 return true
             }
-            if depth < scanDepth {
-                nodes += node.children.prefix(max(0, scanNodes - nodes.count)).map { ($0, depth + 1) }
-            }
+            let remaining = depth < scanDepth ? scanNodes - nodes.count : 0
+            if requireComplete, node.children.count > remaining { return true }
+            nodes += node.children.prefix(remaining).map { ($0, depth + 1) }
         }
         return false
     }
@@ -149,14 +153,28 @@ enum WindowSettle {
             && value as? Bool == true
     }
 
-    /// Each element's signs, read side by side: the app answers one read while the next is on its way.
+    /// Split a frontier into a fixed number of lanes. Read signs in the
+    /// original node order without making one concurrent AX call per node.
+    static let scanConcurrency = 4
+
+    static func scanRanges(count: Int) -> [Range<Int>] {
+        guard count > 0 else { return [] }
+        let lanes = min(scanConcurrency, count)
+        return (0..<lanes).map { lane in
+            (lane * count / lanes)..<((lane + 1) * count / lanes)
+        }
+    }
+
     static func readAll(_ elements: [AXUIElement]) -> [Signs<AXUIElement>?] {
         // Each slot is written by its own iteration only.
         nonisolated(unsafe) let signs = UnsafeMutableBufferPointer<Signs<AXUIElement>?>.allocate(capacity: elements.count)
         nonisolated(unsafe) let elements = elements
         signs.initialize(repeating: nil)
         defer { signs.deinitialize(); signs.deallocate() }
-        DispatchQueue.concurrentPerform(iterations: elements.count) { signs[$0] = read(elements[$0]) }
+        let ranges = scanRanges(count: elements.count)
+        DispatchQueue.concurrentPerform(iterations: ranges.count) { lane in
+            for index in ranges[lane] { signs[index] = read(elements[index]) }
+        }
         return Array(signs)
     }
 

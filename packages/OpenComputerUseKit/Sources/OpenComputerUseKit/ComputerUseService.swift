@@ -729,6 +729,8 @@ public final class ComputerUseService {
     @TaskLocal static var requiredWindowID: CGWindowID?
     @TaskLocal static var requiredRefGeneration: UUID?
     @TaskLocal static var awaitsModalTextFocus = false
+    @TaskLocal static var actionObservation: NativeActionObservation?
+    @TaskLocal static var defersVerifiedSetValueObservation = false
 
     private var snapshotsByApp: [String: AppSnapshot] = [:]
     private var invalidatedSnapshotAliases: Set<String> = []
@@ -787,13 +789,22 @@ public final class ComputerUseService {
 
     /// The result an action returns: the after-action snapshot, or a short status
     /// when read-back is off.
-    private func actionResult(for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> ToolCallResult {
+    func actionResult(
+        for query: String, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+        refresh: ((SnapshotObservationOptions) throws -> AppSnapshot)? = nil
+    ) throws -> ToolCallResult {
         guard Self.requiredWindowID == nil, actionReadBack else {
             return .text("ok")
         }
 
         do {
-            return snapshotResult(for: try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy), style: .actionResult)
+            let options = SnapshotObservationOptions(includeAX: true, includeScreenshot: false)
+            let snapshot = try TimingLog.measure("action.native_readback") {
+                try refresh?(options)
+                    ?? refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: options)
+            }
+            Self.actionObservation?.record(snapshot)
+            return snapshotResult(for: snapshot, style: .actionResult)
         } catch {
             throw ComputerUseError.acknowledged("Input was sent. Read the app to check its effect. \(SmartSteps.messageText(error))")
         }
@@ -897,7 +908,7 @@ public final class ComputerUseService {
             return "Settle skipped: no window to watch yet."
         }
         let settled = WindowSettle.wait(timeout: TimeInterval(min(timeoutMs, 5000)) / 1000) {
-            TimingLog.measure("get_app_state.settle_scan") { WindowSettle.busy(from: context.windowElement, read: WindowSettle.readAll) }
+            TimingLog.measure("get_app_state.settle_scan") { WindowSettle.busy(from: context.windowElement, requireComplete: true, read: WindowSettle.readAll) }
         }
         let waited = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
         return settled
@@ -1923,8 +1934,19 @@ public final class ComputerUseService {
         }
 
         settleVisualCursor(at: cursorTarget)
-        let result = try actionResult(for: query)
-        return result.replacingContent(result.content, deliveryState: delivery)
+        return try Self.verifiedSetValueResult(verified: delivery == .verified) {
+            let result = try actionResult(for: query)
+            return result.replacingContent(result.content, deliveryState: delivery)
+        }
+    }
+
+    static func verifiedSetValueResult(verified: Bool, readBack: () throws -> ToolCallResult) rethrows -> ToolCallResult {
+        if verified, defersVerifiedSetValueObservation {
+            actionObservation?.deferToBatchRead()
+            return .text("ok", deliveryState: .verified)
+        }
+        let result = try readBack()
+        return verified ? result.replacingContent(result.content, deliveryState: .verified) : result
     }
 
     public func selectText(
@@ -2364,7 +2386,9 @@ public final class ComputerUseService {
         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
         observation: SnapshotObservationOptions = .defaults
     ) throws -> AppSnapshot {
-        let app = try observation.includeRefs ? AppDiscovery.resolveRunning(query) : AppDiscovery.resolve(query)
+        let app = try TimingLog.measure("snapshot.resolve_app") {
+            try observation.includeRefs ? AppDiscovery.resolveRunning(query) : AppDiscovery.resolve(query)
+        }
         let snapshot = try SnapshotBuilder.build(
             for: app,
             textLimit: textLimit,
@@ -3803,13 +3827,17 @@ public final class ComputerUseService {
     }
 
     private func snapshotResult(for snapshot: AppSnapshot, style: SnapshotTextStyle) -> ToolCallResult {
-        var content = [ToolResultContentItem.text(snapshot.renderedText(style: style))]
+        let text = TimingLog.measure("snapshot.render_text") { snapshot.renderedText(style: style) }
+        TimingLog.count("snapshot.ax_elements", snapshot.elements.count)
+        TimingLog.count("snapshot.text_bytes", text.utf8.count)
+        TimingLog.count("snapshot.image_bytes", snapshot.screenshotData?.count ?? 0)
+        var content = [ToolResultContentItem.text(text)]
         if snapshot.observation.includeRefs {
             content.append(.text(snapshot.elementRefs?.text ?? "No element refs available for this window."))
         }
         if let note = snapshot.screenshotNote { content.append(.text(note)) }
         if let screenshotData = snapshot.screenshotData {
-            content.append(.screenshotImage(screenshotData))
+            content.append(TimingLog.measure("snapshot.base64_encode") { .screenshotImage(screenshotData) })
         }
         return ToolCallResult(content: content)
     }
