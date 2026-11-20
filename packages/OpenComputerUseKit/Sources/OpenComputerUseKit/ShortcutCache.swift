@@ -43,6 +43,47 @@ public final class ShortcutCache: @unchecked Sendable {
         return chord
     }
 
+    /// Where press_menu sends a path: the menu itself, or a confirmed key equivalent. Strict mode always uses the menu.
+    public enum Route: Equatable, Sendable {
+        case menu
+        case shortcut(String)
+    }
+
+    /// The route for one press_menu path. Only a confirmed, non-destructive chord leaves the menu.
+    public func route(app: String, path: String, strict: Bool) -> Route {
+        guard !strict, let chord = lookup(app: app, path: path) else { return .menu }
+        return .shortcut(chord)
+    }
+
+    /// Cache key: an app's bundle id and version, so an update starts with no confirmed shortcuts.
+    public static func appKey(bundleID: String, version: String) -> String {
+        bundleID + "@" + version
+    }
+
+    private struct Saved: Codable {
+        var chords: [String: [String: String]]
+        var confirmed: [String]
+    }
+
+    /// Writes the chords and confirmations as JSON. Holds only menu titles and key names.
+    public func save(to url: URL) throws {
+        lock.lock()
+        let saved = Saved(chords: chords, confirmed: confirmed.sorted())
+        lock.unlock()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(saved).write(to: url, options: .atomic)
+    }
+
+    /// Restores saved state. A missing file is an empty cache, not an error.
+    public func load(from url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let saved = try JSONDecoder().decode(Saved.self, from: Data(contentsOf: url))
+        lock.lock()
+        defer { lock.unlock() }
+        chords = saved.chords
+        confirmed = Set(saved.confirmed)
+    }
+
     public func invalidate(app: String) {
         lock.lock(); defer { lock.unlock() }
         chords.removeValue(forKey: app)
