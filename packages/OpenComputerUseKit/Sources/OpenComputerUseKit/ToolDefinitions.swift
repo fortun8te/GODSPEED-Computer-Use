@@ -101,7 +101,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: HandoffTool.name,
-            description: "Run a bounded Mac subtask. Exact field checks can run without a model. For ambiguous actions, handoff uses the local checker and stops on risk or uncertainty.",
+            description: "Use for a bounded Mac subtask. Exact field checks can run without a model. For ambiguous actions, handoff uses the local checker and stops on risk or uncertainty.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
