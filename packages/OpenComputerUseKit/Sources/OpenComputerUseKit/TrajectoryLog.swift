@@ -547,12 +547,15 @@ final class TrajectoryLog: @unchecked Sendable {
             var observation: BatchEffects.Receipt?
             var durationMs: Double? = nil
             var deliveryState: DeliveryState = .acknowledged
+            /// Per-click outcome (ClickVerifier), set only for click-like steps that were checked.
+            var verification: ClickVerifier.Verdict?
 
             func metadata(number: Int) -> [String: Any] {
                 var fields: [String: Any] = ["n": number, "status": failureCode == nil ? "ok" : "failed"]
                 fields["duration_ms"] = durationMs
                 fields["failure_code"] = failureCode?.rawValue
                 fields["observation"] = observation?.rawValue.replacingOccurrences(of: " ", with: "_")
+                fields["click_verdict"] = verification?.rawValue
                 for (key, value) in deliveryState.metadata { fields[key] = value }
                 return fields
             }
