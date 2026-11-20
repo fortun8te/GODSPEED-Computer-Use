@@ -32,6 +32,8 @@ In a separate 1.1.11 desktop fixture, 80 visual move requests from two clients p
 
 The deterministic handoff fixture fills two known empty fields in two actions and uses zero chooser requests. The separate ambiguous two-action fixture uses two chooser requests. `swift test --filter HandoffToolTests` verifies target binding, readback and escalation.
 
+The configured local scorer selected the intended field on a separate two-option synthetic input. The first request took 2.48 seconds with the model unloaded. A repeat took 86 ms. Use matched held-out inputs before changing the model or its confidence threshold.
+
 ## Earlier runs
 
 These recorded runs used GPT-6 Luna at low reasoning. A task checker scored the final result.
