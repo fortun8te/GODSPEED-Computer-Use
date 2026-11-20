@@ -397,7 +397,7 @@ enum ArgumentNormalizer {
 
     private static func kind(of key: String, tool: String) -> Kind {
         switch key {
-        case "screenshot", "remember", "foreground", "replace", "include_ax", "include_screenshot", "exact":
+        case "screenshot", "remember", "foreground", "replace", "include_ax", "include_screenshot", "include_menu_bar", "exact":
             return .bool
         case "window_id":
             return tool == "query" ? .int : .none
