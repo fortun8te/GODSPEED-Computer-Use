@@ -258,6 +258,13 @@ func globalPointerFallbacksEnabled(environment: [String: String]) -> Bool {
     return ["1", "true", "yes", "on"].contains(rawValue)
 }
 
+/// Raises the app for a global pointer step. The hands-off check runs first: a step the user's activity
+/// refuses must not bring the app forward.
+func raiseForGlobalPointerInput(_ app: RunningAppDescriptor, prepare: (RunningAppDescriptor) -> Void = InputSimulation.prepareAppForGlobalPointerInput) throws {
+    try requireUserHandsOff()
+    prepare(app)
+}
+
 /// Whether an action's result reads the window back (settle, then a full snapshot).
 /// A program driving the tools (the `js` REPL adapter) reads state explicitly and
 /// sets `OPEN_COMPUTER_USE_ACTION_READ_BACK=0`, so its actions return a short status.
@@ -4200,7 +4207,7 @@ public final class ComputerUseService {
                 targetDescription: targetDescription,
                 snapshot: snapshot
             )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try raiseForGlobalPointerInput(snapshot.app)
             try InputSimulation.scrollGlobally(at: eventPoint, direction: direction, pages: pages)
             return
         }
@@ -4226,7 +4233,7 @@ public final class ComputerUseService {
                 targetDescription: targetDescription,
                 snapshot: snapshot
             )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try raiseForGlobalPointerInput(snapshot.app)
             try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, flags: flags)
         case .appPost:
             guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
@@ -4253,7 +4260,7 @@ public final class ComputerUseService {
                 targetDescription: targetDescription,
                 snapshot: snapshot
             )
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try raiseForGlobalPointerInput(snapshot.app)
             try InputSimulation.clickGlobally(at: eventPoint, button: button, clickCount: clickCount)
             return
         }
@@ -4317,7 +4324,7 @@ public final class ComputerUseService {
                 )
             }
             debugClickDecision("requested=global executed=global_hid target=\(targetDescription)")
-            InputSimulation.prepareAppForGlobalPointerInput(snapshot.app)
+            try raiseForGlobalPointerInput(snapshot.app)
             try InputSimulation.clickGlobally(at: eventPoint, button: button, clickCount: clickCount)
         case .auto, .accessibility:
             throw ComputerUseError.message(
