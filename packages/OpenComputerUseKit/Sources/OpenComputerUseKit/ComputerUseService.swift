@@ -2073,9 +2073,8 @@ public final class ComputerUseService {
                   let observedWindow = snapshot.windowElement else {
                 throw windowBindingError(windowID)
             }
-            let live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID)
-            guard CFEqual(observedWindow, live.windowElement),
-                  SnapshotBuilder.isUsableWindowElement(live.windowElement),
+            let live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID, matchingRoot: observedWindow)
+            guard SnapshotBuilder.isUsableWindowElement(live.windowElement),
                   live.windowBounds == snapshot.windowBounds else {
                 throw windowBindingError(windowID)
             }
