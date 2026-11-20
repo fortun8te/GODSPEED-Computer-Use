@@ -361,6 +361,20 @@ final class BrowserBridge: @unchecked Sendable {
         idleTimer.schedule(deadline: .now() + remaining, leeway: .milliseconds(500))
     }
 
+    /// CDP methods an owned-tab write may send. Calls and hint probes share this list.
+    static let ownedWriteMethods: Set<String> = [
+        "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+        "Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.getPartialAXTree",
+        "Accessibility.queryAXTree", "DOM.getDocument", "DOM.resolveNode", "DOM.focus",
+        "DOM.describeNode", "Page.getFrameTree", "Emulation.setFocusEmulationEnabled",
+        "Input.insertText",
+    ]
+
+    /// Whether a CDP command may go to the owned tab during an owned-tab write.
+    static func ownedWriteMethodAllowed(_ method: String, tabID: Int?, ownedTabID: Int) -> Bool {
+        tabID == ownedTabID && ownedWriteMethods.contains(method)
+    }
+
     /// Calls one OBU tool and returns its text and error flag. One request at a time.
     func callTool(
         _ name: String, arguments: [String: Any], timeout: TimeInterval, referenceGeneration: Int? = nil
@@ -369,16 +383,10 @@ final class BrowserBridge: @unchecked Sendable {
             if let write = Self.ownedWrite {
                 // Fence helper restart, a different tab, and commands that can
                 // move UI focus or affect anything outside this CDP target.
-                let allowed: Set<String> = [
-                    "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-                    "Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.getPartialAXTree",
-                    "Accessibility.queryAXTree", "DOM.getDocument", "DOM.resolveNode", "DOM.focus",
-                    "DOM.describeNode", "Page.getFrameTree", "Emulation.setFocusEmulationEnabled",
-                    "Input.insertText",
-                ]
                 guard write.bridge === self, process?.isRunning == true, helperGeneration == write.generation,
-                      openedTabs.contains(write.id), arguments["tab_id"] as? Int == write.id,
-                      name == "cdp", let method = arguments["method"] as? String, allowed.contains(method) else {
+                      openedTabs.contains(write.id), name == "cdp",
+                      let method = arguments["method"] as? String,
+                      Self.ownedWriteMethodAllowed(method, tabID: arguments["tab_id"] as? Int, ownedTabID: write.id) else {
                     throw ComputerUseError.stateUnavailable("browser: the parallel write lost its owned tab or needs exclusive access. Inspect the tab before repeating the action.")
                 }
             }
@@ -407,12 +415,23 @@ final class BrowserBridge: @unchecked Sendable {
     ) throws -> [[String: Any]?] {
         try withToolConnection {
             guard process?.isRunning == true, generation == helperGeneration else { return [] }
-            var requests: [Int] = []
-            defer { if let last = requests.last { responses.discard(through: last) } }
+            // One slot per command, so replies stay aligned with their commands. A nil slot was never sent.
+            var requests: [Int?] = []
+            defer { if let last = requests.compactMap({ $0 }).last { responses.discard(through: last) } }
+            // Hint probes obey the same owned-write scope as every other command.
+            func permitted(_ method: String) -> Bool {
+                guard let write = Self.ownedWrite else { return true }
+                return write.bridge === self && helperGeneration == write.generation && openedTabs.contains(write.id)
+                    && Self.ownedWriteMethodAllowed(method, tabID: tab["tab_id"] as? Int, ownedTabID: write.id)
+            }
             for (method, params) in commands {
                 try BrowserRequestContext.validateCurrent()
                 let remaining = deadline - TimingLog.now()
                 guard remaining > 0 else { break }
+                guard permitted(method) else {
+                    requests.append(nil)
+                    continue
+                }
                 var args = tab
                 args["method"] = method
                 args["params"] = params
@@ -423,9 +442,9 @@ final class BrowserBridge: @unchecked Sendable {
                 try send(["jsonrpc": "2.0", "id": id, "method": "tools/call",
                           "params": ["name": "cdp", "arguments": args]], deadline: deadline)
             }
-            TimingLog.count("browser.hint_commands", requests.count)
-            return requests.map { id in
-                guard let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
+            TimingLog.count("browser.hint_commands", requests.compactMap { $0 }.count)
+            return requests.map { slot in
+                guard let id = slot, let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
                       let result = message["result"] as? [String: Any],
                       let reply = try? toolReply(result), !reply.isError,
                       let object = try? JSONSerialization.jsonObject(with: Data(reply.text.utf8)) as? [String: Any],
@@ -838,13 +857,23 @@ extension ComputerUseToolDispatcher {
         let implicit = explicit == nil && !tabless.contains(action) ? try bridge.resolveImplicitTab() : nil
         if let id = explicit ?? implicit?.id { tab["tab_id"] = id }
         return try BrowserBridge.$implicitTabGeneration.withValue(implicit?.generation) {
-            let result = try browserAction(action, arguments: arguments, bridge: bridge, tab: tab, policy: policy)
-            // A page can navigate while a read, wait or action is in flight.
-            if !result.isError, tab["tab_id"] != nil, action != "close_tab",
-               !Self.browserOpenActions.contains(action), !Self.browserPreviewActions.contains(action),
-               !Self.browserListActions.contains(action) {
+            func recheckOrigin() throws {
+                guard tab["tab_id"] != nil, action != "close_tab",
+                      !Self.browserOpenActions.contains(action), !Self.browserPreviewActions.contains(action),
+                      !Self.browserListActions.contains(action) else { return }
                 try Self.authorizeBrowserPage(policy, page: BrowserPage(bridge: bridge, tab: tab), afterDelivery: true)
             }
+            let result: ToolCallResult
+            do {
+                result = try browserAction(action, arguments: arguments, bridge: bridge, tab: tab, policy: policy)
+            } catch {
+                // A failed action may already have sent input, so its destination is checked too.
+                // A policy refusal found here takes precedence over the original error.
+                if Self.browserActionMayDeliverInput(action) { try recheckOrigin() }
+                throw error
+            }
+            // A page can navigate while a read, wait or action is in flight, including when the action reports an error.
+            if !result.isError || Self.browserActionMayDeliverInput(action) { try recheckOrigin() }
             return result
         }
     }
@@ -1015,6 +1044,9 @@ extension ComputerUseToolDispatcher {
             let destination = try hasControl
                 ? page.resolveExact(label: destinationLabel, index: destinationIndex, allowPassive: true) : nil
             let point = x.flatMap { x in y.map { CGPoint(x: x, y: $0) } }
+            // The drop target gets the same effect and risk check as a click, before any input is sent.
+            try authorizeBrowserEffect(policy, action: "drag", arguments: ["label": destinationLabel ?? ""], page: page,
+                                       node: destination, point: destination == nil ? point : nil)
             try page.drag(from: source, to: destination, point: point, modifiers: modifiers,
                           steps: options.steps ?? 5, hold: options.hold)
             if let verified = try options.verifiedDrop({ try page.waitForControl($0) }) {
@@ -1252,17 +1284,9 @@ extension ComputerUseToolDispatcher {
 
         case "tabs", "list":
             let mine = try bridge.callTool("tabs", arguments: [:], timeout: 10)
-            var lines = ["Tabs in this session (browser use_tab with tab_id):"]
-            let own = BrowserReply.tabLines(in: mine.text, limit: 30, include: includeTab)
-            lines += own.isEmpty ? [mine.isError ? BatchTool.firstLine(mine.text) : "(none)"] : own
-            if let theirs = try? bridge.callTool("user_tabs", arguments: [:], timeout: 10), !theirs.isError {
-                let user = BrowserReply.tabLines(in: theirs.text, limit: 15, include: includeTab)
-                if !user.isEmpty {
-                    lines.append("Your Chrome tabs (read only; use_tab can take one):")
-                    lines += user
-                }
-            }
-            return .text(BatchTool.clipped(lines.joined(separator: "\n"), limit: 3_000))
+            return .text(try Self.tabListingText(policy: policy, own: mine, userTabs: {
+                try bridge.callTool("user_tabs", arguments: [:], timeout: 10)
+            }))
 
         case "use_tab", "claim", "claim_tab", "switch":
             // Only the id the model named: the current tab is not "claimed" by a call that named none.
@@ -1616,6 +1640,11 @@ extension ComputerUseToolDispatcher {
         }
         if raw.lowercased().hasPrefix("data:") {
             throw ComputerUseError.invalidArguments("browser cannot verify data URLs through the tab helper. Serve the fixture on localhost and pass its HTTP URL.")
+        }
+        // Browser-internal pages and script URLs are refused here, whether or not origin checks are on.
+        let privileged = ["chrome:", "chrome-extension:", "javascript:"]
+        if privileged.contains(where: { raw.lowercased().hasPrefix($0) }) {
+            throw ComputerUseError.invalidArguments("browser only opens HTTP or HTTPS addresses. Use an address that starts with http:// or https://.")
         }
         return browserURL(raw)
     }
