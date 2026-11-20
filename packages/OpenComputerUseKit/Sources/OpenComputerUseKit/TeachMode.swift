@@ -24,6 +24,7 @@ final class TeachMode: @unchecked Sendable {  // every mutable field is guarded 
         let name: String
     }
 
+    static let toolName = "teach"
     static let statusInterval: TimeInterval = 5
 
     private let lock = NSLock()
@@ -100,6 +101,20 @@ final class TeachMode: @unchecked Sendable {  // every mutable field is guarded 
         lock.lock()
         defer { lock.unlock() }
         tickLocked()
+    }
+
+    /// The `teach` tool: action start (app, goal), stop or status.
+    func run(arguments: [String: Any]) throws -> ToolCallResult {
+        switch ((arguments["action"] as? String) ?? "").lowercased() {
+        case "start":
+            return .text(try start(app: (arguments["app"] as? String) ?? "", goal: (arguments["goal"] as? String) ?? ""))
+        case "stop":
+            return .text(stop())
+        case "status":
+            return .text(status())
+        default:
+            throw ComputerUseError.invalidArguments("teach action must be start, stop or status.")
+        }
     }
 
     // MARK: Private
