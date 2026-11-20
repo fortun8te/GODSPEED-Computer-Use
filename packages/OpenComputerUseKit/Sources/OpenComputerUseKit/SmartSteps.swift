@@ -605,8 +605,9 @@ enum SmartSteps {
         return nil
     }
 
-    /// `save_as`: File > Save As… (File > Save… when the item is missing), then the folder, the name and Save,
-    /// all inside a focus borrow. The file is checked on disk before the reply says it was saved.
+    /// `save_as`: the app's scripting first, then File > Save As… (File > Save… when refused), then the folder, the name and
+    /// Save through accessibility, in the background. Only a refused menu press is a focus problem (see the reply below).
+    /// The file is checked on disk before the reply says it was saved.
     /// Saves the app's front document to `path` through AppleScript. False when the app is not scriptable or
     /// the save failed (the caller then uses the save sheet). Never activates the app.
     static func scriptedSave(bundle: String, path: String) throws -> Bool {
@@ -659,8 +660,14 @@ enum SmartSteps {
             do {
                 _ = try service.pressMenu(app: app, titles: ["File", "Save As"])
             } catch ComputerUseError.notSent {
-                // The menu lookup or press was rejected before delivery.
-                _ = try service.pressMenu(app: app, titles: ["File", "Save"])
+                // The menu lookup or press was rejected before delivery: try File > Save, and if that is refused too,
+                // the save needs the app in front (a background menu leaves Save disabled).
+                do {
+                    _ = try service.pressMenu(app: app, titles: ["File", "Save"])
+                } catch ComputerUseError.notSent {
+                    throw FocusBorrow.focusRequiredError(
+                        "The File menu's Save As and Save items did not take a press in the background.", pid: descriptor.pid)
+                }
             }
         }
         guard let panel = existingPanel ?? ReadinessPoll.first(timeout: 3, read: {
