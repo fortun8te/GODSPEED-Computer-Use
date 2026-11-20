@@ -487,7 +487,8 @@ extension ComputerUseToolDispatcher {
         return false
     }
 
-    func runBatch(arguments: [String: Any], inheritedDeadline: TimeInterval? = nil) throws -> ToolCallResult {
+    func runBatch(arguments: [String: Any], inheritedDeadline: TimeInterval? = nil,
+                  validatedHandoffRecipe: BatchRecipes.Recipe? = nil) throws -> ToolCallResult {
         let clock = ProcessInfo.processInfo
         let startedAt = clock.systemUptime
         let deadline = min(startedAt + BatchTool.timeBudget, inheritedDeadline ?? .infinity)
@@ -528,7 +529,7 @@ extension ComputerUseToolDispatcher {
         var replayed: BatchRecipes.Recipe?
         let givenSteps = (rawSteps as? [Any]) ?? []
         if givenSteps.isEmpty, !goal.isEmpty, BatchRecipes.isEnabled {
-            guard let recipe = recipeRun.find(app: defaultApp) else {
+            guard let recipe = validatedHandoffRecipe ?? recipeRun.find(app: defaultApp) else {
                 // No steps and no recipe, but an app: the model wants to look. Read it instead of failing a turn.
                 if let app = defaultApp, clock.systemUptime < deadline {
                     let state = callToolAsResult(name: "get_app_state", arguments: ["app": app])
@@ -786,7 +787,8 @@ extension ComputerUseToolDispatcher {
             let stepApp = (plannedStep.arguments["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             // The batch's numbers belong to the window it started in: stop before an element step that
             // would act on another window (a dialog the previous step opened itself is followed, not a stop).
-            if let title = movedTo, normalizedElementIndexArgument(plannedStep.arguments["element_index"]) != nil {
+            if let title = movedTo, validatedHandoffRecipe != nil
+                || normalizedElementIndexArgument(plannedStep.arguments["element_index"]) != nil {
                 lines.append("window changed after \(offset) steps (now \"\(title)\"). Steps \(number)-\(steps.count) were not run; read the app with get_app_state and send them again.")
                 stoppedForTime = true
                 receipt.stop = .windowChanged
@@ -803,9 +805,14 @@ extension ComputerUseToolDispatcher {
                 }
             }
 
-            guard let step = recipeRun.prepared(
-                plannedStep, number: number, before: stepApp == watchApp ? watchState : nil
-            ) else {
+            let observed = stepApp == watchApp ? watchState : nil
+            let prepared = recipeRun.prepared(
+                plannedStep, number: number, before: observed
+            )
+            let scoped = validatedHandoffRecipe == nil ? prepared : prepared.flatMap { step in
+                defaultApp.flatMap { HandoffTool.bindRecipeStep(step, app: $0, state: observed) }
+            }
+            guard let step = scoped else {
                 lastAttemptedStep = plannedStep
                 lastBrowserContinuationTab = nil
                 if let stepApp { lastApp = stepApp }
@@ -825,7 +832,7 @@ extension ComputerUseToolDispatcher {
 
             // Bring the app forward for the whole batch (foreground: true), or from the first step that opens
             // a dialog or editor on. The borrow stays until the batch's final read (see FocusBorrowSession).
-            if !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
+            if validatedHandoffRecipe == nil, !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
                let app = step.arguments["app"] as? String, !app.isEmpty,
                let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
                foreground || stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) {

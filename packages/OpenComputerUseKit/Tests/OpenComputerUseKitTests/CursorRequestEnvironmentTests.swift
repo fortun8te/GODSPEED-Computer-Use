@@ -38,7 +38,10 @@ final class CursorRequestEnvironmentTests: XCTestCase {
             }
         }
         unsetenv(keys[1])
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        let deadline = Date().addingTimeInterval(1)
+        while VisualCursorSupport.queuedAnimations > 0, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+        }
         XCTAssertEqual(ClientScope.with(first) { SoftwareCursorOverlay.currentAgentNameForTesting }, "Scout")
         XCTAssertEqual(ClientScope.with(second) { SoftwareCursorOverlay.currentAgentNameForTesting }, "Reviewer")
         XCTAssertNil(VisualCursorSupport.settings.agentName)

@@ -174,7 +174,11 @@ Finder file copies go to the same private clipboard. Paste them into Finder or s
 
 Screenshots are available for controls that the accessibility tree misses. The optional decision helper is for ambiguous, goal-directed work. Routine reads and explicit completion checks can use the current observation directly.
 
+Handoff can fill an empty, uniquely named field directly when its supplied value matches the explicit completion check. The helper ranks candidates only when the workflow still has a choice to make. A pinned handoff verifies against that window. If input might already have landed, it reads back before deciding whether to continue.
+
 The visible cursor is feedback. Godspeed resolves and checks the target independently, keeps each agent's window anchor separate, and plays cursor motion on the display clock. If a path crosses a gap with no screen, it reappears beside the next target. The app never needs to move your physical pointer with the default background settings.
+
+When many moves are queued before the next frame, Godspeed keeps the latest pending move for each agent. It preserves clicks and gestures in order. Each cursor can finish and fade on its own while other agents keep working.
 
 Vercel's agent-desktop scopes references to the observed window and keeps cursor travel out of the window interaction lock. [Snapshot guide](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/apps/docs/content/docs/snapshots-and-refs.mdx) · [Cursor delivery](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/crates/core/src/cursor_overlay/submit.rs)
 
