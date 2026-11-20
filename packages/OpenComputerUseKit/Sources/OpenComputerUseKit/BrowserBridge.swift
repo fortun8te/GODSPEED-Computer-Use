@@ -816,8 +816,11 @@ extension ComputerUseToolDispatcher {
             }
             let count = try Self.browserClickCount(arguments["click_count"], button: button)
             let modifiers = try Self.browserPointerModifiers(arguments["modifiers"])
-            let node = try target()
-            let click = try clickAndWatch(node, page: page, bridge: bridge, button: button, count: count, modifiers: modifiers)
+            let placement = try ClickPlacement.isRequested(arguments) ? ClickPlacement(arguments) : nil
+            let precise = placement != nil || modifiers != 0 || count > 2
+            let node = try precise ? page.resolveExact(label: label, index: index) : target()
+            let click = try clickAndWatch(node, page: page, bridge: bridge, button: button, count: count,
+                                          modifiers: modifiers, placement: placement)
             return ToolCallResult(content: [.text(click.text)], isError: false, browserContinuationTabID: click.tabID)
 
         case "drag":
@@ -1131,8 +1134,8 @@ extension ComputerUseToolDispatcher {
 
     private static func browserClickCount(_ raw: Any?, button: BrowserPage.PointerButton) throws -> Int {
         guard let raw else { return 1 }
-        guard let count = browserTabID(raw), count == 1 || (count == 2 && button == .left) else {
-            throw ComputerUseError.invalidArguments("browser click_count must be 1, or 2 for the left button")
+        guard let count = browserTabID(raw), count == 1 || ((2...3).contains(count) && button == .left) else {
+            throw ComputerUseError.invalidArguments("browser click_count must be 1, or 2 or 3 for the left button")
         }
         return count
     }
@@ -1158,11 +1161,11 @@ extension ComputerUseToolDispatcher {
     /// Clicks an element. A link is followed for a moment, so the reply says where it landed. A click that
     /// opens a new tab makes that tab the working tab, and the reply says so.
     private func clickAndWatch(_ node: BrowserNode, page: BrowserPage, bridge: BrowserBridge,
-                               button: BrowserPage.PointerButton, count: Int, modifiers: Int) throws -> (text: String, tabID: Int?) {
+                               button: BrowserPage.PointerButton, count: Int, modifiers: Int, placement: ClickPlacement?) throws -> (text: String, tabID: Int?) {
         // Open an explicit new-tab destination in the background. If delivery is uncertain,
         // do not fall back to clicking the link and potentially open it twice.
         let link = node.role == "link" ? page.linkTarget(node) : nil
-        if button == .left, count == 1, modifiers == 0,
+        if button == .left, count == 1, modifiers == 0, placement == nil,
            let link, let url = BrowserRules.newTabLinkURL(href: link.href, target: link.target) {
             let opened = try bridge.callTool("open_tab", arguments: ["url": url], timeout: 20)
             guard !opened.isError, let newID = BrowserReply.createdTabID(in: opened.text) else {
@@ -1181,8 +1184,8 @@ extension ComputerUseToolDispatcher {
         // A link to another address is followed for a moment: the navigation starts a beat after the click.
         let hrefBefore = link.map { BrowserRules.leadsElsewhere(href: $0.href) } == true ? (try? page.location())?.href : nil
         let textBefore = Self.defersBrowserNavigationObservation ? nil : page.visibleTextLines()
-        try page.click(node, button: button, count: count, modifiers: modifiers)
-        let verb = count == 2 ? "double-clicked" : button == .left ? "clicked" : "\(button.rawValue)-clicked"
+        try page.click(node, button: button, count: count, modifiers: modifiers, placement: placement)
+        let verb = count == 3 ? "triple-clicked" : count == 2 ? "double-clicked" : button == .left ? "clicked" : "\(button.rawValue)-clicked"
         var message = "\(verb) \(node.role) \"\(node.name)\""
         if let hrefBefore, let place = page.followNavigation(from: hrefBefore) {
             message += "; \(BrowserChange.navigated(place.href).line)"

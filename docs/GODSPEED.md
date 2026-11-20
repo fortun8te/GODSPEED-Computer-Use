@@ -256,3 +256,11 @@ The local `OpenComputerUse locked-use status --json` command reports `not-packag
 The fork's page cursor reacts to acknowledged browser movement, press, drag, drop, click, text insertion and scroll. Feedback is sent only to an active matching tab and never delays the input reply. Intermediate moves can be coalesced. Hidden pages suppress the overlay. Near a display or viewport edge, the cursor follows a straight eased path to the action point. The web renderer shares interaction meanings with the Mac cursor.
 
 Use independent browser connections for concurrent reads. Browser writes and native input retain exclusive admission while the app agent applies process-wide settings. A shared budget caps active preview loads, and each helper has one rescheduled idle timer. Compare end-to-end fixture timings and slow runs before promoting the candidate.
+
+## Precise clicks
+
+Use `anchor` with `center`, `left`, `right`, `top` or `bottom` on a control. Optional `offset_x` and `offset_y` move right and down from that point. The target point must still hit the control. Mac offsets are window points. Chrome offsets are CSS pixels. Chrome needs the control in the main frame for precise clicks.
+
+Click with `modifiers` such as `["cmd"]` to toggle an item, or `["shift"]` to extend a selection from an item you have already selected. The app defines which ranges it supports. Use `click_count: 2` or `3` on a left click. In a Mac app, supply the control for a triple click. Read back selected rows or text to confirm the result.
+
+Use `mouse_button: "right"` to open a context menu. Read the resulting state, then click the menu item if the app or website exposes it. Chrome's own context menu requires its native window. Web pages can expose their own menu inside the tab.

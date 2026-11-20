@@ -1081,6 +1081,66 @@ public final class ComputerUseService {
         return try actionResult(for: query, recoveryPolicy: clickActionSnapshotRecoveryPolicy(for: clickMethod))
     }
 
+    func preciseClick(app query: String, elementIndex: String?, x: Double?, y: Double?, placement: ClickPlacement,
+                      hasPlacement: Bool, count: Int, buttonName: String, modifiers: [String]) throws -> ToolCallResult {
+        guard let button = MouseButtonKind(rawValue: buttonName.lowercased()), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Use left, right or middle. Multiple clicks need the left button.")
+        }
+        guard elementIndex != nil ? x == nil && y == nil : !hasPlacement && count == 1 && x != nil && y != nil else {
+            throw ComputerUseError.invalidArguments("Use a control for anchors, offsets or multiple clicks. A single click can use both screenshot coordinates.")
+        }
+        let flags = try dragModifierFlags(modifiers)
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        guard let windowID = snapshot.targetWindowID, let bounds = snapshot.windowBounds, snapshot.mode != .fixture else {
+            throw ComputerUseError.backgroundUnsupported("Precise clicks need a native target window.")
+        }
+        let record = try elementIndex.map { try lookupElement(snapshot: snapshot, index: $0) }
+        let point: CGPoint
+        if let record, let elementIndex {
+            try refuseDisabledControl(record, elementIndex: elementIndex)
+            guard let frame = record.localFrame else {
+                throw ComputerUseError.stateUnavailable("The control has no readable frame.")
+            }
+            point = try placement.point(in: frame)
+        } else if let x, let y, snapshot.observation.includeScreenshot {
+            point = try screenshotPixelToWindowPointInSnapshot(snapshot: snapshot, point: CGPoint(x: x, y: y))
+        } else {
+            throw ComputerUseError.stateUnavailable("Read the target window with a screenshot before clicking by pixels.")
+        }
+        let screen = try windowPointToGlobalPoint(snapshot: snapshot, point: point)
+        let location = inputEventPoint(fromScreenStatePoint: screen)
+        let target = BackgroundDragTarget(start: location, end: location, windowBounds: bounds,
+                                          windowID: windowID, pid: snapshot.app.pid)
+        let visual = makeVisualCursorTarget(at: screen, targetWindowID: windowID, targetWindowLayer: snapshot.targetWindowLayer)
+        moveVisualCursor(to: visual)
+        defer { settleVisualCursor(at: visual) }
+        try BackgroundDragDispatcher.click(target: target, button: button, count: count, flags: flags) {
+            if let record, let elementIndex {
+                try self.validatePointerTarget(record, index: elementIndex, point: point, snapshot: snapshot)
+            }
+        }
+        pulseVisualCursor(at: visual, clickCount: count, mouseButton: button)
+        let state = try actionResult(for: query, recoveryPolicy: .readOnly)
+        return ToolCallResult(content: [.text("Delivered \(count) click event pair(s).")] + state.content, isError: state.isError)
+    }
+
+    private func validatePointerTarget(_ record: ElementRecord, index: String, point: CGPoint, snapshot: AppSnapshot) throws {
+        _ = try keptRecord(record, index: index, snapshot: snapshot)
+        try refuseDisabledControl(record, elementIndex: index)
+        guard let element = record.element, let window = snapshot.windowElement,
+              SnapshotBuilder.belongsToWindow(element, window: window),
+              localFrame(of: element, windowBounds: snapshot.windowBounds) == record.localFrame,
+              var hit = try hitTestElement(at: point, in: snapshot)?.element else {
+            throw ComputerUseError.stateUnavailable("The control moved or its hit point could not be verified. Read the window again.")
+        }
+        for _ in 0..<24 {
+            if CFEqual(hit, element) { return }
+            guard let parent = copyParent(of: hit) else { break }
+            hit = parent
+        }
+        throw ComputerUseError.stateUnavailable("Another control covers the target point.")
+    }
+
     public func performSecondaryAction(app query: String, elementIndex: String, action: String) throws -> ToolCallResult {
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
@@ -2248,7 +2308,7 @@ public final class ComputerUseService {
     /// in the app's current window. Clickable roles win over others; a partial match (3+ characters)
     /// is the last resort. A miss re-reads the window once, so an item that appeared after an earlier
     /// step (an opened menu) is found. Returns the record too, so callers can see role and value.
-    func resolveLabel(app query: String, labels: [String]) throws -> ElementRecord {
+    func resolveLabel(app query: String, labels: [String], strict: Bool = false) throws -> ElementRecord {
         // Compared without spaces, so "All Clear" matches the identifier "AllClear".
         func norm(_ s: String?) -> String {
             (s ?? "").replacingOccurrences(of: " External link", with: "").lowercased().filter { !$0.isWhitespace }
@@ -2319,6 +2379,12 @@ public final class ComputerUseService {
                 let t = norm(r.title)
                 return [t, norm(r.identifier), norm(r.identity?.name), t.isEmpty ? norm(r.value) : ""].filter { !$0.isEmpty }
             }
+            if strict {
+                for w in given {
+                    if let hit = try single(all.filter { names($0).contains(w) }, names: names) { return hit }
+                }
+                return nil
+            }
             let buttons = all.filter { clickable.contains(roleKey($0.role)) }
             for pool in [buttons, all] {
                 for w in given {
@@ -2368,6 +2434,15 @@ public final class ComputerUseService {
                 return try single(buttons.filter { names($0).contains(where: { $0.contains(w) }) }, names: names)
             }
             return nil
+        }
+
+        // The strict route preserves the current observation and never heals a missing target.
+        if strict {
+            let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+            guard let hit = try find(in: snapshot) else {
+                throw ComputerUseError.stateUnavailable("No exact control matches '\(labels[0])'. Read the window again.")
+            }
+            return hit
         }
 
         // A cached state may list controls that are gone, so an ambiguity there is checked against a fresh read.

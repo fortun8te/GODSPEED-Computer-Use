@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CoreGraphics
 
 enum ActionOptions {
     // These actions have their own delivery checks. Skip legacy vision, retargeting and focus borrowing.
@@ -7,6 +8,8 @@ enum ActionOptions {
         switch tool {
         case "scroll_into_view": return true
         case "scroll": return ScrollChunks.isRequested(args)
+        case "click": return ClickPlacement.isRequested(args) || args["modifiers"] != nil
+            || (args["click_count"] as? NSNumber)?.intValue == 3 && args["click_method"] == nil
         default: return false
         }
     }
@@ -90,5 +93,49 @@ struct ScrollChunks {
             if !moved { return Outcome(chunks: step, stop: .stalled) }
         }
         return Outcome(chunks: limit, stop: .limit)
+    }
+}
+
+
+struct ClickPlacement {
+    let fraction: CGPoint
+    let offset: CGPoint
+
+    static func isRequested(_ args: [String: Any]) -> Bool {
+        ["anchor", "offset_x", "offset_y"].contains { args[$0] != nil }
+    }
+
+    init(_ args: [String: Any]) throws {
+        let anchor = try ActionOptions.string("anchor", in: args) ?? "center"
+        switch anchor {
+        case "center": fraction = CGPoint(x: 0.5, y: 0.5)
+        case "left": fraction = CGPoint(x: 0, y: 0.5)
+        case "right": fraction = CGPoint(x: 1, y: 0.5)
+        case "top": fraction = CGPoint(x: 0.5, y: 0)
+        case "bottom": fraction = CGPoint(x: 0.5, y: 1)
+        default: throw ComputerUseError.invalidArguments("anchor must be center, left, right, top or bottom")
+        }
+        offset = try CGPoint(x: Self.offset("offset_x", in: args), y: Self.offset("offset_y", in: args))
+    }
+
+    private static func offset(_ key: String, in args: [String: Any]) throws -> Double {
+        guard let raw = args[key] else { return 0 }
+        guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite else {
+            throw ComputerUseError.invalidArguments("\(key) must be a finite number")
+        }
+        return number.doubleValue
+    }
+
+    func point(in frame: CGRect) throws -> CGPoint {
+        // Keep an edge anchor just inside the control, even for a thin track.
+        let insetX = min(1, frame.width / 2)
+        let insetY = min(1, frame.height / 2)
+        let point = CGPoint(x: frame.minX + insetX + (frame.width - 2 * insetX) * fraction.x + offset.x,
+                            y: frame.minY + insetY + (frame.height - 2 * insetY) * fraction.y + offset.y)
+        guard frame.contains(point) else {
+            throw ComputerUseError.invalidArguments("Click offsets place the point outside the control.")
+        }
+        return point
     }
 }

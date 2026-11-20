@@ -405,6 +405,25 @@ public final class ComputerUseToolDispatcher {
                 windowID: try validatedQueryWindowID(arguments["window_id"])
             )
         case "click":
+            // Precise clicks use one window-addressed route and never fall back to vision.
+            if ActionOptions.usesStrictRoute(name, arguments) {
+                let app = try requireString("app", in: arguments)
+                let method = try parseClickMethod(optionalString("click_method", in: arguments))
+                guard method == .auto || method == .appPost else {
+                    throw ComputerUseError.backgroundUnsupported("Precise clicks use window-addressed delivery.")
+                }
+                let count = try ActionOptions.integer("click_count", in: arguments, range: 1...3) ?? 1
+                let button = optionalString("mouse_button", in: arguments) ?? "left"
+                let modifiers = arguments["modifiers"] as? [String]
+                guard arguments["modifiers"] == nil || modifiers != nil else {
+                    throw ComputerUseError.invalidArguments("modifiers must be an array of key names")
+                }
+                let index = try strictActionIndex(app: app, arguments: arguments)
+                return try service.preciseClick(app: app, elementIndex: index,
+                    x: optionalDouble("x", in: arguments), y: optionalDouble("y", in: arguments),
+                    placement: ClickPlacement(arguments), hasPlacement: ClickPlacement.isRequested(arguments),
+                    count: count, buttonName: button, modifiers: modifiers ?? [])
+            }
             let clickCount = try optionalPositiveInt("click_count", in: arguments) ?? 1
             guard clickCount <= 32 else {
                 throw ComputerUseError.invalidArguments("click_count must be between 1 and 32")
@@ -448,17 +467,15 @@ public final class ComputerUseToolDispatcher {
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
             )
         case "scroll_into_view":
-            return try service.scrollIntoView(
-                app: requireString("app", in: arguments),
-                elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
-            )
+            let app = try requireString("app", in: arguments)
+            return try service.scrollIntoView(app: app, elementIndex: requireStrictActionIndex(app: app, arguments: arguments))
         case "scroll":
             // Explicit chunks use a pinned scroll area and verify progress after each input.
             if let chunks = try ScrollChunks(arguments) {
+                let app = try requireString("app", in: arguments)
                 return try service.scroll(
-                    app: requireString("app", in: arguments),
-                    direction: requireString("direction", in: arguments),
-                    elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log),
+                    app: app, direction: requireString("direction", in: arguments),
+                    elementIndex: requireStrictActionIndex(app: app, arguments: arguments),
                     chunks: chunks
                 )
             }
@@ -704,6 +721,20 @@ public final class ComputerUseToolDispatcher {
     }
 
     /// An element named by `label`/`labels` (its visible name) or by `element_index`, for actions that need one.
+    // New actions do not use label healing or a vision fallback.
+    private func strictActionIndex(app: String, arguments: [String: Any]) throws -> String? {
+        if let index = optionalElementIndex(in: arguments) { return index }
+        guard let labels = labelArguments(in: arguments) else { return nil }
+        return String(try service.resolveLabel(app: app, labels: labels, strict: true).index)
+    }
+
+    private func requireStrictActionIndex(app: String, arguments: [String: Any]) throws -> String {
+        guard let index = try strictActionIndex(app: app, arguments: arguments) else {
+            throw ComputerUseError.missingArgument("label or element_index")
+        }
+        return index
+    }
+
     private func labelledOrRequiredElementIndex(in arguments: [String: Any], log: SmartLog) throws -> String {
         try labelledElementIndex(in: arguments, log: log) ?? requireElementIndex(in: arguments)
     }
