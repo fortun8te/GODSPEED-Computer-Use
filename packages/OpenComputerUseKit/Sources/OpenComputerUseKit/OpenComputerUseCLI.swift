@@ -12,6 +12,7 @@ public enum OpenComputerUseCLICommand: Equatable {
     case turnEnded(payload: String?)
     case help(command: String?)
     case version
+    case relayAuthorityPublicKey
 }
 
 public enum OpenComputerUseCallInvocation: Equatable {
@@ -37,7 +38,7 @@ public func shouldUseMacOSAppAgentProxy(
         return !runningFromLaunchServicesAppInstance
     case .mcp, .doctor, .lockedUseStatus, .listApps, .snapshot, .call:
         return true
-    case .lockedUseManagement, .turnEnded, .help, .version:
+    case .lockedUseManagement, .turnEnded, .help, .version, .relayAuthorityPublicKey:
         return false
     }
 }
@@ -117,6 +118,10 @@ public func parseOpenComputerUseCLI(arguments: [String]) throws -> OpenComputerU
         return try parseLockedUse(arguments: Array(arguments.dropFirst()))
     case "list-apps":
         return try parseSimpleCommand(name: "list-apps", arguments: Array(arguments.dropFirst()), result: .listApps)
+    case "relay-authority-public-key":
+        return try parseSimpleCommand(
+            name: "relay-authority-public-key", arguments: Array(arguments.dropFirst()), result: .relayAuthorityPublicKey
+        )
     case "call":
         return try parseCall(arguments: Array(arguments.dropFirst()))
     case "turn-ended":
@@ -150,6 +155,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
           snapshot <app>       Print the current accessibility snapshot for an app.
           call <tool>           Call one tool, or run a JSON array of tool calls.
           turn-ended           Notify the running MCP process that the host turn ended.
+          relay-authority-public-key  Print the Chrome relay public key for the installer.
           help [command]       Show general or command-specific help.
           version              Print the CLI version.
 
@@ -238,6 +244,15 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         can reuse the app state and element indices captured by get_app_state.
         Sequence execution stops after the first tool result with isError=true.
         Sequence runs do not pause between operations unless --sleep is given.
+        """
+    case "relay-authority-public-key":
+        return """
+        Usage:
+          open-computer-use relay-authority-public-key
+
+        Print the public half of the Chrome relay signing key (unpadded base64url, 32 raw bytes).
+        The installer provisions it as OBU_RELAY_AUTHORITY_KEY for the native host.
+        Creates the Keychain key on first use. The private key never leaves this machine.
         """
     case "turn-ended":
         return """
