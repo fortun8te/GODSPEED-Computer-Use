@@ -421,7 +421,7 @@ final class BrowserBridge: @unchecked Sendable {
                 nextID += 1
                 requests.append(id)
                 try send(["jsonrpc": "2.0", "id": id, "method": "tools/call",
-                          "params": ["name": "cdp", "arguments": args]])
+                          "params": ["name": "cdp", "arguments": args]], deadline: deadline)
             }
             TimingLog.count("browser.hint_commands", requests.count)
             return requests.map { id in

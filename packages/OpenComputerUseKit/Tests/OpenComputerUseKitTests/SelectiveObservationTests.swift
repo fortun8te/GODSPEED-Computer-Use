@@ -42,7 +42,7 @@ final class SelectiveObservationTests: XCTestCase {
                        .snapshot(app: "TextEdit", observation: .init(includeMenuBar: true)))
     }
 
-    func testFrameSamplingRequiresAnExplicitOptIn() {
+    func testFrameSamplingDefaultsOnAndCanBeDisabled() {
         XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: [:]))
         XCTAssertFalse(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "0"]))
         XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "1"]))

@@ -429,8 +429,9 @@ enum HandoffTool {
         if receipt.totalSteps == 0, receipt.doneCheck == .weakEvidence, let note = result.primaryText {
             return .alreadySatisfied(note)
         }
-        if receipt.stop == .windowChanged || result.failureCode == .windowChanged || result.failureCode == .staleRef {
-            return .blocked("The saved window changed. Read the intended window before continuing.")
+        if receipt.stop == .windowChanged || receipt.stop == .recipeVerification
+            || receipt.failureCode == .windowChanged || receipt.failureCode == .staleRef {
+            return .blocked("The saved target could not be confirmed. Read the intended window before continuing.")
         }
         return receipt.steps.allSatisfy { $0.deliveryState == .notSent } ? .incomplete : .uncertain
     }

@@ -630,11 +630,14 @@ enum SmartSteps {
         let descriptor = try AppDiscovery.resolveRunning(app)
         let fileManager = FileManager.default
         let startedAt = Date()
+        let modifiedBefore = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date
 
         func isSaved() -> Bool {
             guard fileManager.fileExists(atPath: full) else { return false }
-            let modified = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date
-            return modified.map { $0 >= startedAt } ?? false
+            guard let modified = (try? fileManager.attributesOfItem(atPath: full)[.modificationDate]) as? Date else {
+                return false
+            }
+            return modified > startedAt && modified != modifiedBefore
         }
 
         // First choice: the app's own scripting (TextEdit, Preview, Pages, Numbers, Keynote, Script Editor and

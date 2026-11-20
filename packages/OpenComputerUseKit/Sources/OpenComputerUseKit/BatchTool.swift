@@ -543,6 +543,7 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.invalidArguments(reason)
             case .match(let recipe):
                 guard !foreground, defaultApp != nil,
+                      pinnedWindow == nil || pinnedWindow == recipe.window?.id,
                       validatedHandoffRecipe == nil || validatedHandoffRecipe?.version == recipe.version,
                       doneConditions.isEmpty || doneConditions == recipe.doneWhen else {
                     throw ComputerUseError.invalidArguments("Confirm the original app, background mode and done_when, or provide fresh steps.")

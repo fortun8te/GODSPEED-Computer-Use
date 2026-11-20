@@ -95,12 +95,12 @@ final class AppAgentAdmission: @unchecked Sendable {
             condition.broadcast()
         }
         while nextTicket() != ticket.id {
-            try RequestCancellation.check()
+            try RequestCancellation.check(delivery: .notSent)
             let left = deadline - clock.systemUptime
             guard left > 0 else { throw Timeout() }
             _ = condition.wait(until: Date().addingTimeInterval(min(left, 0.05)))
         }
-        try RequestCancellation.check()
+        try RequestCancellation.check(delivery: .notSent)
         active[ticket.id] = ticket.mode
         generation &+= 1
         if ticket.mode == .exclusive {

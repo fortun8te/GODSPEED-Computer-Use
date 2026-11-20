@@ -84,16 +84,25 @@ final class ActionPolicyTests: XCTestCase {
             ("enter fixture name", [:]),
             ("enter fixture name with locator", ["_loc": locator.dictionary]),
         ]
+        let screen = "App=\(app) (pid 100)\nWindow: \"Fixture\", App: Fixture.\nWindow ID: 41"
+        let fakeWindow = try XCTUnwrap(BatchRecipes.Window(state: screen))
+        let values = ["name": "Ann"]
         for (goal, metadata) in cases {
-            var step: [String: Any] = ["tool": "set_value", "label": "Name", "value": "Ann"]
+            var step: [String: Any] = ["tool": "set_value", "label": "Name", "value": "{{name}}"]
             step.merge(metadata) { _, new in new }
-            recipes.save(app: app, goal: goal, steps: [step])
+            recipes.save(app: app, goal: goal, steps: [step], params: values, slotKinds: ["name": .text],
+                         doneWhen: [.fieldChanged(label: "Name", equals: "Ann")], window: fakeWindow, verified: true)
             let result = dispatcher.callToolAsResult(name: "batch", arguments: [
-                "app": app, "goal": goal, "effects": false, "return_state": false,
+                "app": app, "goal": goal, "values": values, "effects": false, "return_state": false,
             ])
             assertRefusal(result, "ACTION_DENIED")
-            XCTAssertEqual(result.batchReceipt?.steps.count, 1)
-            XCTAssertEqual(recipes.find(app: app, goal: goal)?.failures, 0)
+            // The policy now blocks the lookup's window read before a recipe is selected.
+            XCTAssertNil(result.batchReceipt)
+            XCTAssertEqual(result.deliveryState, .notSent)
+            guard case .match(let saved) = recipes.lookup(app: app, goal: goal, values: values, state: screen) else {
+                return XCTFail("The refused replay lost its saved recipe")
+            }
+            XCTAssertEqual(saved.failures, 0)
         }
     }
 
