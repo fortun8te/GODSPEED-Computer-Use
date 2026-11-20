@@ -338,6 +338,42 @@ enum BatchTool {
     }
 
     /// `click "Send"`, `type_text "running late"`, `press_key Return`, `scroll #12 down`.
+    /// One `step` row per executed step and one `episode` row for the batch. Receipt steps are appended in order and
+    /// only the last one can be a stop, so receipt.steps[i] is steps[i]. Labels come from observed results only.
+    /// Typed values and before/after text are never written.
+    static func learn(receipt: TrajectoryLog.BatchReceipt, steps: [Step], goal: String, app: String?, log: LearningLog) {
+        guard log.isEnabled else { return }
+        for (index, executed) in receipt.steps.enumerated() where index < steps.count {
+            let step = steps[index]
+            let isLast = index == receipt.steps.count - 1
+            log.append(LearningStepRow(
+                app: step.arguments["app"] as? String ?? app, tool: step.tool,
+                target_label: step.arguments["label"] as? String,
+                delivery_state: executed.deliveryState.rawValue,
+                failure_code: executed.failureCode?.rawValue,
+                verification: executed.observation?.rawValue,
+                done_when: isLast ? doneLabel(receipt.doneCheck) : nil,
+                n: index + 1
+            ))
+        }
+        log.append(LearningEpisodeRow(app: app, goal: goal, outcome: episodeOutcome(receipt)))
+    }
+
+    private static func doneLabel(_ check: TrajectoryLog.BatchReceipt.DoneCheck) -> String? {
+        switch check {
+        case .verified: return "verified"
+        case .weakEvidence: return "weak"
+        case .unmet: return "unmet"
+        case .notRequested, .skipped: return nil
+        }
+    }
+
+    /// A stop wins; otherwise the done_when result. A batch with no done_when is "unchecked", never a success.
+    private static func episodeOutcome(_ receipt: TrajectoryLog.BatchReceipt) -> String {
+        if let stop = receipt.stop { return "stopped_" + stop.rawValue }
+        return doneLabel(receipt.doneCheck) ?? "unchecked"
+    }
+
     static func describe(_ step: Step) -> String {
         if step.tool == waitName, let wait = try? BatchEffects.Wait(arguments: step.arguments) {
             return "wait " + wait.summary
@@ -658,6 +694,8 @@ extension ComputerUseToolDispatcher {
         var lastStepReturnedBrowserImage = false
         var lastStepText = ""
         var lastResultText = ""
+        // Learning rows for this batch, written on every exit below (see learn). Reads only what the batch computed.
+        defer { BatchTool.learn(receipt: receipt, steps: steps, goal: goal, app: defaultApp ?? lastApp, log: LearningLog.shared) }
         var lastAttemptedStep: BatchTool.Step?
         var lastBrowserContinuationTab: Int?
         var stepResults: [(step: String, result: String)] = []

@@ -93,10 +93,20 @@ enum Referee {
             "view": RefereeSummary.clip(summary, to: maxViewCharacters),
         ]
         if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait) else {
+        let started = ProcessInfo.processInfo.systemUptime
+        let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait)
+        // Learning row (see LearningLog): the view sent and the answer, or a timeout. Never changes the verdict.
+        recordDecision(kind: "decide", view: body["view"] as? String ?? "", options: [], reply: reply,
+                       latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: LearningLog.shared)
+        guard let object = reply else {
             if wait == timeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
+        return verdict(from: object)
+    }
+
+    /// The verdict in a helper reply, or nil when its label or confidence is missing or out of range.
+    static func verdict(from object: [String: Any]) -> Verdict? {
         guard let label = object["label"] as? String,
               ["act", "look_again", "done", "stuck"].contains(label),
               let number = object["confidence"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
@@ -149,14 +159,50 @@ enum Referee {
             "options": options.map { ["id": $0.id, "text": $0.text] },
         ]
         if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait) else {
+        let started = ProcessInfo.processInfo.systemUptime
+        let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait)
+        // Learning row (see LearningLog): the screen sent, the options and the scores, or a timeout.
+        recordDecision(kind: "choose", view: body["screen"] as? String ?? "", options: options, reply: reply,
+                       latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: LearningLog.shared)
+        guard let object = reply else {
             if wait == chooseTimeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
-        guard let probabilities = parseChoose(object),
-              probabilities["none"] != nil,
+        return chooseProbabilities(object, options: options)
+    }
+
+    /// The usable scores of a choose reply: "none" and every option id must be present.
+    static func chooseProbabilities(_ object: [String: Any], options: [(id: String, text: String)]) -> [String: Double]? {
+        guard let probabilities = parseChoose(object), probabilities["none"] != nil,
               options.allSatisfy({ probabilities[$0.id] != nil }) else { return nil }
         return probabilities
+    }
+
+    /// Writes one decide or choose row. The outcome comes from the helper's answer only: decide gives act, hint
+    /// (a line would be shown) or abstain; choose gives act, or abstain when "none" scores highest. No reply is
+    /// timeout and an unusable reply is invalid. Nothing is written unless LearningLog is enabled.
+    static func recordDecision(kind: String, view: String, options: [(id: String, text: String)], reply: [String: Any]?,
+                               latencyMs: Double, log: LearningLog) {
+        guard log.isEnabled else { return }
+        var row = LearningDecisionRow(
+            kind: kind, view: view, options: options.map { LearningOption(id: $0.id, text: $0.text) },
+            latency_ms: latencyMs, model: reply?["model"] as? String
+        )
+        if let reply, kind == "choose" {
+            if let probabilities = chooseProbabilities(reply, options: options) {
+                row.probabilities = probabilities
+                row.outcome = probabilities.max { $0.value < $1.value }?.key == "none" ? "abstain" : "act"
+            } else {
+                row.outcome = "invalid"
+            }
+        } else if let reply, let verdict = verdict(from: reply) {
+            row.label = verdict.label
+            row.confidence = verdict.confidence
+            row.outcome = verdict.label == "act" ? "act" : (hint(for: verdict) != nil ? "hint" : "abstain")
+        } else {
+            row.outcome = reply == nil ? "timeout" : "invalid"
+        }
+        log.append(row)
     }
 
     /// `{"probs": {"a": 0.7, "none": 0.1}}` as a dictionary; nil when it has no usable numbers.
