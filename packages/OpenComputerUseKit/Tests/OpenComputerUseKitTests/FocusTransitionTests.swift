@@ -63,4 +63,38 @@ final class FocusTransitionTests: XCTestCase {
         let named = ObservedFocus(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: " save ")
         XCTAssertEqual(FocusTransition.check(target: target, observed: named), .ok)
     }
+
+    /// The same field, but in another window than the one read or pinned: keys must not go there.
+    func testSameFieldInAnotherWindowIsRefused() {
+        let read = ObservedFocus(windowID: 4, elementRole: "AXTextField", label: "Email")
+        let otherWindow = ObservedFocus(windowID: 9, elementRole: "AXTextField", label: "Email")
+        guard case .notSent? = ComputerUseService.keyboardFocusRefusal(read: read, observed: otherWindow) else {
+            return XCTFail("a field in another window must refuse with notSent")
+        }
+    }
+
+    /// An unnamed sheet that the read did not show is in front of the matching field: refuse.
+    func testUnnamedSheetNotInTheReadIsRefused() {
+        let read = ObservedFocus(windowID: 4, elementRole: "AXTextField", label: "Name")
+        let sheet = ObservedFocus(windowID: 4, elementRole: "AXTextField", label: "Name", dialogTitle: "")
+        guard case .notSent(let message)? = ComputerUseService.keyboardFocusRefusal(read: read, observed: sheet) else {
+            return XCTFail("an unnamed sheet the read did not show must refuse with notSent")
+        }
+        XCTAssertEqual(message, "Typing would go to a sheet or dialog that the read did not show; read the app and target the field.")
+    }
+
+    /// A sheet the read already showed (named the same) may take keys: the save panel's name field.
+    func testSheetTheReadAlreadyShowedIsAccepted() {
+        let read = ObservedFocus(windowID: 4, elementRole: "AXTextField", label: "Name", dialogTitle: "Save")
+        let same = ObservedFocus(windowID: 4, elementRole: "AXTextField", label: "Name", dialogTitle: "Save")
+        XCTAssertNil(ComputerUseService.keyboardFocusRefusal(read: read, observed: same))
+    }
+
+    /// The modal editor path (Go to Folder) types by keys, so its editor must sit in the window that was read.
+    func testModalEditorMustBeInTheReadWindow() {
+        XCTAssertNil(ComputerUseService.modalEditorRefusal(readWindowID: 4, observedWindowID: 4))
+        XCTAssertNotNil(ComputerUseService.modalEditorRefusal(readWindowID: 4, observedWindowID: 9))
+        XCTAssertNotNil(ComputerUseService.modalEditorRefusal(readWindowID: 4, observedWindowID: nil))
+        XCTAssertNotNil(ComputerUseService.modalEditorRefusal(readWindowID: nil, observedWindowID: 4))
+    }
 }

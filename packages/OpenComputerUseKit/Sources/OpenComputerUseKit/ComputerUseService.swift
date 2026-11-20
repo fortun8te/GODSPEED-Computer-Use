@@ -1865,6 +1865,13 @@ public final class ComputerUseService {
             guard let editor else {
                 throw ComputerUseError.stateUnavailable("The Go to Folder dialog did not expose a focused text field. Read the dialog before retrying.")
             }
+            // Keys go to this editor, so it must belong to the window that was read. (An unnamed sheet is expected here:
+            // this path exists to type into the one dialog the batch opened.)
+            if let refusal = Self.modalEditorRefusal(
+                readWindowID: snapshot.targetWindowID.map { Int($0) },
+                observedWindowID: Self.observedWindowID(of: editor, expectedWindow: snapshot.windowElement, expectedID: snapshot.targetWindowID)) {
+                throw refusal
+            }
             focused = editor
         } else {
             focused = Self.currentInputFocus(pid: snapshot.app.pid)
@@ -2027,13 +2034,63 @@ public final class ComputerUseService {
     /// Pure gate for keyboard text: nil when the observed focus is the field the snapshot showed (FocusTransition
     /// `.ok`), otherwise the notSent refusal. Unknown focus on either side is refused too: unknown means do not type.
     static func keyboardFocusRefusal(read: ObservedFocus, observed: ObservedFocus) -> ComputerUseError? {
-        guard let role = read.elementRole, let label = read.label else {
+        guard let role = read.elementRole, let label = read.label, let readWindow = read.windowID else {
             return .notSent("Typing would go to an unknown control; read the app and target the field.")
         }
-        let target = FocusTarget(windowID: read.windowID ?? 0, elementRole: role, label: label)
-        guard FocusTransition.check(target: target, observed: observed) == .ok else {
+        // The read's sheet or dialog (nil when the read showed none) is what the observed focus must sit in.
+        let target = FocusTarget(windowID: readWindow, elementRole: role, label: label, dialogTitle: read.dialogTitle)
+        switch FocusTransition.check(target: target, observed: observed) {
+        case .ok:
+            return nil
+        case .unexpectedDialog:
+            return .notSent("Typing would go to a sheet or dialog that the read did not show; read the app and target the field.")
+        case .wrongWindow, .wrongElement, .unknown:
             let seen = observed.label ?? observed.elementRole ?? "an unknown control"
             return .notSent("Typing would go to \(seen); read the app and target the field.")
+        }
+    }
+
+    /// Pure gate for the modal editor path (Go to Folder), which types by keys without a read of its own: the editor
+    /// must sit in the window that was read or pinned. Unknown on either side is refused.
+    static func modalEditorRefusal(readWindowID: Int?, observedWindowID: Int?) -> ComputerUseError? {
+        guard let readWindowID, let observedWindowID, readWindowID == observedWindowID else {
+            return .notSent("The dialog's text field is not in the window that was read; read the app and target the field.")
+        }
+        return nil
+    }
+
+    /// The window the focused element sits in, as the read's window id. The walk up the accessibility tree reaches the
+    /// read window (sheets hang off it), so a sheet over the read window still counts. Nil when the window cannot be named.
+    static func observedWindowID(of focused: AXUIElement, expectedWindow: AXUIElement?, expectedID: CGWindowID?) -> Int? {
+        var node: AXUIElement? = focused
+        for _ in 0..<40 {
+            guard let current = node else { break }
+            if let expectedWindow, CFEqual(current, expectedWindow) { return expectedID.map { Int($0) } }
+            node = elementAttribute(current, kAXParentAttribute)
+        }
+        return elementAttribute(focused, kAXWindowAttribute).flatMap { SkyLightSPI.shared.windowID(for: $0) }.map { Int($0) }
+    }
+
+    /// The title of the sheet or dialog that `focused` sits in, or the first sheet of `window`; "" when that sheet has
+    /// no title. Nil when no sheet or dialog is in front. The window itself is never a dialog here.
+    static func frontDialogTitle(focused: AXUIElement?, window: AXUIElement?) -> String? {
+        var node = focused
+        for _ in 0..<40 {
+            guard let current = node else { break }
+            if let window, CFEqual(current, window) { break }
+            let role = copyStringAttribute(current, kAXRoleAttribute)
+            let subrole = copyStringAttribute(current, kAXSubroleAttribute)
+            if role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" {
+                return (copyStringAttribute(current, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            node = elementAttribute(current, kAXParentAttribute)
+        }
+        if let window {
+            var value: CFTypeRef?
+            if AXUIElementCopyAttributeValue(window, "AXSheets" as CFString, &value) == .success,
+               let sheets = value as? [AXUIElement], let sheet = sheets.first {
+                return (copyStringAttribute(sheet, kAXTitleAttribute) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
         return nil
     }
@@ -2043,12 +2100,23 @@ public final class ComputerUseService {
         func describe(_ element: AXUIElement) -> (role: String?, label: String?) {
             (stringValue(of: element, attribute: kAXRoleAttribute), accessibilityLabels(for: element).first)
         }
-        let windowID = snapshot.targetWindowID.map { Int($0) }
         let read = snapshot.focusedElement.map(describe)
+        // The read's own window and dialog: the window read or pinned, and any sheet the read listed (by its role).
+        let readDialog = snapshot.elements.values
+            .first { SmartSteps.dialogRoles.contains(SmartSteps.roleKey($0.role)) }
+            .map { ($0.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
         let now = focused.map(describe)
+        // The focus now: the window it sits in (not the read's window by assumption), and any sheet or dialog in front
+        // of that window, named or not.
+        let observedWindow = focused.flatMap {
+            Self.observedWindowID(of: $0, expectedWindow: snapshot.windowElement, expectedID: snapshot.targetWindowID)
+        }
+        let observedDialog = Self.frontDialogTitle(focused: focused, window: snapshot.windowElement)
         if let refusal = Self.keyboardFocusRefusal(
-            read: ObservedFocus(windowID: windowID, elementRole: read?.role, label: read?.label),
-            observed: ObservedFocus(windowID: windowID, elementRole: now?.role, label: now?.label)) {
+            read: ObservedFocus(windowID: snapshot.targetWindowID.map { Int($0) }, elementRole: read?.role, label: read?.label,
+                                dialogTitle: readDialog),
+            observed: ObservedFocus(windowID: observedWindow, elementRole: now?.role, label: now?.label,
+                                    dialogTitle: observedDialog)) {
             throw refusal
         }
     }
