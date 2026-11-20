@@ -677,15 +677,15 @@ extension ComputerUseToolDispatcher {
             (try? AppDiscovery.resolveRunning(app)).flatMap { ElementNumbering.forApp(pid: $0.pid).currentWindowID }
         }
         var waitReadRefusal: ToolCallResult?
-        func readWatch(_ app: String, settleMs: Int, optionalEffect: Bool = true) -> (
-            text: String, sig: BatchEffects.WindowSig, result: ToolCallResult
-        )? {
+        func readWatch(_ app: String, settleMs: Int, optionalEffect: Bool = true) -> BatchEffects.Watch? {
             if optionalEffect, effectBudget.exhausted || clock.systemUptime >= actionDeadline { return nil }
             let began = clock.systemUptime
             var readArguments: [String: Any] = ["app": app, "include_screenshot": NSNumber(value: false)]
             if let pinnedWindow, app == defaultApp { readArguments["window_id"] = pinnedWindow }
             if settleMs > 0 { readArguments["settle_ms"] = settleMs }
-            let read = callToolAsResult(name: "get_app_state", arguments: readArguments)
+            let read = TimingLog.measure(optionalEffect ? "batch.effect_read" : "batch.wait_read") {
+                callToolAsResult(name: "get_app_state", arguments: readArguments)
+            }
             if !optionalEffect, read.failureCode?.isActionRefusal == true { waitReadRefusal = read }
             let text = read.isError ? nil : LeanOutput.stateText(of: read)
             if optionalEffect {
@@ -695,7 +695,7 @@ extension ComputerUseToolDispatcher {
                 }
             }
             guard let text else { return nil }
-            return (text, BatchEffects.windowSig(state: text, id: windowID(app)), read)
+            return .init(text: text, sig: BatchEffects.windowSig(state: text, id: windowID(app)), result: read)
         }
         /// Effect and window lines for a step that took `before` to `after`; follows a dialog, remembers a move.
         /// `noEffect` is true when the step should have changed something and nothing visible did: the step
@@ -773,10 +773,23 @@ extension ComputerUseToolDispatcher {
                 let budgetCut = limit < Double(wait.timeoutMs) / 1000
                 var met = false
                 var observed = false
+                // Shallow checks can defer an expensive read. Only full state
+                // can satisfy the original wait predicate or bind its window.
+                let fallbackInterval = BatchEffects.WaitReadGate.fallbackInterval
+                let firstFullRead = limit <= fallbackInterval ? waitStart : waitStart + fallbackInterval
+                var readGate = BatchEffects.WaitReadGate(nextFullRead: firstFullRead)
                 while clock.systemUptime - waitStart < limit {
-                    if let read = readWatch(app, settleMs: 0, optionalEffect: false) {
+                    let shouldRead = readGate.shouldRead(at: clock.systemUptime) {
+                        TimingLog.measure("batch.wait_readiness") {
+                            BatchEffects.waitMayBeReady(wait.kind, app: app, windowID: pinnedWindow)
+                        }
+                    }
+                    if shouldRead, clock.systemUptime - waitStart < limit,
+                       let read = readWatch(app, settleMs: 0, optionalEffect: false) {
                         observed = true
-                        if wait.isMet(state: read.text, id: read.sig.id) {
+                        let busy = wait.kind == .settle
+                            && BatchEffects.waitMayBeReady(.settle, app: app, windowID: read.sig.id) != true
+                        if wait.isMet(state: busy ? "" : read.text, id: read.sig.id) {
                             met = true
                             if !wantsScreenshot { trailingObservation = read.result }
                             watchApp = app
@@ -792,14 +805,6 @@ extension ComputerUseToolDispatcher {
                     Thread.sleep(forTimeInterval: min(0.2, remaining))
                 }
                 let waited = Int((clock.systemUptime - waitStart) * 1000)
-                // A settle wait is only a pause: a screen that keeps moving (an animation, a clock) is not a failure.
-                if !met, observed, wait.kind == .settle, !budgetCut {
-                    lines.append("\(number). \(lastStepText): ok (waited \(waited) ms; the screen was still changing)")
-                    lastResultText = "ok"
-                    stepResults.append((lastStepText, "ok"))
-                    receipt.steps.append(.init())
-                    continue
-                }
                 if met {
                     lines.append("\(number). \(lastStepText): ok (\(waited) ms)")
                     lastResultText = "ok"
@@ -891,20 +896,30 @@ extension ComputerUseToolDispatcher {
             if isLastStep, step.tool == "get_app_state", wantsScreenshot {
                 stepArguments["include_screenshot"] = true
             }
+            // A directly verified AX write can use the next explicit read or
+            // the batch's final screenshot read. Other writes keep readback.
+            let nextStep = steps.dropFirst(number).first
+            let nextReadsSameApp = nextStep?.tool == "get_app_state"
+                && (nextStep?.arguments["app"] as? String) == stepApp
+                && (nextStep?.arguments["include_ax"] as? Bool) != false
+                && nextStep?.arguments["window_id"] == nil
+            let deferValueRead = step.tool == "set_value"
+                && ((isLastStep && wantsScreenshot) || (!effectsOn && nextReadsSameApp))
             let dispatchStarted = clock.systemUptime
             let result = BrowserCallBudget.withDeadline(actionDeadline) {
                 Self.$defersBrowserNavigationObservation.withValue(defersNavigationRead) {
                     Self.$clipsBrowserStepObservation.withValue(step.tool == "browser" && !isLastStep) {
                         ComputerUseService.$awaitsModalTextFocus.withValue(awaitsPathEditor) {
-                            callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false) {
-                                // An authorized step may borrow focus. Strict and window-bound steps skip this hook.
-                                guard validatedHandoffRecipe == nil, !hasPinnedSteps, FocusBorrow.isEnabled,
-                                      let app = step.arguments["app"] as? String, !app.isEmpty,
-                                      let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
-                                      foreground || self.stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) else { return }
-                                if !focus.ensure(pid: pid) {
-                                    stepLog.note("Could not bring \(app) to the front. The step ran in the background.")
-                                }
+                            ComputerUseService.$defersVerifiedSetValueObservation.withValue(deferValueRead) {
+                                callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false) {
+                                    // An authorized step may borrow focus. Strict and window-bound steps skip this hook.
+                                    guard validatedHandoffRecipe == nil, !hasPinnedSteps, FocusBorrow.isEnabled,
+                                          let app = step.arguments["app"] as? String, !app.isEmpty,
+                                          let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
+                                          foreground || self.stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) else { return }
+                                    if !focus.ensure(pid: pid) {
+                                        stepLog.note("Could not bring \(app) to the front. The step ran in the background.")
+                                    }
                             }
                         }
                     }
@@ -968,7 +983,10 @@ extension ComputerUseToolDispatcher {
             if effectsOn, !effectBudget.exhausted, isMutating, let app = stepApp, watchApp == app, let before = watchState {
                 if isLastStep {
                     pendingLastEffect = (app, before, lines.count, stepLineIndex, step.tool)
-                } else if let read = readWatch(app, settleMs: 600) {
+                } else if let read = BatchEffects.Watch.afterAction(
+                    snapshot: stepLog.afterActionSnapshot, before: before, tool: step.tool,
+                    fallback: { readWatch(app, settleMs: 600) }
+                ) {
                     let effect = effectLines(before: before, after: read.text, sig: read.sig, tool: step.tool)
                     if effect.noEffect {
                         lines[stepLineIndex] = BatchEffects.line(lines[stepLineIndex], receipt: .noEffectSeen)
@@ -989,16 +1007,17 @@ extension ComputerUseToolDispatcher {
                 movedTo = nil
             }
 
-            // A final action may already have read the window back. Menu and keyboard
+            // Smart steps may have a newer observation than the action reply. Menu and keyboard
             // shortcuts still use the final settle path because they can open a delayed dialog.
             if step.tool == "get_app_state" || isPageRead {
                 trailingObservation = result
             } else if isLastStep, !hasPinnedSteps, stepApp != nil,
                       ["click", "type_text", "set_value", "scroll"].contains(step.tool),
-                      let state = LeanOutput.stateText(of: result),
-                      !state.contains(SnapshotObservationOptions.accessibilityOmittedNote),
+                      let snapshot = stepLog.afterActionSnapshot, snapshot.observedWindowID != nil,
+                      DoneCheck.supportsAbsenceCheck(snapshot.renderedText),
+                      !snapshot.renderedText.contains("the app hides its web content"),
                       !wantsScreenshot {
-                trailingObservation = .text(state)
+                trailingObservation = LeanOutput.condensed(.text(snapshot.renderedText))
             }
             if let stop = recipeRun.verify(number: number, total: steps.count, lines: lines) {
                 lines.append(stop)
@@ -1013,7 +1032,13 @@ extension ComputerUseToolDispatcher {
         if !failed, !stoppedForTime, trailingObservation == nil, let last = lastAttemptedStep,
            last.tool == "press_menu" || (last.tool == "press_key" && ((last.arguments["key"] as? String) ?? "").lowercased().contains("+")) {
             let remaining = max(0, deadline - clock.systemUptime)
-            if remaining > 0 { Thread.sleep(forTimeInterval: min(0.35, remaining)) }
+            if remaining > 0, let app = lastApp, !hasPinnedSteps,
+               let pid = (try? AppDiscovery.resolveRunning(app))?.pid, stepOpensDialog(last, pid: pid) {
+                // Stop the dialog wait as soon as AX exposes a sheet.
+                SmartSteps.waitForDialog(pid: pid, timeout: min(0.35, remaining))
+            } else if remaining > 0 {
+                Thread.sleep(forTimeInterval: min(0.35, remaining))
+            }
         }
 
         let verificationWindow = pinnedWindow ?? (try? validatedQueryWindowID(lastAttemptedStep?.arguments["window_id"]))
@@ -1055,9 +1080,9 @@ extension ComputerUseToolDispatcher {
                 callToolAsResult(name: "browser", arguments: browserVerificationArgs(action))
             }
         }
-        func waitForBrowserEvidence(_ condition: DoneCheck.Condition) -> Bool {
+        func waitForBrowserEvidence(_ condition: DoneCheck.Condition) -> ToolCallResult? {
             let waitDeadline = min(browserObservationDeadline - 1.5, clock.systemUptime + 6)
-            guard waitDeadline - clock.systemUptime > 0.6 else { return false }
+            guard waitDeadline - clock.systemUptime > 0.6 else { return nil }
             // A submitted form may still be rendering its confirmation. Give the
             // existing event-based wait a short part of the same recovery budget.
             var args = browserVerificationArgs("wait_for")
@@ -1069,7 +1094,10 @@ extension ComputerUseToolDispatcher {
                 for (key, value) in condition.arguments { args[key] = value }
             }
             return BrowserCallBudget.withDeadline(waitDeadline) {
-                !callToolAsResult(name: "browser", arguments: args).isError
+                Self.$bindsBrowserWaitEvidence.withValue(true) {
+                    let result = callToolAsResult(name: "browser", arguments: args)
+                    return result.isError ? nil : result
+                }
             }
         }
         let pageURL: () -> String? = {
@@ -1099,11 +1127,32 @@ extension ComputerUseToolDispatcher {
             case .missing: break
             }
         }
+        // When the caller only asked for a verified receipt, files and exact
+        // native fields can be checked without a final tree.
+        if (arguments["return_state"] as? Bool) == false,
+           !failed, !stoppedForTime, !wantsScreenshot, trailingObservation == nil,
+           pendingLastEffect == nil, lastAttemptedStep?.tool != "browser", clock.systemUptime < deadline {
+            earlyCompletion = TimingLog.measure("batch.final_direct_check") {
+                DoneCheck.directCompletion(doneConditions) { label in
+                    guard clock.systemUptime < deadline, let lastApp,
+                          (try? requireUsableComputerUseSession()) != nil,
+                          let app = try? AppDiscovery.resolveRunning(lastApp),
+                          let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: verificationWindow) else { return nil }
+                    return SnapshotBuilder.directFieldValue(label, in: context)
+                }
+            }
+        }
+        var browserTextChecks: [(DoneCheck.Condition, BrowserEvidenceScope)] = []
+        func recordBrowserTextCheck(_ condition: DoneCheck.Condition, from check: ToolCallResult) {
+            if case .text(let text) = condition, !DoneCheck.isPlainNumber(text), let scope = check.browserEvidenceScope {
+                browserTextChecks.append((condition, scope))
+            }
+        }
         var observation = trailingObservation
         if receipt.failureCode?.isActionRefusal != true, !unconfirmedOpen, earlyCompletion == nil,
            observation == nil, lastAttemptedStep?.tool == "browser" {
             if unconfirmedFinalClick, let condition = doneConditions.first {
-                _ = waitForBrowserEvidence(condition)
+                if let check = waitForBrowserEvidence(condition) { recordBrowserTextCheck(condition, from: check) }
             }
             observation = browserObservation("read")
         }
@@ -1126,7 +1175,9 @@ extension ComputerUseToolDispatcher {
             } else {
                 readArguments["settle_ms"] = LeanDefaults.batchSettleMs
             }
-            observation = callToolAsResult(name: "get_app_state", arguments: readArguments)
+            observation = TimingLog.measure("batch.final_native_read") {
+                callToolAsResult(name: "get_app_state", arguments: readArguments)
+            }
         }
 
         // The final read is taken: give focus back before anything slower (done checks, the checker model).
@@ -1207,7 +1258,8 @@ extension ComputerUseToolDispatcher {
                         return evidence.isEmpty ? nil : evidence
                     }
                     guard let state = LeanOutput.stateText(of: result),
-                          !state.contains(SnapshotObservationOptions.accessibilityOmittedNote) else { return nil }
+                          DoneCheck.supportsAbsenceCheck(state),
+                          !state.contains("the app hides its web content") else { return nil }
                     if let verificationWindow {
                         let header = state.split(separator: "\n").prefix(3)
                         guard header.count == 3,
@@ -1223,13 +1275,15 @@ extension ComputerUseToolDispatcher {
                         }
                         return pageURL()
                     },
-                    supportsAbsence: lastAttemptedStep?.tool != "browser"
-                ), baseline: completionBaseline, after: temporalEvidence())
+                    supportsAbsence: lastAttemptedStep?.tool != "browser",
+                    directlyVerified: browserTextChecks.filter { $0.1 == observation?.browserEvidenceScope }.map(\.0)
+                ))
             }
-            var doneResult = earlyCompletion ?? checkConditions()
+            var doneResult = earlyCompletion ?? TimingLog.measure("batch.final_check", checkConditions)
             if (!failed || ambiguousFinalClick), finalClickChecksPage, case .missing(let unmet) = doneResult,
                let pending = doneConditions.first(where: { unmet.contains($0.summary) }),
-               waitForBrowserEvidence(pending) {
+               let check = waitForBrowserEvidence(pending) {
+                recordBrowserTextCheck(pending, from: check)
                 observation = browserObservation("read")
                 doneResult = checkConditions()
             }

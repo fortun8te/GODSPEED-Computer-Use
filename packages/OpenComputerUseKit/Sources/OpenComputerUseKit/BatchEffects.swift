@@ -1,3 +1,4 @@
+import ApplicationServices
 import Foundation
 
 /// Pure helpers for batch replies: what one step changed on screen, whether the batch is still in the
@@ -178,6 +179,36 @@ enum BatchEffects {
         WindowSig(id: id, title: windowTitle(in: state), dialog: dialog(in: state))
     }
 
+    struct Watch {
+        let text: String
+        let sig: WindowSig
+        let result: ToolCallResult
+
+        /// Reuse only a complete read of the same app and exact window. An
+        /// unchanged read or dialog transition still needs the original check.
+        static func afterAction(
+            snapshot: AppSnapshot?, before: String, tool: String, fallback: () -> Watch?
+        ) -> Watch? {
+            guard ["click", "type_text", "set_value", "scroll"].contains(tool),
+                  let snapshot, let id = snapshot.observedWindowID else { return fallback() }
+            let result = LeanOutput.condensed(.text(snapshot.renderedText))
+            guard let text = LeanOutput.stateText(of: result),
+                  let sig = reusableSignature(before: before, after: text, id: id) else { return fallback() }
+            return Watch(text: text, sig: sig, result: result)
+        }
+
+        static func reusableSignature(before: String, after: String, id: UInt32) -> WindowSig? {
+            let head = before.split(separator: "\n", maxSplits: 3).prefix(3)
+            guard head.count == 3, head.last == "Window ID: \(id)",
+                  head.first == after.split(separator: "\n", maxSplits: 1).first,
+                  after != before, DoneCheck.supportsAbsenceCheck(before), DoneCheck.supportsAbsenceCheck(after),
+                  !before.contains("the app hides its web content"), !after.contains("the app hides its web content")
+            else { return nil }
+            let sig = BatchEffects.windowSig(state: after, id: id)
+            return sig.dialog == BatchEffects.dialog(in: before) ? sig : nil
+        }
+    }
+
     /// The title from `Window: "Untitled", App: Notes.`
     static func windowTitle(in state: String) -> String? {
         guard let line = state.split(separator: "\n", maxSplits: 4).first(where: { $0.hasPrefix("Window: ") }),
@@ -239,6 +270,44 @@ enum BatchEffects {
     }
 
     // MARK: - wait step
+
+    /// The cheap check only decides when to take a full verification read.
+    /// Periodic full reads cover labels and dialogs a shallow AX probe can miss.
+    struct WaitReadGate {
+        var nextFullRead: TimeInterval
+        static let fallbackInterval: TimeInterval = 0.75
+
+        mutating func shouldRead(at now: TimeInterval, probe: () -> Bool?) -> Bool {
+            guard now >= nextFullRead || probe() != false else { return false }
+            nextFullRead = now + Self.fallbackInterval
+            return true
+        }
+    }
+
+    static func waitMayBeReady(_ kind: Wait.Kind, app: String, windowID: UInt32?) -> Bool? {
+        guard (try? requireUsableComputerUseSession()) != nil,
+              let app = try? AppDiscovery.resolveRunning(app),
+              let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID) else { return nil }
+        switch kind {
+        case .window(let title):
+            if SmartSteps.axText(kAXTitleAttribute, of: context.windowElement)?.localizedCaseInsensitiveContains(title) == true {
+                return true
+            }
+            return SmartSteps.sheetCandidates(pid: app.pid).contains {
+                SmartSteps.axText(kAXTitleAttribute, of: $0)?.localizedCaseInsensitiveContains(title) == true
+            }
+        case .text(let text), .gone(let text):
+            let criteria = TargetedAX.Criteria(text: text, exact: false, role: nil, limit: 1, maxNodes: 32)
+            guard let scan = try? SnapshotBuilder.targetedSearch(criteria, in: context, timeout: 0.06) else { return nil }
+            switch kind {
+            case .text: return !scan.records.isEmpty
+            case .gone: return scan.records.isEmpty
+            default: return nil
+            }
+        case .settle:
+            return !WindowSettle.busy(from: context.windowElement, requireComplete: true, read: WindowSettle.readAll)
+        }
+    }
 
     /// `{"tool": "wait", "window": "Save"}` (or text, gone, settle: true, timeout_ms).
     struct Wait {
@@ -344,6 +413,11 @@ enum BatchEffects {
             case .gone(let wanted):
                 return DoneCheck.supportsAbsenceCheck(state) && !state.localizedCaseInsensitiveContains(wanted)
             case .settle:
+                guard DoneCheck.supportsAbsenceCheck(state) else {
+                    lastHash = nil
+                    stableSince = nil
+                    return false
+                }
                 let hash = BatchTool.stateText(ofText: state).hashValue
                 if hash != lastHash {
                     lastHash = hash

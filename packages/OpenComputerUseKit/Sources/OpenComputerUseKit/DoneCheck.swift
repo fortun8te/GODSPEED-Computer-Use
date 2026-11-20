@@ -80,6 +80,8 @@ enum DoneCheck {
         var pageURL: () -> String?
         var fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
         var supportsAbsence = true
+        /// The exact predicates already checked against an independent source.
+        var directlyVerified: [Condition] = []
     }
 
     enum Result: Equatable {
@@ -163,6 +165,10 @@ enum DoneCheck {
         var fetchedURL: String?
         var didFetchURL = false
         for condition in conditions {
+            if !condition.requiresBaseline, evidence.directlyVerified.contains(condition) {
+                met.append(condition.summary)
+                continue
+            }
             let ok: Bool
             switch condition {
             case .fileExists(let path):
@@ -202,6 +208,34 @@ enum DoneCheck {
         }
     }
 
+    /// Verifies only conditions with an independent source. Missing or
+    /// ambiguous evidence goes through the normal recovery observation.
+    static func directCompletion(
+        _ conditions: [Condition],
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        fieldValue: (String) -> String?
+    ) -> Result? {
+        guard !conditions.isEmpty, conditions.allSatisfy({
+            switch $0 {
+            case .fileExists, .field: return true
+            default: return false
+            }
+        }) else { return nil }
+        func normalized(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespaces).lowercased()
+        }
+        for condition in conditions {
+            switch condition {
+            case .fileExists(let path):
+                guard fileExists(path) else { return nil }
+            case .field(let label, let expected):
+                guard let actual = fieldValue(label), normalized(actual) == normalized(expected) else { return nil }
+            default: return nil
+            }
+        }
+        return .weak(met: conditions.map(\.summary))
+    }
+
     static func supportsAbsenceCheck(_ text: String) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         // Browser snapshots cap both controls and text. A missing label in that reply does not
@@ -213,6 +247,7 @@ enum DoneCheck {
                 || content.hasPrefix("[Compact batch:")
                 || content.hasPrefix("Note: this window is covered")
                 || content.hasPrefix("…(")
+                || content.hasPrefix("Note: this window is covered or on another Space")
                 || content == SnapshotObservationOptions.accessibilityOmittedNote
         }
     }

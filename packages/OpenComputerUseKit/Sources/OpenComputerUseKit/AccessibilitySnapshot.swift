@@ -115,8 +115,6 @@ let screenshotResultMaxDimension: CGFloat = 1280
 private let windowVisibilityRecoveryDelay: TimeInterval = 0.7
 private let axWebAreaRole = "AXWebArea"
 // A lazy web engine can need up to ~2 s after the accessibility flags before its tree exists.
-private let webAreaRewalkAttempts = 30
-private let webAreaRewalkInterval: TimeInterval = 0.1
 
 /// Layer-0 windows ordered above `windowID` on screen, excluding this process
 /// (the visual cursor overlay must not count as cover).
@@ -386,14 +384,10 @@ enum SnapshotBuilder {
         var occlusionNote: String?
         if lazyWebAccessibility, !renderer.hasWebArea {
             if pinned {
-                for _ in 0..<webAreaRewalkAttempts {
-                    Thread.sleep(forTimeInterval: webAreaRewalkInterval)
+                refreshLazyWebArea(probe: { shallowWebAreaIsPresent(in: rootElement) }) {
                     numbering?.beginSnapshot()
                     renderer = TreeRenderer(context: context)
-                    AXSnapshotReadCache.withSnapshot { renderer.render(rootElement) }
-                    if renderer.hasWebArea {
-                        break
-                    }
+                    TimingLog.measure("snapshot.tree_walk") { AXSnapshotReadCache.withSnapshot { renderer.render(rootElement) } }
                 }
             } else {
                 var note = "Note: this window is covered or on another Space, so the app hides its web content and it is not in the tree. Bring the window into view once (covering it afterwards keeps working)."
@@ -409,10 +403,12 @@ enum SnapshotBuilder {
             guard !record.isSyntheticText, record.element != nil, record.identity?.role != nil else { return nil }
             return record.index
         } : []
-        if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
-           !CFEqual(menuBar, rootElement)
-        {
-            AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+        observation.readMenuBar {
+            if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute), !CFEqual(menuBar, rootElement) {
+                TimingLog.measure("snapshot.menu_tree_walk") {
+                    AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+                }
+            }
         }
 
         numbering?.endSnapshot(windowID: windowCapture.windowID)
@@ -796,7 +792,9 @@ private struct WindowCapture {
 
     func screenshotResult() -> ScreenshotEncodingResult {
         guard let image else { return ScreenshotEncodingResult(data: nil, note: nil) }
-        return encodeScreenshot(for: image, config: imageConfig)
+        return TimingLog.measure("snapshot.screenshot_encode") {
+            encodeScreenshot(for: image, config: imageConfig)
+        }
     }
 
 }
@@ -2683,6 +2681,17 @@ extension SnapshotBuilder {
         )
     }
 
+    static func directFieldValue(_ label: String, in context: TargetedAX.WindowContext) -> String? {
+        let criteria = TargetedAX.Criteria(text: label, exact: true, role: nil, limit: 2, maxNodes: 120)
+        guard let scan = try? targetedSearch(criteria, in: context, timeout: 0.15), !scan.truncated,
+              scan.records.count == 1, let field = scan.records.first,
+              field.title?.caseInsensitiveCompare(label) == .orderedSame,
+              ComputerUseService.typingRoles.contains(SmartSteps.roleKey(field.role)),
+              let element = field.element, belongsToWindow(element, window: context.windowElement),
+              let value = field.value else { return nil }
+        return value
+    }
+
     /// Current window bounds and element frame for a queried control, so an action
     /// lands correctly even if the window moved after the query.
     static func currentGeometry(of record: ElementRecord, in context: TargetedAX.WindowContext,
@@ -2736,6 +2745,39 @@ extension SnapshotBuilder {
         return listed.first(where: matches) ?? focused().flatMap { matches($0) ? $0 : nil }
     }
 
+    static func refreshLazyWebArea(
+        timeout: TimeInterval = 3, probe: () -> Bool, render: () -> Void
+    ) {
+        TimingLog.measure("snapshot.web_area_readiness") {
+            _ = ReadinessPoll.first(timeout: timeout, interval: 0.1) { probe() ? true : nil }
+        }
+        // Read once on readiness or once at the deadline for diagnosis. A
+        // shallow miss says nothing about whether deep web content is present.
+        render()
+    }
+
+    private static func shallowWebAreaIsPresent(in root: AXUIElement) -> Bool {
+        let deadline = TimingLog.now() + 0.075
+        let result = try? boundedTargetedWalk(
+            root: AXSearchNode(element: root), maxNodes: 64, limit: 1, expired: { TimingLog.now() >= deadline },
+            inspect: { node in
+                let role = stringValue(of: node.element, attribute: kAXRoleAttribute)
+                return (role == axWebAreaRole, role.map {
+                    !largeContainerRoles.contains($0) && $0 != kAXMenuBarRole as String
+                } ?? false)
+            },
+            children: { node, remaining in
+                guard remaining > 0 else { return ([], true) }
+                var children: CFArray?
+                let size = min(remaining, 12)
+                let status = AXUIElementCopyAttributeValues(node.element, kAXChildrenAttribute as CFString, 0, size, &children)
+                guard status == .success, let children = children as? [AXUIElement] else { return ([], false) }
+                return (children.map { AXSearchNode(element: $0) }, children.count == size)
+            }
+        )
+        return result?.matches.isEmpty == false
+    }
+
     // Attributes read for every visited node, in one batched IPC call. Position
     // and size ride along so we can (a) skip descending into off-screen subtrees
     // and (b) fill the record's frame without another round trip.
@@ -2750,8 +2792,10 @@ extension SnapshotBuilder {
     ]
 
     /// Use one bounded traversal so every app has the same visibility and match rules.
-    static func targetedSearch(_ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext) throws -> TargetedAX.SearchResult {
-        let deadline = ProcessInfo.processInfo.systemUptime + 2
+    static func targetedSearch(
+        _ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext, timeout: TimeInterval = 2
+    ) throws -> TargetedAX.SearchResult {
+        let deadline = TimingLog.now() + timeout
         let expired = { ProcessInfo.processInfo.systemUptime >= deadline }
         var scans: [AXSearchNode: NodeScan] = [:]
         var records: [AXSearchNode: ElementRecord] = [:]

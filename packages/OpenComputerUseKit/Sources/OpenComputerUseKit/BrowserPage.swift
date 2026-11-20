@@ -91,6 +91,12 @@ struct BrowserAXParse: Sendable {
     /// Headings ("# …") and text lines ("  …"), in page order, already capped.
     var texts: [String] = []
     var droppedControls = 0
+    var clippedText = false
+
+    var isCompleteEvidence: Bool {
+        droppedControls == 0 && !clippedText
+            && controls.allSatisfy { $0.name.count <= 100 && $0.value.count <= 80 }
+    }
     var framedControls = 0
     /// Icon-only controls kept so far (capped by `BrowserPage.maxUnnamedControls`).
     var unnamedControls = 0
@@ -111,10 +117,11 @@ final class BrowserPage {
     let remember: Bool
     private var indexedGeneration: Int?
 
-    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true) {
+    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true, referenceGeneration: Int? = nil) {
         self.bridge = bridge
         self.tab = tab
         self.remember = remember
+        self.indexedGeneration = referenceGeneration
     }
 
     /// Roles a model can act on.
@@ -142,7 +149,7 @@ final class BrowserPage {
         "browser: the tab or document changed; browser read again before using an element number"
     )
 
-    private func documentIdentity() throws -> BrowserDocumentIdentity? {
+    func documentIdentity() throws -> BrowserDocumentIdentity? {
         guard let frames = try cdp("Page.getFrameTree")["frameTree"] as? [String: Any] else { return nil }
         return BrowserDocumentIdentity(tree: frames)
     }
@@ -156,11 +163,31 @@ final class BrowserPage {
     }
 
     func readSnapshot(find: String?, full: Bool, interactive: Bool = false, diff: Bool = false,
-                      includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true) throws
-        -> (text: String, verifiedURL: String?, fullText: String?) {
+                      includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true,
+                      findExact: String? = nil) throws
+        -> (text: String, verifiedURL: String?, fullText: String?, evidenceScope: BrowserEvidenceScope?) {
         guardForeignFrames()
         let identity = remember && tabID != nil ? try? documentIdentity() : nil
         let generation = bridge.referenceGeneration
+        if let exact = findExact?.trimmingCharacters(in: .whitespacesAndNewlines), !exact.isEmpty {
+            let matches = try Self.exactControls(named: exact, query: { try queryNamedRaw(exact) }, fallback: fullTree)
+            var parse = BrowserAXParse()
+            parse.controls = Array(matches.prefix(150))
+            parse.droppedControls = max(0, matches.count - parse.controls.count)
+            let place = try? location()
+            // Scope this discovery to labels. An exact-name result lacks the
+            // neighboring text used to fingerprint an indexed control.
+            let stable = identity != nil && (try? documentIdentity()) == identity && generation == bridge.referenceGeneration
+            if !stable {
+                if let tabID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID) }
+                parse.controls = []
+            }
+            let text = Self.renderRead(parse, href: place?.href ?? "?", title: place?.title ?? "",
+                                       readyState: place?.readyState ?? "complete", wholePage: false, numbered: false,
+                                       includeLinkURLs: includeLinkURLs)
+            return (text + "\n(exact-name search; read the page for numbered controls or to verify page content)",
+                    stable ? place?.href : nil, "", nil)
+        }
         let raw = try fullTree()
         let query = find?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A find looks through the whole page, however long (only its matches are printed); a full read lists
@@ -174,7 +201,9 @@ final class BrowserPage {
             : Self.parseAX(raw, controlBudget: .max, textBudget: interactive ? 0 : .max, maxControls: .max,
                            includeLinkURLs: includeLinkURLs)
         var parse = parsed
-        addHints(to: &parse)
+        TimingLog.measure("browser.read_hints") {
+            addHints(to: &parse, find: query, generation: generation)
+        }
         let context = try? readContext(texts: parse.texts)
         let place = context?.location ?? (try? location())
         if let context { parse.texts = context.texts }
@@ -203,8 +232,13 @@ final class BrowserPage {
                             numbered: indicesAvailable, includeLinkURLs: includeLinkURLs)
         }
         var text = render(includeLinkURLs: includeLinkURLs)
-        // Destination annotations describe a possible next page, not the text on this page.
-        let evidence = includeLinkURLs ? render(includeLinkURLs: false) : nil
+        // A filtered or clipped page is useful for discovery. Keep its URL
+        // available, but don't use the partial text to verify a batch.
+        let evidence: String? = if !query.isEmpty || interactive || !parse.isCompleteEvidence {
+            ""
+        } else {
+            includeLinkURLs ? render(includeLinkURLs: false) : nil
+        }
         if interactive {
             text += "\n(controls only; read without interactive for page text)"
         }
@@ -214,6 +248,9 @@ final class BrowserPage {
                 : "\n(only lines mentioning \"\(query)\"; use \(indicesAvailable ? "indexes or labels" : "labels") for actions)"
         }
         let url = indicesAvailable ? place?.href : nil
+        let scope = url.flatMap { url in
+            identity.flatMap { evidenceScope(document: $0, generation: generation, url: url) }
+        }
         if indicesAvailable, let tabID, let identity {
             let mode = keepsDiffBaseline && query.isEmpty && url != nil ? "\(full):\(interactive):\(includeLinkURLs)" : nil
             BrowserPageMemory.shared.store(parse.controls, bridge: bridge, tab: tabID, document: identity,
@@ -224,35 +261,79 @@ final class BrowserPage {
                let change = AXStateDiff.diff(previous: previous, current: text, matchIndexes: true),
                let header = text.split(separator: "\n").first {
                 let compact = "\(header)\nBrowser changes (read without diff for the full page):\n\(change)"
-                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text) }
+                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text, scope) }
             }
         }
-        return (text, url, evidence)
+        return (text, url, evidence, scope)
+    }
+
+    func evidenceScope(document: BrowserDocumentIdentity, generation: Int, url: String) -> BrowserEvidenceScope? {
+        guard let tabID, generation == bridge.referenceGeneration else { return nil }
+        return .init(connection: bridge.referenceScope, generation: generation, tabID: tabID, document: document, url: url)
     }
 
     /// Labels the controls a model could not otherwise tell apart: those with no name and those that share
     /// their role and name with another (three "Edit" buttons). Unnamed ones first, then duplicates, in page
     /// order, within a small time budget, so a read never slows down noticeably.
-    private func addHints(to parse: inout BrowserAXParse) {
+    private func addHints(to parse: inout BrowserAXParse, find: String, generation: Int) {
+        let positions = Self.hintCandidates(in: parse, find: find)
+        guard !positions.isEmpty else { return }
+        let deadline = BrowserCallBudget.deadline(after: min(Self.hintBudget, BrowserCallBudget.remaining()))
+        let hints = Self.readHints(positions.map { parse.controls[$0].backendNodeID }) { commands in
+            (try? bridge.hintCommands(tab: tab, commands: commands, generation: generation, deadline: deadline)) ?? []
+        }
+        for position in positions {
+            if let hint = hints[parse.controls[position].backendNodeID] { parse.controls[position].hint = hint }
+        }
+    }
+
+    static func hintCandidates(in parse: BrowserAXParse, find: String) -> [Int] {
         var counts: [String: Int] = [:]
-        for control in parse.controls { counts["\(control.role)\u{1}\(control.name)", default: 0] += 1 }
+        func key(_ control: BrowserNode) -> String { "\(control.role)\u{1}\(control.name)" }
+        for control in parse.controls { counts[key(control), default: 0] += 1 }
+        let directMatches = find.isEmpty ? [] : filtered(parse, find: find).controls.map(\.index)
+        let matchingIndexes = Set(directMatches)
         let candidates = parse.controls.indices.filter { position in
             let control = parse.controls[position]
-            guard !control.inFrame, Self.clickableRoles.contains(control.role) || Self.fieldRoles.contains(control.role) else { return false }
-            return control.name.isEmpty || counts["\(control.role)\u{1}\(control.name)", default: 0] > 1
+            guard !control.inFrame, clickableRoles.contains(control.role) || fieldRoles.contains(control.role) else { return false }
+            if control.name.isEmpty { return true }
+            return counts[key(control), default: 0] > 1
+                && (matchingIndexes.isEmpty || matchingIndexes.contains(control.index))
         }
-        guard !candidates.isEmpty else { return }
-        let ordered = candidates.filter { parse.controls[$0].name.isEmpty } + candidates.filter { !parse.controls[$0].name.isEmpty }
-        let deadline = Date().addingTimeInterval(Self.hintBudget)
-        for position in ordered.prefix(Self.maxHintedControls) {
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0.02 else { break }
-            let control = parse.controls[position]
-            let value = BrowserCallBudget.withDeadline(BrowserCallBudget.deadline(after: remaining)) {
-                try? callOnNode(control, Self.hintJS) as? String
-            }
-            if let value, !value.isEmpty { parse.controls[position].hint = value }
+        // Keep relevant named duplicates ahead of icon-only fallback probes.
+        let unnamed = candidates.filter { parse.controls[$0].name.isEmpty }
+        let named = candidates.filter { !parse.controls[$0].name.isEmpty }
+        return Array((matchingIndexes.isEmpty ? unnamed + named : named + unnamed).prefix(maxHintedControls))
+    }
+
+    static func readHints(
+        _ backendIDs: [Int], call: ([(String, [String: Any])]) -> [[String: Any]?]
+    ) -> [Int: String] {
+        let objectGroup = "godspeed-read-hints"
+        let resolves = backendIDs.map {
+            ("DOM.resolveNode", ["backendNodeId": $0, "objectGroup": objectGroup])
         }
+        let objects = zip(backendIDs, call(resolves)).compactMap { backend, reply -> (Int, String)? in
+            guard let object = reply?["object"] as? [String: Any], let id = object["objectId"] as? String else { return nil }
+            return (backend, id)
+        }
+        defer { _ = call([("Runtime.releaseObjectGroup", ["objectGroup": objectGroup])]) }
+        guard let first = objects.first else { return [:] }
+        // Every handle is from this tab and these controls are outside iframes.
+        // Detached or cross-context handles may fail this optional enrichment.
+        let function = "function(...nodes){const hint=(\(hintJS));return nodes.map(n=>{try{return n.isConnected?hint.call(n):''}catch{return ''}});}"
+        let params: [String: Any] = [
+            "objectId": first.1, "functionDeclaration": function,
+            "arguments": objects.map { ["objectId": $0.1] }, "returnByValue": true,
+        ]
+        guard let reply = call([("Runtime.callFunctionOn", params)]).first ?? nil,
+              let result = reply["result"] as? [String: Any],
+              let values = result["value"] as? [String], values.count == objects.count else { return [:] }
+        var hints: [Int: String] = [:]
+        for (object, value) in zip(objects, values) where !value.isEmpty {
+            hints[object.0] = value
+        }
+        return hints
     }
 
     /// A control's title, icon, image, stable attribute and row, as "icon:trash; testid:delete; in:Invoice 12".
@@ -468,7 +549,9 @@ final class BrowserPage {
                 let value = collapse(axValue(node["value"]) ?? "")
                 // An icon-only control (trash, close, menu) has no name but is often the one a task needs. It is
                 // kept, up to a cap, and labelled by a hint after the parse (see `addHints`).
-                let unnamedClickable = name.isEmpty && clickableRoles.contains(role) && result.unnamedControls < maxUnnamedControls
+                let isUnnamedClickable = name.isEmpty && clickableRoles.contains(role)
+                let unnamedClickable = isUnnamedClickable && result.unnamedControls < maxUnnamedControls
+                if isUnnamedClickable, !unnamedClickable { result.droppedControls += 1 }
                 guard let backend = (node["backendDOMNodeId"] as? NSNumber)?.intValue,
                       !name.isEmpty || fieldRoles.contains(role) || unnamedClickable
                 else { continue }
@@ -521,16 +604,23 @@ final class BrowserPage {
             }
 
             if !name.isEmpty, role == "heading" || role == "StaticText" { lastText = name }
-            guard textCharacters < textBudget, !name.isEmpty else { continue }
+            guard !name.isEmpty else { continue }
+            let limit: Int
+            let prefix: String
             if role == "heading" {
-                let line = "# \(name.prefix(120))"
-                result.texts.append(line)
-                textCharacters += line.count
+                limit = 120
+                prefix = "# "
             } else if role == "StaticText", name.count >= 2, name != lastControlName {
-                let line = "  \(name.prefix(160))"
-                result.texts.append(line)
-                textCharacters += line.count
+                limit = 160
+                prefix = "  "
+            } else {
+                continue
             }
+            if name.count > limit || textCharacters >= textBudget { result.clippedText = true }
+            guard textCharacters < textBudget else { continue }
+            let line = prefix + String(name.prefix(limit))
+            result.texts.append(line)
+            textCharacters += line.count
         }
         return result
     }
@@ -604,7 +694,12 @@ final class BrowserPage {
             let matches = observation.nodes.filter { Self.hint($0.hint, matches: wanted) }
             if matches.count == 1, let node = matches.first {
                 indexedGeneration = observation.generation
-                return try verified(node, index: node.index)
+                let current = try verified(node, index: node.index)
+                guard let live = try callOnNode(current, Self.hintJS) as? String,
+                      Self.hint(live, matches: wanted), try documentIdentity() == document else {
+                    throw Self.staleIndex
+                }
+                return current
             }
         }
         let raw = try fullTree()
@@ -683,6 +778,20 @@ final class BrowserPage {
         }
         let payload = try cdp("Accessibility.queryAXTree", ["objectId": objectID, "accessibleName": label])
         return Self.nodes(of: payload)
+    }
+
+    static func exactControls(
+        named name: String, query: () throws -> [[String: Any]], fallback: () throws -> [[String: Any]]
+    ) throws -> [BrowserNode] {
+        let wanted = normalize(name)
+        func matches(_ raw: [[String: Any]]) -> [BrowserNode] {
+            namedCandidates(raw).filter { normalize($0.name) == wanted }
+        }
+        if let raw = try? query(), !raw.isEmpty {
+            let found = matches(raw)
+            if !found.isEmpty { return found }
+        }
+        return matches(try fallback())
     }
 
     static func namedCandidates(_ raw: [[String: Any]]) -> [BrowserNode] {
@@ -1937,7 +2046,7 @@ final class BrowserPage {
     private func cdpOnce(_ method: String, _ params: [String: Any], feedback: String?) throws -> [String: Any] {
         Self.trace("\(method) \((params["type"] as? String) ?? "")")
         do {
-            return try cdpSend(method, params, feedback: feedback)
+            return try TimingLog.measure("browser.cdp") { try cdpSend(method, params, feedback: feedback) }
         } catch {
             Self.trace("  FAILED \(method): \(String(describing: error).prefix(120))")
             throw error
@@ -1960,6 +2069,7 @@ final class BrowserPage {
         let commandWait = min(isQuery ? 2 : 10, transportWait - 0.5)
         arguments["timeout_ms"] = Int(commandWait * 1_000)
         let reply = try bridge.callTool("cdp", arguments: arguments, timeout: transportWait, referenceGeneration: indexedGeneration)
+        TimingLog.count("browser.cdp_reply_bytes", reply.text.utf8.count)
         if reply.isError {
             if Self.linkDropped(reply.text) { throw BrowserLinkDropped(text: reply.text) }
             throw ComputerUseError.message("browser: \(BrowserReply.explain(reply.text))")
@@ -2457,6 +2567,14 @@ enum BrowserReply {
 }
 
 /// The document identity Chrome exposes for each frame in the tab's frame tree.
+struct BrowserEvidenceScope: Equatable {
+    let connection: UUID
+    let generation: Int
+    let tabID: Int
+    let document: BrowserDocumentIdentity
+    let url: String
+}
+
 struct BrowserDocumentIdentity: Equatable {
     private let loadersByFrame: [String: String]
 

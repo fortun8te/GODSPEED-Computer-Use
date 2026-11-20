@@ -6,6 +6,104 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testClippedBrowserTextAndControlsCannotBeCompletionEvidence() {
+        let heading: [String: Any] = ["role": ["value": "heading"], "name": ["value": "Ready"]]
+        let clipped: [String: Any] = ["role": ["value": "heading"], "name": ["value": String(repeating: "x", count: 200)]]
+        XCTAssertTrue(BrowserPage.parseAX([heading]).isCompleteEvidence)
+        XCTAssertFalse(BrowserPage.parseAX([heading, clipped]).isCompleteEvidence)
+        XCTAssertFalse(BrowserPage.parseAX([heading], textBudget: 0).isCompleteEvidence)
+        let button: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
+        XCTAssertFalse(BrowserPage.parseAX([button], maxControls: 0).isCompleteEvidence)
+    }
+
+    func testExactLookupUsesOneQueryAndFallsBackOnNoCertainMatch() throws {
+        let save: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 42]
+        let duplicate: [String: Any] = ["role": ["value": "button"], "name": ["value": "Save"], "backendDOMNodeId": 43]
+        var queries = 0
+        var fullReads = 0
+        func fullTree() -> [[String: Any]] {
+            fullReads += 1
+            return [save, duplicate]
+        }
+        let targeted = try BrowserPage.exactControls(named: "Save", query: {
+            queries += 1
+            return [save, duplicate]
+        }, fallback: fullTree)
+        XCTAssertEqual(targeted.map(\.backendNodeID), [42, 43])
+        XCTAssertEqual(queries, 1)
+        XCTAssertEqual(fullReads, 0)
+
+        let fallback = try BrowserPage.exactControls(named: "Save", query: { [] }, fallback: fullTree)
+        XCTAssertEqual(fallback.map(\.backendNodeID), [42, 43])
+        XCTAssertEqual(fullReads, 1)
+    }
+
+    func testFindHintsSkipUnrelatedDuplicatesAndKeepIconOnlyControls() {
+        var parse = BrowserAXParse()
+        parse.controls = (1...24).map { BrowserNode(index: $0, role: "button", name: "Edit", value: "", backendNodeID: $0) }
+        parse.controls.append(.init(index: 25, role: "button", name: "Save", value: "", backendNodeID: 25))
+        parse.controls.append(.init(index: 26, role: "button", name: "", value: "", backendNodeID: 26))
+        XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "Save"), [25])
+        XCTAssertEqual(BrowserPage.hintCandidates(in: parse, find: "trash").first, 25)
+    }
+
+    func testHintTransportSendsBothProbesBeforeWaitingForReplies() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        // The fake helper withholds both replies until both requests arrive,
+        // then sends them out of order.
+        let script = #"""
+        #!/bin/sh
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"[]"}]}}'
+        IFS= read -r first
+        IFS= read -r second
+        case "$first" in *DOM.resolveNode*) ;; *) exit 1 ;; esac
+        case "$second" in *DOM.resolveNode*) ;; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"result\":{\"object\":{\"objectId\":\"second\"}}}"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"result\":{\"object\":{\"objectId\":\"first\"}}}"}]}}'
+        IFS= read -r finalize
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "hint-pipeline-test", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("tabs", arguments: [:], timeout: 3)
+        let replies = try bridge.hintCommands(tab: ["tab_id": 12], commands: [
+            ("DOM.resolveNode", ["backendNodeId": 101]),
+            ("DOM.resolveNode", ["backendNodeId": 102]),
+        ], generation: bridge.referenceGeneration, deadline: TimingLog.now() + 2)
+        XCTAssertEqual(replies.compactMap { ($0?["object"] as? [String: Any])?["objectId"] as? String }, ["first", "second"])
+    }
+
+    func testHintProbesResolveTogetherAndShareOneRuntimeRead() {
+        var waves: [[String]] = []
+        let hints = BrowserPage.readHints(Array(1...24)) { commands in
+            waves.append(commands.map(\.0))
+            switch commands.first?.0 {
+            case "DOM.resolveNode":
+                return commands.map { _, params in
+                    ["object": ["objectId": "handle-\(params["backendNodeId"] as? Int ?? 0)"]]
+                }
+            case "Runtime.callFunctionOn":
+                XCTAssertEqual((commands[0].1["arguments"] as? [[String: String]])?.count, 24)
+                return [["result": ["value": (1...24).map { "hint-\($0)" }]]]
+            default:
+                return []
+            }
+        }
+        XCTAssertEqual(waves, [Array(repeating: "DOM.resolveNode", count: 24), ["Runtime.callFunctionOn"], ["Runtime.releaseObjectGroup"]])
+        XCTAssertEqual(hints.count, 24)
+        XCTAssertEqual(hints[24], "hint-24")
+    }
+
     func testRememberedBrowserControlsRequireTheOriginalHelperAndLoaders() throws {
         let memory = BrowserPageMemory()
         let first = BrowserBridge(sessionID: "test-first")
@@ -492,6 +590,26 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(alpha.sessionID == main.sessionID)
         let otherClient = ClientScope.with("alpha-lane1") { BrowserBridge.shared.sessionID }
         XCTAssertNotEqual(alpha.sessionID, otherClient)
+    }
+
+    func testPeekLaneCleansMultipleReadsTogetherAndStopsOnUnconfirmedCleanup() {
+        var nextIndex = 0
+        var cleaned = 0
+        var stored: [Int: BrowserPreviewPage] = [:]
+        ComputerUseToolDispatcher.runPeekLane(next: {
+            defer { nextIndex += 1 }
+            return nextIndex < 3 ? nextIndex : nil
+        }, read: { index in
+            XCTAssertEqual(cleaned, 0)
+            return (index == 1 ? "failed" : "read", "page \(index)")
+        }, cleanup: {
+            cleaned += 1
+            return false
+        }, store: { stored[$0] = $1 })
+        XCTAssertEqual(cleaned, 1)
+        XCTAssertEqual(stored.keys.sorted(), [0, 1])
+        XCTAssertEqual(stored[0]?.cleanupConfirmed, false)
+        XCTAssertEqual(stored[1]?.cleanupConfirmed, false)
     }
 
     func testRequestEnvironmentReachesEveryPeekLaneAndRestoresTheCaller() throws {
