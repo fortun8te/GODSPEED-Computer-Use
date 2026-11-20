@@ -170,9 +170,13 @@ public enum RelayGrantError: Error, LocalizedError, Equatable {
     case processUnavailable(pid_t)
     case invalidLifetime(Int64)
     case emptySession
+    /// The host rejected the helper's grant: the relay authority key is missing or does not match.
+    case helperNeedsRelayKey
 
     public var errorDescription: String? {
         switch self {
+        case .helperNeedsRelayKey:
+            return "Chrome helper needs the Godspeed relay key; run the installer."
         case .processUnavailable(let pid):
             return "Chrome helper process \(pid) is not running, so no relay grant can be issued."
         case .invalidLifetime(let seconds):
