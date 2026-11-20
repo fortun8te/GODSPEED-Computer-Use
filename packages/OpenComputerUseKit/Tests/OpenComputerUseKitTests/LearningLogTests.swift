@@ -195,7 +195,7 @@ final class LearningLogTests: XCTestCase {
         let log = makeLog()
         VisionFallback.recordLocate(query: "Save", crop: crop,
                                     candidate: VisionFallback.Candidate(fraction: CGPoint(x: 0.5, y: 0.25), evidence: .model),
-                                    verified: true, log: log)
+                                    verified: true, secure: false, log: log)
         let row = try object(try lines()[0])
         XCTAssertEqual(row["kind"] as? String, "locate")
         XCTAssertEqual(row["evidence"] as? String, "model")
@@ -209,7 +209,7 @@ final class LearningLogTests: XCTestCase {
     func testVisionLocateMissStillWritesRowWithoutImageWhenImagesOff() throws {
         let crop = try XCTUnwrap(makeImage())
         let log = LearningLog(directory: directory, enabled: true, imagesEnabled: false, runID: "r", clock: { Date(timeIntervalSince1970: 0) })
-        VisionFallback.recordLocate(query: "Save", crop: crop, candidate: nil, verified: false, log: log)
+        VisionFallback.recordLocate(query: "Save", crop: crop, candidate: nil, verified: false, secure: false, log: log)
         let row = try object(try lines(day: "1970-01-01")[0])
         XCTAssertEqual(row["kind"] as? String, "locate")
         XCTAssertNil(row["point"])
@@ -219,7 +219,7 @@ final class LearningLogTests: XCTestCase {
 
     func testVisionLocateDisabledWritesNothing() throws {
         let crop = try XCTUnwrap(makeImage())
-        VisionFallback.recordLocate(query: "Save", crop: crop, candidate: nil, verified: false,
+        VisionFallback.recordLocate(query: "Save", crop: crop, candidate: nil, verified: false, secure: false,
                                     log: LearningLog(directory: directory, enabled: false, imagesEnabled: true))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
@@ -305,6 +305,70 @@ final class LearningLogTests: XCTestCase {
         XCTAssertEqual(failing.kind, quiet.kind)
         XCTAssertEqual(failing.reply(), quiet.reply())
         XCTAssertEqual(failing.steps, quiet.steps)
+    }
+
+    // MARK: Durability
+
+    /// Separate log instances (separate file descriptors, as separate processes would have) append at once.
+    /// Every row must arrive whole, exactly once, and the folder must still parse.
+    func testConcurrentWritersKeepEveryRowWhole() throws {
+        let writers = (0..<4).map { _ in makeLog(maxBytes: LearningLog.defaultMaxBytes) }
+        let group = DispatchGroup()
+        for (index, log) in writers.enumerated() {
+            group.enter()
+            DispatchQueue.global().async {
+                for row in 0..<200 {
+                    // Spaced words: a long hyphenated token with digits would be redacted by the scrubber.
+                    _ = log.append(LearningEpisodeRow(goal: "writer \(index) row \(row) " + String(repeating: "word ", count: 60)))
+                }
+                group.leave()
+            }
+        }
+        group.wait()
+        let rows = try lines()
+        XCTAssertEqual(rows.count, 800)
+        let goals = try Set(rows.map { try object($0)["goal"] as? String ?? "" })
+        XCTAssertEqual(goals.count, 800, "No row was lost or duplicated")
+    }
+
+    /// Eviction runs under the same lock as the writes. Racing writers across days under a small cap leave every
+    /// file that survives parseable. Which days survive depends on the race, so only parseability is asserted.
+    func testConcurrentWritersUnderCapStayParseable() throws {
+        let days = ["2026-11-18", "2026-11-19", "2026-11-20"]
+        let group = DispatchGroup()
+        for day in days {
+            let log = makeLog(at: "\(day)T10:00:00Z", maxBytes: 60_000)
+            group.enter()
+            DispatchQueue.global().async {
+                for _ in 0..<60 { _ = log.append(LearningDecisionRow(view: String(repeating: "y ", count: 200))) }
+                group.leave()
+            }
+        }
+        group.wait()
+        for day in days where exists("learning-\(day).jsonl") {
+            for line in try lines(day: day) { _ = try object(line) }
+        }
+    }
+
+    func testSecureFieldKeepsRowButNeverItsImage() throws {
+        let crop = try XCTUnwrap(makeImage())
+        let log = makeLog()
+        VisionFallback.recordLocate(query: "Enter PIN", crop: crop,
+                                    candidate: VisionFallback.Candidate(fraction: CGPoint(x: 0.1, y: 0.1), evidence: .ocr),
+                                    verified: true, secure: true, log: log)
+        let row = try object(try lines()[0])
+        XCTAssertEqual(row["kind"] as? String, "locate")
+        XCTAssertNil(row["image"])
+        let pngs = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasSuffix(".png") }
+        XCTAssertTrue(pngs.isEmpty, "No crop was written for a secure view")
+    }
+
+    func testSecureMarkersMatchEnglishAndDutchOnly() {
+        XCTAssertTrue(LearningScrubber.marksSecureField(["Password"]))
+        XCTAssertTrue(LearningScrubber.marksSecureField(["Voer je Wachtwoord in"]))
+        XCTAssertTrue(LearningScrubber.marksSecureField(["secure text field"]))
+        XCTAssertTrue(LearningScrubber.marksSecureField(["Window text", "Passcode"]))
+        XCTAssertFalse(LearningScrubber.marksSecureField(["Save", "Export PDF"]))
     }
 
     private func makeImage() -> CGImage? {
