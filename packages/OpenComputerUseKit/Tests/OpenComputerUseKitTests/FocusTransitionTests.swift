@@ -39,6 +39,23 @@ final class FocusTransitionTests: XCTestCase {
         XCTAssertEqual(FocusTransition.check(target: target, observed: sheet), .unexpectedDialog(title: "Confirm Delete"))
     }
 
+    /// The gate both keyboard paths (sky_key and the plain fallback) use before any key is sent.
+    func testWrongFocusTypingIsRefusedWithNotSent() {
+        let read = ObservedFocus(windowID: 4, elementRole: "AXTextField", label: "Email")
+        XCTAssertNil(ComputerUseService.keyboardFocusRefusal(read: read, observed: read), "the field that was read may take keys")
+
+        let moved = ObservedFocus(windowID: 4, elementRole: "AXButton", label: "Send")
+        guard case .notSent(let message)? = ComputerUseService.keyboardFocusRefusal(read: read, observed: moved) else {
+            return XCTFail("focus on another control must refuse with notSent")
+        }
+        XCTAssertEqual(message, "Typing would go to Send; read the app and target the field.")
+
+        let unknownNow = ObservedFocus(windowID: 4, elementRole: nil, label: nil)
+        XCTAssertNotNil(ComputerUseService.keyboardFocusRefusal(read: read, observed: unknownNow), "unknown focus is never typed into")
+        let unknownRead = ObservedFocus(windowID: 4, elementRole: nil, label: nil)
+        XCTAssertNotNil(ComputerUseService.keyboardFocusRefusal(read: unknownRead, observed: read), "an unread focus is never typed into")
+    }
+
     func testDifferentDialogThanNamedIsUnexpectedAndNamedDialogIsOK() {
         let target = FocusTarget(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: "Save")
         let other = ObservedFocus(windowID: 4, elementRole: "TextField", label: "Name", dialogTitle: "Replace")
