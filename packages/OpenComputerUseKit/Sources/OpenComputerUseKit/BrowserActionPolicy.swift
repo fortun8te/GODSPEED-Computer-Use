@@ -46,10 +46,14 @@ extension ComputerUseToolDispatcher {
     /// still needs its origin allowed. A refused or unreadable user list is omitted, not guessed.
     static func tabListingText(policy: ActionPolicy, own: (text: String, isError: Bool),
                                userTabs: () throws -> (text: String, isError: Bool)) throws -> String {
+        // A helper error is not an empty inventory: report it, and do not go on to read the user's tabs.
+        guard !own.isError else {
+            throw ComputerUseError.stateUnavailable("browser: could not list this session's tabs (\(BatchTool.firstLine(own.text))). Try browser tabs again before acting.")
+        }
         func allowed(_ url: String) -> Bool { (try? authorizeBrowserAddresses(policy, addresses: [url])) != nil }
         var lines = ["Tabs in this session (browser use_tab with tab_id):"]
         let mine = BrowserReply.tabLines(in: own.text, limit: 30, include: allowed)
-        lines += mine.isEmpty ? [own.isError ? BatchTool.firstLine(own.text) : "(none)"] : mine
+        lines += mine.isEmpty ? ["(none)"] : mine
         if (try? policy.authorize(bundleIDs: [ActionPolicy.browserBundleID])) != nil,
            let theirs = try? userTabs(), !theirs.isError {
             let user = BrowserReply.tabLines(in: theirs.text, limit: 15, include: allowed)

@@ -52,6 +52,18 @@ final class BrowserActionPolicyTests: XCTestCase {
         }
     }
 
+    /// A failed tab inventory is an error, not an empty list, and the user's tabs are not read after it.
+    func testTabInventoryFailsWhenHelperReportsError() throws {
+        let open = try JSONDecoder().decode(ActionPolicy.self, from: Data("{}".utf8))
+        let failed = (text: "helper timed out", isError: true)
+        XCTAssertThrowsError(try ComputerUseToolDispatcher.tabListingText(policy: open, own: failed, userTabs: {
+            XCTFail("user tabs must not be read after a failed inventory")
+            return (text: "", isError: true)
+        })) { error in
+            guard case ComputerUseError.stateUnavailable = error else { return XCTFail("\(error)") }
+        }
+    }
+
     /// The user's own Chrome tabs are listed only when the browser app passes the same policy as other browser actions.
     func testUserChromeTabsNeedBrowserAppAuthorization() throws {
         let own = (text: #"{"result":[{"id":3,"url":"https://a.test","title":"Agent tab"}]}"#, isError: false)
