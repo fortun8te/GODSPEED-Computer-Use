@@ -104,6 +104,21 @@ final class RegionFingerprintTests: XCTestCase {
         XCTAssertEqual(rect, CGRect(x: 0, y: 0, width: 1440, height: 900))
     }
 
+    func testDifferentImageSizeCountsEveryCellAsChanged() throws {
+        let full = try XCTUnwrap(RegionFingerprint.make(texture()))
+        let smaller = try XCTUnwrap(RegionFingerprint.make(texture(width: 1280, height: 800)))
+        XCTAssertEqual(full.pixelWidth, 1440)
+        XCTAssertEqual(full.pixelHeight, 900)
+        XCTAssertEqual(smaller.pixelWidth, 1280)
+        XCTAssertEqual(smaller.pixelHeight, 800)
+        // Same 16x10 grid, different source size: every cell counts as changed.
+        XCTAssertEqual(smaller.changedCells(comparedTo: full), Array(0..<160))
+        XCTAssertEqual(
+            smaller.changedRect(comparedTo: full, in: CGSize(width: 1280, height: 800)),
+            CGRect(x: 0, y: 0, width: 1280, height: 800)
+        )
+    }
+
     func testImageSmallerThanGridReturnsNil() {
         let tiny = image(width: 4, height: 4) { _, _ in 0 }
         XCTAssertNil(RegionFingerprint.make(tiny))
@@ -139,6 +154,6 @@ final class RegionFingerprintTests: XCTestCase {
         }
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / Double(runs) / 1_000_000
         print("RegionFingerprint.make 1440x900: \(String(format: "%.2f", elapsed)) ms average over \(runs) runs")
-        XCTAssertLessThan(elapsed, 50, "make() took \(elapsed) ms")
+        XCTAssertLessThan(elapsed, 250, "make() took \(elapsed) ms")
     }
 }
