@@ -90,6 +90,12 @@ struct BrowserAXParse: Sendable {
     /// Headings ("# …") and text lines ("  …"), in page order, already capped.
     var texts: [String] = []
     var droppedControls = 0
+    var clippedText = false
+
+    var isCompleteEvidence: Bool {
+        droppedControls == 0 && !clippedText
+            && controls.allSatisfy { $0.name.count <= 100 && $0.value.count <= 80 }
+    }
     var framedControls = 0
     /// Icon-only controls kept so far (capped by `BrowserPage.maxUnnamedControls`).
     var unnamedControls = 0
@@ -225,8 +231,13 @@ final class BrowserPage {
                             numbered: indicesAvailable, includeLinkURLs: includeLinkURLs)
         }
         var text = render(includeLinkURLs: includeLinkURLs)
-        // Destination annotations describe a possible next page, not the text on this page.
-        let evidence = includeLinkURLs ? render(includeLinkURLs: false) : nil
+        // A filtered or clipped page is useful for discovery. Keep its URL
+        // available, but don't use the partial text to verify a batch.
+        let evidence: String? = if !query.isEmpty || interactive || !parse.isCompleteEvidence {
+            ""
+        } else {
+            includeLinkURLs ? render(includeLinkURLs: false) : nil
+        }
         if interactive {
             text += "\n(controls only; read without interactive for page text)"
         }
@@ -510,7 +521,9 @@ final class BrowserPage {
                 let value = collapse(axValue(node["value"]) ?? "")
                 // An icon-only control (trash, close, menu) has no name but is often the one a task needs. It is
                 // kept, up to a cap, and labelled by a hint after the parse (see `addHints`).
-                let unnamedClickable = name.isEmpty && clickableRoles.contains(role) && result.unnamedControls < maxUnnamedControls
+                let isUnnamedClickable = name.isEmpty && clickableRoles.contains(role)
+                let unnamedClickable = isUnnamedClickable && result.unnamedControls < maxUnnamedControls
+                if isUnnamedClickable, !unnamedClickable { result.droppedControls += 1 }
                 guard let backend = (node["backendDOMNodeId"] as? NSNumber)?.intValue,
                       !name.isEmpty || fieldRoles.contains(role) || unnamedClickable
                 else { continue }
@@ -563,16 +576,23 @@ final class BrowserPage {
             }
 
             if !name.isEmpty, role == "heading" || role == "StaticText" { lastText = name }
-            guard textCharacters < textBudget, !name.isEmpty else { continue }
+            guard !name.isEmpty else { continue }
+            let limit: Int
+            let prefix: String
             if role == "heading" {
-                let line = "# \(name.prefix(120))"
-                result.texts.append(line)
-                textCharacters += line.count
+                limit = 120
+                prefix = "# "
             } else if role == "StaticText", name.count >= 2, name != lastControlName {
-                let line = "  \(name.prefix(160))"
-                result.texts.append(line)
-                textCharacters += line.count
+                limit = 160
+                prefix = "  "
+            } else {
+                continue
             }
+            if name.count > limit || textCharacters >= textBudget { result.clippedText = true }
+            guard textCharacters < textBudget else { continue }
+            let line = prefix + String(name.prefix(limit))
+            result.texts.append(line)
+            textCharacters += line.count
         }
         return result
     }

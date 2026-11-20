@@ -48,6 +48,8 @@ enum DoneCheck {
         var pageURL: () -> String?
         var fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
         var supportsAbsence = true
+        /// The exact predicates already checked against an independent source.
+        var directlyVerified: [Condition] = []
     }
 
     enum Result: Equatable {
@@ -116,6 +118,10 @@ enum DoneCheck {
         var fetchedURL: String?
         var didFetchURL = false
         for condition in conditions {
+            if evidence.directlyVerified.contains(condition) {
+                met.append(condition.summary)
+                continue
+            }
             let ok: Bool
             switch condition {
             case .fileExists(let path):
@@ -191,6 +197,7 @@ enum DoneCheck {
             return content.hasPrefix("[Accessibility tree truncated:")
                 || content.hasPrefix("[Compact batch:")
                 || content.hasPrefix("…(")
+                || content.hasPrefix("Note: this window is covered or on another Space")
                 || content == SnapshotObservationOptions.accessibilityOmittedNote
         }
     }
