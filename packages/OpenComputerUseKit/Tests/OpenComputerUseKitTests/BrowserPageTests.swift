@@ -524,6 +524,20 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNil(BrowserReply.uploadSelected(in: "unknown tool: upload_via_button"))
     }
 
+    func testTargetedLabelDecidesDuplicatesWithoutTheWholeTree() throws {
+        // PERF-01: two exact-name controls from the targeted query are ambiguous, and say so without a full read.
+        let first = BrowserNode(index: 0, role: "button", name: "Delete", value: "", backendNodeID: 11)
+        let second = BrowserNode(index: 0, role: "button", name: "Delete", value: "", backendNodeID: 12)
+        XCTAssertThrowsError(try BrowserPage.decideFromTargeted([first, second], label: "Delete")) { error in
+            XCTAssertTrue("\(error)".contains("2 elements are labelled"), "\(error)")
+        }
+        // One exact control is the answer.
+        XCTAssertEqual(try BrowserPage.decideFromTargeted([first], label: "Delete")?.backendNodeID, 11)
+        // No exact-name candidate: the caller must search the whole page, so nil.
+        XCTAssertNil(try BrowserPage.decideFromTargeted([first], label: "Del"))
+        XCTAssertNil(try BrowserPage.decideFromTargeted([], label: "Delete"))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {

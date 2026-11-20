@@ -723,7 +723,8 @@ final class BrowserPage {
             throw ComputerUseError.invalidArguments("browser: give a label (visible text) or an index from browser read")
         }
         let wanted = Self.normalize(label)
-        if let named = try? queryNamed(label), let hit = Self.pickNamed(named, wanted: wanted) {
+        let targeted = (try? queryNamed(label)) ?? []
+        if let hit = Self.pickNamed(targeted, wanted: wanted) {
             return hit
         }
         // A hint from the last read ("icon:trash", "trash", "in:Invoice 12") names an icon-only control.
@@ -740,6 +741,8 @@ final class BrowserPage {
                 return current
             }
         }
+        // PERF-01: the targeted query already names the exact-label candidates. Decide from them before any full read.
+        if let hit = try Self.decideFromTargeted(targeted, label: label) { return hit }
         let raw = try fullTree()
         let nodes = Self.parseAX(raw, controlBudget: Int.max, textBudget: 0, maxControls: .max).controls
         if let hit = try Self.pickFuzzy(nodes, label: label) { return hit }
@@ -871,6 +874,15 @@ final class BrowserPage {
 
     /// The one element whose name equals the label (clickable ones first). Several different elements with
     /// that name give nil: the full read then decides, and lists them with their numbers if they are distinct.
+    /// PERF-01: decides a label from the targeted AX query's exact-name candidates. Nil when none of them carries
+    /// the exact name, so the caller searches the whole page. Duplicates throw the same ambiguity message as a full read.
+    static func decideFromTargeted(_ targeted: [BrowserNode], label: String) throws -> BrowserNode? {
+        let wanted = normalize(label)
+        if let hit = pickNamed(targeted, wanted: wanted) { return hit }
+        guard targeted.contains(where: { normalize($0.name) == wanted }) else { return nil }
+        return try pickFuzzy(targeted, label: label)
+    }
+
     static func pickNamed(_ nodes: [BrowserNode], wanted: String) -> BrowserNode? {
         let exact = nodes.filter { normalize($0.name) == wanted }
         let clickable = exact.filter { clickableRoles.contains($0.role) }
