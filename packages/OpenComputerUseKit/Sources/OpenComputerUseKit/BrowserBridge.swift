@@ -417,6 +417,10 @@ final class BrowserBridge: @unchecked Sendable {
             if reply.isError, RelayGrantRenewal.typedError(for: ComputerUseError.message(reply.text)) as? RelayGrantError == .helperNeedsRelayKey {
                 throw ComputerUseError.notSent(RelayGrantError.helperNeedsRelayKey.errorDescription ?? "Chrome helper needs the Godspeed relay key.")
             }
+            // A tab opened by the agent's own verified link click is the agent's, like one from open_tab (ACT-02).
+            if name == "click_target", !reply.isError, let id = BrowserReply.clickedTab(in: reply.text)?.openedTabID {
+                openedTabs.insert(id)
+            }
             if name == "open_tab", !reply.isError, let id = BrowserReply.createdTabID(in: reply.text) {
                 openedTabs.insert(id)
             }
