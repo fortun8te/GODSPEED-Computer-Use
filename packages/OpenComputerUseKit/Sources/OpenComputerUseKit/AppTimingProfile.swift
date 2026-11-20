@@ -22,7 +22,6 @@ public struct AppTimingProfile: Codable, Sendable {
 public final class AppTimingProfiles: @unchecked Sendable {
     private let lock = NSLock()
     private var profiles: [String: AppTimingProfile] = [:]
-    private var clock: Date = .distantPast
     private func mutate(_ app: String, _ body: (inout AppTimingProfile) -> Void) {
         lock.lock(); defer { lock.unlock() }
         var profile = profiles[app] ?? AppTimingProfile(bundleID: app)
@@ -45,10 +44,13 @@ public final class AppTimingProfiles: @unchecked Sendable {
         guard ms.isFinite, ms >= 0 else { return }
         mutate(app) { $0.settleTimesMs = Array(($0.settleTimesMs + [ms]).suffix(64)) }
     }
-    public func messagingTimeout(for app: String) -> TimeInterval {
+    /// AX messaging timeout for `app`: the floor while the app is marked unresponsive (checked first, so a
+    /// frozen app never waits for enough samples), 0.25 s until 8 samples exist, then about 3x the p95.
+    public func messagingTimeout(for app: String, now: Date = Date()) -> TimeInterval {
         lock.lock(); defer { lock.unlock() }
-        guard let p = profiles[app], p.axLatenciesMs.count >= 8 else { return 0.25 }
-        if let until = p.unresponsiveUntil, Date() < until { return 0.05 }
+        guard let p = profiles[app] else { return 0.25 }
+        if let until = p.unresponsiveUntil, now < until { return 0.05 }
+        guard p.axLatenciesMs.count >= 8 else { return 0.25 }
         return min(1, max(0.05, p.p95AXLatencyMs * 3 / 1000))
     }
     public func settleBudget(for app: String) -> TimeInterval {
@@ -57,7 +59,7 @@ public final class AppTimingProfiles: @unchecked Sendable {
         return min(1.2, max(0.08, p.p95SettleMs / 1000))
     }
     public func isUnresponsive(app: String, now: Date) -> Bool {
-        lock.lock(); defer { lock.unlock() }; clock = now
+        lock.lock(); defer { lock.unlock() }
         guard let until = profiles[app]?.unresponsiveUntil else { return false }
         return now < until
     }
