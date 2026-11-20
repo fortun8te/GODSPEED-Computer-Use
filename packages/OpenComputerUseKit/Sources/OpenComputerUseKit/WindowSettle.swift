@@ -124,11 +124,16 @@ enum WindowSettle {
         timeout: TimeInterval,
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        // With a pid, the interval sleep ends early on an AX notification for that app. The quiet-period rule is unchanged.
+        pid: pid_t? = nil,
+        monitor: AXChangeMonitor? = nil,
         busy: () throws -> Bool
     ) rethrows -> Bool {
         let deadline = now() + timeout
         var quietSince: TimeInterval?
         while !RequestCancellation.requested, now() < deadline {
+            let watch = pid.map { (monitor ?? AXChangeMonitor.shared, $0) }
+            let token = watch.map { $0.0.track($0.1) }
             let sawBusy = try busy()
             let sampledAt = now()
             guard sampledAt <= deadline else { return false }
@@ -141,7 +146,11 @@ enum WindowSettle {
             }
             let remaining = deadline - sampledAt
             if remaining <= 0 { break }
-            sleep(min(interval, remaining))
+            if let watch, let token {
+                watch.0.awaitChange(pid: watch.1, since: token, upTo: min(interval, remaining))
+            } else {
+                sleep(min(interval, remaining))
+            }
         }
         return false
     }
