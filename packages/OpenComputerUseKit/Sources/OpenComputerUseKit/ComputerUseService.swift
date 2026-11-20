@@ -751,7 +751,7 @@ public final class ComputerUseService {
     /// first. Without read-back nothing is read, so there is no wait.
     /// With a target window, returns as soon as the window stops changing (WindowSettle),
     /// capped at `interval`; without one, sleeps the fixed interval as before.
-    private func pauseBeforeReadBack(_ interval: TimeInterval, windowID: CGWindowID? = nil) {
+    private func pauseBeforeReadBack(_ interval: TimeInterval, windowID: CGWindowID? = nil, window: AXUIElement? = nil) {
         guard Self.requiredWindowID == nil, actionReadBack else {
             return
         }
@@ -760,7 +760,7 @@ public final class ComputerUseService {
             Thread.sleep(forTimeInterval: interval)
             return
         }
-        WindowSettle.waitUntilStill(cap: interval) {
+        WindowSettle.waitUntilStill(cap: interval, axBusy: { WindowSettle.rootShowsBusy(window) }) {
             SkyLightSPI.shared.hardwareCaptureWindow(windowID).flatMap(WindowSettle.fingerprint(of:))
         }
     }
@@ -876,8 +876,8 @@ public final class ComputerUseService {
         }
         let waited = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
         return settled
-            ? "Settled: the window shows no busy sign (waited \(waited) ms)."
-            : "Not settled: the window still showed a busy sign after \(waited) ms; this is its state at that point."
+            ? "Settled: the window stayed free of busy signs (waited \(waited) ms)."
+            : "Not settled: no quiet period confirmed after \(waited) ms. Showing the current state."
     }
 
     public func click(
@@ -1121,7 +1121,7 @@ public final class ComputerUseService {
             throw ComputerUseError.message("AXUIElementPerformAction failed with \(result.rawValue)")
         }
 
-        pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+        pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
         return try actionResult(for: query)
     }
 
@@ -1208,7 +1208,7 @@ public final class ComputerUseService {
             }
         }
 
-        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
         return try actionResult(for: query)
     }
 
@@ -1339,13 +1339,13 @@ public final class ComputerUseService {
             }
             // A background calculator has no focused element at all; its keypad still takes keys.
             if try typeOnKeypad(text, snapshot: snapshot, focused: nil) {
-                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                 return try actionResult(for: query)
             }
             throw ComputerUseError.stateUnavailable(focusedElementUnreadableMessage + FocusBorrow.retryHint(pid: snapshot.app.pid))
         }
         if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
-            pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+            pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
             return try actionResult(for: query)
         }
 
@@ -1364,7 +1364,7 @@ public final class ComputerUseService {
                     "type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element."
                         + FocusBorrow.retryHint(pid: snapshot.app.pid))
             }
-            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
             let result = try actionResult(for: query)
             return ToolCallResult(
                 content: [.text("No text field had focus, so the text went to the window as key presses.")] + result.content,
@@ -1387,7 +1387,7 @@ public final class ComputerUseService {
             try selectWholeNameForKeys(text: text, focused: focused, pid: snapshot.app.pid, windowID: nil)
             try InputSimulation.typeText(text, pid: snapshot.app.pid)
         }
-        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
         let after = isSecure ? nil : stringValue(of: focused, attribute: kAXValueAttribute)
         // Keys that never reached the field leave its text as it was: say so instead of reporting a success.
         // Without read-back nothing settles before this read, so the comparison would be unreliable.
@@ -1713,7 +1713,7 @@ public final class ComputerUseService {
             // the key-window route, which makes the window key for the event and then puts focus back.
             switch try SkyKeyboardDispatcher.pressMenuKeyEquivalent(key, pid: snapshot.app.pid) {
             case .pressed(let reportedDisabled):
-                pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+                pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                 let result = try actionResult(for: query, recoveryPolicy: .readOnly)
                 return reportedDisabled ? insertingNote(disabledMenuKeyNote, into: result) : result
             case .notAMenuItem:
@@ -1727,7 +1727,7 @@ public final class ComputerUseService {
         try InputSimulation.pressKey(key, pid: snapshot.app.pid)
         // The key is delivered; how long the app takes to show its effect only matters to
         // the read-back, so that wait is frame-driven and skipped when nothing is read.
-        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
+        pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
         return try actionResult(for: query)
     }
 
@@ -2553,7 +2553,7 @@ public final class ComputerUseService {
         // select it in Finder, so a following Return renamed whichever file was selected before.
         if button == .left, clickCount == 1, clickPoint == nil, try selectContainingTableRow(for: record) {
             debugClickDecision("handled by selecting the table row of \(clickDebugDescription(record))")
-            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
             return true
         }
 
@@ -2563,7 +2563,7 @@ public final class ComputerUseService {
         if preferContainingWebRowAXClick,
            try performContainingWebRowClick(for: record, snapshot: snapshot, button: button, clickCount: clickCount)
         {
-            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
             return true
         }
 
@@ -2575,14 +2575,14 @@ public final class ComputerUseService {
         if !preferContainingWebRowAXClick && !windowIndexClick {
             if try performPreferredClick(on: record, button: button, clickCount: clickCount) {
                 debugClickDecision("handled by preferred target \(clickDebugDescription(record))")
-                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                 return true
             }
 
             for candidate in descendantClickCandidates(for: record, snapshot: snapshot) where isAtTarget(candidate) {
                 if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
                     debugClickDecision("handled by descendant \(clickDebugDescription(candidate))")
-                    pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                    pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                     return true
                 }
             }
@@ -2597,7 +2597,7 @@ public final class ComputerUseService {
                        try performPreferredClick(on: hitRecord, button: button, clickCount: clickCount)
                     {
                         debugClickDecision("handled by hit record \(clickDebugDescription(hitRecord))")
-                        pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                        pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                         return true
                     }
 
@@ -2612,7 +2612,7 @@ public final class ComputerUseService {
                         ) where isAtTarget(candidate) {
                             if try performPreferredClick(on: candidate, button: button, clickCount: clickCount) {
                                 debugClickDecision("handled by hit descendant \(clickDebugDescription(candidate))")
-                                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+                                pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
                                 return true
                             }
                         }
@@ -2633,7 +2633,7 @@ public final class ComputerUseService {
 
         if try activateClickTarget(element: element, availableActions: record.rawActions) {
             debugClickDecision("handled by activation fallback \(clickDebugDescription(record))")
-            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
+            pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID, window: snapshot.windowElement)
             return true
         }
 
