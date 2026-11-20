@@ -16,22 +16,24 @@ public final class MCPRequestStream: @unchecked Sendable {
     public init() {}
 
     /// JSON-RPC IDs are scoped to this connection. String and numeric IDs are distinct.
-    public func receive(_ line: String, rpcLine: String?) {
+    @discardableResult
+    public func receive(_ line: String, rpcLine: String?) -> Bool {
         let rpc = rpcLine.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
         if rpc?["method"] as? String == "notifications/cancelled" {
             let params = rpc?["params"] as? [String: Any]
-            guard let id = Self.requestID(params?["requestId"]) else { return }
+            guard let id = Self.requestID(params?["requestId"]) else { return true }
             condition.lock()
             let requests = ([active].compactMap { $0 } + pending).filter { $0.id == id }
             condition.unlock()
             for request in requests { request.cancellation.cancel() }
-            return
+            return true
         }
         condition.lock()
         defer { condition.unlock() }
-        guard !closed else { return }
+        guard !closed, pending.count < 16 else { return false }
         pending.append(Request(line: line, cancellation: RequestCancellation(), id: Self.requestID(rpc?["id"])))
         condition.signal()
+        return true
     }
 
     public func next() -> Request? {

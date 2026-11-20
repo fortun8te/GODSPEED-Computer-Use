@@ -213,6 +213,17 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertEqual(Array(probe.lifecycle.suffix(2)), ["release", "deactivate"])
     }
 
+    func testCancellationAfterPressStillReleasesExactlyOnce() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        probe.posted = { if $0.type == .leftMouseDown { token.cancel() } }
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {})
+        })
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(Array(probe.lifecycle.suffix(2)), ["release", "deactivate"])
+    }
+
     func testCleanupErrorIsReportedEvenWhenAnInputCheckAlsoFailed() {
         let probe = Probe(); probe.failValidation = 4; probe.failEnd = true
         XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {})) { error in
