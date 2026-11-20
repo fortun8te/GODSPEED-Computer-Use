@@ -12,6 +12,10 @@ public struct RegionFingerprint: Equatable, Sendable {
     public let rows: Int
     /// One hash per cell, row by row, starting at the top-left cell.
     public let hashes: [UInt64]
+    /// Width of the source image in pixels. Fingerprints of different sizes never match.
+    public let pixelWidth: Int
+    /// Height of the source image in pixels.
+    public let pixelHeight: Int
 
     /// Builds a fingerprint. Returns nil if the grid is empty or a cell is smaller than 8 pixels.
     public static func make(_ image: CGImage, columns: Int = 16, rows: Int = 10) -> RegionFingerprint? {
@@ -40,29 +44,37 @@ public struct RegionFingerprint: Equatable, Sendable {
         var values = [Int](repeating: 0, count: 64)
         var hashes: [UInt64] = []
         hashes.reserveCapacity(columns * rows)
-        for row in 0..<rows {
-            for column in 0..<columns {
-                // Crop the cell first, so neighbouring cells never bleed into its samples.
-                let x0 = column * width / columns
-                let x1 = (column + 1) * width / columns
-                let y0 = row * height / rows
-                let y1 = (row + 1) * height / rows
-                let rect = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
-                guard let cell = grayImage.cropping(to: rect) else { return nil }
-                small.draw(cell, in: CGRect(x: 0, y: 0, width: 8, height: 8))
-                for index in 0..<64 {
-                    values[index] = Int(pixels[index])
+        // `pixels` points into `small`'s buffer, so `small` must stay alive until the last read.
+        let completed = withExtendedLifetime(small) { () -> Bool in
+            for row in 0..<rows {
+                for column in 0..<columns {
+                    // Crop the cell first, so neighbouring cells never bleed into its samples.
+                    let x0 = column * width / columns
+                    let x1 = (column + 1) * width / columns
+                    let y0 = row * height / rows
+                    let y1 = (row + 1) * height / rows
+                    let rect = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+                    guard let cell = grayImage.cropping(to: rect) else { return false }
+                    small.draw(cell, in: CGRect(x: 0, y: 0, width: 8, height: 8))
+                    for index in 0..<64 {
+                        values[index] = Int(pixels[index])
+                    }
+                    hashes.append(averageHash(values))
                 }
-                hashes.append(averageHash(values))
             }
+            return true
         }
-        return RegionFingerprint(columns: columns, rows: rows, hashes: hashes)
+        guard completed else { return nil }
+        return RegionFingerprint(
+            columns: columns, rows: rows, hashes: hashes, pixelWidth: width, pixelHeight: height
+        )
     }
 
     /// Cell indexes whose hash differs from `other` by more than `threshold` bits.
-    /// Different grid sizes count every cell as changed.
+    /// Different grid sizes or source image sizes count every cell as changed.
     public func changedCells(comparedTo other: RegionFingerprint, threshold: Int = 6) -> [Int] {
-        guard other.columns == columns, other.rows == rows, other.hashes.count == hashes.count else {
+        guard other.columns == columns, other.rows == rows, other.hashes.count == hashes.count,
+              other.pixelWidth == pixelWidth, other.pixelHeight == pixelHeight else {
             return Array(hashes.indices)
         }
         var changed: [Int] = []
