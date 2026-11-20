@@ -546,6 +546,26 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNotEqual(alpha.sessionID, otherClient)
     }
 
+    func testPeekLaneCleansMultipleReadsTogetherAndStopsOnUnconfirmedCleanup() {
+        var nextIndex = 0
+        var cleaned = 0
+        var stored: [Int: BrowserPreviewPage] = [:]
+        ComputerUseToolDispatcher.runPeekLane(next: {
+            defer { nextIndex += 1 }
+            return nextIndex < 3 ? nextIndex : nil
+        }, read: { index in
+            XCTAssertEqual(cleaned, 0)
+            return (index == 1 ? "failed" : "read", "page \(index)")
+        }, cleanup: {
+            cleaned += 1
+            return false
+        }, store: { stored[$0] = $1 })
+        XCTAssertEqual(cleaned, 1)
+        XCTAssertEqual(stored.keys.sorted(), [0, 1])
+        XCTAssertEqual(stored[0]?.cleanupConfirmed, false)
+        XCTAssertEqual(stored[1]?.cleanupConfirmed, false)
+    }
+
     func testRequestEnvironmentReachesEveryPeekLaneAndRestoresTheCaller() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

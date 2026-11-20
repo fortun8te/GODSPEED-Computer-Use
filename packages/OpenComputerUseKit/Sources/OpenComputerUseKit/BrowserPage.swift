@@ -110,10 +110,11 @@ final class BrowserPage {
     let remember: Bool
     private var indexedGeneration: Int?
 
-    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true) {
+    init(bridge: BrowserBridge, tab: [String: Any], remember: Bool = true, referenceGeneration: Int? = nil) {
         self.bridge = bridge
         self.tab = tab
         self.remember = remember
+        self.indexedGeneration = referenceGeneration
     }
 
     /// Roles a model can act on.
