@@ -280,3 +280,7 @@ Use `select_text` with exact `text`. Add `prefix` or `suffix` for repeats. For a
 Mac apps need a writable accessibility text range. Chrome supports plain inputs and text areas that expose a selection range. A password field or a custom editor can refuse this action.
 
 Use `hover` with `dwell_ms` up to 2000 for a delayed tooltip or hover menu. Read the result or wait for the expected control. Some Mac apps only show tooltips under the real pointer.
+
+## Hold a key
+
+Use `press_key` with `hold_ms` up to 1000 to send one key-down and key-up with a pause. Chrome targets its own tab. Mac holds require the observed window to already have focus, and Godspeed leaves focus where it is. Clipboard shortcuts still use the private clipboard.

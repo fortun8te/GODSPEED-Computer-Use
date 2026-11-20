@@ -1964,6 +1964,41 @@ public final class ComputerUseService {
         }
     }
 
+    func holdKey(app query: String, key: String, method: KeyMethod, hold: TimeInterval) throws -> ToolCallResult {
+        let parsed = try KeyPressParser.parse(key)
+        guard PrivateClipboard.Action(key: key) == nil else {
+            throw ComputerUseError.backgroundUnsupported("Clipboard shortcuts use the private clipboard and cannot be held.")
+        }
+        guard method == .auto else {
+            throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
+        }
+        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+        guard let id = snapshot.targetWindowID, let window = snapshot.windowElement, snapshot.mode != .fixture else {
+            throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
+        }
+        let io = BackgroundDragIO.system()
+        let validate = {
+            try requireUsableComputerUseSession()
+            guard !(try io.needsFocus(snapshot.app.pid)) else {
+                throw ComputerUseError.backgroundUnsupported("Held keys need the observed Mac window to already have focus.")
+            }
+            let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(window, live.windowElement), live.windowBounds == snapshot.windowBounds else {
+                throw self.windowBindingError(id)
+            }
+            try Self.$requiredWindowID.withValue(id) { try self.requireBoundFocusedWindow(in: snapshot) }
+        }
+        try ActionOptions.requireTime(for: hold + 0.3)
+        let pid = snapshot.app.pid
+        let launch = snapshot.app.runningApplication.launchDate
+        try InputSimulation.deliverHeldKey(parsed, hold: hold, validate: validate, post: { $0.postToPid(pid) }, release: { event in
+            if let process = NSRunningApplication(processIdentifier: pid), !process.isTerminated, process.launchDate == launch {
+                event.postToPid(pid)
+            }
+        })
+        return .text("Held \(key) for \(Int((hold * 1000).rounded())) ms and released.")
+    }
+
     public func pressKey(app query: String, key: String, keyMethod: KeyMethod = .auto) throws -> ToolCallResult {
         let recoveryPolicy = backgroundOnlyMode() ? .readOnly : keyActionSnapshotRecoveryPolicy(for: keyMethod)
         let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: recoveryPolicy)

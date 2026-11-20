@@ -863,11 +863,16 @@ extension ComputerUseToolDispatcher {
             guard let key = arguments["key"] as? String, !key.isEmpty else {
                 throw ComputerUseError.invalidArguments("browser key needs key, e.g. Enter, Tab, Escape, ArrowDown, or a combination such as Cmd+A")
             }
+            let hold = try ActionOptions.duration("hold_ms", in: arguments, maxMs: 1000)
             if let operation = PrivateClipboard.Action(key: key, browser: true) {
+                guard hold == nil else {
+                    throw ComputerUseError.backgroundUnsupported("Clipboard shortcuts use the private clipboard and cannot be held.")
+                }
                 return try clipboardAction(operation)
             }
-            let change = try page.pressKeyAndWatch(key)
-            return .text("pressed \(key); \(change.line)")
+            let change = try page.pressKeyAndWatch(key, hold: hold)
+            let action = hold.map { "Held \(key) for \(Int(($0 * 1000).rounded())) ms and released." } ?? "Pressed \(key)."
+            return .text("\(action) \(change.line)")
 
         case "hover":
             let dwell = try ActionOptions.duration("dwell_ms", in: arguments, maxMs: 2000)

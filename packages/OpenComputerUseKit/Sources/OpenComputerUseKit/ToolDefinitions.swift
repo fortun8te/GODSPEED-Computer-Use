@@ -142,7 +142,7 @@ public enum ToolDefinitions {
                     "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
                                   "description": "click or drag: optional modifier keys."],
                     "dwell_ms": integerProperty(description: "Hover dwell, up to 2000 ms."),
-                    "hold_ms": integerProperty(description: "Drag hold before moving, up to 1000 ms."),
+                    "hold_ms": integerProperty(description: "Drag or key hold, up to 1000 ms."),
                     "drag_steps": integerProperty(description: "Drag movement steps, 2 to 30."),
                     "to_x": numberProperty(description: "Drag destination viewport X from screenshot."),
                     "to_y": numberProperty(description: "Drag destination viewport Y from screenshot."),
@@ -274,6 +274,7 @@ public enum ToolDefinitions {
                     "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "key": stringProperty(description: "Key or combination, e.g. \"cmd+s\""),
+                    "hold_ms": integerProperty(description: "Hold for up to 1000 ms in the already focused window."),
                     "key_method": keyMethodProperty(),
                 ],
                 required: ["app", "key"]
