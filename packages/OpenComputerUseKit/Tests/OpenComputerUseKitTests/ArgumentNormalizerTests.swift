@@ -362,7 +362,7 @@ final class ArgumentNormalizerTests: XCTestCase {
         let message = ArgumentNormalizer.problem(tool: "click", arguments: ["app": "Notes"])
         XCTAssertEqual(
             message,
-            "click needs \"label\" (its visible name), \"element_index\", or \"x\" and \"y\". Example: click {\"app\": \"Notes\", \"label\": \"Send\"}"
+            "click needs \"label\" (its visible name), \"element_index\", \"ref\", or \"x\" and \"y\". Example: click {\"app\": \"Notes\", \"label\": \"Send\"}"
         )
         XCTAssertNil(ArgumentNormalizer.problem(tool: "click", arguments: ["app": "Notes", "x": 1.0]))
     }
