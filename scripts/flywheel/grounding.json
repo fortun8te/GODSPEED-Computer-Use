@@ -1,0 +1,104 @@
+[
+  {
+    "id": "navigation-0",
+    "family": "navigation",
+    "image": "navigation",
+    "query": "button labeled Archived",
+    "box": [
+      0.09166666666666666,
+      0.35365853658536583,
+      0.40694444444444444,
+      0.5
+    ],
+    "sha256": "e36cec24f0dc6bb18cd6a62d21ba433d524fad326d2652e6c2a8045ea62f6d57"
+  },
+  {
+    "id": "navigation-1",
+    "family": "navigation",
+    "image": "navigation",
+    "query": "button labeled Archive",
+    "box": [
+      0.5319444444444444,
+      0.5317073170731708,
+      0.9027777777777778,
+      0.6780487804878049
+    ],
+    "sha256": "e36cec24f0dc6bb18cd6a62d21ba433d524fad326d2652e6c2a8045ea62f6d57"
+  },
+  {
+    "id": "navigation-2",
+    "family": "navigation",
+    "image": "navigation",
+    "query": "button labeled Create collection",
+    "box": null,
+    "sha256": "e36cec24f0dc6bb18cd6a62d21ba433d524fad326d2652e6c2a8045ea62f6d57"
+  },
+  {
+    "id": "attachment-0",
+    "family": "attachment",
+    "image": "attachment",
+    "query": "button labeled Remove attachment",
+    "box": [
+      0.5319444444444444,
+      0.5317073170731708,
+      0.9027777777777778,
+      0.6780487804878049
+    ],
+    "sha256": "7ac2bf0b50d8e19e7b28be7c9cca663841d09b23eae542e79a565b6f8310a7d6"
+  },
+  {
+    "id": "attachment-1",
+    "family": "attachment",
+    "image": "attachment",
+    "query": "button labeled Replace attachment",
+    "box": [
+      0.09305555555555556,
+      0.7219512195121951,
+      0.40555555555555556,
+      0.8682926829268293
+    ],
+    "sha256": "7ac2bf0b50d8e19e7b28be7c9cca663841d09b23eae542e79a565b6f8310a7d6"
+  },
+  {
+    "id": "attachment-2",
+    "family": "attachment",
+    "image": "attachment",
+    "query": "button labeled Send message",
+    "box": null,
+    "sha256": "7ac2bf0b50d8e19e7b28be7c9cca663841d09b23eae542e79a565b6f8310a7d6"
+  },
+  {
+    "id": "workspace-0",
+    "family": "workspace",
+    "image": "workspace",
+    "query": "button labeled Switch workspace",
+    "box": [
+      0.09305555555555556,
+      0.7219512195121951,
+      0.40555555555555556,
+      0.8682926829268293
+    ],
+    "sha256": "79b354128be86ba07a820ea94b908e1bc37764b4137d4989148efd7f7b07fc13"
+  },
+  {
+    "id": "workspace-1",
+    "family": "workspace",
+    "image": "workspace",
+    "query": "button labeled Duplicate workspace",
+    "box": [
+      0.09166666666666666,
+      0.35365853658536583,
+      0.40694444444444444,
+      0.5
+    ],
+    "sha256": "79b354128be86ba07a820ea94b908e1bc37764b4137d4989148efd7f7b07fc13"
+  },
+  {
+    "id": "workspace-2",
+    "family": "workspace",
+    "image": "workspace",
+    "query": "button labeled Delete workspace",
+    "box": null,
+    "sha256": "79b354128be86ba07a820ea94b908e1bc37764b4137d4989148efd7f7b07fc13"
+  }
+]

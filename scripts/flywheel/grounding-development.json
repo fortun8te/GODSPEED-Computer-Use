@@ -1,0 +1,104 @@
+[
+  {
+    "id": "filters-0",
+    "family": "filters",
+    "image": "filters",
+    "query": "button labeled Clear filters",
+    "box": [
+      0.09166666666666666,
+      0.35365853658536583,
+      0.40694444444444444,
+      0.5
+    ],
+    "sha256": "624a48b84b2948bcc16aa76751b488715ad3687d738f66ac53dc1bcf1f198f59"
+  },
+  {
+    "id": "filters-1",
+    "family": "filters",
+    "image": "filters",
+    "query": "button labeled Apply filters",
+    "box": [
+      0.5319444444444444,
+      0.5317073170731708,
+      0.9027777777777778,
+      0.6780487804878049
+    ],
+    "sha256": "624a48b84b2948bcc16aa76751b488715ad3687d738f66ac53dc1bcf1f198f59"
+  },
+  {
+    "id": "filters-2",
+    "family": "filters",
+    "image": "filters",
+    "query": "button labeled Reset account",
+    "box": null,
+    "sha256": "624a48b84b2948bcc16aa76751b488715ad3687d738f66ac53dc1bcf1f198f59"
+  },
+  {
+    "id": "playback-0",
+    "family": "playback",
+    "image": "playback",
+    "query": "button labeled Pause",
+    "box": [
+      0.5319444444444444,
+      0.5317073170731708,
+      0.9027777777777778,
+      0.6780487804878049
+    ],
+    "sha256": "ba2429fa545586a752f25d2631cb83430e6a84ebf8e4ce8df5909ce4a64be667"
+  },
+  {
+    "id": "playback-1",
+    "family": "playback",
+    "image": "playback",
+    "query": "button labeled Play next",
+    "box": [
+      0.09305555555555556,
+      0.7219512195121951,
+      0.40555555555555556,
+      0.8682926829268293
+    ],
+    "sha256": "ba2429fa545586a752f25d2631cb83430e6a84ebf8e4ce8df5909ce4a64be667"
+  },
+  {
+    "id": "playback-2",
+    "family": "playback",
+    "image": "playback",
+    "query": "button labeled Delete playlist",
+    "box": null,
+    "sha256": "ba2429fa545586a752f25d2631cb83430e6a84ebf8e4ce8df5909ce4a64be667"
+  },
+  {
+    "id": "review-0",
+    "family": "review",
+    "image": "review",
+    "query": "button labeled Approve draft",
+    "box": [
+      0.09305555555555556,
+      0.7219512195121951,
+      0.40555555555555556,
+      0.8682926829268293
+    ],
+    "sha256": "259ceeebd3a7976b4be76ed632af49d1acfc16b07c765987732029c69894da06"
+  },
+  {
+    "id": "review-1",
+    "family": "review",
+    "image": "review",
+    "query": "button labeled Preview draft",
+    "box": [
+      0.09166666666666666,
+      0.35365853658536583,
+      0.40694444444444444,
+      0.5
+    ],
+    "sha256": "259ceeebd3a7976b4be76ed632af49d1acfc16b07c765987732029c69894da06"
+  },
+  {
+    "id": "review-2",
+    "family": "review",
+    "image": "review",
+    "query": "button labeled Publish immediately",
+    "box": null,
+    "sha256": "259ceeebd3a7976b4be76ed632af49d1acfc16b07c765987732029c69894da06"
+  }
+]
