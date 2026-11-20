@@ -516,6 +516,14 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(BrowserReply.isUnsupportedTool("Could not verify an unobstructed click on the requested node. No click sent."))
     }
 
+    func testUploadThroughButtonCountsOnlyAVerifiedSelection() {
+        // ACT-01: the files count as selected only when Chrome read back the names and sizes.
+        XCTAssertEqual(BrowserReply.uploadSelected(in: #"{"result":{"selected":2,"verified":true}}"#), 2)
+        XCTAssertNil(BrowserReply.uploadSelected(in: #"{"result":{"selected":2,"verified":false}}"#))
+        XCTAssertNil(BrowserReply.uploadSelected(in: #"{"error":"File selection could not be verified"}"#))
+        XCTAssertNil(BrowserReply.uploadSelected(in: "unknown tool: upload_via_button"))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {

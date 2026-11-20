@@ -222,7 +222,7 @@ public struct RelayGrantIssuer {
     /// not used by the bridge (clipboard is private and local), so they are not granted.
     public static let bridgeMethods = [
         "getInfo", "getTabs", "createTab", "navigateTab", "getUserTabs", "claimUserTab", "executeCdp",
-        "waitForFileChooser", "setFileChooserFiles", "finalizeTabs", "turnEnded", "clickTarget",
+        "waitForFileChooser", "setFileChooserFiles", "finalizeTabs", "turnEnded", "clickTarget", "uploadViaButton",
     ]
 
     private let key: Curve25519.Signing.PrivateKey

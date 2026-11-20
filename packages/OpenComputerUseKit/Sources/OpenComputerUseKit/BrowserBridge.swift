@@ -1404,8 +1404,17 @@ extension ComputerUseToolDispatcher {
                 throw ComputerUseError.invalidArguments("browser upload needs files: [\"/path/to/file\"]. Click the page's upload button in the same batch first.")
             }
             if label != nil || index != nil {
-                try page.setFiles(files, on: target())
-                return .text("Selected \(files.count) file(s) in the upload control.")
+                let node = try target()
+                if page.isFileInput(node) {
+                    try page.setFiles(files, on: node)
+                    return .text("Selected \(files.count) file(s) in the upload control.")
+                }
+                // ACT-01: an upload button arms its chooser and clicks once, in one helper call.
+                if let selected = try uploadThroughButton(node, files: files, page: page, bridge: bridge) {
+                    return .text("Selected \(selected) file(s) in the upload control.")
+                }
+                // An older helper: today's path, a click on the button, then the chooser wait below.
+                try page.click(node)
             }
             let chooser = try call("wait_file_chooser", timeout: 15)
             guard !chooser.isError else { return finish([chooser]) }
@@ -1445,6 +1454,26 @@ extension ComputerUseToolDispatcher {
             }
         }
         return mask
+    }
+
+    /// ACT-01: selects files through an upload button with `upload_via_button`. Nil when this helper lacks the
+    /// command. The files count as selected only from Chrome's verified receipt.
+    private func uploadThroughButton(_ node: BrowserNode, files: [String], page: BrowserPage, bridge: BrowserBridge) throws -> Int? {
+        guard let tab = page.tab["tab_id"] as? Int, let loader = page.topFrameLoaderID() else { return nil }
+        let paths = files.map { ($0 as NSString).expandingTildeInPath }
+        guard paths.allSatisfy({ $0.hasPrefix("/") }) else {
+            throw ComputerUseError.invalidArguments("browser upload needs absolute file paths. Nothing was sent.")
+        }
+        let point = try page.clickPoint(of: node, beforeFirstAction: true)
+        let reply = try bridge.callTool("upload_via_button", arguments: [
+            "tab_id": tab, "backend_node_id": node.backendNodeID, "loader_id": loader,
+            "x": Double(point.x), "y": Double(point.y), "files": paths,
+        ], timeout: 20)
+        if reply.isError, BrowserReply.isUnsupportedTool(reply.text) { return nil }
+        guard !reply.isError, let selected = BrowserReply.uploadSelected(in: reply.text) else {
+            throw ComputerUseError.stateUnavailable("browser: \(BatchTool.firstLine(reply.text)) Inspect the upload control before retrying.")
+        }
+        return selected
     }
 
     /// ACT-02: one verified left click on a `_blank` link through `click_target`. Nil when the helper has no such
