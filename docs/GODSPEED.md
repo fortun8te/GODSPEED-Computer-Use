@@ -157,9 +157,15 @@ Helpers (referee and vision):
 | `OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS` | 1500 | Longest wait for a verdict. |
 | `OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE` | 0.6 | Below this, no hint. |
 | `OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE` | 0.86 | A `done` hint needs this. |
-| `OPEN_COMPUTER_USE_REFEREE_MAX_VIEW` | 1200 | Characters of state sent to the referee. |
-| `OPEN_COMPUTER_USE_VISION_URL` | unset (off) | Helper service base URL for `/locate`. |
+| `OPEN_COMPUTER_USE_REFEREE_MAX_VIEW` | 1200 | Maximum characters of state sent to the referee. |
+| `OPEN_COMPUTER_USE_VISION_URL` | unset (off) | Loopback helper URL for find on screen. |
 | `OPEN_COMPUTER_USE_VISION_TIMEOUT_MS` | 8000 | Longest wait for a vision answer. |
+
+The local checker keeps the window title, focus and the lines most relevant to the goal. When it ranks actions, it also gets the candidate rows and nearby labels. The existing character limit still applies.
+
+To enable vision, set `find_on_screen` to `true` in `~/.godspeed/settings.json`. Godspeed looks for a named accessibility control first. If none matches, it tries Apple Vision text recognition, then asks the local helper for a point. It checks the window, the current pixels and the accessibility hit before clicking. Risky or ambiguous visual targets require another route.
+
+With vision enabled, a thin native window view can include a window-only picture up to 1280 pixels on its long side. This needs a loopback helper that advertises picture support. See [the local helper experiment](../experiments/LocalHelper/README.md).
 
 Browser:
 
