@@ -74,8 +74,12 @@ final class CursorHideTimerTests: XCTestCase {
 
         target.orderOut(nil)
         target.close()
-        // The window watch checks every 0.1 s and the fade takes about 0.12 s.
-        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        // WindowServer can report the closed window briefly. Wait for the
+        // actual fade before the normal three-second idle timeout could hide it.
+        let deadline = Date().addingTimeInterval(1.5)
+        while panel?.isVisible == true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
         XCTAssertEqual(panel?.isVisible, false, "the cursor must fade out once its window is gone")
         XCTAssertEqual(panel?.alphaValue, 1, "a hidden cursor must leave the panel fully opaque for the next action")
     }

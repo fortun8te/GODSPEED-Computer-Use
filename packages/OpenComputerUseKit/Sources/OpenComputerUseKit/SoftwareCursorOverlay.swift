@@ -50,26 +50,31 @@ public enum VisualCursorSupport {
         return !["0", "false", "no", "off"].contains(raw)
     }
 
-    private static let backlogLock = NSLock()
-    nonisolated(unsafe) private static var backlog = 0
-    /// What a queued cursor animation is. Moves can be skipped when a later move is queued; see the drain loop.
-    enum AnimationKind { case move, other }
+    /// Moves can be replaced by a newer move for the same client. Other
+    /// requests mark an interaction boundary and are always delivered.
+    enum AnimationKind: Sendable { case move, other }
 
-    @MainActor private static var pendingAnimations: [(kind: AnimationKind, client: String, body: @MainActor () -> Void)] = []
-    @MainActor private static var isDrainingAnimations = false
-    /// A reset asked for by another process or a finished turn while animations play. Resetting then aborted
-    /// the glide and the cursor vanished mid-batch, so it waits until the queue is empty.
-    @MainActor static var deferredReset = false
-    @MainActor static var isDraining: Bool { isDrainingAnimations || !pendingAnimations.isEmpty }
-    @MainActor static var isAnimating: Bool {
-        isDrainingAnimations || !pendingAnimations.isEmpty || SoftwareCursorOverlay.isBusy
+    private struct AnimationRequest: Sendable {
+        let kind: AnimationKind
+        let client: String
+        let body: @MainActor () -> Void
     }
 
-    /// Animations still waiting to start. A move that has others queued behind it plays faster, so the
-    /// cursor keeps up with a fast batch instead of replaying it for seconds afterwards.
+    private struct AnimationQueue {
+        var pending: [AnimationRequest] = []
+        var deliveriesRemaining = 0
+        var drainScheduled = false
+    }
+
+    private static let queueLock = NSLock()
+    nonisolated(unsafe) private static var animationQueue = AnimationQueue()
+    @MainActor static var deferredReset = false
+    @MainActor static var isDraining: Bool { queueLock.withLock { animationQueue.drainScheduled } }
+    @MainActor static var isAnimating: Bool { isDraining || SoftwareCursorOverlay.isBusy }
+
+    /// Deliveries still waiting in the incoming queue or a retained main-thread slice.
     static var queuedAnimations: Int {
-        backlogLock.lock(); defer { backlogLock.unlock() }
-        return backlog
+        queueLock.withLock { animationQueue.pending.count + animationQueue.deliveriesRemaining }
     }
 
     static func performCursorAnimation(kind: AnimationKind = .other, _ body: @escaping @MainActor () -> Void) {
@@ -96,26 +101,57 @@ public enum VisualCursorSupport {
             performOnMain(perform)
             return
         }
-        backlogLock.lock(); backlog += 1; backlogLock.unlock()
-        DispatchQueue.main.async {
-            MainActor.assumeIsolated {
-                pendingAnimations.append((kind, client, perform))
-                // Bodies only queue work on the overlay's timeline and return at once; the
-                // display-synced frame clock plays it. Order is kept (move, then pulse), and the
-                // overlay itself collapses or retargets moves that pile up.
-                guard !isDrainingAnimations else { return }
-                isDrainingAnimations = true
-                defer { isDrainingAnimations = false }
-                while !pendingAnimations.isEmpty {
-                    let next = pendingAnimations.removeFirst()
-                    backlogLock.lock(); backlog -= 1; backlogLock.unlock()
-                    next.body()
-                }
-                if deferredReset {
-                    deferredReset = false
-                    SoftwareCursorOverlay.resetWhenIdle()
-                }
+        let shouldSchedule = queueLock.withLock {
+            animationQueue.pending.append(AnimationRequest(kind: kind, client: client, body: perform))
+            guard !animationQueue.drainScheduled else { return false }
+            animationQueue.drainScheduled = true
+            return true
+        }
+        if shouldSchedule { DispatchQueue.main.async { drainAnimationSlice() } }
+    }
+
+    @MainActor
+    private static func drainAnimationSlice(_ remainder: ArraySlice<AnimationRequest> = []) {
+        var deliveries = remainder
+        if deliveries.isEmpty {
+            let pending = queueLock.withLock {
+                let batch = animationQueue.pending
+                animationQueue.pending = []
+                animationQueue.deliveriesRemaining = batch.count
+                return batch
             }
+            var newerMoves: Set<String> = []
+            let retained = pending.reversed().filter { request in
+                if request.kind == .move { return newerMoves.insert(request.client).inserted }
+                newerMoves.remove(request.client)
+                return true
+            }.reversed()
+            deliveries = Array(retained)[...]
+        }
+
+        // Yield between slices if callbacks queue a long gesture sequence.
+        // A single expensive WindowServer operation can still exceed this budget.
+        let deadline = CACurrentMediaTime() + 0.004
+        while let next = deliveries.popFirst() {
+            next.body()
+            if CACurrentMediaTime() >= deadline { break }
+        }
+        let drained = queueLock.withLock {
+            animationQueue.deliveriesRemaining = deliveries.count
+            if deliveries.isEmpty, animationQueue.pending.isEmpty {
+                animationQueue.drainScheduled = false
+                return true
+            }
+            return false
+        }
+        if drained {
+            if deferredReset {
+                deferredReset = false
+                SoftwareCursorOverlay.resetWhenIdle()
+            }
+        } else {
+            let retained = deliveries
+            DispatchQueue.main.async { drainAnimationSlice(retained) }
         }
     }
 
@@ -2007,6 +2043,10 @@ enum SoftwareCursorOverlay {
 
     /// End of a turn: every cursor fades out once its queued work has played.
     static func resetWhenIdle() {
+        if VisualCursorSupport.isDraining {
+            VisualCursorSupport.deferredReset = true
+            return
+        }
         for stage in stages.values { stage.resetWhenIdle() }
     }
 

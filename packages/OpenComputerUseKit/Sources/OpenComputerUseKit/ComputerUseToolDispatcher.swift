@@ -54,7 +54,8 @@ public final class ComputerUseToolDispatcher {
         if let problem = ArgumentNormalizer.problem(tool: name, arguments: arguments) {
             throw ComputerUseError.message(problem)
         }
-        if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name {
+        if arguments["window_id"] != nil, name != "query", name != "get_app_state", name != BatchTool.name,
+           name != HandoffTool.name {
             guard ArgumentNormalizer.windowBoundTools.contains(name) else {
                 throw ComputerUseError.invalidArguments("\(name) cannot be bound to a native window")
             }
