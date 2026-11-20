@@ -444,8 +444,10 @@ final class BrowserBridge: @unchecked Sendable {
             }
             TimingLog.count("browser.hint_commands", requests.compactMap { $0 }.count)
             return requests.map { slot in
-                guard let id = slot, let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
-                      let result = message["result"] as? [String: Any],
+                guard let id = slot else { return nil }
+                let arrived = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now()))
+                if let arrived { AgentEvents.receive(arrived) }
+                guard let message = arrived, let result = message["result"] as? [String: Any],
                       let reply = try? toolReply(result), !reply.isError,
                       let object = try? JSONSerialization.jsonObject(with: Data(reply.text.utf8)) as? [String: Any],
                       object["error"] == nil else { return nil }
@@ -660,6 +662,7 @@ final class BrowserBridge: @unchecked Sendable {
             )
         }
         received = true
+        AgentEvents.receive(message)
         if let error = message["error"] as? [String: Any] {
             throw ComputerUseError.message("Open Browser Use: \(error["message"] as? String ?? "request failed")")
         }
@@ -824,7 +827,7 @@ extension ComputerUseToolDispatcher {
         let remaining = min(limit, BrowserCallBudget.activeRemaining ?? limit)
         return try BrowserCallBudget.withDeadline(BrowserCallBudget.deadline(after: remaining)) {
             try BrowserRequestContext.validateCurrent()
-            let result = try runBrowserAction(arguments: arguments)
+            let result = AgentEvents.attach(try runBrowserAction(arguments: arguments))
             try BrowserRequestContext.validateCurrent()
             return result
         }
