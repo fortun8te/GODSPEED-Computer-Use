@@ -870,12 +870,23 @@ extension ComputerUseToolDispatcher {
             if isLastStep, step.tool == "get_app_state", wantsScreenshot {
                 stepArguments["include_screenshot"] = true
             }
+            // A directly verified AX write can use the next explicit read or
+            // the batch's final screenshot read. Other writes keep readback.
+            let nextStep = steps.dropFirst(number).first
+            let nextReadsSameApp = nextStep?.tool == "get_app_state"
+                && (nextStep?.arguments["app"] as? String) == stepApp
+                && (nextStep?.arguments["include_ax"] as? Bool) != false
+                && nextStep?.arguments["window_id"] == nil
+            let deferValueRead = step.tool == "set_value"
+                && ((isLastStep && wantsScreenshot) || (!effectsOn && nextReadsSameApp))
             let dispatchStarted = clock.systemUptime
             let result = BrowserCallBudget.withDeadline(actionDeadline) {
                 Self.$defersBrowserNavigationObservation.withValue(defersNavigationRead) {
                     Self.$clipsBrowserStepObservation.withValue(step.tool == "browser" && !isLastStep) {
                         ComputerUseService.$awaitsModalTextFocus.withValue(awaitsPathEditor) {
-                            callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false)
+                            ComputerUseService.$defersVerifiedSetValueObservation.withValue(deferValueRead) {
+                                callStepAsResult(name: step.tool, arguments: stepArguments, log: stepLog, notesInResult: false)
+                            }
                         }
                     }
                 }

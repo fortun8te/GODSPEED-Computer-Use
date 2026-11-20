@@ -47,6 +47,28 @@ final class SelectiveObservationTests: XCTestCase {
         XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "1"]))
     }
 
+    func testOnlyVerifiedSetValueDefersToScheduledRead() {
+        let capture = NativeActionObservation()
+        var reads = 0
+        func readBack() -> ToolCallResult {
+            reads += 1
+            return .text("readback")
+        }
+        ComputerUseService.$actionObservation.withValue(capture) {
+            ComputerUseService.$defersVerifiedSetValueObservation.withValue(true) {
+                XCTAssertEqual(ComputerUseService.verifiedSetValueResult(verified: true, readBack: readBack).textContent, "ok")
+                XCTAssertEqual(reads, 0)
+                XCTAssertNil(capture.read {
+                    reads += 1
+                    return self.snapshot()
+                })
+                XCTAssertEqual(reads, 0)
+                XCTAssertEqual(ComputerUseService.verifiedSetValueResult(verified: false, readBack: readBack).textContent, "readback")
+                XCTAssertEqual(reads, 1)
+            }
+        }
+    }
+
     func testSmartStepsReuseActionReadbackAndRefreshOnNoChange() throws {
         let capture = NativeActionObservation()
         var reads = 0
