@@ -30,4 +30,53 @@ final class ShortcutCacheTests: XCTestCase {
         cache.invalidate(app: "A")
         XCTAssertNil(cache.lookup(app: "A", path: "File > Save", includeUnverified: true))
     }
+
+    func testDestructiveEnglishAndDutchTitlesNeverResolve() {
+        let titles = [
+            "Delete", "Delete…", "Remove Item…", "Erase All Content...", "Quit Editor", "quit editor", "Close Window",
+            "Stop", "Empty Trash", "Move to Trash", "Move-to-Trash…", "Log Out…", "Log out...", "Logout", "LOGOUT",
+            "Sign Out", "Restart…", "Shut Down…", "Shutdown", "Force Quit Editor", "Discard Changes", "Revert to Saved",
+            "Format Disk…",
+            "Verwijderen", "Verwijder bestand…", "Wis alles", "Sluit venster", "Afmelden…", "Uitloggen", "Herstart",
+            "Opnieuw opstarten…", "Zet uit…", "Prullenmand leegmaken", "Naar prullenmand verplaatsen", "Weggooien",
+            "Löschen", "Entfernen", "Beenden", "Schließen", "Abmelden…", "Neustarten", "Papierkorb leeren", "Verwerfen",
+            "Supprimer", "Quitter", "Fermer", "Déconnexion", "Vider la corbeille", "Redémarrer…", "Éteindre…",
+            "Eliminar", "Borrar", "Cerrar sesión…", "Vaciar la papelera",
+        ]
+        let items = titles.enumerated().map { i, title in
+            ShortcutCache.MenuItem(path: "Menu > \(title)", title: title, commandCharacter: "d", modifierMask: 0)
+        }
+        for title in titles {
+            XCTAssertTrue(ShortcutCache.isDestructive(title), "\(title) should be destructive")
+        }
+        let cache = ShortcutCache()
+        cache.parse(app: "A", items: items)
+        for item in items {
+            XCTAssertNil(cache.lookup(app: "A", path: item.path, includeUnverified: true), "\(item.title) resolved")
+            cache.confirm(app: "A", path: item.path)
+            XCTAssertNil(cache.lookup(app: "A", path: item.path), "\(item.title) resolved after confirm")
+        }
+    }
+
+    func testHarmlessTitlesStillResolve() {
+        XCTAssertFalse(ShortcutCache.isDestructive("Save"))
+        XCTAssertFalse(ShortcutCache.isDestructive("Wishlist"))
+        XCTAssertFalse(ShortcutCache.isDestructive("Stopwatch"))
+        XCTAssertFalse(ShortcutCache.isDestructive("Bold"))
+        let cache = ShortcutCache()
+        cache.parse(app: "A", items: [.init(path: "Edit > Bold", title: "Bold", commandCharacter: "b", modifierMask: 0)])
+        XCTAssertEqual(cache.lookup(app: "A", path: "Edit > Bold", includeUnverified: true), "cmd+b")
+    }
+
+    func testExtraPredicateBlocksOnTopOfBuiltIns() {
+        let cache = ShortcutCache(isExtraDestructive: { $0.hasPrefix("Publish") })
+        cache.parse(app: "A", items: [
+            .init(path: "File > Publish Now", title: "Publish Now", commandCharacter: "p", modifierMask: 0),
+            .init(path: "File > Logout", title: "Logout", commandCharacter: "l", modifierMask: 0),
+            .init(path: "File > Save", title: "Save", commandCharacter: "s", modifierMask: 0),
+        ])
+        XCTAssertNil(cache.lookup(app: "A", path: "File > Publish Now", includeUnverified: true))
+        XCTAssertNil(cache.lookup(app: "A", path: "File > Logout", includeUnverified: true))
+        XCTAssertEqual(cache.lookup(app: "A", path: "File > Save", includeUnverified: true), "cmd+s")
+    }
 }
