@@ -35,4 +35,9 @@ final class TeachSourcesTests: XCTestCase {
         key.flags = .maskControl
         XCTAssertNil(TeachLive.typedText(of: key))
     }
+
+    func testTargetAppTerminationBecomesAnAppQuitInputOnlyForThatApp() {
+        XCTAssertEqual(LiveTeachSource.terminationInput(terminated: 42, target: 42), TeachInput(pid: 42, event: .appQuit))
+        XCTAssertNil(LiveTeachSource.terminationInput(terminated: 7, target: 42))
+    }
 }
