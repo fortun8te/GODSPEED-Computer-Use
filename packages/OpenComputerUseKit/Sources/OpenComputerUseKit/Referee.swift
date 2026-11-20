@@ -54,7 +54,7 @@ enum Referee {
     /// cold load (about 2.3 s, longer than the hint timeout). Fire and forget, at most once a minute; the
     /// helper unloads it again after 3 idle minutes. Starts the helper when it is down.
     static func warmInBackground(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard let baseURL else { return }
+        guard RequestInferenceAdmission.withoutExclusive == nil, let baseURL else { return }
         warmLock.lock()
         let due = lastWarm.map { now - $0 >= 60 } ?? true
         if due { lastWarm = now }
@@ -202,7 +202,15 @@ enum HelperHTTP {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
-        guard let reply = send(request, timeout: timeout) else { return nil }
+        let reply: Data?
+        if let withoutExclusive = RequestInferenceAdmission.withoutExclusive {
+            // Never release an active focus borrow or a protected desktop lease.
+            guard !FocusBorrow.shared.isBorrowing, !LockedUseActionScope.requiresScreenCaptureKit else { return nil }
+            reply = withoutExclusive { send(request, timeout: timeout) }
+        } else {
+            reply = send(request, timeout: timeout)
+        }
+        guard let reply else { return nil }
         return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
     }
 
@@ -262,7 +270,8 @@ final class HelperAutoStarter: @unchecked Sendable {
     /// Called after a helper call got no answer. Checks health off the calling thread and starts the
     /// launcher detached when the helper is really down.
     func helperUnreachable(_ baseURL: URL, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard Self.isLoopback(baseURL) else { return }
+        guard RequestInferenceAdmission.withoutExclusive == nil, !RequestCancellation.requested,
+              Self.isLoopback(baseURL) else { return }
         lock.lock()
         let check = !launched && Self.shouldCheck(lastCheck: lastCheck, now: now, cooldown: Self.checkCooldown)
         if check { lastCheck = now }

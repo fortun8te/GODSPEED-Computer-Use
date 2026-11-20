@@ -153,6 +153,8 @@ final class FocusBorrowController: @unchecked Sendable {
         self.activator = activator
     }
 
+    var isBorrowing: Bool { lock.withLock { !activePIDs.isEmpty } }
+
     /// Opens a borrow of `pid`: the first borrow records the app in front, then `pid` is brought forward.
     func acquire(pid: pid_t) -> Lease {
         let ownPID = ProcessInfo.processInfo.processIdentifier

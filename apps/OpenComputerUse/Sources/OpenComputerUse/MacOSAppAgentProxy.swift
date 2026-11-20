@@ -1,4 +1,5 @@
 import AppKit
+import CoreFoundation
 import Darwin
 import Foundation
 import OpenComputerUseKit
@@ -174,7 +175,8 @@ enum MacOSAppAgentProxy {
         let requests = MCPRequestStream()
         Thread.detachNewThread {
             while let line = readLine(strippingNewline: true) {
-                autoreleasepool { requests.receive(line, rpcLine: line) }
+                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
+                if !accepted { break }
             }
             requests.disconnect()
         }
@@ -387,7 +389,8 @@ private final class AgentIdleClock: @unchecked Sendable {
     /// False when the agent is exiting; the caller closes the connection.
     func clientConnected() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard timer.clientConnected() else { return false }
+        guard timer.connectedClients < AppAgentAdmission.connectionLimit,
+              timer.clientConnected() else { return false }
         if timer.connectedClients == 1 { source.schedule(deadline: .distantFuture) }
         return true
     }
@@ -639,16 +642,24 @@ private final class AppAgentConnection: @unchecked Sendable {
                     }
                     return ["response": response ?? NSNull()]
                 }
-                if let payload, AppAgentBrowserRead.accepts(payload), let client, !client.isEmpty {
+                let admission = AppAgentAdmission.shared
+                if let payload, let client, !client.isEmpty,
+                   let mode = AppAgentBrowserRead.mode(payload, client: ClientScope.sanitized(client),
+                                                       allowWrites: admission.parallelTabWrites) {
                     do {
-                        let response = try AppAgentAdmission.shared.withAdmission(.browserRead(client: ClientScope.sanitized(client))) {
+                        let response = try admission.withAdmission(mode) {
                             try ClientScope.with(client) { [lockedUse] in
-                                try lockedUse.performParallelBrowserRead {
+                                try lockedUse.performParallelBrowserOperation {
                                     try AppAgentEnvironment.withConfiguration(
                                         browserEnvironment,
-                                        validate: { try lockedUse.validateParallelBrowserRead() }
+                                        validate: { try lockedUse.validateParallelBrowserOperation() }
                                     ) {
-                                        server.handle(line: line, admissionMs: admissionMs())
+                                        if let tab = mode.tabWrite {
+                                            return try withOwnedBrowserTabWrite(tab) {
+                                                server.handle(line: line, admissionMs: admissionMs())
+                                            }
+                                        }
+                                        return server.handle(line: line, admissionMs: admissionMs())
                                     }
                                 }
                             }
@@ -656,6 +667,8 @@ private final class AppAgentConnection: @unchecked Sendable {
                         return ["response": response ?? NSNull()]
                     } catch LockedUseConnection.ParallelReadFallback.needsExclusive {
                         // Nothing was sent. Let the normal serialized path handle the session.
+                    } catch BrowserTabWriteNeedsExclusive.unconfirmedOwnership {
+                        // Only ownership preflight can take this fallback.
                     }
                 }
                 let response: String? = try AppAgentEnvironment.withOverrides(environment, client: client) {
@@ -750,7 +763,9 @@ private final class AppAgentConnection: @unchecked Sendable {
                 return ["error": "Unknown app-agent request kind: \(kind)"]
             }
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            let message = error is RequestCancellation.Cancelled
+                ? "Request cancelled before dispatch. No steps ran."
+                : (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             // Preserve the native RPC id even when lease acquisition fails
             // before the MCP server runs. The stdio proxy forwards responses,
             // not the app-agent envelope's error field.
@@ -836,8 +851,8 @@ private final class AppAgentConnection: @unchecked Sendable {
 private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
 private let cursorNameEnvironmentKey = "OPEN_COMPUTER_USE_CURSOR_NAME"
 
-/// Only canonical browser reads enter the shared route. Browser batches can
-/// contain native actions, and browser mutations still need exclusive admission.
+/// Match only canonical requests. Batches and actions with shared side
+/// effects use exclusive admission.
 enum AppAgentBrowserRead {
     private static let common: Set<String> = ["action", "tab_id"]
     private static let arguments: [String: Set<String>] = [
@@ -855,6 +870,29 @@ enum AppAgentBrowserRead {
         "tabs": ["action"],
         "peek": ["action", "urls"],
     ]
+
+    static func mode(_ payload: [String: Any], client: String, allowWrites: Bool) -> AppAgentAdmission.Mode? {
+        guard payload["method"] as? String == "tools/call",
+              let params = payload["params"] as? [String: Any], params["name"] as? String == "browser",
+              let args = params["arguments"] as? [String: Any], let action = args["action"] as? String else { return nil }
+        if accepts(payload) {
+            return action == "peek" ? .browserPeek(client: client) : .browserRead(client: client)
+        }
+        guard allowWrites, let tab = args["tab_id"] as? NSNumber,
+              CFGetTypeID(tab) != CFBooleanGetTypeID(), tab.intValue > 0,
+              tab.compare(NSNumber(value: tab.intValue)) == .orderedSame else { return nil }
+        switch action {
+        case "scroll":
+            guard Set(args.keys).isSubset(of: common.union(["direction", "amount", "label", "index", "element_index"])) else { return nil }
+        case "fill_field":
+            guard Set(args.keys).isSubset(of: common.union(["label", "text"])),
+                  let text = args["text"] as? String, !text.isEmpty,
+                  let label = args["label"] as? String, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+        default: return nil
+        }
+        return .browserTabWrite(client: client, tabID: tab.intValue)
+    }
 
     static func accepts(_ payload: [String: Any]) -> Bool {
         guard payload["method"] as? String == "tools/call",
@@ -1092,10 +1130,14 @@ private final class AppAgentLineSource: @unchecked Sendable {
     func read(into requests: MCPRequestStream) {
         defer { fclose(file) }
         while let line = readAgentLine(file) {
-            autoreleasepool {
+            let accepted = autoreleasepool {
                 let envelope = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
                 let rpc = envelope?["kind"] as? String == "mcp" ? envelope?["line"] as? String : nil
-                requests.receive(line, rpcLine: rpc)
+                return requests.receive(line, rpcLine: rpc)
+            }
+            if !accepted {
+                shutdown(fileno(file), SHUT_RDWR)
+                break
             }
         }
         requests.disconnect()

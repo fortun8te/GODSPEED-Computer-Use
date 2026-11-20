@@ -123,6 +123,7 @@ public final class ComputerUseToolDispatcher {
         do {
             result = try autoreleasepool { try runWithSmartSteps(name: name, arguments: arguments, log: log) }
         } catch {
+            try RequestCancellation.check()
             // Renaming in Finder: Finder's rename field takes no typing in the background. Finder's own scripting
             // renames the selected (type_text) or named (set_value) item without focus, keys or a dialog.
             if let renamed = FinderRename.attempt(tool: name, arguments: arguments) { return renamed }
@@ -344,6 +345,8 @@ public final class ComputerUseToolDispatcher {
     }
 
     private func dispatchTool(name: String, arguments: [String: Any], log: SmartLog) throws -> ToolCallResult {
+        // Smart fallbacks can reach the native dispatcher without another tool call.
+        if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check() }
         switch name {
         case BatchTool.name:
             return try runBatch(arguments: arguments)

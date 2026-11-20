@@ -81,6 +81,196 @@ final class AppAgentAdmissionTests: XCTestCase {
         XCTAssertEqual(ready.count, 2)
     }
 
+    func testWaitingPeekLeavesRoomForReadsAndYieldsToWriter() throws {
+        let gate = AppAgentAdmission(environment: ["OPEN_COMPUTER_USE_PARALLEL_READS": "2"])
+        let finished = DispatchGroup()
+        let writerRan = DispatchSemaphore(value: 0)
+        let peekRan = DispatchSemaphore(value: 0)
+
+        try gate.withAdmission(.browserPeek(client: "first")) {
+            finished.enter()
+            DispatchQueue.global().async {
+                defer { finished.leave() }
+                do {
+                    try gate.withAdmission(.browserPeek(client: "second"), timeout: 5) {
+                        XCTAssertEqual(writerRan.wait(timeout: .now()), .success)
+                        peekRan.signal()
+                    }
+                } catch { XCTFail("Second peek failed: \(error)") }
+            }
+            XCTAssertTrue(waitForQueue(gate, count: 1))
+            try gate.withAdmission(.browserRead(client: "ordinary"), timeout: 0) {}
+            XCTAssertEqual(peekRan.wait(timeout: .now()), .timedOut)
+            finished.enter()
+            DispatchQueue.global().async {
+                defer { finished.leave() }
+                do {
+                    try gate.withAdmission(.exclusive, timeout: 5) { _ = writerRan.signal() }
+                } catch { XCTFail("Writer failed: \(error)") }
+            }
+            XCTAssertTrue(waitForQueue(gate, count: 2))
+            XCTAssertThrowsError(try gate.withAdmission(.browserRead(client: "late"), timeout: 0) {})
+        }
+        XCTAssertEqual(peekRan.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+    }
+
+    func testWriteLanesRequireOptInAndExcludeTheSameTabAndNativeInput() throws {
+        let first = AppAgentAdmission.Mode.browserTabWrite(client: "a", tabID: 17)
+        let second = AppAgentAdmission.Mode.browserTabWrite(client: "b", tabID: 18)
+        let serial = AppAgentAdmission(environment: [:])
+        try serial.withAdmission(first, timeout: 0) {
+            XCTAssertThrowsError(try serial.withAdmission(second, timeout: 0) {})
+        }
+        let parallel = AppAgentAdmission(environment: ["OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES": "1"])
+        try parallel.withAdmission(first, timeout: 0) {
+            XCTAssertThrowsError(try parallel.withAdmission(.browserTabWrite(client: "b", tabID: 17), timeout: 0) {})
+            XCTAssertThrowsError(try parallel.withAdmission(.browserTabWrite(client: "a", tabID: 19), timeout: 0) {})
+            XCTAssertThrowsError(try parallel.withAdmission(.exclusive, timeout: 0) {})
+            try parallel.withAdmission(second, timeout: 0) {}
+        }
+    }
+
+    func testTwoClientsWriteOnlyTheirOwnedTabsThroughSeparateHelpers() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("obu-fixture")
+        try """
+        #!/usr/bin/python3
+        import json, os, pathlib, sys, time
+
+        root = pathlib.Path(os.environ["OBU_WRITE_FIXTURE_DIR"])
+        tab = int(os.environ["OBU_WRITE_FIXTURE_TAB"])
+        for line in sys.stdin:
+            req = json.loads(line)
+            if "id" not in req:
+                continue
+            params = req.get("params", {})
+            name = params.get("name")
+            result = {}
+            if name == "open_tab":
+                result = {"content": [{"type": "text", "text": json.dumps({"result": {"tab": {"id": tab}}})}]}
+            if name == "cdp":
+                args = params["arguments"]
+                if args["tab_id"] != tab or args["method"] != "Runtime.evaluate":
+                    sys.exit(4)
+                marker = root / (str(tab) + ".write")
+                with marker.open("a") as effects:
+                    effects.write("once" + chr(10))
+                deadline = time.monotonic() + 5
+                while len(list(root.glob("*.write"))) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                ok = len(list(root.glob("*.write"))) == 2
+                result = {"isError": not ok, "content": [
+                    {"type": "text", "text": json.dumps({"result":{"result":{"value":[20,100]}}})}
+                ]}
+            print(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result}), flush=True)
+            if name == "turn_ended":
+                break
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let gate = AppAgentAdmission(environment: ["OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES": "1"])
+        DispatchQueue.concurrentPerform(iterations: 2) { index in
+            let tab = 71 + index
+            let client = "write-\(index)-" + UUID().uuidString.prefix(20)
+            let environment = [
+                "OPEN_COMPUTER_USE_BROWSER": "1",
+                "OPEN_COMPUTER_USE_OBU_BIN": executable.path,
+                "OPEN_COMPUTER_USE_TRAJECTORY_LOG": "0",
+                "OBU_WRITE_FIXTURE_DIR": root.path,
+                "OBU_WRITE_FIXTURE_TAB": String(tab),
+            ]
+            let server = StdioMCPServer(backgroundStateReset: {}, trajectoryEnvironment: environment)
+            do {
+                try ClientScope.with(client) {
+                    try withBrowserRequestEnvironment(environment) {
+                        let payload: [String: Any] = ["jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": ["name": "browser", "arguments": ["action": "scroll", "tab_id": tab]]]
+                        let mode = try XCTUnwrap(AppAgentBrowserRead.mode(
+                            payload, client: client, allowWrites: gate.parallelTabWrites
+                        ))
+                        XCTAssertEqual(mode.tabWrite, tab)
+                        XCTAssertNil(AppAgentBrowserRead.mode(payload, client: client, allowWrites: false))
+                        XCTAssertThrowsError(try withOwnedBrowserTabWrite(tab) {})
+                        let open = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browser","arguments":{"action":"open"}}}"#
+                        try gate.withAdmission(.exclusive, timeout: 10) {
+                            XCTAssertTrue(server.handle(line: open)?.contains("opened a blank tab") == true)
+                        }
+                        defer { try? gate.withAdmission(.exclusive) { server.endSession() } }
+                        XCTAssertThrowsError(try withOwnedBrowserTabWrite(tab + 10) {})
+                        let line = String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
+                        let reply = try gate.withAdmission(mode, timeout: 10) {
+                            try withOwnedBrowserTabWrite(tab) { server.handle(line: line) }
+                        }
+                        XCTAssertTrue(reply?.contains("scrolled") == true, reply ?? "(no reply)")
+                    }
+                }
+            } catch { XCTFail("Browser fixture write failed: \(error)") }
+        }
+        for tab in 71...72 {
+            let marker = root.appendingPathComponent("\(tab).write")
+            XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "once\n")
+        }
+    }
+
+    func testInferenceReleasesExclusiveAndDiscardsAnInterleavedResult() throws {
+        let gate = AppAgentAdmission(environment: [:])
+        let token = RequestCancellation()
+        try RequestCancellation.$current.withValue(token) {
+            try gate.withAdmission(.exclusive) {
+                let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
+                let result = outside {
+                    do {
+                        try gate.withAdmission(.exclusive, timeout: 0) {}
+                    } catch { XCTFail("Inference still owned desktop admission: \(error)") }
+                    return Data([1])
+                }
+                XCTAssertNil(result)
+                XCTAssertTrue(token.isCancelled)
+            }
+        }
+        try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testCancellingTwentyQueuedClientsReleasesTheirTickets() throws {
+        let gate = AppAgentAdmission(environment: [:])
+        let requests = (0..<20).map { _ in RequestCancellation() }
+        let finished = DispatchGroup()
+        try gate.withAdmission(.exclusive) {
+            for (index, token) in requests.enumerated() {
+                finished.enter()
+                Thread.detachNewThread {
+                    defer { finished.leave() }
+                    do {
+                        try RequestCancellation.$current.withValue(token) {
+                            try gate.withAdmission(.browserRead(client: "queued-\(index)")) {
+                                XCTFail("Cancelled request reached dispatch")
+                            }
+                        }
+                    } catch {
+                        XCTAssertTrue(error is RequestCancellation.Cancelled)
+                    }
+                }
+            }
+            XCTAssertTrue(waitForQueue(gate, count: 20))
+            requests.forEach { $0.cancel() }
+            XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+            XCTAssertEqual(gate.waitingCount, 0)
+        }
+        try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    private func waitForQueue(_ gate: AppAgentAdmission, count: Int) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if gate.waitingCount == count { return true }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        return false
+    }
+
     func testQueuedWriterPreventsNewReadersUntilItCompletes() throws {
         let gate = AppAgentAdmission()
         let writerAcquired = DispatchSemaphore(value: 0)

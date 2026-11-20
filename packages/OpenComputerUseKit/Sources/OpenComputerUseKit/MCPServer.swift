@@ -35,7 +35,8 @@ public final class StdioMCPServer {
         let requests = MCPRequestStream()
         Thread.detachNewThread {
             while let line = readLine(strippingNewline: true) {
-                autoreleasepool { requests.receive(line, rpcLine: line) }
+                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
+                if !accepted { break }
             }
             requests.disconnect()
         }

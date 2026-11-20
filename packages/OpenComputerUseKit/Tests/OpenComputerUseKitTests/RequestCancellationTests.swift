@@ -82,6 +82,49 @@ final class RequestCancellationTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(second.next()).cancellation.isCancelled)
     }
 
+    func testReadAheadPreservesCancellationWhenTheQueueIsFull() throws {
+        let stream = MCPRequestStream()
+        let first = #"{"id":1,"method":"tools/call"}"#
+        stream.receive(first, rpcLine: first)
+        let active = try XCTUnwrap(stream.next())
+        for id in 2...17 {
+            let line = #"{"method":"tools/call","id":\#(id)}"#
+            XCTAssertTrue(stream.receive(line, rpcLine: line))
+        }
+        let cancel = #"{"method":"notifications/cancelled","params":{"requestId":1}}"#
+        XCTAssertTrue(stream.receive(cancel, rpcLine: cancel))
+        XCTAssertTrue(active.cancellation.isCancelled)
+        XCTAssertFalse(stream.receive(first, rpcLine: first))
+    }
+
+    func testCancellationInterruptsAHelperThatHasStoppedReading() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let helper = folder.appendingPathComponent("obu")
+        try """
+        #!/usr/bin/python3
+        import json, sys, time
+        request = json.loads(sys.stdin.readline())
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {}}), flush=True)
+        sys.stdin.readline()
+        time.sleep(3)
+        """.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "blocked-fixture", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        let token = RequestCancellation()
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(350)) { token.cancel() }
+        let started = ProcessInfo.processInfo.systemUptime
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try bridge.callTool("cdp", arguments: ["fixture": String(repeating: "x", count: 1_048_576)], timeout: 5)
+        })
+        XCTAssertTrue(token.isCancelled)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 2)
+    }
+
     func testCancelledBrowserWaitReturnsWithinTwoSeconds() {
         let token = RequestCancellation()
         let response = BrowserBridgeResponses()
