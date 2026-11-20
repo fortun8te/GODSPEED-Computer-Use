@@ -407,7 +407,9 @@ public final class ComputerUseToolDispatcher {
                     includeAX: try strictObservationBool("include_ax", in: arguments),
                     includeScreenshot: try strictObservationBool(
                         "include_screenshot", in: arguments, default: LeanDefaults.includeScreenshot
-                    )
+                    ),
+                    // The menu tree is separate from the window's controls.
+                    includeMenuBar: try strictObservationBool("include_menu_bar", in: arguments, default: false)
                 ),
                 settleMs: try optionalSettleMs(in: arguments),
                 compact: try strictObservationBool("compact", in: arguments, default: false),

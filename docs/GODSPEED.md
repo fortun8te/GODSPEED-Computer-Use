@@ -54,6 +54,8 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
 - **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
 
+Window reads skip the menu bar by default. Use `include_menu_bar: true` on `get_app_state` or `--include-menu-bar true` on a CLI snapshot to include it. `press_menu` takes the menu path directly.
+
 Native actions read back accessibility text. Use `get_app_state` with `include_screenshot: true` or set `screenshot: true` on a batch when you need an image.
 
 Save waits for the name field, folder choice and any confirmation to appear. It checks the disk for the new write.

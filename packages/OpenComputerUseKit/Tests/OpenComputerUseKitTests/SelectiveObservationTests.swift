@@ -31,6 +31,17 @@ final class SelectiveObservationTests: XCTestCase {
         XCTAssertTrue(result.textContent.contains("Input"))
     }
 
+    func testMenuTraversalIsOptInAndRequiresAX() throws {
+        var menuReads = 0
+        SnapshotObservationOptions.defaults.readMenuBar { menuReads += 1 }
+        SnapshotObservationOptions(includeAX: false, includeMenuBar: true).readMenuBar { menuReads += 1 }
+        XCTAssertEqual(menuReads, 0)
+        SnapshotObservationOptions(includeMenuBar: true).readMenuBar { menuReads += 1 }
+        XCTAssertEqual(menuReads, 1)
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["snapshot", "TextEdit", "--include-menu-bar", "true"]),
+                       .snapshot(app: "TextEdit", observation: .init(includeMenuBar: true)))
+    }
+
     func testFrameSamplingRequiresAnExplicitOptIn() {
         XCTAssertFalse(WindowSettle.frameSamplingEnabled(environment: [:]))
         XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "1"]))
@@ -66,7 +77,7 @@ final class SelectiveObservationTests: XCTestCase {
 
     func testDispatcherRequiresActualJSONBooleans() {
         let dispatcher = ComputerUseToolDispatcher()
-        for key in ["include_ax", "include_screenshot"] {
+        for key in ["include_ax", "include_screenshot", "include_menu_bar"] {
             // "false", 0 and 1 are read as booleans on purpose (ArgumentNormalizer forgives weak models).
             for value: Any in [NSNull(), [], [:]] {
                 XCTAssertThrowsError(try dispatcher.callTool(name: "get_app_state", arguments: ["app": "missing-test-app", key: value])) {

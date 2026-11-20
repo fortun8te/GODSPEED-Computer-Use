@@ -391,10 +391,12 @@ enum SnapshotBuilder {
             }
         }
 
-        if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
-           !CFEqual(menuBar, rootElement)
-        {
-            AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+        observation.readMenuBar {
+            if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute), !CFEqual(menuBar, rootElement) {
+                TimingLog.measure("snapshot.menu_tree_walk") {
+                    AXSnapshotReadCache.withSnapshot { renderer.render(menuBar) }
+                }
+            }
         }
 
         numbering?.endSnapshot(windowID: windowCapture.windowID)

@@ -180,6 +180,7 @@ public enum ToolDefinitions {
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "include_ax": ["type": "boolean", "default": true, "description": "False skips the element list and invalidates earlier element numbers."],
                     "include_screenshot": ["type": "boolean", "default": LeanDefaults.includeScreenshot, "description": "Also return a screenshot, e.g. for pixel clicks."],
+                    "include_menu_bar": ["type": "boolean", "default": false, "description": "Include the app menu bar in the AX list. For a known menu command, use press_menu."],
                     "text_limit": textLimitProperty(description: "Max text characters per element; \"max\" for all. Default 500."),
                     "max_tree_nodes": positiveIntegerProperty(description: "Default 1200."),
                     "max_tree_depth": positiveIntegerProperty(description: "Default 64."),
