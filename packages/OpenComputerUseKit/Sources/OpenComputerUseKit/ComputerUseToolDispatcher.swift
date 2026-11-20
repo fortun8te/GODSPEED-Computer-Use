@@ -482,7 +482,9 @@ public final class ComputerUseToolDispatcher {
         case "list_apps":
             return service.listApps()
         case "query":
-            let matches = try service.query(
+            // The targeted search or a full-tree read, whichever ReadRouting has learned to be better for this app.
+            let matches = try ReadRouting.query(
+                service: service,
                 app: requireString("app", in: arguments),
                 text: try validatedQueryString(arguments["text"], key: "text"),
                 role: try validatedQueryString(arguments["role"], key: "role"),
@@ -493,8 +495,13 @@ public final class ComputerUseToolDispatcher {
             )
             return .text(try renderedQueryMatches(matches))
         case "get_app_state":
-            return try service.getAppState(
-                app: requireString("app", in: arguments),
+            // A settle wait the caller asked for is capped by the tuned wait when that is shorter (ReadRouting).
+            let stateApp = try requireString("app", in: arguments)
+            let stateWindow = try validatedQueryWindowID(arguments["window_id"])
+            let settle = ReadRouting.settlePlan(requested: try optionalSettleMs(in: arguments), app: stateApp, windowID: stateWindow)
+            let settleStarted = Date()
+            let state = try service.getAppState(
+                app: stateApp,
                 textLimit: try optionalTextLimit("text_limit", in: arguments) ?? .defaults,
                 treeLimits: AccessibilityTreeLimits.defaults.replacing(
                     maxNodeCount: try optionalPositiveInt("max_tree_nodes", in: arguments),
@@ -510,10 +517,12 @@ public final class ComputerUseToolDispatcher {
                     // The menu tree is separate from the window's controls.
                     includeMenuBar: try strictObservationBool("include_menu_bar", in: arguments, default: false)
                 ),
-                settleMs: try optionalSettleMs(in: arguments),
+                settleMs: settle.wait,
                 compact: try strictObservationBool("compact", in: arguments, default: false),
-                windowID: try validatedQueryWindowID(arguments["window_id"])
+                windowID: stateWindow
             )
+            ReadRouting.recordSettle(settle.tuned, result: state, startedAt: settleStarted, app: stateApp)
+            return state
         case "click":
             // Precise clicks use one window-addressed route and never fall back to vision.
             if ActionOptions.usesStrictRoute(name, arguments) {
