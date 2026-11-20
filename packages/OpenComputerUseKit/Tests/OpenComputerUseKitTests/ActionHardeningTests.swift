@@ -142,6 +142,19 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertEqual(result.failureCode, .backgroundUnsupported)
     }
 
+    func testDropVerificationChecksAfterDeliveryAndReportsUncertainty() throws {
+        let args = ["verify": ["label": "Saved row", "condition": "appears"]]
+        let options = try DragOptions(args)
+        XCTAssertEqual(try options.verifiedDrop { wait in
+            try wait.run { () -> ControlWait.Sample<Int> in .present }
+        }, "Drop delivered. Saved row appeared.")
+        XCTAssertThrowsError(try options.verifiedDrop { _ in
+            throw ComputerUseError.stateUnavailable("Could not read the destination.")
+        }) { XCTAssertTrue($0.localizedDescription.contains("Drag delivered")) }
+        XCTAssertThrowsError(try DragOptions(["verify": ["label": "Counter", "condition": "value_changed"]]))
+        XCTAssertNil(try DragOptions([:]).verifiedDrop { _ in XCTFail("Unexpected check"); return "" })
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

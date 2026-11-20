@@ -159,9 +159,10 @@ struct ClickPlacement {
 struct DragOptions {
     let steps: Int?
     let hold: TimeInterval
+    let verification: ControlWait?
 
     static func isRequested(_ args: [String: Any]) -> Bool {
-        ["label", "element_index", "from_label", "from_index", "to_label", "to_index", "hold_ms", "drag_steps", "files"]
+        ["label", "element_index", "from_label", "from_index", "to_label", "to_index", "hold_ms", "drag_steps", "verify", "files"]
             .contains { args[$0] != nil }
     }
 
@@ -170,7 +171,27 @@ struct DragOptions {
             throw ComputerUseError.backgroundUnsupported("Use a file input upload or an app file command for files. A background pointer drag cannot guarantee OS file delivery.")
         }
         steps = try ActionOptions.integer("drag_steps", in: args, range: 2...30)
-        hold = try Double(ActionOptions.integer("hold_ms", in: args, range: 0...1000) ?? 0) / 1000
+        hold = try ActionOptions.duration("hold_ms", in: args, maxMs: 1000) ?? 0
+        if let raw = args["verify"] {
+            guard let fields = raw as? [String: Any], let check = try ControlWait(fields) else {
+                throw ComputerUseError.invalidArguments("verify needs a label and condition from wait_for.")
+            }
+            guard check.condition != .valueChanged || check.fromValue != nil else {
+                throw ComputerUseError.invalidArguments("A drop value check needs the previous from_value.")
+            }
+            verification = check
+        } else {
+            verification = nil
+        }
+    }
+
+    func verifiedDrop(_ check: (ControlWait) throws -> String) throws -> String? {
+        guard let verification else { return nil }
+        do {
+            return "Drop delivered. " + (try check(verification))
+        } catch {
+            throw ComputerUseError.stateUnavailable("Drag delivered. Drop check failed: \(error.localizedDescription) Inspect the target before repeating.")
+        }
     }
 
     static func validateEndpoint(index: String?, x: Double?, y: Double?, name: String) throws {
