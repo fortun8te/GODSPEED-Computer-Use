@@ -843,13 +843,19 @@ private final class OpenOutcome: @unchecked Sendable {
 final class NativeActionObservation: @unchecked Sendable {
     private let lock = NSLock()
     private var snapshot: AppSnapshot?
+    private var deferred = false
 
     func record(_ snapshot: AppSnapshot) {
         lock.withLock { self.snapshot = snapshot }
     }
 
+    func deferToBatchRead() {
+        lock.withLock { deferred = true }
+    }
+
     func read(before: [String]? = nil, fallback: () -> AppSnapshot?) -> AppSnapshot? {
-        let captured = lock.withLock { snapshot }
+        let (captured, wasDeferred) = lock.withLock { (snapshot, deferred) }
+        if wasDeferred { return nil }
         // An early no-change read may precede a delayed effect. Leave the existing
         // fresh-read and retry decision in place for this case.
         if let captured, captured.treeLines != before,

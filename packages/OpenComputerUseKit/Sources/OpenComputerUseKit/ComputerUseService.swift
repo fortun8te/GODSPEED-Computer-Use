@@ -725,6 +725,7 @@ public final class ComputerUseService {
     @TaskLocal static var requiredWindowID: CGWindowID?
     @TaskLocal static var awaitsModalTextFocus = false
     @TaskLocal static var actionObservation: NativeActionObservation?
+    @TaskLocal static var defersVerifiedSetValueObservation = false
 
     private var snapshotsByApp: [String: AppSnapshot] = [:]
     private var invalidatedSnapshotAliases: Set<String> = []
@@ -1841,6 +1842,7 @@ public final class ComputerUseService {
         let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
         moveVisualCursor(to: cursorTarget)
 
+        var verifiedValue = false
         do {
             try requireUsableComputerUseSession()
             let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
@@ -1857,6 +1859,7 @@ public final class ComputerUseService {
                     var actual: CFTypeRef?
                     return AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &actual) == .success ? actual : nil
                 }, validate: { try requireUsableComputerUseSession() })
+                verifiedValue = true
             }
         } catch {
             settleVisualCursor(at: cursorTarget)
@@ -1864,7 +1867,15 @@ public final class ComputerUseService {
         }
 
         settleVisualCursor(at: cursorTarget)
-        return try actionResult(for: query)
+        return try Self.verifiedSetValueResult(verified: verifiedValue) { try actionResult(for: query) }
+    }
+
+    static func verifiedSetValueResult(verified: Bool, readBack: () throws -> ToolCallResult) rethrows -> ToolCallResult {
+        if verified, defersVerifiedSetValueObservation {
+            actionObservation?.deferToBatchRead()
+            return .text("ok")
+        }
+        return try readBack()
     }
 
     public func selectText(
