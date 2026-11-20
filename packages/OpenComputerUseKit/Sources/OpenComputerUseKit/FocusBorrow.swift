@@ -14,10 +14,44 @@ import Foundation
 ///   if the user did not switch to another app meanwhile.
 /// - Borrows nest: an inner borrow adds to the count and does not restore anything on its own.
 /// - Every lease is released by `defer`, so an error still gives focus back.
-/// - `OPEN_COMPUTER_USE_FOCUS_BORROW=0` turns the whole feature off (default on, also in background-only mode).
+/// - Off by default. `OPEN_COMPUTER_USE_FOCUS_BORROW=1` turns it on; background-only and strict modes always keep it off.
+///
+/// Every step that needs the app in front tries the background route first. Only when that fails for want of focus
+/// does the reply say so (`needsBorrowingMessage`), typed as BACKGROUND_UNSUPPORTED while borrowing is off.
 enum FocusBorrow {
     /// The process-wide borrow state used by the tools.
     static let shared = FocusBorrowController(activator: WorkspaceFocusActivator())
+
+    /// The exact reply for a step that could only succeed with the app in front, while focus borrowing is off.
+    static let needsBorrowingMessage = "This needs focus borrowing: set OPEN_COMPUTER_USE_FOCUS_BORROW=1 or allow it in Settings"
+
+    /// The refusal for a step that failed only because it needed the app in front. Borrowing off: the typed
+    /// BACKGROUND_UNSUPPORTED reply with the exact sentence. Borrowing on: the ordinary refusal (unsent unless `unsent`
+    /// is false, which keeps the read's stateUnavailable delivery) with the retry hint when the app is not borrowed.
+    static func focusRequiredError(_ detail: String, enabled: Bool, borrowed: Bool, unsent: Bool = true) -> ComputerUseError {
+        guard enabled else { return .backgroundUnsupported(needsBorrowingMessage) }
+        let text = borrowed ? detail : detail + " If nothing else works, those steps can be sent in a batch with \"foreground\": true (only done while the user is away)."
+        return unsent ? .notSent(text) : .stateUnavailable(text)
+    }
+
+    /// `focusRequiredError` for the current settings and the app `pid`.
+    static func focusRequiredError(_ detail: String, pid: pid_t, unsent: Bool = true) -> ComputerUseError {
+        focusRequiredError(detail, enabled: isEnabled, borrowed: isBorrowed(pid: pid), unsent: unsent)
+    }
+
+    /// A dialog-opening step (Save, Export, a save chord) that failed in the background with focus borrowing off failed for
+    /// want of focus: the typed reply replaces the bare failure. Policy refusals and steps that did not fail are kept as they are.
+    static func dialogStepReply(_ result: ToolCallResult, opensDialog: Bool, appIsFrontmost: Bool, enabled: Bool) -> ToolCallResult {
+        guard opensDialog, result.isError, !enabled, !appIsFrontmost, result.failureCode?.isActionRefusal != true else {
+            return result
+        }
+        return .failure(ComputerUseError.backgroundUnsupported(needsBorrowingMessage))
+    }
+
+    /// The sentence a `foreground: true` batch adds to its reply when it failed with focus borrowing off. Nil otherwise.
+    static func foregroundBatchNote(foreground: Bool, failed: Bool, enabled: Bool) -> String? {
+        foreground && failed && !enabled ? needsBorrowingMessage : nil
+    }
 
     /// Menu titles that open a dialog or an editor, so the steps after them need the app in front.
     /// Matched after dropping a trailing "…" or "...", case-insensitively.

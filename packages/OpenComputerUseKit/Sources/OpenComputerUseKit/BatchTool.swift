@@ -522,16 +522,21 @@ extension ComputerUseToolDispatcher {
     /// press_menu of such an item (Save, Export, New Folder, a title ending "…"), or a command chord that
     /// presses one.
     func stepOpensDialog(_ step: BatchTool.Step, pid: pid_t) -> Bool {
-        if step.tool == "press_menu" {
-            if let path = step.arguments["path"] as? String, let titles = try? menuPathTitles(path) {
+        opensDialog(tool: step.tool, arguments: step.arguments, pid: pid)
+    }
+
+    /// The same test for a tool and its arguments, whether a batch step or a direct press_menu / press_key call.
+    func opensDialog(tool: String, arguments: [String: Any], pid: pid_t) -> Bool {
+        if tool == "press_menu" {
+            if let path = arguments["path"] as? String, let titles = try? menuPathTitles(path) {
                 return FocusBorrow.menuPathOpensDialog(titles)
             }
-            if let titles = step.arguments["path"] as? [String] {
+            if let titles = arguments["path"] as? [String] {
                 return FocusBorrow.menuPathOpensDialog(titles)
             }
             return false
         }
-        if step.tool == "press_key", let key = step.arguments["key"] as? String, let title = FocusBorrow.menuTitle(forKey: key, pid: pid) {
+        if tool == "press_key", let key = arguments["key"] as? String, let title = FocusBorrow.menuTitle(forKey: key, pid: pid) {
             return FocusBorrow.menuTitleOpensDialog(title)
         }
         return false
@@ -564,9 +569,6 @@ extension ComputerUseToolDispatcher {
         // Focus borrowed for this batch: whole-batch (foreground: true) or per dialog step (see FocusBorrow).
         let focus = FocusBorrowSession()
         defer { focus.close() }
-        if foreground, !FocusBorrow.isEnabled {
-            lines.append("Focus borrowing is off. Enable OPEN_COMPUTER_USE_FOCUS_BORROW to use foreground batches.")
-        }
 
         // Preserve a policy refusal if a recipe cannot inspect its saved target.
         var recipeReadRefusal: ToolCallResult?
@@ -1483,7 +1485,11 @@ extension ComputerUseToolDispatcher {
         focus.close()
 
         let compactVerified = compactReply && verifiedDone && !failed && !stoppedForTime
-        let replyLines = compactVerified ? BatchTool.compactVerifiedLines(lines) : lines
+        var replyLines = compactVerified ? BatchTool.compactVerifiedLines(lines) : lines
+        // A foreground batch that failed with borrowing off says what it needed, in the sentence the caller can act on.
+        if let note = FocusBorrow.foregroundBatchNote(foreground: foreground, failed: failed, enabled: FocusBorrow.isEnabled) {
+            replyLines.insert(note, at: 0)
+        }
         var content: [ToolResultContentItem] = [.text(replyLines.joined(separator: "\n"))]
         if let observation {
             receipt.observation = observation.isError ? .failed : .returned
