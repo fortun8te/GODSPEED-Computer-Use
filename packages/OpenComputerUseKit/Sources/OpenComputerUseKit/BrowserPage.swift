@@ -1720,6 +1720,23 @@ final class BrowserPage {
 
     enum ControlCondition: String {
         case visible, enabled, checked, unchecked
+        /// The accessibility tree names a control with the label, whether or not it is shown (explicit only).
+        case exists
+    }
+
+    /// ACT-04: a label is ready when exactly one control carries it and that control meets the condition.
+    /// Hidden or ambiguous matches are not ready. Accessibility existence counts only for `.exists`.
+    static func labelReady(matches: [BrowserNode], state: (visible: Bool, enabled: Bool, checked: String?)?,
+                           condition: ControlCondition) -> Bool {
+        if condition == .exists { return !matches.isEmpty }
+        guard Set(matches.map(\.backendNodeID)).count == 1, let state else { return false }
+        switch condition {
+        case .visible: return state.visible
+        case .enabled: return state.enabled
+        case .checked: return state.checked == "true"
+        case .unchecked: return state.checked == "false"
+        case .exists: return false
+        }
     }
 
     func controlState(_ node: BrowserNode) throws -> String {
@@ -2297,20 +2314,12 @@ final class BrowserPage {
                         return true
                     }
                 } else if let label {
-                    if let controlCondition {
-                        let matches = ((try? queryNamed(label)) ?? []).filter { Self.normalize($0.name) == Self.normalize(label) }
-                        if Set(matches.map(\.backendNodeID)).count == 1, let node = matches.first,
-                           let state = try? inspectControl(node) {
-                            switch controlCondition {
-                            case .visible: if state.visible { return true }
-                            case .enabled: if state.enabled { return true }
-                            case .checked: if state.checked == "true" { return true }
-                            case .unchecked: if state.checked == "false" { return true }
-                            }
-                        }
-                    } else if let named = try? queryNamedAny(label), !named.isEmpty {
-                        return true
-                    }
+                    // ACT-04: with no condition, a label waits for one visible control, not for AX existence.
+                    let condition = controlCondition ?? .visible
+                    let matches = ((try? queryNamed(label)) ?? []).filter { Self.normalize($0.name) == Self.normalize(label) }
+                    let state = Set(matches.map(\.backendNodeID)).count == 1 && condition != .exists
+                        ? matches.first.flatMap { try? inspectControl($0) } : nil
+                    if Self.labelReady(matches: matches, state: state, condition: condition) { return true }
                 }
                 Thread.sleep(forTimeInterval: min(0.25, max(0, deadline - clock.systemUptime)))
             }

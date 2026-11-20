@@ -538,6 +538,19 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNil(try BrowserPage.decideFromTargeted([], label: "Delete"))
     }
 
+    func testLabelReadinessNeedsOneVisibleControlUnlessExistenceIsAsked() {
+        // ACT-04: a label waits for one visible control. Hidden or ambiguous matches are not ready.
+        let hidden = BrowserNode(index: 1, role: "button", name: "Save", value: "", backendNodeID: 1)
+        let shown = BrowserNode(index: 2, role: "button", name: "Save", value: "", backendNodeID: 2)
+        XCTAssertFalse(BrowserPage.labelReady(matches: [hidden], state: (false, true, nil), condition: .visible))
+        XCTAssertTrue(BrowserPage.labelReady(matches: [shown], state: (true, true, nil), condition: .visible))
+        XCTAssertFalse(BrowserPage.labelReady(matches: [hidden, shown], state: (true, true, nil), condition: .visible))
+        XCTAssertFalse(BrowserPage.labelReady(matches: [], state: nil, condition: .visible))
+        // Existence is a separate, explicit request: a hidden control still exists.
+        XCTAssertTrue(BrowserPage.labelReady(matches: [hidden], state: nil, condition: .exists))
+        XCTAssertFalse(BrowserPage.labelReady(matches: [], state: nil, condition: .exists))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {
