@@ -68,7 +68,7 @@ extension ComputerUseService {
         }
         let record: ElementRecord?
         if let labels {
-            record = try? resolveLabel(app: app, labels: labels)
+            record = try? resolveLabel(app: app, labels: labels, recoveryPolicy: .readOnly)
         } else if let index {
             record = policyRecord(app: app, index: index)
         } else {
