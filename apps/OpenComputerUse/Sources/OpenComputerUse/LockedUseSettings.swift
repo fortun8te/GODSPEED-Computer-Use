@@ -54,13 +54,16 @@ enum LockedUseSettings {
         print(text, terminator: "")
     }
     private static func enable(recovering: Bool = false) throws {
+        guard LockedUseDiagnostics.currentBundlePluginVersion != nil else {
+            throw OpenComputerUseCLIError(message: LockedUseDiagnostics.unpackagedMessage)
+        }
         guard LockedUseSession.current().state == .unlocked else { throw OpenComputerUseCLIError(message: "Unlock the Mac normally before administrator installation or recovery.") }
         let identity = try LockedUseSigningIdentity.current()
         guard identity.userID > 0, ["com.ifuryst.opencomputeruse", "com.ifuryst.opencomputeruse.dev"].contains(identity.signingIdentifier),
               let team = identity.teamIdentifier else { throw OpenComputerUseCLIError(message: "Use the signed Open Computer Use app to enable Locked Use.") }
         let source = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/LockedUse")
         guard FileManager.default.fileExists(atPath: source.appendingPathComponent("OCULockInstaller").path) else {
-            throw OpenComputerUseCLIError(message: "Signed Locked Use components are missing from this app. Build with OPEN_COMPUTER_USE_INCLUDE_LOCKED_USE=1.")
+            throw OpenComputerUseCLIError(message: "The signed Locked Use package is incomplete. Install a complete vendor-signed build before enrollment.")
         }
         // Administrator staging has a protected parent; /tmp ancestry would
         // permit path replacement even when a leaf happens to be root owned.

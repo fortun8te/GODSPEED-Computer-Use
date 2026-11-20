@@ -288,12 +288,13 @@ final class OpenComputerUseKitTests: XCTestCase {
     }
 
     func testToolDefinitionCount() {
-        XCTAssertEqual(ToolDefinitions.all.filter { $0.name != "browser" }.count, 17)
+        XCTAssertEqual(ToolDefinitions.all.filter { $0.name != "browser" }.count, 18)
         XCTAssertEqual(
             ToolDefinitions.all.filter { $0.name != "browser" }.map(\.name).sorted(),
             [
                 "batch",
                 "click",
+                "clipboard",
                 "drag",
                 "get_app_state", "handoff", "hover",
                 "list_apps",
@@ -2406,6 +2407,22 @@ final class OpenComputerUseKitTests: XCTestCase {
         )
 
         XCTAssertEqual(point, CGPoint(x: 2415, y: 1783))
+    }
+
+    func testVisualCursorBoundaryOutsideQuartzDisplayStillFlipsY() {
+        let display = VisualCursorScreenMapping(
+            screenStateFrame: CGRect(x: -1200, y: 120, width: 1200, height: 800),
+            appKitFrame: CGRect(x: -1200, y: 260, width: 1200, height: 800)
+        )
+        for bottom in [920.0, 922.0] {
+            XCTAssertEqual(
+                screenStatePointToAppKitGlobalPoint(
+                    fromScreenStatePoint: CGPoint(x: -200, y: bottom),
+                    screenMappings: [display]
+                ),
+                CGPoint(x: -200, y: 260)
+            )
+        }
     }
 
     func testInputEventPointKeepsCoreGraphicsScreenStateCoordinates() {

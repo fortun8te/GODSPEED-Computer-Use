@@ -2,6 +2,19 @@ import XCTest
 @testable import OpenComputerUse
 
 final class AppAgentProxyTests: XCTestCase {
+    func testCursorNameUsesOnlyKnownClientInitializationMetadata() {
+        XCTAssertEqual(
+            MacOSAppAgentProxy.knownCursorClientName(initializeLine: #"{"method":"initialize","params":{"clientInfo":{"name":"codex-mcp-client","version":"1.0"}}}"#),
+            "Codex"
+        )
+        XCTAssertNil(MacOSAppAgentProxy.knownCursorClientName(
+            initializeLine: #"{"method":"initialize","params":{"clientInfo":{"name":"private-project-owner"}}}"#
+        ))
+        XCTAssertNil(MacOSAppAgentProxy.knownCursorClientName(
+            initializeLine: #"{"method":"tools/call","params":{"clientInfo":{"name":"codex"}}}"#
+        ))
+    }
+
     func testSharedAdmissionIsOnlyForCanonicalBrowserReads() {
         func accepts(_ name: String = "browser", _ arguments: [String: Any]) -> Bool {
             AppAgentBrowserRead.accepts([

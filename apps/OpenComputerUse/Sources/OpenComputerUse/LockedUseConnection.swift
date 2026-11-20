@@ -34,17 +34,14 @@ final class LockedUseConnection: @unchecked Sendable {
 
     func perform<T>(_ body: () throws -> T) throws -> T {
         let session = LockedUseSession.current()
+        guard session.state != .unavailable else {
+            throw ComputerUseError.stateUnavailable("No completed GUI session for the current console user is available. Sign in normally before using Godspeed.")
+        }
         mutex.lock(); let needsRecovery = stopped && lease == nil; mutex.unlock()
         if session.state == .unlocked, needsRecovery || FileManager.default.fileExists(atPath: LockedUseIPCEndpoint.observer.path) {
             _ = try observeManualUnlock()
         }
         if session.state == .locked {
-            // Locked Use needs an Apple-signed build; a locally signed one failed here with a bare
-            // "invalidSignature(-67050)" on every action. Say what is actually wrong.
-            guard (try? LockedUseSigningIdentity.current()) != nil else {
-                throw ComputerUseError.stateUnavailable(
-                    "The Mac's screen is locked, so apps cannot be used. Ask the user to unlock it, then try again.")
-            }
             try acquire(session: session)
         }
         mutex.lock()
@@ -60,9 +57,11 @@ final class LockedUseConnection: @unchecked Sendable {
             if drain { acknowledgeDrain() }
         }
         if scoped {
-            return try LockedUseActionScope.withValidator({ [self] in try validateAction() }, body: body)
+            return try LockedUseActionScope.withValidator({ [self] in try validateAction() }) {
+                try withBrowserDesktopValidation(body)
+            }
         }
-        return try body()
+        return try withBrowserDesktopValidation(body)
     }
 
     enum ParallelReadFallback: Error { case needsExclusive }
@@ -97,10 +96,16 @@ final class LockedUseConnection: @unchecked Sendable {
     }
 
     private func acquire(session: LockedUseSession, recoveryProbe: Bool = false) throws {
+        guard LockedUseDiagnostics.currentBundlePluginVersion != nil else {
+            throw ComputerUseError.stateUnavailable("The Mac is locked. " + LockedUseDiagnostics.unpackagedMessage)
+        }
         mutex.lock(); let existing = lease; let denied = stopped || clientDisconnected; mutex.unlock()
         if existing != nil || denied { try validateAction(); return }
+        guard let requirement = try? LockedUseSigningIdentity.brokerRequirement() else {
+            throw ComputerUseError.stateUnavailable("This app has no approved signing identity for Locked Use. Unlock the Mac normally before using it.")
+        }
         let connection = try LockedUseIPCClient(endpoint: .agent,
-            brokerRequirement: LockedUseSigningIdentity.brokerRequirement(), clientSocket: clientSocket)
+            brokerRequirement: requirement, clientSocket: clientSocket)
         let reply = try connection.request(.init(operation: recoveryProbe ? .beginRecoveryProbe : .begin, session: session))
         let now = ProcessInfo.processInfo.systemUptime
         let startupDeadline = reply.startupDeadline ?? now + LockedUseStateMachine.unlockTimeout

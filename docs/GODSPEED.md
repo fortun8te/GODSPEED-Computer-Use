@@ -7,7 +7,7 @@ The desktop implementation lives in `packages/OpenComputerUseKit`. See the [veri
 ## How a call flows
 
 ```
-agent (TIANWANG, SuperApp Pi, Codex)
+MCP client
   │  stdio MCP, one JSON-RPC message per line
   ▼
 GODSPEED.app/Contents/MacOS/OpenComputerUse mcp        (stdio entry point)
@@ -43,7 +43,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 ## Batch features
 
 - **Steps**: each step is a tool name plus arguments. Spelling is forgiving (`type` → `type_text`, `key` → `press_key`, and so on). A missing `app` is filled from the last app used.
-- **Labels**: name elements by their visible text, not by index. Indexes still work.
+- **Labels**: use visible text first. Current element indexes also work.
 - **Fill**: `{"tool": "fill", "fields": {"To": "sam@x.com"}, "submit": "Send"}` becomes one `set_value` per field and a click. Add `"web": true` for a page.
 - **Goal**: `goal` is one sentence. The reply may add a `Check:` line (done, stuck, or still loading) from the referee. Treat it as a hint.
 - **Recipes**: send `remember: true` with a goal that reached it. Later, send only `goal` to replay the saved steps and their completion checks. Changed recipe values need a fresh check. Keep secrets out of completion conditions because saved recipes store them locally. Steps with element numbers or coordinates are never saved. A recipe that fails twice in a row is dropped.
@@ -79,9 +79,7 @@ Two places, one rule: **an environment variable that is set always wins**. Other
 | `decision_hints` | `OPEN_COMPUTER_USE_REFEREE_URL` = `helper_url` | `false` |
 | `find_on_screen` | `OPEN_COMPUTER_USE_VISION_URL` = `helper_url` | `false` |
 | `helper_url` | the URL used by the two keys above | `http://127.0.0.1:8765` |
-| `recipes` | `OPEN_COMPUTER_USE_HANDOFF_HELPER` | on | Set to 0 to prevent handoff ranking requests, including when a referee URL is configured. |
-| `OPEN_COMPUTER_USE_REFEREE_DONE_HINTS` | off | Use experimental model completion hints. Deterministic `done_when` checks still determine verified completion. |
-| `OPEN_COMPUTER_USE_RECIPES` | `true` |
+| `recipes` | `OPEN_COMPUTER_USE_RECIPES` | `true` |
 | `browser` | `OPEN_COMPUTER_USE_BROWSER` | on if `obu` is found, else off |
 
 ### Environment variables
@@ -105,7 +103,9 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 | `OPEN_COMPUTER_USE_VIRTUAL_DISPLAY_ENABLED` | off | Adds `window_placement` to `get_app_state`. |
 | `OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE` | none | Separate socket for tests (`godspeed-agent-<hash>.sock`). |
 
-Cursor:
+### Cursor and client names
+
+The MCP proxy uses known client names from initialization. Overlapping cursors with the same name receive a number. Labels show a client or nickname, while window and browser state stay scoped to the connection. For a nickname, set `OPEN_COMPUTER_USE_CURSOR_NAME` on that client's MCP process. Use up to 20 letters, digits, spaces, or hyphens and start with a letter.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -114,13 +114,15 @@ Cursor:
 | `OPEN_COMPUTER_USE_CURSOR_SPEED` | 4 | 2 calm, 4 normal, 8 fast, `instant` (settings key `cursor_speed`). |
 | `OPEN_COMPUTER_USE_CURSOR_FLOAT` | off | Draw above every window. |
 | `OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS` | 3 | Seconds before the idle cursor fades. |
-| `OPEN_COMPUTER_USE_CURSOR_ASYNC` | on | Queue cursor animation on the main thread. Env only. |
+| `OPEN_COMPUTER_USE_CURSOR_ASYNC` | on | Cursor work is queued and played by a display-synced frame clock; actions never wait for it. Env only. |
 
 Helpers (referee and vision):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPEN_COMPUTER_USE_REFEREE_URL` | unset (off) | Helper service base URL, e.g. `http://127.0.0.1:8765`. |
+| `OPEN_COMPUTER_USE_HANDOFF_HELPER` | on with a configured referee | Set to `0` to skip model-ranked recipe handoff. |
+| `OPEN_COMPUTER_USE_REFEREE_DONE_HINTS` | off | Optional model hints. `done_when` controls verified completion. |
 | `OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS` | 1500 | Longest wait for a verdict. |
 | `OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE` | 0.6 | Below this, no hint. |
 | `OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE` | 0.85 | A `done` hint needs this. |
@@ -164,6 +166,18 @@ Use `clipboard` with `action: "read"`, `"write"` and `text`, or `"clear"`. The R
 
 Finder file copies go to the same private clipboard. Paste them into Finder or select them in a labelled Chrome file input. Finder cut moves files only in Finder. Editors must expose selection and input through Accessibility or Chrome. Secure field contents, rich formatting, and image clipboard pastes are outside this feature.
 
+## Verified workflows
+
+1. Read the active window or tab. Use a label that identifies one control.
+2. Batch related steps with `done_when` set to a visible result. Add `compact: true` to get a short reply when the check passes.
+3. If the batch stops, use its recovery receipt. Inspect the current state before retrying a step whose effect is unknown.
+
+Screenshots are available for controls that the accessibility tree misses. The optional decision helper is for ambiguous, goal-directed work. Routine reads and explicit completion checks can use the current observation directly.
+
+The visible cursor is feedback. Godspeed resolves and checks the target independently, keeps each agent's window anchor separate, and plays cursor motion on the display clock. If a path crosses a gap with no screen, it reappears beside the next target. The app never needs to move your physical pointer with the default background settings.
+
+Vercel's agent-desktop scopes references to the observed window and keeps cursor travel out of the window interaction lock. [Snapshot guide](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/apps/docs/content/docs/snapshots-and-refs.mdx) · [Cursor delivery](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/crates/core/src/cursor_overlay/submit.rs)
+
 ## Parallel browser reads
 
 To inspect a known native window directly, pass its ID to `get_app_state`. This read does not move the window or use app-wide settle. For an exact native action target, take a fresh app observation and use its reported `Window ID` as `window_id` on a supported action or a single-app batch. Godspeed stops if the observed window or required focus no longer matches. Refresh the observation before trying again. In the JavaScript REPL, use `app.batch(steps, { windowId, doneWhen })` to execute a sequence and check the final state in one call. The reply includes a `receipt` with each step's status, the number of steps left and the completion verdict. Acknowledged actions and verified outcomes are reported separately.
@@ -198,7 +212,7 @@ Open or select a tab and read its controls. For example, use `{"action":"drag","
 
 ## Local traces
 
-Tool logs at `~/.godspeed/trajectories` record time before dispatch, tool duration, admission timeouts, fixed failure codes, individual batch outcomes, the remaining steps and the final verification status. Partial or uncertain delivery stays visible in the receipt. Arguments, screen text, and screenshots are omitted by default. Turn logging off with `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0`. Only set `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` on an approved fixture connection. That captures typed text and observations. Review those files before using or sharing them.
+Tool logs at `~/.godspeed/trajectories` record queue time, tool duration, batch outcomes and verification. The default omits arguments, screen text and screenshots. Set `OPEN_COMPUTER_USE_TRAJECTORY_LOG=0` to turn logging off. For a local fixture, `OPEN_COMPUTER_USE_TRAJECTORY_FAILURES=1` adds a short error and argument shape. Review it before sharing because errors can include app names, filenames or controls. `OPEN_COMPUTER_USE_TRAJECTORY_CONTENT=1` captures typed text and observations.
 
 Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper activity. A helper receipt records that the helper ran. Match verified fixture outcomes to exact run streams before using them as labels.
 
@@ -218,6 +232,12 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 See [training fixtures](training-fixtures.md) for reviewed vision annotations and verified decision labels.
 
 See the [macOS capability audit](macos-capabilities.md) for the boundary between Godspeed tools, app workflows, and other macOS interfaces.
+
+### When macOS is locked
+
+The public Godspeed package requires a signed-in, unlocked desktop for app controls, browser tools and screenshots. Its MCP connection can still answer `ping` and `tools/list` while the Mac is awake and the agent is running. For jobs that can run outside the desktop, use the app's supported API or command-line tools. After an interrupted desktop batch, unlock normally, read the current app state and resume from the last confirmed result.
+
+The local `OpenComputerUse locked-use status --json` command reports `not-packaged` on this build. Apple Screen Sharing provides authenticated remote desktop access when it is enabled in System Settings. [Apple Screen Sharing guide](https://support.apple.com/en-sg/guide/mac-help/mh14066/mac)
 
 ### Browser feedback and parallel jobs
 

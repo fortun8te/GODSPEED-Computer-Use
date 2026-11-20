@@ -65,7 +65,7 @@ public enum ToolDefinitions {
     private static let definitions: [ToolDefinition] = [
         ToolDefinition(
             name: BatchTool.name,
-            description: "Use for 2 or more steps in a native Mac app, not for a web page (use browser) or one lone step (use that tool). Runs in the background, dialogs included. Send 2-10 steps; they run in order and stop at the first failure. The reply is one line per step (ok, or FAILED with the reason) plus the app's state. A step is a tool name and its arguments: {\"tool\": \"click\", \"label\": \"Send\"}. Whole form: {\"tool\": \"fill\", \"fields\": {\"To\": \"sam@x.com\"}, \"submit\": \"Send\"}; add \"web\": true for a page. Wait for something slow: {\"tool\": \"wait\", \"window\": \"Export\"} (or text, gone, settle: true, timeout_ms).",
+            description: "Use to run ordered steps with a final check. Give each step a tool and its arguments, for example {\"tool\": \"wait\", \"window\": \"Export\"}. Use fill with a fields map and optional submit for a form. On failure, use the receipt to continue from current state.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -92,7 +92,7 @@ public enum ToolDefinitions {
                     "foreground": ["type": "boolean", "default": false, "description": "Last resort only: bring the app forward (skipped while the user is using the Mac). Steps, dialogs included, normally work in the background."],
                     "remember": ["type": "boolean", "default": false, "description": "Save these steps as the recipe for goal once they all succeed."],
                     "return_state": ["type": "boolean", "default": true, "description": "False skips the final browser snapshot when a URL-only completion check already passed. Recovery still includes state."],
-                    "compact": ["type": "boolean", "default": false, "description": "Return a smaller final native observation after completion checks."],
+                    "compact": ["type": "boolean", "description": "Smaller final observation. Default: on when done_when is given (a verified goal replies in a few lines)."],
                     "effects": ["type": "boolean", "default": true, "description": "False skips per-step effect reads. Use a pinned window and a final completion check for known sequences."],
                     "screenshot": ["type": "boolean", "default": false, "description": "Also return a screenshot."],
                 ],
@@ -101,7 +101,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: HandoffTool.name,
-            description: "Use to hand off a bounded subtask in a native Mac app (5 to 30 steps), not for one or two known steps (use batch). GODSPEED runs it alone and returns only when done, stuck or unsure. Give app, goal and done_when. Optional values: text to type, by field name. It replays a saved recipe if one exists, else picks labelled controls itself, never pressing risky ones (Delete, Send, Buy, Pay). When unsure it returns the reason and the top options for you to decide.",
+            description: "Use for a bounded native Mac subtask with a checkable finish. Give app, goal and done_when. Handoff reuses a recipe or chooses labeled controls. It stops at risky actions or uncertainty and reports what it found.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -117,7 +117,7 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "browser",
-            description: "Use for web pages, in your own background Chrome tab; the user's tab is never touched. Not for native Mac apps (use batch or app tools), and never app tools in Google Chrome. Actions: open, go, read (numbered links, buttons, fields, headings; find: \"words\" lists only matching lines, full: true lists more), screenshot (visible page), click, drag (between visible controls in one tab), fill_field (default for replacing a form value), type (when the field needs key events or appending), copy, cut, paste (private clipboard), key, select, check, uncheck, hover, scroll, scroll_into_view, back, forward, reload, wait_for, peek (up to 6 URLs), tabs, use_tab, close_tab, wait, location (URL and title without page text), info, outline (visible headings), frames (document tree), read_text (read a named control or region), link_destination, control_state (visibility, enabled, checked), value (read one editable field), upload. Batch related field changes and use done_when to verify the result. For ordinary forms, use fill_field for text, select for dropdowns, and check for checkboxes. Replies already show what changed; read again only when unsure.",
+            description: "Use for web pages in an owned background Chrome tab. Find controls with read, then use their labels or current references. For forms, use fill_field, select and check. Use type for key events or appending. Batch related changes with a final check. Read again after uncertain delivery.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
@@ -229,13 +229,14 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "type_text",
-            description: "Use to type literal text into the focused field; not to replace a field's value (use set_value). Click the field first. Example: {\"app\": \"Notes\", \"text\": \"hello\"}.",
+            description: "Use to type literal text into the focused field; to set a field's whole value use set_value. Click the field first. replace: true selects the focused field's text first (search boxes, chat inputs set_value cannot write). Example: {\"app\": \"Notes\", \"text\": \"hello\"}.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "text": stringProperty(description: "Text to type"),
+                    "replace": ["type": "boolean", "description": "Select the focused field's existing text first, so the typed text replaces it"],
                     "key_method": keyMethodProperty(),
                 ],
                 required: ["app", "text"]

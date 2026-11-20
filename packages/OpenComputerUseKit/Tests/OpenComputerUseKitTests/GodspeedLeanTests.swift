@@ -590,7 +590,8 @@ final class GodspeedLeanTests: XCTestCase {
     func testDiffAlwaysAppliesWithStableNumbers() throws {
         // A new element takes a new number; the old ones keep theirs, so the diff lists only what changed.
         let before = "App=X\nWindow: w\n[legend]\n\t1 button Save\n\t2 text field To = a (w:str)"
-        let after = "App=X\nWindow: w\n[legend]\n\t1 button Save\n\t2 text field To = a (w:str)\n\t3 button New"
+            + (10...25).map { "\n\t\($0) button Another control \($0)" }.joined()
+        let after = before + "\n\t3 button New"
         let observation = ToolCallResult(content: [.text(after)], isError: false)
         let diffed = LeanOutput.diffed(observation, previous: before)
         XCTAssertTrue(diffed.textContent.contains("+ \t3 button New"), diffed.textContent)

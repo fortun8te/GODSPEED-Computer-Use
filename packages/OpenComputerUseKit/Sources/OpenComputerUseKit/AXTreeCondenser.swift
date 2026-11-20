@@ -138,9 +138,11 @@ enum AXTreeCondenser {
         if hasTrailingNewline { parts.removeLast() }
 
         // Rule 5: the header is everything before the first tree line.
-        let firstTree = parts.firstIndex(where: { parseLine($0).isTree }) ?? parts.count
+        // Each line is parsed once (this ran twice per line before).
+        let parsed = parts.map(parseLine)
+        let firstTree = parsed.firstIndex(where: \.isTree) ?? parts.count
         let header = Array(parts[..<firstTree])
-        var lines = parts[firstTree...].map { parseLine($0) }
+        var lines = Array(parsed[firstTree...])
 
         if options.dropHidden { lines = dropHidden(lines) }
         if options.dropStructuralNoise { lines = dropStructuralNoise(lines, unwrapSingleChild: options.unwrapSingleChild) }
@@ -176,14 +178,19 @@ enum AXTreeCondenser {
     }
 
     private static func parseLine(_ line: String) -> Line {
-        let scan = line.drop(while: { $0 == "\t" || $0 == " " })
-        let indent = String(line.prefix(line.count - scan.count))
-        let digits = scan.prefix(while: { $0.isASCII && $0.isNumber })
-        guard !digits.isEmpty, scan.dropFirst(digits.count).first == " " else {
-            return Line(raw: line)
-        }
-        let rest = String(scan.dropFirst(digits.count + 1))
-        return Line(raw: line, isTree: true, indent: indent, index: String(digits), rest: rest, role: roleName(of: rest))
+        // Byte scan: indentation, then ASCII digits, then one space. Avoids counting the whole line.
+        let bytes = line.utf8
+        var cursor = bytes.startIndex
+        while cursor < bytes.endIndex, bytes[cursor] == 9 || bytes[cursor] == 32 { cursor = bytes.index(after: cursor) }
+        let digitStart = cursor
+        while cursor < bytes.endIndex, (48...57).contains(bytes[cursor]) { cursor = bytes.index(after: cursor) }
+        guard cursor > digitStart, cursor < bytes.endIndex, bytes[cursor] == 32 else { return Line(raw: line) }
+        let restStart = bytes.index(after: cursor)
+        let rest = String(line[restStart...])
+        return Line(
+            raw: line, isTree: true, indent: String(line[..<digitStart]), index: String(line[digitStart..<cursor]),
+            rest: rest, role: roleName(of: rest)
+        )
     }
 
     private static let multiWordRoles = [
@@ -192,8 +199,11 @@ enum AXTreeCondenser {
         "search field", "web area", "split group", "tab group", "color well", "disclosure triangle", "date field",
     ]
 
+    /// The multi-word roles with their trailing space, built once (they were rebuilt for every line).
+    private static let multiWordRolePrefixes = multiWordRoles.map { (role: $0, prefix: $0 + " ") }
+
     private static func roleName(of rest: String) -> String {
-        for role in multiWordRoles where rest == role || rest.hasPrefix(role + " ") { return role }
+        for entry in multiWordRolePrefixes where rest == entry.role || rest.hasPrefix(entry.prefix) { return entry.role }
         if textParts(rest) != nil { return "text" }
         return String(rest.prefix(while: { $0 != " " }))
     }

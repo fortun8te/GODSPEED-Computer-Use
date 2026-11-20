@@ -117,18 +117,24 @@ final class TrajectoryLogTests: XCTestCase {
         XCTAssertNil(record["arguments"])
         XCTAssertNil(record["result_text"])
         let contents = try String(contentsOf: directory.appendingPathComponent(log.sessionID + ".jsonl"), encoding: .utf8)
-        XCTAssertFalse(contents.contains("PRIVATE_"))
+        XCTAssertFalse(contents.contains("PRIVATE_INPUT"))
+        XCTAssertFalse(contents.contains("PRIVATE_RESULT"))
+        XCTAssertNil(record["failure_detail"])
     }
 
-    func testTypedFailureCodeOmitsTheOriginalErrorMessage() throws {
-        let log = TrajectoryLog(environment: [:], directory: directory)
+    func testTypedFailureKeepsOnlyItsShapeAndReason() throws {
+        let log = TrajectoryLog(environment: [TrajectoryLog.failureDetailVariable: "1"], directory: directory)
         log.recordFailedToolCall(
             name: "get_app_state", arguments: ["app": "PRIVATE_APP"],
             error: ComputerUseError.permissionDenied("PRIVATE_MESSAGE"), startedAt: started()
         )
         let record = try XCTUnwrap(records(log).first)
         XCTAssertEqual(record["failure_code"] as? String, "permission_denied")
-        XCTAssertFalse(String(describing: record).contains("PRIVATE_"))
+        // The app name is kept (it says where failures happen); the message is Godspeed's own.
+        let detail = try XCTUnwrap(record["failure_detail"] as? [String: Any])
+        XCTAssertEqual((detail["arguments"] as? [String: Any])?["app"] as? String, "PRIVATE_APP")
+        XCTAssertNil(record["arguments"])
+        XCTAssertNil(record["result_text"])
     }
 
     func testDispatcherProducesReceiptWhenBatchStopsBeforeSendingInput() throws {

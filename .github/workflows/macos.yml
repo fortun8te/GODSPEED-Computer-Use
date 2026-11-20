@@ -21,6 +21,8 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Verify Godspeed behavior
         run: swift test --filter 'AXTreeCondenserTests/testCompactObservation|BackgroundDragTests|AppAgentAdmissionTests|AppAgentProxyTests|TrajectoryLogTests|BatchEffectsTests|DoneCheckTests|CursorTimingTests/testClickRipple|CursorTimingTests/testCursorLens|CursorTimingTests/testInteractionIndicator|GodspeedLeanTests|BrowserPageTests|HeadlessScenarioBankTests|PrivateClipboardTests|RecipeSafetyTests|BatchReceiptsTests|LabelSpellingsTests|ClientScopeTests|ClientScopeSafetyTests|testInitializeResponseContainsComputerUseInstructions'
+      - name: Verify compact replies, cursor identity and idle exit
+        run: swift test --filter 'CompactVerifiedReplyTests|CursorRequestEnvironmentTests|CursorGlideShapeTests|CursorWindowAnchorTests|LifecycleTests|LockedUseDispatchTests|testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep'
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: '24'
