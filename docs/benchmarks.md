@@ -13,6 +13,17 @@ Run `swift test --filter CompactVerifiedReplyTests` to reproduce the reply check
 
 The app agent used to check for idle exit every five seconds. It now arms a single deadline after the last client disconnects. `swift test --filter LifecycleTests` covers deadline changes as clients connect and disconnect. Whole-machine CPU, GPU and power measurements are pending.
 
+### Desktop cursor checks
+
+GitHub CI covers client names, cursor geometry and idle deadlines. Run the animation and window-follow checks on an unlocked Mac with Reduce Motion off. Enable Accessibility for the local test host to exercise the real button click. A second connected display lets the window-follow test cover both displays.
+
+```sh
+OPEN_COMPUTER_USE_CURSOR_NAMESPACE=godspeed-test swift test \
+  --filter 'CursorHideTimerTests|CursorWindowFollowTests'
+```
+
+The 1.1.10 desktop run passed both the two-display follow check and the live click on a moved window. Those checks verify the cursor's behavior and placement.
+
 ## Earlier runs
 
 These recorded runs used GPT-6 Luna at low reasoning. A task checker scored the final result.
