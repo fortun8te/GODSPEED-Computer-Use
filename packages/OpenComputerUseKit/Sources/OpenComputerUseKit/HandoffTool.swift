@@ -4,10 +4,8 @@ import Foundation
 /// when the goal is done, it is stuck, or it is unsure. Every action uses a background call
 /// bound to the window it was selected from.
 ///
-/// Loop: replay a saved recipe for the goal when there is one; else read the state, build up to 12 candidate
-/// actions (labelled controls the goal mentions, each given value typed into a matching field, Return, a
-/// scroll). Fill an unambiguous empty field with the exact requested value directly. For other choices,
-/// score the options with the local helper and only act on a clear winner. Check `done_when` after each step.
+/// Loop: resolve exact actions first, then try a verified recipe or ask the local helper to rank
+/// up to 12 relevant actions. Check `done_when` after every action.
 /// It stops on done, on stuck (two steps that changed nothing, two failed steps, or the checker's stuck
 /// verdict), on a risky control (Delete, Send, Buy, Pay ...: escalated, never pressed), and on budget.
 enum HandoffTool {
@@ -214,67 +212,55 @@ enum HandoffTool {
         typedAny: Bool,
         scrollsDone: Int
     ) -> [Candidate] {
-        var found: [Candidate] = []
-        func add(_ kind: Candidate.Kind, text: String, tool: String, arguments: [String: Any], risky: Bool = false, key: String) {
-            guard !tried.contains(key), !found.contains(where: { $0.key == key }) else { return }
-            found.append(Candidate(id: "", kind: kind, text: text, tool: tool, arguments: arguments, risky: risky, key: key))
+        var found: [(candidate: Candidate, score: Double)] = []
+        var seen = tried
+        func add(_ candidate: Candidate, score: Double) {
+            guard seen.insert(candidate.key).inserted else { return }
+            found.append((candidate, score))
         }
 
-        // 1. Typing: each value into the fields that fit its key, else into up to two empty fields.
-        // Never into a password or other secret field: that is the model's call (and the secret stays out of d1).
+        // Rank all actions together before applying the shared cap. A fuzzy typing suggestion should
+        // not crowd out a click the goal names, or a field named explicitly by the supplied key.
         let fields = controls.filter { fieldRoles.contains($0.role) && !$0.disabled && !RecipeLocator.looksSecret($0.label) }
         for (key, value) in values where !RecipeLocator.looksSecret(key) {
             let keyWords = Set(words(key))
-            var matches = fields.filter { field in
-                let name = field.label.lowercased()
-                let loose = key.count >= 3 && name.contains(key.lowercased())
-                return loose || !keyWords.isDisjoint(with: words(field.label))
-            }
-            if matches.isEmpty { matches = Array(fields.filter { ($0.value ?? "").isEmpty && ($0.role != "text entry area" || $0.label.isEmpty) }.prefix(2)) }
-            for field in matches.prefix(3) {
-                if field.value == value || field.label == value { continue } // already there
-                let name = field.label.isEmpty || field.role == "text entry area" ? field.role : field.label
-                let shown = value.count > 40 ? String(value.prefix(40)) + "..." : value
-                add(.setValue, text: "type \"\(shown)\" into \"\(name)\"", tool: "set_value",
-                    arguments: ["element_index": String(field.index), "value": value], key: "set|\(value)|\(field.index)")
+            let named = fields.filter { !keyWords.isDisjoint(with: words($0.label)) }
+            let fallback = fields.filter { ($0.value ?? "").isEmpty && ($0.role != "text entry area" || $0.label.isEmpty) }
+            for field in named.isEmpty ? Array(fallback.prefix(2)) : named {
+                if field.value == value || field.label == value { continue }
+                let score: Double = sameLabel(field.label, key) ? 12 : (named.isEmpty ? 0.25 : 1)
+                add(fill(field, value: value), score: score)
             }
         }
 
-        // 2. Clicks on labelled controls, ranked by how well they fit the goal.
-        var goalWords = Set(words(goal + " " + doneSummary + " " + values.map(\.key).joined(separator: " ")))
-        goalWords.subtract(stopWords)
-        let labelCounts = Dictionary(controls.map { ($0.label, 1) }, uniquingKeysWith: +)
-        let ranked = controls.enumerated().compactMap { offset, control -> (Double, Int, Control)? in
-            guard clickRoles.contains(control.role), !control.disabled, !control.label.isEmpty else { return nil }
-            // A risky control is offered only when the goal names it; a generic "Next" or "Save" needs no mention.
+        let explicitWords = Set(words(goal)).subtracting(stopWords)
+        let clickLabel = explicitClickLabel(goal)
+        let goalWords = explicitWords.union(words(doneSummary + " " + values.map(\.key).joined(separator: " "))).subtracting(stopWords)
+        let labelCounts = Dictionary(grouping: controls) { $0.label.lowercased() }.mapValues(\.count)
+        for control in controls where clickRoles.contains(control.role) && !control.disabled && !control.label.isEmpty {
             let risky = isRisky(label: control.label)
-            // The risky word itself (Delete, Send ...) must be in the goal, not just the control's other words.
-            if risky, Set(words(control.label)).intersection(riskyWords).isDisjoint(with: goalWords) { return nil }
+            let labelWords = Set(words(control.label)).subtracting(stopWords)
+            if risky, labelWords.intersection(riskyWords).isDisjoint(with: explicitWords) { continue }
             let score = relevance(label: control.label, goalWords: goalWords, countingProgressWords: !risky)
-            guard score > 0 else { return nil }
-            return (score, offset, control)
-        }.sorted { $0.0 != $1.0 ? $0.0 > $1.0 : $0.1 < $1.1 }
-        for (_, _, control) in ranked {
-            let unique = labelCounts[control.label] == 1
-            let args = ["element_index": String(control.index)]
-            // Same-named controls are different actions: the position is part of what was tried.
-            add(.click, text: "click \"\(control.label)\"" + (unique ? "" : " (#\(control.index))"), tool: "click", arguments: args,
-                risky: isRisky(label: control.label), key: "click|\(control.role)|\(control.label)" + (unique ? "" : "|\(control.index)"))
+            guard score > 0 else { continue }
+            let named = !labelWords.isEmpty && labelWords.isSubset(of: explicitWords)
+            let priority = clickLabel.map { sameLabel(control.label, $0) } == true ? 16 : (named ? 8 : 0)
+            add(click(control, unique: labelCounts[control.label.lowercased()] == 1), score: Double(priority) + min(3, score))
         }
 
-        // 3. Return may trigger a default submission even when no button reports its role.
         if typedAny {
-            add(.pressReturn, text: "press Return", tool: "press_key", arguments: ["key": "Return"], risky: true, key: "return")
+            add(Candidate(id: "", kind: .pressReturn, text: "press Return", tool: "press_key",
+                          arguments: ["key": "Return"], risky: true, key: "return"), score: 0)
+        }
+        if scrollsDone < maxScrolls, let area = controls.first(where: { $0.role == "scroll area" && !$0.disabled }) {
+            add(Candidate(id: "", kind: .scroll, text: "scroll down", tool: "scroll",
+                          arguments: ["direction": "down", "element_index": String(area.index)],
+                          risky: false, key: "scroll|\(scrollsDone)"), score: 0)
         }
 
-        // 4. Scroll down, a few times.
-        if scrollsDone < maxScrolls, let area = controls.first(where: { $0.role == "scroll area" }) {
-            add(.scroll, text: "scroll down", tool: "scroll",
-                arguments: ["direction": "down", "element_index": String(area.index)], key: "scroll|\(scrollsDone)")
-        }
-
-        // Typing first, then the best clicks, Return, scroll; the cut falls on the weakest clicks.
-        let limited = Array(found.prefix(maxCandidates))
+        let limited = found.enumerated().sorted {
+            $0.element.score == $1.element.score ? $0.offset < $1.offset : $0.element.score > $1.element.score
+        }.prefix(maxCandidates).map { $0.element.candidate }
         return limited.enumerated().map { offset, item in
             Candidate(id: String(Character(UnicodeScalar(UInt8(97 + offset)))), kind: item.kind, text: item.text, tool: item.tool,
                       arguments: item.arguments, risky: item.risky, key: item.key)
@@ -292,24 +278,53 @@ enum HandoffTool {
         lhs.trimmingCharacters(in: .whitespaces).caseInsensitiveCompare(rhs.trimmingCharacters(in: .whitespaces)) == .orderedSame
     }
 
-    /// A deterministic write requires an explicit value and completion check for the same field.
-    /// Ambiguity, existing text, or inferred labels leave the selection to the local checker.
-    static func exactFieldFill(request: Request, controls: [Control], candidates: [Candidate]) -> Candidate? {
+    private static func click(_ control: Control, unique: Bool) -> Candidate {
+        let suffix = unique ? "" : " (#\(control.index))"
+        return Candidate(id: "", kind: .click, text: "click \"\(control.label)\"\(suffix)", tool: "click",
+                         arguments: ["element_index": String(control.index)], risky: isRisky(label: control.label),
+                         key: "click|\(control.role)|\(control.label)" + (unique ? "" : "|\(control.index)"))
+    }
+
+    private static func fill(_ field: Control, value: String) -> Candidate {
+        let name = field.label.isEmpty || field.role == "text entry area" ? field.role : field.label
+        let shown = value.count > 40 ? String(value.prefix(40)) + "..." : value
+        return Candidate(id: "", kind: .setValue, text: "type \"\(shown)\" into \"\(name)\"", tool: "set_value",
+                         arguments: ["element_index": String(field.index), "value": value],
+                         risky: isRisky(label: field.label) || isRisky(label: field.role), key: "set|\(value)|\(field.index)")
+    }
+
+    /// A deterministic write requires a unique empty field and an explicit equality check for the value.
+    static func exactFieldFill(request: Request, controls: [Control], tried: Set<String>) -> Candidate? {
         for (label, value) in request.values where !value.isEmpty && !RecipeLocator.looksSecret(label) && !isRisky(label: label) {
             let checks = request.doneWhen.compactMap { condition -> String? in
                 guard case .field(let field, let expected) = condition, sameLabel(field, label) else { return nil }
                 return expected
             }
             guard checks == [value], request.values.filter({ sameLabel($0.key, label) }).count == 1 else { continue }
-            let matches = controls.filter { fieldRoles.contains($0.role) && sameLabel($0.label, label) }
+            let matches = controls.filter { (fieldRoles.contains($0.role) || $0.role == "secure text field") && sameLabel($0.label, label) }
             guard matches.count == 1, let field = matches.first,
                   field.role == "text field", !field.disabled, field.value == "" else { continue }
-            if let candidate = candidates.first(where: {
-                $0.kind == .setValue && $0.arguments["element_index"] as? String == String(field.index)
-                    && $0.arguments["value"] as? String == value
-            }) { return candidate }
+            let candidate = fill(field, value: value)
+            if !tried.contains(candidate.key) { return candidate }
         }
         return nil
+    }
+
+    private static func explicitClickLabel(_ goal: String) -> String? {
+        guard goal.lowercased().hasPrefix("click ") else { return nil }
+        let label = String(goal.dropFirst("click ".count)).trimmingCharacters(in: .whitespaces)
+        return label.isEmpty ? nil : label
+    }
+
+    static func exactAction(request: Request, controls: [Control], tried: Set<String>) -> Candidate? {
+        if let fill = exactFieldFill(request: request, controls: controls, tried: tried) { return fill }
+        // Only the whole "click <label>" instruction permits a deterministic click.
+        guard !request.doneWhen.isEmpty, request.values.isEmpty, let label = explicitClickLabel(request.goal) else { return nil }
+        let matches = controls.filter { clickRoles.contains($0.role) && sameLabel($0.label, label) }
+        guard matches.count == 1, let control = matches.first, !control.disabled,
+              !RecipeLocator.looksSecret(control.label) else { return nil }
+        let candidate = click(control, unique: true)
+        return !candidate.risky && !tried.contains(candidate.key) ? candidate : nil
     }
 
     static func check(_ conditions: [DoneCheck.Condition], screen: String) -> DoneCheck.Result {
@@ -333,6 +348,9 @@ enum HandoffTool {
     static func decide(candidates: [Candidate], probabilities: [String: Double]?) -> Decision {
         guard !candidates.isEmpty else { return .escalate("no action on screen fits the goal") }
         guard let probabilities else { return .escalate("the checker model is not available, so GODSPEED cannot rank the options") }
+        guard probabilities.values.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+            return .escalate("the checker returned invalid scores")
+        }
         let scored = candidates.map { ($0, probabilities[$0.id] ?? 0) }.sorted { $0.1 > $1.1 }
         let (best, p) = scored[0]
         let runnerUp = max(scored.dropFirst().first?.1 ?? 0, probabilities["none"] ?? 0)
@@ -354,11 +372,16 @@ enum HandoffTool {
 
     /// An unattended replay cannot type into an unknown focus, send shortcuts, or operate another app.
     static func isSafeRecipeStep(_ step: BatchTool.Step, app: String) -> Bool {
-        if let stepApp = step.arguments["app"] as? String, BatchRecipes.normalize(app) != BatchRecipes.normalize(stepApp) {
+        if let stepApp = step.arguments["app"] as? String, !BatchRecipes.sameApp(app, stepApp) {
             return false
         }
+        guard step.arguments["window_id"] == nil else { return false }
         switch step.tool {
-        case "get_app_state", "query", "wait":
+        case "get_app_state", "query":
+            return true
+        case "wait":
+            guard let wait = try? BatchEffects.Wait(arguments: step.arguments) else { return false }
+            if case .window = wait.kind { return false }
             return true
         case "click", "set_value":
             let args = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
@@ -378,18 +401,19 @@ enum HandoffTool {
         }
     }
 
-    /// Bind the executable step to the control it actually found, even if a stored locator healed.
+    /// Bind the executable step to fresh evidence from the original window.
     static func bindRecipeStep(_ step: BatchTool.Step, app: String, state: String?) -> BatchTool.Step? {
-        guard isSafeRecipeStep(step, app: app) else { return nil }
-        if step.isReadOnly { return step }
+        guard isSafeRecipeStep(step, app: app), let state, let window = observedWindowID(in: state) else { return nil }
         var args = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
-        guard let state, let window = observedWindowID(in: state), let label = args["label"] as? String else { return nil }
+        args["app"] = app
+        args["window_id"] = window
+        if step.isReadOnly { return BatchTool.Step(tool: step.tool, arguments: args) }
+        guard let label = args["label"] as? String else { return nil }
         let roles = step.tool == "set_value" ? fieldRoles : clickRoles
         let matches = parseControls(state).filter { roles.contains($0.role) && sameLabel($0.label, label) }
         guard matches.count == 1, let control = matches.first, !control.disabled else { return nil }
         args["label"] = nil
         args["element_index"] = String(control.index)
-        args["window_id"] = window
         if step.tool == "click" { args["click_method"] = "accessibility" }
         return BatchTool.Step(tool: step.tool, arguments: args)
     }
@@ -401,9 +425,14 @@ enum HandoffTool {
 
     static func replayResult(_ result: ToolCallResult) -> Replay {
         if batchReportsVerifiedDone(result) { return .verified }
-        guard let receipt = result.batchReceipt,
-              receipt.steps.allSatisfy({ $0.deliveryState == .notSent }) else { return .uncertain }
-        return .incomplete
+        guard let receipt = result.batchReceipt else { return .uncertain }
+        if receipt.totalSteps == 0, receipt.doneCheck == .weakEvidence, let note = result.primaryText {
+            return .alreadySatisfied(note)
+        }
+        if receipt.stop == .windowChanged || result.failureCode == .windowChanged || result.failureCode == .staleRef {
+            return .blocked("The saved window changed. Read the intended window before continuing.")
+        }
+        return receipt.steps.allSatisfy { $0.deliveryState == .notSent } ? .incomplete : .uncertain
     }
 
     static func percent(_ value: Double) -> String { "\(Int((value * 100).rounded()))%" }
@@ -477,7 +506,7 @@ enum HandoffTool {
         var now: () -> TimeInterval
     }
 
-    enum Replay { case verified, incomplete, uncertain }
+    enum Replay: Equatable { case verified, incomplete, uncertain, blocked(String), alreadySatisfied(String) }
 
     static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
@@ -534,7 +563,13 @@ enum HandoffTool {
         guard hasTime() else {
             return finish(.budget, "the time budget elapsed before any action was sent", initial: initial, latest: state)
         }
-        if request.windowID == nil, let replayed = deps.replay(state) {
+        var initialControls = parseControls(state)
+        var initialExact = exactAction(request: request, controls: initialControls, tried: tried)
+        if initialExact == nil, request.windowID == nil, let replayed = deps.replay(state) {
+            if case .blocked(let reason) = replayed { return finish(.escalate, reason, initial: initial, latest: state) }
+            if case .alreadySatisfied(let evidence) = replayed {
+                return finish(.done, evidence, initial: initial, latest: state)
+            }
             steps.append("replayed the saved recipe")
             if replayed == .verified {
                 deliveryState = .verified
@@ -557,20 +592,23 @@ enum HandoffTool {
             }
             steps[steps.count - 1] = "the saved recipe did not finish; continued by hand"
             initial = fresh
+            initialControls = parseControls(fresh)
+            initialExact = exactAction(request: request, controls: initialControls, tried: tried)
         }
 
         for number in 1...request.maxSteps {
             if !hasTime() {
                 return finish(.budget, "\(Int(request.timeBudget)) seconds used", initial: initial, latest: state)
             }
-            let controls = parseControls(state)
-            let options = candidates(
+            let controls = number == 1 ? initialControls : parseControls(state)
+            let exact = number == 1 ? initialExact : exactAction(request: request, controls: controls, tried: tried)
+            let options = exact == nil ? candidates(
                 goal: request.goal, doneSummary: doneSummary, values: request.values,
                 controls: controls, tried: tried, typedAny: typedAny, scrollsDone: scrolls
-            )
+            ) : []
             var probabilities: [String: Double]?
             let decision: Decision
-            if let exact = exactFieldFill(request: request, controls: controls, candidates: options) {
+            if let exact {
                 decision = .act(exact, probability: 1)
             } else if !options.isEmpty, options.allSatisfy(\.risky) {
                 decision = .escalate("the only available actions are risky")
@@ -584,7 +622,10 @@ enum HandoffTool {
             }
             switch decision {
             case .escalate(let reason):
-                let ranked = options.map { ($0.text, probabilities?[$0.id] ?? 0) }.sorted { $0.1 > $1.1 }
+                let ranked = options.map { option in
+                    let score = probabilities?[option.id] ?? 0
+                    return (option.text, (0...1).contains(score) ? score : 0)
+                }.sorted { $0.1 > $1.1 }
                 return finish(.escalate, reason, initial: initial, latest: state, options: ranked)
             case .act(let choice, _):
                 guard hasTime() else {
@@ -637,7 +678,7 @@ enum HandoffTool {
                 }
                 // A changed screen already gives the next step new evidence. Ask the checker
                 // only on a stall that the two-action rule has not yet handled.
-                if unchanged, number >= 2, number < request.maxSteps,
+                if exact == nil, unchanged, number >= 2, number < request.maxSteps,
                    hasTime() {
                     let summary = RefereeSummary.build(
                         goal: request.goal, steps: steps.map { ($0, "ok") }, repeatedFailures: failures,
@@ -725,15 +766,23 @@ extension ComputerUseToolDispatcher {
             },
             replay: { [self] state in
                 // Recipe variables are named after field labels ("Name" -> "name"); the handoff's value keys map to them.
+                guard BatchRecipes.isEnabled else { return nil }
                 var recipeValues: [String: String] = [:]
-                for (key, value) in request.values { recipeValues[BatchRecipes.variableName(label: key)] = value }
-                let shape = BatchRecipes.windowShape(title: BatchEffects.windowTitle(in: state))
-                guard BatchRecipes.isEnabled,
-                      let recipe = recipeStore.find(app: app, goal: request.goal, values: recipeValues, shape: shape)
-                else { return nil }
-                let storedSteps = BatchRecipes.substitute(recipe.steps, params: recipe.params, values: recipeValues).steps
-                guard let steps = try? BatchTool.parseSteps(storedSteps, defaultApp: app),
-                      steps.allSatisfy({ HandoffTool.isSafeRecipeStep($0, app: app) }) else { return nil }
+                for (key, value) in request.values {
+                    let name = BatchRecipes.variableName(label: key)
+                    guard recipeValues.updateValue(value, forKey: name) == nil else {
+                        return .blocked("More than one value names the same recipe slot. Confirm the inputs.")
+                    }
+                }
+                let recipe: BatchRecipes.Recipe
+                switch recipeStore.lookup(app: app, goal: request.goal, values: recipeValues, state: state) {
+                case .match(let match): recipe = match
+                case .blocked(let reason): return .blocked(reason)
+                case .missing: return nil
+                }
+                guard recipe.doneWhen == request.doneWhen else {
+                    return .blocked("The recipe's done_when changed. Confirm the check and provide fresh steps.")
+                }
                 var batchArguments: [String: Any] = ["app": app, "goal": request.goal]
                 if !recipeValues.isEmpty { batchArguments["values"] = recipeValues }
                 if let doneWhen = arguments["done_when"] { batchArguments["done_when"] = doneWhen }
