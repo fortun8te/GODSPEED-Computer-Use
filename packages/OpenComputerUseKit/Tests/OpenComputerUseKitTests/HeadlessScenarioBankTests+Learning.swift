@@ -108,7 +108,7 @@ extension HeadlessScenarioBankTests {
         var receipt = TrajectoryLog.BatchReceipt(totalSteps: clicks)
         let step = TrajectoryLog.BatchReceipt.Step(
             failureCode: disabled ? .toolError : nil,
-            observation: disabled ? BatchEffects.failureReceipt("Button is disabled. Nothing sent.") :
+            observation: disabled ? BatchEffects.failureReceipt(.notSent) :
                 BatchEffects.sawNoChange(effects) ? .noEffectSeen : nil
         )
         receipt.steps = Array(repeating: step, count: clicks)
