@@ -568,7 +568,7 @@ private final class AppAgentConnection: @unchecked Sendable {
         // The pointer belongs to the reader until EOF. The worker only writes.
         let source = AppAgentLineSource(file: input)
         Thread.detachNewThread { [self] in
-            source.read(into: requests)
+            source.read(into: requests, output: output)
             lockedUse.end(disconnecting: true)
         }
         defer {
@@ -1130,17 +1130,24 @@ private final class AppAgentLineSource: @unchecked Sendable {
 
     init(file: UnsafeMutablePointer<FILE>) { self.file = file }
 
-    func read(into requests: MCPRequestStream) {
+    func read(into requests: MCPRequestStream, output: UnsafeMutablePointer<FILE>) {
         defer { fclose(file) }
         while let line = readAgentLine(file) {
-            let accepted = autoreleasepool {
+            let intake = autoreleasepool {
                 let envelope = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
                 let rpc = envelope?["kind"] as? String == "mcp" ? envelope?["line"] as? String : nil
-                return requests.receive(line, rpcLine: rpc)
+                return requests.intake(line, rpcLine: rpc)
             }
-            if !accepted {
+            switch intake {
+            case .accepted:
+                continue
+            case .busy:
+                // Refuse this request only. The active request keeps running and the connection stays open.
+                if let reply = MCPRequestStream.busyEnvelope(for: line) { writeAgentLine(reply, to: output) }
+            case .closed:
                 shutdown(fileno(file), SHUT_RDWR)
-                break
+                requests.disconnect()
+                return
             }
         }
         requests.disconnect()
