@@ -53,7 +53,7 @@ enum SnapshotMode {
 /// OPEN_COMPUTER_USE_BACKGROUND_ONLY=1: the user keeps working on this Mac. Nothing OCU does may
 /// bring an app or window in front of their work or take focus: no unhide, activate or raise to
 /// read or click, no foreground launch, no Raise action, no physical-pointer fallback.
-func backgroundOnlyMode(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+func backgroundOnlyMode(environment: [String: String] = RequestConfiguration.environment) -> Bool {
     let raw = environment["OPEN_COMPUTER_USE_BACKGROUND_ONLY"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "0"
     return ["1", "true", "yes", "on"].contains(raw)
 }
@@ -2509,7 +2509,7 @@ func summaryMarkdownLinkText(text: String, url: String) -> String {
 /// On-screen rows of a collection, at most `OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS` (default 20).
 /// Without usable frames the first rows are kept, so nothing disappears entirely.
 private let maxCollectionRows: Int = {
-    let raw = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS"] ?? ""
+    let raw = RequestConfiguration.environment["OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS"] ?? ""
     return Int(raw).map { max(1, $0) } ?? 20
 }()
 

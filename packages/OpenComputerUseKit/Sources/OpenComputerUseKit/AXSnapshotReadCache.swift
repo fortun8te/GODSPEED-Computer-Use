@@ -39,7 +39,7 @@ final class AXSnapshotReadCache: NSObject {
     }
 
     static func withSnapshot<T>(_ body: () throws -> T) rethrows -> T {
-        let cache = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_DISABLE_AX_READ_CACHE"] == "1"
+        let cache = RequestConfiguration.environment["OPEN_COMPUTER_USE_DISABLE_AX_READ_CACHE"] == "1"
             ? nil : AXSnapshotReadCache()
         return try withCache(cache, body)
     }

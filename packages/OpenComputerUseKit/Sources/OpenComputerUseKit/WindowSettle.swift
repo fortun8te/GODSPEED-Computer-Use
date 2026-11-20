@@ -21,11 +21,11 @@ import Foundation
 enum WindowSettle {
     // MARK: Still: frame-driven settle for action read-back
 
-    static let enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_SETTLE_BY_FRAME"]?
+    static var enabled: Bool {
+        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_SETTLE_BY_FRAME"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     /// Minimum wait before the first comparison, so an animation that has not started yet is not missed.
     static let floor: TimeInterval = 0.02

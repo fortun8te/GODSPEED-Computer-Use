@@ -5,11 +5,11 @@ import Foundation
 /// `[open-computer-use] timing <label> <ms>ms` so a tool session can be
 /// profiled without changing tool output.
 enum TimingLog {
-    nonisolated(unsafe) static var enabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_DEBUG_TIMING"]?
+    static var enabled: Bool {
+        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_DEBUG_TIMING"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         return ["1", "true", "yes", "on"].contains(value)
-    }()
+    }
 
     static func now() -> TimeInterval {
         ProcessInfo.processInfo.systemUptime
@@ -39,7 +39,7 @@ enum InputTiming {
     static func milliseconds(
         _ variable: String,
         default fallback: Double,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = RequestConfiguration.environment
     ) -> TimeInterval {
         guard let raw = environment[variable], let ms = Double(raw) else { return fallback / 1000 }
         return max(0, ms) / 1000
@@ -51,24 +51,30 @@ enum InputTiming {
     // margin over the passing minimum. Focus records and CGEvents travel
     // different channels, which is why a small gap between them stays.
     /// Gap after a synthetic focus / defocus record (sky_click and sky_key). Was 40 ms.
-    static let focusRecordSettle = milliseconds("OPEN_COMPUTER_USE_FOCUS_RECORD_SETTLE_MS", default: 10)
+    static var focusRecordSettle: TimeInterval {
+        milliseconds("OPEN_COMPUTER_USE_FOCUS_RECORD_SETTLE_MS", default: 10)
+    }
     /// Multiplier for the sky_click recipe gaps (move/primer/click pairs) and the renderer settle. Was 1.
-    static let skyClickDelayScale: Double = {
-        guard let raw = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_SKY_CLICK_DELAY_SCALE"], let scale = Double(raw) else { return 0.2 }
+    static var skyClickDelayScale: Double {
+        guard let raw = RequestConfiguration.environment["OPEN_COMPUTER_USE_SKY_CLICK_DELAY_SCALE"], let scale = Double(raw) else { return 0.2 }
         return max(0, scale)
-    }()
+    }
     /// Gap between Unicode chunks in type_text. Keep the established default for
     /// app/toolkit compatibility; callers can explicitly tune it after testing.
-    static let typeChunkDelay = milliseconds(
-        "OPEN_COMPUTER_USE_TYPE_CHUNK_DELAY_MS",
-        default: typeChunkDelayDefaultMilliseconds
-    )
+    static var typeChunkDelay: TimeInterval {
+        milliseconds(
+            "OPEN_COMPUTER_USE_TYPE_CHUNK_DELAY_MS",
+            default: typeChunkDelayDefaultMilliseconds
+        )
+    }
     /// Gap after a press_key chord. Keep the established default because the
     /// target may process its event queue asynchronously.
-    static let pressKeySettle = milliseconds(
-        "OPEN_COMPUTER_USE_PRESS_KEY_SETTLE_MS",
-        default: pressKeySettleDefaultMilliseconds
-    )
+    static var pressKeySettle: TimeInterval {
+        milliseconds(
+            "OPEN_COMPUTER_USE_PRESS_KEY_SETTLE_MS",
+            default: pressKeySettleDefaultMilliseconds
+        )
+    }
 }
 
 /// Poll `condition` every `interval` until it holds or `timeout` elapses.
