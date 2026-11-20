@@ -361,6 +361,20 @@ final class BrowserBridge: @unchecked Sendable {
         idleTimer.schedule(deadline: .now() + remaining, leeway: .milliseconds(500))
     }
 
+    /// CDP methods an owned-tab write may send. Calls and hint probes share this list.
+    static let ownedWriteMethods: Set<String> = [
+        "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
+        "Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.getPartialAXTree",
+        "Accessibility.queryAXTree", "DOM.getDocument", "DOM.resolveNode", "DOM.focus",
+        "DOM.describeNode", "Page.getFrameTree", "Emulation.setFocusEmulationEnabled",
+        "Input.insertText",
+    ]
+
+    /// Whether a CDP command may go to the owned tab during an owned-tab write.
+    static func ownedWriteMethodAllowed(_ method: String, tabID: Int?, ownedTabID: Int) -> Bool {
+        tabID == ownedTabID && ownedWriteMethods.contains(method)
+    }
+
     /// Calls one OBU tool and returns its text and error flag. One request at a time.
     func callTool(
         _ name: String, arguments: [String: Any], timeout: TimeInterval, referenceGeneration: Int? = nil
@@ -369,16 +383,10 @@ final class BrowserBridge: @unchecked Sendable {
             if let write = Self.ownedWrite {
                 // Fence helper restart, a different tab, and commands that can
                 // move UI focus or affect anything outside this CDP target.
-                let allowed: Set<String> = [
-                    "Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.releaseObject",
-                    "Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.getPartialAXTree",
-                    "Accessibility.queryAXTree", "DOM.getDocument", "DOM.resolveNode", "DOM.focus",
-                    "DOM.describeNode", "Page.getFrameTree", "Emulation.setFocusEmulationEnabled",
-                    "Input.insertText",
-                ]
                 guard write.bridge === self, process?.isRunning == true, helperGeneration == write.generation,
-                      openedTabs.contains(write.id), arguments["tab_id"] as? Int == write.id,
-                      name == "cdp", let method = arguments["method"] as? String, allowed.contains(method) else {
+                      openedTabs.contains(write.id), name == "cdp",
+                      let method = arguments["method"] as? String,
+                      Self.ownedWriteMethodAllowed(method, tabID: arguments["tab_id"] as? Int, ownedTabID: write.id) else {
                     throw ComputerUseError.stateUnavailable("browser: the parallel write lost its owned tab or needs exclusive access. Inspect the tab before repeating the action.")
                 }
             }
@@ -407,12 +415,23 @@ final class BrowserBridge: @unchecked Sendable {
     ) throws -> [[String: Any]?] {
         try withToolConnection {
             guard process?.isRunning == true, generation == helperGeneration else { return [] }
-            var requests: [Int] = []
-            defer { if let last = requests.last { responses.discard(through: last) } }
+            // One slot per command, so replies stay aligned with their commands. A nil slot was never sent.
+            var requests: [Int?] = []
+            defer { if let last = requests.compactMap({ $0 }).last { responses.discard(through: last) } }
+            // Hint probes obey the same owned-write scope as every other command.
+            func permitted(_ method: String) -> Bool {
+                guard let write = Self.ownedWrite else { return true }
+                return write.bridge === self && helperGeneration == write.generation && openedTabs.contains(write.id)
+                    && Self.ownedWriteMethodAllowed(method, tabID: tab["tab_id"] as? Int, ownedTabID: write.id)
+            }
             for (method, params) in commands {
                 try BrowserRequestContext.validateCurrent()
                 let remaining = deadline - TimingLog.now()
                 guard remaining > 0 else { break }
+                guard permitted(method) else {
+                    requests.append(nil)
+                    continue
+                }
                 var args = tab
                 args["method"] = method
                 args["params"] = params
@@ -423,9 +442,9 @@ final class BrowserBridge: @unchecked Sendable {
                 try send(["jsonrpc": "2.0", "id": id, "method": "tools/call",
                           "params": ["name": "cdp", "arguments": args]], deadline: deadline)
             }
-            TimingLog.count("browser.hint_commands", requests.count)
-            return requests.map { id in
-                guard let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
+            TimingLog.count("browser.hint_commands", requests.compactMap { $0 }.count)
+            return requests.map { slot in
+                guard let id = slot, let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
                       let result = message["result"] as? [String: Any],
                       let reply = try? toolReply(result), !reply.isError,
                       let object = try? JSONSerialization.jsonObject(with: Data(reply.text.utf8)) as? [String: Any],
