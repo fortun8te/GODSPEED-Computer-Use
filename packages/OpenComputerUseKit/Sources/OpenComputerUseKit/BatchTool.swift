@@ -1214,7 +1214,10 @@ extension ComputerUseToolDispatcher {
                 screenChanged: screenChanged,
                 dialogOpen: RefereeSummary.dialogOpen(in: state),
                 changes: changes,
-                screen: RefereeSummary.screen(from: state), maxCharacters: Referee.maxViewCharacters
+                // Select evidence before the summary applies its screen budget.
+                screen: RefereeView.build(state: state, goal: goal, doneWhen: lastStepText,
+                                                 limit: Referee.maxViewCharacters / 2),
+                maxCharacters: Referee.maxViewCharacters
             )
             let result = unchanged ? lastResultText + "; app unchanged since the previous batch" : lastResultText
             if let verdict = Referee.decide(goal: goal, lastStep: lastStepText, result: result, summary: summary,
