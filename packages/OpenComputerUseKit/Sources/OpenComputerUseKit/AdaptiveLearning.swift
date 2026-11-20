@@ -25,6 +25,7 @@ final class AdaptiveLearning: @unchecked Sendable {
     let failures = FailureSignatureStore()
     let routes = RouteBandit()
     let settle = ParameterTuner(bounds: AdaptiveLearning.settleBounds)
+    lazy var hints = FailureHintTracker(store: failures, save: { [unowned self] in self.saveFailures() })
     private let saveLock = NSLock()
 
     init(directory: URL) {
