@@ -481,6 +481,85 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNotNil(BrowserRules.appendNote(expected: "hello!", actual: nil))
     }
 
+    func testAppendExpectationInsertsAtTheCapturedSelectionInUTF16Offsets() {
+        // A nonterminal caret: the text lands between the captured offsets, not at the end.
+        XCTAssertEqual(BrowserRules.appendExpectation(value: "abcd", selectionStart: 2, selectionEnd: 2, typed: "X"), "abXcd")
+        // A selection is replaced, and offsets count UTF-16 units (the emoji takes two).
+        XCTAssertEqual(BrowserRules.appendExpectation(value: "a\u{1F600}bc", selectionStart: 3, selectionEnd: 4, typed: "X"), "a\u{1F600}Xc")
+        XCTAssertNil(BrowserRules.appendExpectation(value: "ab", selectionStart: 3, selectionEnd: 3, typed: "X"))
+        XCTAssertNil(BrowserRules.appendExpectation(value: "ab", selectionStart: 2, selectionEnd: 1, typed: "X"))
+    }
+
+    func testDroppedDuplicateAppendIsNotConfirmedEvenWhenTheTextAlreadySits() throws {
+        // First append landed: the field reads "hellox". A second, identical append was dropped.
+        let expected = try XCTUnwrap(BrowserRules.appendExpectation(value: "hellox", selectionStart: 6, selectionEnd: 6, typed: "x"))
+        XCTAssertEqual(expected, "helloxx")
+        XCTAssertTrue(BrowserRules.fieldMatches(actual: "hellox", typed: "x", replaced: false), "the loose check alone would accept it")
+        XCTAssertNotNil(BrowserRules.appendNote(expected: expected, actual: "hellox"))
+        XCTAssertNil(BrowserRules.appendNote(expected: expected, actual: "helloxx"))
+    }
+
+    func testClickTargetReplyNamesTheTabItOpened() {
+        let opened = BrowserReply.clickedTab(in: #"{"result":{"clicked":true,"openedTabId":42}}"#)
+        XCTAssertEqual(opened?.clicked, true)
+        XCTAssertEqual(opened?.openedTabID, 42)
+        // Chrome could not verify a child: the click happened, but no tab is named.
+        let unverified = BrowserReply.clickedTab(in: #"{"clicked":true,"openedTabId":null}"#)
+        XCTAssertEqual(unverified?.clicked, true)
+        XCTAssertNil(unverified?.openedTabID)
+        XCTAssertNil(BrowserReply.clickedTab(in: "not json"))
+    }
+
+    func testOlderHelpersAreRecognisedAsLackingACommand() {
+        XCTAssertTrue(BrowserReply.isUnsupportedTool("unknown tool: click_target"))
+        XCTAssertFalse(BrowserReply.isUnsupportedTool("The click ran and multiple tabs opened."))
+        XCTAssertFalse(BrowserReply.isUnsupportedTool("Could not verify an unobstructed click on the requested node. No click sent."))
+    }
+
+    func testUploadThroughButtonCountsOnlyAVerifiedSelection() {
+        // ACT-01: the files count as selected only when Chrome read back the names and sizes.
+        XCTAssertEqual(BrowserReply.uploadSelected(in: #"{"result":{"selected":2,"verified":true}}"#), 2)
+        XCTAssertNil(BrowserReply.uploadSelected(in: #"{"result":{"selected":2,"verified":false}}"#))
+        XCTAssertNil(BrowserReply.uploadSelected(in: #"{"error":"File selection could not be verified"}"#))
+        XCTAssertNil(BrowserReply.uploadSelected(in: "unknown tool: upload_via_button"))
+    }
+
+    func testTargetedLabelDecidesDuplicatesWithoutTheWholeTree() throws {
+        // PERF-01: two exact-name controls from the targeted query are ambiguous, and say so without a full read.
+        let first = BrowserNode(index: 0, role: "button", name: "Delete", value: "", backendNodeID: 11)
+        let second = BrowserNode(index: 0, role: "button", name: "Delete", value: "", backendNodeID: 12)
+        XCTAssertThrowsError(try BrowserPage.decideFromTargeted([first, second], label: "Delete")) { error in
+            XCTAssertTrue("\(error)".contains("2 elements are labelled"), "\(error)")
+        }
+        // One exact control is the answer.
+        XCTAssertEqual(try BrowserPage.decideFromTargeted([first], label: "Delete")?.backendNodeID, 11)
+        // No exact-name candidate: the caller must search the whole page, so nil.
+        XCTAssertNil(try BrowserPage.decideFromTargeted([first], label: "Del"))
+        XCTAssertNil(try BrowserPage.decideFromTargeted([], label: "Delete"))
+    }
+
+    func testLabelReadinessNeedsOneVisibleControlUnlessExistenceIsAsked() {
+        // ACT-04: a label waits for one visible control. Hidden or ambiguous matches are not ready.
+        let hidden = BrowserNode(index: 1, role: "button", name: "Save", value: "", backendNodeID: 1)
+        let shown = BrowserNode(index: 2, role: "button", name: "Save", value: "", backendNodeID: 2)
+        XCTAssertFalse(BrowserPage.labelReady(matches: [hidden], state: (false, true, nil), condition: .visible))
+        XCTAssertTrue(BrowserPage.labelReady(matches: [shown], state: (true, true, nil), condition: .visible))
+        XCTAssertFalse(BrowserPage.labelReady(matches: [hidden, shown], state: (true, true, nil), condition: .visible))
+        XCTAssertFalse(BrowserPage.labelReady(matches: [], state: nil, condition: .visible))
+        // Existence is a separate, explicit request: a hidden control still exists.
+        XCTAssertTrue(BrowserPage.labelReady(matches: [hidden], state: nil, condition: .exists))
+        XCTAssertFalse(BrowserPage.labelReady(matches: [], state: nil, condition: .exists))
+    }
+
+    func testHelperFailuresReadAsPlainWordsNotEnvelopes() {
+        // A click or upload refusal arrives as a JSON-RPC error envelope. The user sees the message alone.
+        let envelope = #"{"id":3,"error":{"code":-32000,"message":"Could not verify an unobstructed click on the requested node. No click sent."}}"#
+        let plain = BrowserReply.failureText(envelope)
+        XCTAssertTrue(plain.contains("Could not verify an unobstructed click"), plain)
+        XCTAssertFalse(plain.contains("{"), plain)
+        XCTAssertEqual(BrowserReply.failureText("unknown tool: click_target"), "unknown tool: click_target")
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {
@@ -619,6 +698,47 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(stored.keys.sorted(), [0, 1])
         XCTAssertEqual(stored[0]?.cleanupConfirmed, false)
         XCTAssertEqual(stored[1]?.cleanupConfirmed, false)
+    }
+
+    func testPeekReceiptMarksPartialResultsAsErrorsAndListsRetries() {
+        let urls = ["https://a.test", "https://b.test"]
+        let oneFailed = [
+            BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: true),
+            BrowserPreviewPage(status: "failed", text: "could not load", cleanupConfirmed: true),
+        ]
+        let partial = ComputerUseToolDispatcher.peekReceipt(urls, pages: oneFailed)
+        XCTAssertTrue(partial.isError)
+        XCTAssertEqual(partial.read, 1)
+        XCTAssertEqual(partial.failed, 1)
+        XCTAssertEqual(partial.retryURLs, ["https://b.test"])
+        XCTAssertTrue(partial.line.contains("1 read"), partial.line)
+        XCTAssertTrue(partial.line.contains("1 failed"), partial.line)
+
+        let allFailed = [
+            BrowserPreviewPage(status: "failed", text: "x", cleanupConfirmed: true),
+            BrowserPreviewPage(status: "not_started", text: "y", cleanupConfirmed: nil),
+        ]
+        let none = ComputerUseToolDispatcher.peekReceipt(urls, pages: allFailed)
+        XCTAssertTrue(none.isError)
+        XCTAssertEqual(none.read, 0)
+        XCTAssertEqual(none.retryURLs, urls)
+
+        let unconfirmed = [
+            BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: false),
+            BrowserPreviewPage(status: "read", text: "b", cleanupConfirmed: false),
+        ]
+        let cleanup = ComputerUseToolDispatcher.peekReceipt(urls, pages: unconfirmed)
+        XCTAssertTrue(cleanup.isError)
+        XCTAssertEqual(cleanup.cleanupUnconfirmed, 2)
+        XCTAssertEqual(cleanup.retryURLs, [], "read pages are not retried; unconfirmed tabs are inspected first")
+
+        let complete = [
+            BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: true),
+            BrowserPreviewPage(status: "read", text: "b", cleanupConfirmed: true),
+        ]
+        let clean = ComputerUseToolDispatcher.peekReceipt(urls, pages: complete)
+        XCTAssertFalse(clean.isError)
+        XCTAssertEqual(clean.retryURLs, [])
     }
 
     func testRequestEnvironmentReachesEveryPeekLaneAndRestoresTheCaller() throws {

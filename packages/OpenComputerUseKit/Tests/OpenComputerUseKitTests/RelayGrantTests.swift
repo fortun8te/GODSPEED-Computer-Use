@@ -28,7 +28,7 @@ final class RelayGrantTests: XCTestCase {
         let expected = """
         {"aud":"godspeed-chrome-relay-v1","exp":1800000900,"iat":1800000000,"methods":["getInfo","getTabs",\
         "createTab","navigateTab","getUserTabs","claimUserTab","executeCdp","waitForFileChooser",\
-        "setFileChooserFiles","finalizeTabs","turnEnded"],"pid":4242,"sessionId":"godspeed-4242",\
+        "setFileChooserFiles","finalizeTabs","turnEnded","clickTarget","uploadViaButton"],"pid":4242,"sessionId":"godspeed-4242",\
         "startTime":"1700000000:123456","uid":501}
         """
         XCTAssertEqual(String(decoding: payload, as: UTF8.self), expected)
