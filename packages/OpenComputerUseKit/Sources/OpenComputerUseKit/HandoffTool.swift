@@ -472,6 +472,8 @@ enum HandoffTool {
         /// What done_when still lacks.
         var unmet: [String] = []
         var deliveryState: DeliveryState = .notSent
+        /// The window the handoff started in (see LearningWindow). Learning rows only; nothing replies with it.
+        var window: LearningWindow?
 
         /// One outcome line, the steps taken, the net change and, when it needs the model, the top options.
         func reply() -> String {
@@ -549,15 +551,22 @@ enum HandoffTool {
         case .failed: kind = "failed"
         case .cancelled: kind = "cancelled"
         }
-        log.append(LearningEpisodeRow(app: request.app, goal: request.goal, outcome: kind))
+        // The done result uses the same labels as a batch: verified, weak or unmet. Only "done" is ever verified.
+        let done: String
+        switch outcome.kind {
+        case .done: done = outcome.deliveryState == .verified ? "verified" : "weak"
+        case .notVerified: done = "weak"
+        default: done = "unmet"
+        }
+        log.append(LearningEpisodeRow(app: request.app, goal: request.goal, outcome: kind, done: done, window: outcome.window))
     }
 
     /// One `step` row per action the handoff ran, from the action's own result. Typed values are never written.
-    static func learnStep(app: String, choice: Candidate, result: ActResult, log: LearningLog) {
+    static func learnStep(app: String, choice: Candidate, result: ActResult, log: LearningLog, window: LearningWindow? = nil) {
         guard log.isEnabled else { return }
         let failure = result.ok ? nil : (result.refused ? "refused" : "failed")
         log.append(LearningStepRow(
-            app: app, tool: choice.tool, delivery_state: result.delivery?.rawValue, failure_code: failure
+            app: app, tool: choice.tool, delivery_state: result.delivery?.rawValue, failure_code: failure, window: window
         ))
     }
 
@@ -608,7 +617,8 @@ enum HandoffTool {
                 if changes == AXStateDiff.noChangesMessage { changes = "the screen did not change" }
             }
             return Outcome(kind: kind, reason: reason, steps: steps, changes: changes, options: options,
-                           screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet, deliveryState: deliveryState)
+                           screen: kind == .done ? "" : (latest.map { RefereeSummary.screen(from: $0) } ?? ""), unmet: lastUnmet, deliveryState: deliveryState,
+                           window: LearningWindow(state: initial))
         }
 
         func cancelled() -> Outcome {
@@ -716,7 +726,7 @@ enum HandoffTool {
                 }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
-                learnStep(app: request.app, choice: choice, result: result, log: learning)
+                learnStep(app: request.app, choice: choice, result: result, log: learning, window: LearningWindow(state: initial))
                 if result.refused {
                     return finish(.failed, result.message, initial: initial, latest: state)
                 }

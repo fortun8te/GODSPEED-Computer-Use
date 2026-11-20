@@ -249,6 +249,69 @@ final class LearningLogTests: XCTestCase {
         XCTAssertFalse(text.contains("hunter2-secret"))
     }
 
+    func testBatchWritesDoneWhenResultAndWindowWithoutSecretValues() throws {
+        var receipt = TrajectoryLog.BatchReceipt(totalSteps: 1)
+        receipt.steps = [.init()]
+        receipt.doneCheck = .verified
+        let state = "App=com.apple.Notes (pid 9)\nWindow: \"Draft - Notes\", App: Notes.\nWindow ID: 42\n1 button Save"
+        let doneWhen: [DoneCheck.Condition] = [
+            .text("Message sent"), .field(label: "Password", equals: "hunter2"), .field(label: "Volume", equals: "40"),
+        ]
+        BatchTool.learn(receipt: receipt, steps: [BatchTool.Step(tool: "click", arguments: ["label": "Save"])],
+                        goal: "Save note", app: "Notes", log: makeLog(), doneWhen: doneWhen,
+                        window: BatchRecipes.Window(state: state))
+        let text = try lines().joined(separator: "\n")
+        let rows = try lines().map { try object($0) }
+        let window: [String: String] = ["app": "com.apple.Notes", "title": "Window: \"Draft - Notes\", App: Notes."]
+        XCTAssertEqual(rows[0]["window"] as? [String: String], window, "Bundle id and title only: no pid or window number")
+        XCTAssertEqual(rows[1]["window"] as? [String: String], window)
+        XCTAssertEqual(rows[1]["done"] as? String, "verified")
+        let conditions = rows[1]["done_when"] as? [[String: String]]
+        XCTAssertEqual(conditions, [
+            ["text": "Message sent"],
+            ["field": "Password", "equals": LearningScrubber.redacted],
+            ["field": "Volume", "equals": "40"],
+        ])
+        XCTAssertFalse(text.contains("hunter2"))
+        XCTAssertFalse(text.contains("pid 9"))
+    }
+
+    func testBatchWithoutDoneWhenOrWindowWritesNoNewFields() throws {
+        var receipt = TrajectoryLog.BatchReceipt(totalSteps: 1)
+        receipt.steps = [.init()]
+        BatchTool.learn(receipt: receipt, steps: [BatchTool.Step(tool: "click", arguments: ["label": "Save"])],
+                        goal: "Save note", app: "Notes", log: makeLog())
+        let rows = try lines().map { try object($0) }
+        for row in rows {
+            XCTAssertNil(row["window"])
+            XCTAssertNil(row["done_when"])
+        }
+        XCTAssertNil(rows[1]["done"])
+    }
+
+    func testHandoffEpisodeAndStepRowsCarryWindowAndDoneResult() throws {
+        let request = handoffRequest()
+        let initial = "App=com.example.app (pid 3)\nWindow: \"Export\", App: x.\nWindow ID: 12\n1 button Export PDF"
+        let deps = HandoffTool.Dependencies(
+            readState: { initial },
+            act: { _, _ in .init(ok: true, message: "", delivery: .acknowledged,
+                                 observedState: initial + "\n2 static text Exported") },
+            choose: { _, _, _, _, _ in nil },
+            looksStuck: { _, _, _ in false },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) },
+            replay: { _ in nil },
+            now: { 0 }
+        )
+        _ = HandoffTool.run(request, deps, learning: makeLog())
+        let rows = try lines().map { try object($0) }
+        let window: [String: String] = ["app": "com.example.app", "title": "Window: \"Export\", App: x."]
+        XCTAssertEqual(rows.map { $0["kind"] as? String }, ["step", "episode"])
+        XCTAssertEqual(rows[0]["window"] as? [String: String], window)
+        XCTAssertEqual(rows[1]["window"] as? [String: String], window)
+        XCTAssertNotNil(rows[1]["done"] as? String)
+        XCTAssertNil(rows[1]["done_when"], "Handoffs carry no done_when list, only their result")
+    }
+
     func testBatchDisabledWritesNothing() {
         BatchTool.learn(receipt: TrajectoryLog.BatchReceipt(totalSteps: 1), steps: [], goal: "g", app: nil,
                         log: LearningLog(directory: directory, enabled: false, imagesEnabled: true))
