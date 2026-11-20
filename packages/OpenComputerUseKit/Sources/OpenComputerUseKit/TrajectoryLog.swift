@@ -482,6 +482,8 @@ final class TrajectoryLog: @unchecked Sendable {
         case permissionDenied = "permission_denied"
         case stateUnavailable = "state_unavailable"
         case staleState = "stale_state"
+        case staleRef = "STALE_REF"
+        case windowChanged = "WINDOW_CHANGED"
         case timeout
         case cancelled
         case recipeVerification = "recipe_verification"
@@ -499,6 +501,8 @@ final class TrajectoryLog: @unchecked Sendable {
         case .appNotFound: return .appNotFound
         case .permissionDenied: return .permissionDenied
         case .stateUnavailable: return .stateUnavailable
+        case .staleRef: return .staleRef
+        case .windowChanged: return .windowChanged
         case .message: return failureCode(message: message)
         }
     }

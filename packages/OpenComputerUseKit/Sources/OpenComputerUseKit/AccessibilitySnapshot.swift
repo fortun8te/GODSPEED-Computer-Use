@@ -168,12 +168,11 @@ public struct AppSnapshot {
     /// shown at some point, so one this snapshot lacks belongs to an element that is gone. Nil: fixture or numbered per read.
     var numberingHighWater: Int? = nil
 
-    /// The capture and AX tree have a confirmed, shared native window identity.
-    public var observedWindowID: CGWindowID? {
-        guard let windowElement, let targetWindowID, targetWindowID != kCGNullWindowID,
-              SkyLightSPI.shared.windowID(for: windowElement) == targetWindowID else { return nil }
-        return targetWindowID
-    }
+    var nativeWindow: NativeWindowObservation? = nil
+    var elementRefs: NativeSnapshotRefs? = nil
+
+    /// The capture and AX tree shared an exact window ID at observation time.
+    public var observedWindowID: CGWindowID? { nativeWindow?.id }
 
     public var renderedText: String {
         renderedText(style: .fullState)
@@ -334,6 +333,12 @@ enum SnapshotBuilder {
         scopeFocusToWindow: Bool = false
     ) -> AppSnapshot {
         let windowBounds = windowCapture.bounds
+        let appIdentity = TargetedAppIdentity(app: app)
+        func bindWindow() -> NativeWindowObservation? {
+            guard !app.runningApplication.isTerminated,
+                  SkyLightSPI.shared.windowID(for: rootElement) == windowCapture.windowID else { return nil }
+            return NativeWindowObservation(id: windowCapture.windowID, app: appIdentity)
+        }
         // The image is already captured; encoding it is pure CPU work, so it runs beside the
         // tree walk instead of in front of it.
         let encoding = ScreenshotEncodingJob(
@@ -348,7 +353,7 @@ enum SnapshotBuilder {
                                screenshotData: screenshotData, mode: .accessibility, treeLines: [],
                                focusedSummary: nil, focusedElement: nil, selectedText: nil,
                                windowElement: rootElement, elements: [:], screenshotNote: screenshot.note,
-                               observation: observation)
+                               observation: observation, nativeWindow: bindWindow())
         }
         let appFocus = preferredFocusedElement(appElement: appElement, appPID: app.pid, focusedApplication: focusedApplication, systemWide: systemWide)
         let focusedElement = appFocus.flatMap { element in
@@ -397,6 +402,11 @@ enum SnapshotBuilder {
             }
         }
 
+        // The menu bar is appended for display, but its elements belong to the app, not the window.
+        let refIndexes = observation.includeRefs ? renderer.records.values.compactMap { record -> Int? in
+            guard !record.isSyntheticText, record.element != nil, record.identity?.role != nil else { return nil }
+            return record.index
+        } : []
         if let menuBar = copyElement(appElement, attribute: kAXMenuBarAttribute),
            !CFEqual(menuBar, rootElement)
         {
@@ -410,6 +420,9 @@ enum SnapshotBuilder {
         }
         let screenshot = encoding.result()
         let screenshotData = screenshot.data
+        let nativeWindow = bindWindow()
+        let elementRefs = nativeWindow?.app.launchedAt != nil && !refIndexes.isEmpty
+            ? NativeSnapshotRefs(elementIndexes: refIndexes) : nil
 
         return AppSnapshot(
             app: app,
@@ -427,7 +440,9 @@ enum SnapshotBuilder {
             elements: renderer.records,
             screenshotNote: screenshot.note,
             observation: observation,
-            numberingHighWater: numbering?.highWater
+            numberingHighWater: numbering?.highWater,
+            nativeWindow: nativeWindow,
+            elementRefs: elementRefs
         )
     }
 
