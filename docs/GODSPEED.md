@@ -46,22 +46,19 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Labels**: use visible text first. Current element indexes also work.
 - **Fill**: `{"tool": "fill", "fields": {"To": "sam@x.com"}, "submit": "Send"}` becomes one `set_value` per field and a click. Add `"web": true` for a page.
 - **Goal**: `goal` is one sentence. The reply may add a `Check:` line (done, stuck, or still loading) from the referee. Treat it as a hint.
-- **Recipes** require a passing `done_when` to save mutating steps. To replay, send the same `app` and exact `goal` without steps. Supply each recorded slot in `values`. Slots can hold a recipient, email, number, path, or text. Missing or changed slots need confirmation and changed inputs need fresh steps.
-- Unattended replay requires a verified recipe and the original open Mac window. Each write checks its label, role and surrounding controls again. Recipes from older versions need a fresh verified run. Keep secrets out of completion checks and steps with element numbers or coordinates out of recipes.
-- Godspeed keeps the current recipe and one alternate version. Two consecutive replay failures drop the current version. A verified alternate with the same inputs and check can take over on a later call.
-- **Verified receipts**. With `return_state: false`, a verified file, exact native field, or browser URL can finish the batch without a final tree. Missing evidence still gets a recovery read. Partial or clipped trees are for discovery. Completion needs an independent check or a complete observation.
+- **Final reads**. `return_state: false` can skip the final tree when a direct file, exact native field, or URL check supplies the requested evidence. Missing evidence triggers a recovery read. Presence-only matches still report weak evidence.
 - **Wait steps**. Godspeed can check for a window, matching text, or busy indicator before taking a full read. The full read still confirms the wait. Busy checks make up to four accessibility reads at a time.
-- **Action readback**. The dialog check reuses the action’s window read when available. A verified field write can use the next scheduled read. Batch effect checks can reuse a complete read of the same window when it shows a change. A delayed result or a change of window can require another read.
+- **Action readback**. The dialog check reuses the action's window read when available. A verified field write can use the next scheduled read. Batch effect checks can reuse a complete read of the same window when it shows a change. A delayed result or a change of window can require another read.
 - **Change-only replies**: the final read is compared with what the model last saw for that app. Only changed lines are sent. If an element's number moved, the full state is sent instead. If nothing changed, the reply says so.
 - **Condensed trees**: long rows are collapsed, text is cut at 160 characters, and container noise is dropped. Every element number the model can act on stays the same.
 - **Referee and vision hooks**: both are off by default (see settings). The referee adds one hint line. Vision finds a labelled element on a screenshot when no accessibility element matches, then clicks there.
-- **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. A preview lane can reuse its own temporary tab and checks cleanup before returning. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
+- **Browser**: `browser` with `action`: `open`, `go`, `read`, `click`, `drag`, `type`, `key`, `peek` (up to 6 URLs, 3 parallel lanes), `tabs`, `use_tab`, `wait`, `info`, `upload`. Click and type use the Chrome DevTools Protocol on that one tab, so the tab the user is reading is never touched.
 
 Window reads skip the menu bar by default. Use `include_menu_bar: true` on `get_app_state` or `--include-menu-bar true` on a CLI snapshot to include it. `press_menu` takes the menu path directly.
 
 Native actions read back accessibility text. Use `get_app_state` with `include_screenshot: true` or set `screenshot: true` on a batch when you need an image.
 
-Save waits for the name field, folder choice and any confirmation to appear. It checks the disk for the new write.
+Save uses a supported app's save command first when no sheet is open. The accessibility route waits for the name field and save controls. Both routes verify a new write on disk.
 
 When a visible app is still preparing its web content, Godspeed checks for the web area before walking the full tree again.
 
@@ -127,7 +124,7 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 | `OPEN_COMPUTER_USE_AX_INDENTATION` | `level` | `tab4` for four-space indent (opt-in). |
 | `OPEN_COMPUTER_USE_MAX_COLLECTION_ROWS` | 20 | Visible rows kept per list, table or outline. |
 | `OPEN_COMPUTER_USE_ACTION_READ_BACK` | on | Read the window back after an action. |
-| `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | off | Sample window images during action readback to detect the end of animations. |
+| `OPEN_COMPUTER_USE_SETTLE_BY_FRAME` | on | Sample window images during action readback to detect the end of animations. |
 | `OPEN_COMPUTER_USE_BACKGROUND_ONLY` | off | Never raise or activate an app. Opt-in for when the user keeps working. |
 | `OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS` | off | Allow moving the real pointer. Off means never. |
 | `OPEN_COMPUTER_USE_FOCUS_BORROW` | off | Allow focus borrowing when background-only and strict modes are off. |
@@ -207,11 +204,11 @@ Finder file copies go to the same private clipboard. Paste them into Finder or s
 
 Screenshots are available for controls that the accessibility tree misses. The optional decision helper is for ambiguous, goal-directed work. Routine reads and explicit completion checks can use the current observation directly.
 
-Handoff fills a unique, empty field directly when its value matches the completion check. It can also act on an explicit `Click <label>` goal with one enabled, low-risk target. These matches use zero model calls for that action. If a choice remains, handoff ranks the most relevant 12 options before asking the local Referee chooser. The local helper uses d1-2B 8-bit by default. It hands control back if confidence or the lead over the next option is too low. A pinned handoff verifies against that window. If input might already have landed, it reads back before continuing.
+Handoff fills a unique, empty field directly when its value matches the completion check. It can also act on an explicit `Click <label>` goal with one enabled, low-risk target. These matches use zero model calls for that action. If a choice remains, handoff ranks the most relevant 12 options before asking the local Referee chooser. The local helper uses d1-2B 8-bit by default. It hands control back if confidence or the lead over the next option is too low. A pinned handoff verifies against that window. If input may already have landed, it stops for inspection.
 
 ### Completion checks
 
-Godspeed takes a baseline before step 1. Use one check or a list.
+A batch takes a baseline before step 1 for checks that require a change. Use one check or a list.
 
 | Check | Evidence |
 | --- | --- |
@@ -221,9 +218,15 @@ Godspeed takes a baseline before step 1. Use one check or a list.
 | `{"url_changed":"https://example.com/thanks"}` | An existing tab changed to the exact URL. |
 | `{"file_changed":"~/Desktop/out.pdf"}` | A regular file appeared at the path or its size, fresh modification time, or contents changed. Files up to 16 MiB are hashed. |
 
-A check that only matches final text, a field, a missing label, part of a URL, or an existing file reports `weak_evidence`. A preexisting match can pass those checks. The full reply stays available for inspection and recipe auto-save requires verified checks. An unavailable baseline leaves a change check unconfirmed. A UI change proves what Godspeed observed during the batch. Check the app's own receipt when you need to confirm that a send, payment, or save persisted.
+A check that only matches final text, a field, a missing label, part of a URL, or an existing file reports `weak_evidence`. Those checks can match a preexisting state. An unavailable baseline leaves a change check unconfirmed. A UI change proves what Godspeed observed during the batch. Check the app's own receipt when you need to confirm that a send, payment, or save persisted.
 
-For window settling, Godspeed looks for 120 ms of quiet and checks Accessibility where it can. It reads at the time limit if the window keeps moving or shows a busy sign.
+Action readback looks for 120 ms of stable frames and checks for a busy Accessibility root. An explicit `settle_ms` read looks for 120 ms without an AX busy sign. It returns the current state with a status note if the budget runs out. A batch settle step requires repeated complete reads of the same state and stops on timeout.
+
+### Saved recipes
+
+Mutating recipes require verified `done_when` evidence. To replay, send the original `app` and exact `goal` without steps. Supply every recorded slot in `values`. Changed inputs, checks, or windows require fresh steps. Each write checks its label, role, and nearby controls again. Legacy recipes need a fresh verified run. Keep secrets out of completion conditions and use labels for steps you want to save.
+
+Replay uses the same completion checks as an explicit batch. A presence-only check that already matches returns `weak_evidence` with zero steps run. Godspeed keeps the current version and one alternate in `~/.godspeed/recipes.json`. Two consecutive replay failures drop the current version. A verified alternate with the same inputs and checks can then take over.
 
 ### Delivery receipts
 
@@ -237,6 +240,12 @@ For window settling, Godspeed looks for 120 ms of quiet and checks Accessibility
 | `verified` | `do_not_retry` | A readback or change-aware check confirmed the requested result. |
 
 A batch stops on uncertain delivery. A completion check can still report what changed, and the affected step keeps its uncertain receipt.
+
+MCP cancellation stops queued work and interrupts waits in a running batch or handoff. A disconnect also stops work for that connection. A cancellation reply lists the steps already attempted and the steps skipped. A step interrupted during delivery may have taken effect. Inspect it before trying again. A macOS call already in progress must return before Godspeed can finish cleanup.
+
+Godspeed records a write step's intent before dispatch and its outcome afterward in `~/.godspeed/journal/operations.jsonl`. Records contain the tool name, timestamps and generated IDs. They omit arguments, replies and screenshots. After a restart, an intent without an outcome is `outcome_unknown`. Starting Godspeed never replays it.
+
+## Cursor feedback
 
 The visible cursor is feedback. Godspeed resolves and checks the target independently, keeps each agent's window anchor separate, and plays cursor motion on the display clock. If a path crosses a gap with no screen, it reappears beside the next target. The app never needs to move your physical pointer with the default background settings.
 
@@ -253,7 +262,7 @@ When many moves are queued before the next frame, Godspeed keeps the latest pend
 
 Vercel's agent-desktop scopes references to the observed window and keeps cursor travel out of the window interaction lock. [Snapshot guide](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/apps/docs/content/docs/snapshots-and-refs.mdx) · [Cursor delivery](https://github.com/vercel-labs/agent-desktop/blob/e8934a5e95e1d212c74ead95cd3e4701c04eca31/crates/core/src/cursor_overlay/submit.rs)
 
-## Parallel browser reads
+## Native window and element identity
 
 To inspect a known native window directly, pass its ID to `get_app_state`. This read does not move the window or use app-wide settle. For an exact native action target, take a fresh app observation and use its reported `Window ID` as `window_id` on a supported action or a single-app batch. Godspeed checks the same accessibility window it read, even if macOS lists another object for that window ID. If the window, its bounds or the required focus changes, Godspeed stops. Refresh the observation before trying again. In the JavaScript REPL, use `app.batch(steps, { windowId, doneWhen })` to execute a sequence and check the final state in one call. The reply includes a `receipt` with each step's status, the number of steps left and the completion verdict. Acknowledged actions and verified outcomes are reported separately.
 
@@ -263,9 +272,11 @@ In the JavaScript REPL, use `app.getAXState({ includeRefs: true })` and pass `{ 
 
 For a known workflow, use `app.batch(steps, { windowId, doneWhen, compact: true, effects: false })`. Compact mode trims surplus plain text from the final reply after the checks run. Failed or incomplete batches keep their normal detail. Disabling effects skips per-step observation reads, so use it when the sequence needs only a final check.
 
-For a browser batch whose final success is a known URL, set `return_state: false` with a URL-only `done_when` (REPL option `returnState`). Use `url_changed` to confirm a transition to a full URL. Godspeed can return a passing receipt after reading the tab's address alone. A failed check keeps the normal recovery read.
-
 For longer tasks, check `receipt.recovery` before resuming a partial batch. `refresh_then_continue` marks a step that never started, `fix_then_continue` marks an explicitly unsent failure, and `inspect_before_retry` means the action may have landed. `inspect_result` asks you to check the outcome without resending inputs. Recovery step numbers refer to expanded steps in the receipt, so a single form instruction can occupy several numbered steps.
+
+## Browser observations
+
+For a browser batch whose final success is a known URL, set `return_state: false` with a URL-only `done_when` (REPL option `returnState`). Use `url_changed` to confirm a transition to a full URL. Godspeed can return a passing receipt after reading the tab's address alone. A failed check keeps the normal recovery read.
 
 Use `browser read` with `interactive: true` to find controls with fewer tokens. Use the default read when prose or confirmation messages matter. Interactive reads retain tab- and document-scoped references and can overlap across independent clients. Add `diff: true` on repeated, unfiltered browser reads for a smaller change summary. Godspeed returns the full view when the document, mode or reference mapping changes. Batch completion checks still use the full current observation.
 
@@ -281,15 +292,15 @@ For a file input with a visible label or current reference, pass it to `browser 
 
 Use browser `close_tab` with the explicit `tab_id` returned by `open_tab`. Godspeed checks that the current session still owns the tab and that the browser reports it closed.
 
-MCP cancellation stops queued work and interrupts waits in a running batch or handoff. A disconnect also stops work for that connection. A cancellation reply lists the steps already attempted and the steps skipped. A step interrupted during delivery may have taken effect. Inspect it before trying again. A macOS call already in progress must return before Godspeed can finish cleanup.
-
-Godspeed records a write step's intent before dispatch and its outcome afterward in `~/.godspeed/journal/operations.jsonl`. Records contain the tool name, timestamps and generated IDs. They omit arguments, replies and screenshots. After a restart, an intent without an outcome is `outcome_unknown`. Starting Godspeed never replays it.
+## Parallel browser work
 
 While the Mac is unlocked, up to four different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. An explicit `wait_for` of 1–3 seconds can also share admission. Each client has its own tab state and can have one read in flight. Native actions, mixed batches, and Locked Use recovery get exclusive access. Browser writes also run one at a time by default. Exclusive requests run in arrival order. A queued writer normally gets the next turn. When a reader has waited through two exclusive admissions, the oldest eligible reader gets a turn. One client cannot take multiple read slots. Set `OPEN_COMPUTER_USE_PARALLEL_READS` to 1, 2, 3, or 4 in the shared app agent environment to compare reader limits. The default is 3.
 
 If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.
 
-Only one peek group can load pages at a time. A waiting peek leaves space for other browser reads. The active group uses up to three helpers. The app agent accepts up to 32 connections and queues up to 32 admissions. Each connection can buffer up to 16 requests.
+Only one peek group can load pages at a time in the app agent. A waiting group leaves room for other browser reads. Use `cua.peekPages(urls)` or `browser peek` for up to six URLs with one 40-second budget. Up to three workers reuse their own temporary tabs, take the next URL as soon as ready, and check cleanup before returning. Idle helpers expire after one minute. Replies keep input order and show each URL's status, text, and cleanup result.
+
+The app agent accepts up to 32 connections and queues up to 32 admissions. Each connection can buffer up to 16 requests.
 
 Set `OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES=1` in the app agent's launch environment to allow two or more clients to scroll or fill a named field in different tabs. Each call must name its tab ID. The current helper must have opened that tab. The same tab and the same client still run one write at a time.
 
@@ -310,12 +321,11 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 ## Known limits
 
 - macOS only. The app is built for the native arch. `obu` is built for arm64.
-- Native app input and browser writes are serialized. Eligible browser reads overlap across clients. Use `cua.peekPages(urls)` in the REPL to load up to three independent pages at once, with up to six URLs per call. Keep steps that share input or depend on each other's output in one ordered batch.
+- Keep steps that share input or depend on each other's output in one ordered batch.
 - Set `OPEN_COMPUTER_USE_CURSOR_COLOR=auto` for stable per-client cursor colors. The active cursor shows which client is driving the shared Mac input.
 - Background delivery depends on the app. Some dialogs, sheets and key chords require foreground input.
-- A batch is at most 40 steps. `peek` takes at most 6 URLs with a shared 40-second browser budget. Idle preview workers pick up the next unread URL automatically. At most three preview loads run across the shared process. Preview helpers expire after a minute of inactivity. The REPL returns `pages` with a URL, status, text, and cleanup result for each page. Retry only failed or unstarted URLs. Results stay in the input order and report pages that could not be read.
+- A batch is at most 40 steps.
 - The referee and vision are hints and fallbacks, off by default. Vision has been checked on one synthetic image, not on real apps.
-- Recipes match the exact goal text. They are stored only on this Mac (`~/.godspeed/recipes.json`).
 - The browser tool needs Chrome, the Open Browser Use extension, and the one-time setup step. It cannot use other browsers.
 - Model results are not measured yet. The fixed task set (steps, seconds, finish rate against Codex native) has not been run.
 - Apps with no usable accessibility tree can be clicked only by vision. That needs `find_on_screen` on and the helper service running.
