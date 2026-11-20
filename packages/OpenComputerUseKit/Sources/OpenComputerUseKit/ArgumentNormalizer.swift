@@ -124,7 +124,7 @@ enum ArgumentNormalizer {
 
     /// What each tool needs before it can run. Each entry needs at least one of its keys.
     private static let needs: [String: [Need]] = [
-        "batch": [Need(keys: ["steps", "goal"], text: "\"steps\" (a list of steps) or a \"goal\" with a saved recipe")],
+        "batch": [Need(keys: ["steps", "goal", "resume"], text: "\"steps\" (a list of steps), a \"goal\" with a saved recipe, or a \"resume\" token")],
         "get_app_state": [appNeed],
         "list_apps": [],
         "query": [appNeed, Need(keys: ["text", "role"], text: "\"text\" or \"role\"")],

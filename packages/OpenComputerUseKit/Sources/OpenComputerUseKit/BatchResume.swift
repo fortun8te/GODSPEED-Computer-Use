@@ -124,8 +124,8 @@ enum BatchResume {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    /// Reads a token once. A token is consumed when it is loaded, so the same steps never run twice.
-    static func consume(_ id: String, now: Date = Date()) throws -> Record {
+    /// Reads a token without using it. An expired token is removed on the way.
+    static func load(_ id: String, now: Date = Date()) throws -> Record {
         guard UUID(uuidString: id) != nil else {
             throw ComputerUseError.invalidArguments("RESUME_NOT_FOUND. \"\(id)\" is not a resume token from a stopped batch.")
         }
@@ -133,11 +133,32 @@ enum BatchResume {
         guard let data = try? Data(contentsOf: url), let record = try? JSONDecoder().decode(Record.self, from: data) else {
             throw ComputerUseError.invalidArguments("RESUME_NOT_FOUND. No stopped batch has the token \(id), or it was already resumed. Send the steps again.")
         }
-        try? FileManager.default.removeItem(at: url)
         guard now < record.expiresAt else {
+            discard(id)
             throw ComputerUseError.invalidArguments("RESUME_EXPIRED. The resume token is older than 24 hours. Read the app and send the remaining steps again.")
         }
         return record
+    }
+
+    /// Ends a token once its steps have started, so the same steps never run twice.
+    static func discard(_ id: String) {
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(id.uppercased() + ".json"))
+    }
+
+    /// Reads and uses a token in one step.
+    static func consume(_ id: String, now: Date = Date()) throws -> Record {
+        let record = try load(id, now: now)
+        discard(id)
+        return record
+    }
+
+    /// The live process and pinned window for an app, to compare with a stored record.
+    static func liveState(app: String?, windowID: UInt32?) -> (processID: Int32?, windowID: UInt32?) {
+        guard let app, let descriptor = try? AppDiscovery.resolveRunning(app) else { return (nil, nil) }
+        let window = windowID.flatMap { id in
+            (try? SnapshotBuilder.resolveTargetWindow(for: descriptor, windowID: id))?.windowID
+        }
+        return (descriptor.pid, window.map { UInt32($0) })
     }
 
     private static func prune(_ folder: URL, now: Date) {
