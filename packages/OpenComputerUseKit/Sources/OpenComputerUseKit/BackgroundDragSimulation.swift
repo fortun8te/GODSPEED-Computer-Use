@@ -135,6 +135,40 @@ enum BackgroundDragDispatcher {
         io.post(event, target.pid)
     }
 
+    static func scroll(target: BackgroundDragTarget, direction: String, unit: ScrollChunks.Unit, size: Int,
+                       io: BackgroundDragIO = .system(),
+                       validateSession: () throws -> Void = { try requireUsableComputerUseSession() }) throws {
+        try validateSession()
+        try target.validateGeometry()
+        guard io.windowLocationCapability.isAvailable else {
+            throw ComputerUseError.backgroundUnsupported("Window-addressed scroll events are unavailable.")
+        }
+        let event = try scrollEvent(direction: direction, unit: unit, size: size)
+        event.location = target.start
+        event.setIntegerValueField(windowNumberField, value: Int64(target.windowID))
+        try io.setWindowLocation(event, CGPoint(x: target.start.x - target.windowBounds.minX,
+                                                y: target.start.y - target.windowBounds.minY))
+        try validateSession()
+        try io.validateWindow(target)
+        event.timestamp = DispatchTime.now().uptimeNanoseconds
+        io.post(event, target.pid)
+    }
+
+    static func scrollEvent(direction: String, unit: ScrollChunks.Unit, size: Int) throws -> CGEvent {
+        guard unit != .pages, (1...10_000).contains(size),
+              ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("Wheel events require a positive line or point count and a direction.")
+        }
+        let amount = Int32(size)
+        let y = direction == "up" ? amount : direction == "down" ? -amount : 0
+        let x = direction == "left" ? amount : direction == "right" ? -amount : 0
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: unit == .lines ? .line : .pixel,
+                                  wheelCount: 2, wheel1: y, wheel2: x, wheel3: 0) else {
+            throw ComputerUseError.stateUnavailable("Could not create a scroll event.")
+        }
+        return event
+    }
+
     static func drag(
         target: BackgroundDragTarget,
         flags: CGEventFlags = [],

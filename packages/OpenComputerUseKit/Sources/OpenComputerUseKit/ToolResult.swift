@@ -78,6 +78,7 @@ public struct ToolCallResult: @unchecked Sendable {
         ]
         var metadata: [String: Any] = [:]
         metadata["godspeed/preview_pages"] = browserPreviewPages
+        if failureCode == .backgroundUnsupported { metadata["godspeed/error_code"] = failureCode?.rawValue }
         if let receipt = batchReceipt {
             var batch: [String: Any] = [
                 "total_steps": receipt.totalSteps,

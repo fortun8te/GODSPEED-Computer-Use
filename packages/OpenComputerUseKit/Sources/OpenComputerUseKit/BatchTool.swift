@@ -209,8 +209,8 @@ enum BatchTool {
             // {"tool": "select", "web": true, ...}: a browser action named as the tool. Browser-only names
             // Hover with an app belongs to the native tool.
             let browserOnly: Set<String> = ["select", "check", "uncheck", "go", "goto", "navigate", "back",
-                                            "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "upload", "peek", "outline", "frames", "scroll_into_view"]
-            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "scroll", "wait", "open", "screenshot"]
+                                            "forward", "reload", "wait_for", "tabs", "use_tab", "close_tab", "upload", "peek", "outline", "frames"]
+            let browserShared: Set<String> = ["click", "type", "key", "read", "hover", "scroll", "scroll_into_view", "wait", "open", "screenshot"]
             let isWeb = (arguments["web"] as? Bool) == true || (arguments["web"] as? String)?.lowercased() == "true"
             // With "web": true, the native names a model reaches for mean the browser action of the same job. Without
             // this, {"tool": "type_text", "web": true} would type into the app named, which may be the user's own Chrome.
@@ -219,7 +219,8 @@ enum BatchTool {
             let tabHover = lowered == "hover" && defaultApp == nil
                 && !arguments.keys.contains(where: { ["app", "application", "app_name", "appName", "bundle_id", "bundleId", "target_app", "program", "application_name"].contains($0) })
             if known.contains("browser"), lowered != "browser",
-               browserOnly.contains(lowered) || tabHover || (isWeb && browserShared.contains(browserName)) {
+               browserOnly.contains(lowered) || tabHover || (lowered == "scroll_into_view" && defaultApp == nil && arguments["app"] == nil)
+                   || (isWeb && browserShared.contains(browserName)) {
                 arguments["web"] = nil
                 if arguments["action"] == nil {
                     arguments["action"] = ["goto": "go", "navigate": "go"][browserName] ?? browserName
@@ -835,7 +836,8 @@ extension ComputerUseToolDispatcher {
             if validatedHandoffRecipe == nil, !hasPinnedSteps, step.tool != "browser", FocusBorrow.isEnabled,
                let app = step.arguments["app"] as? String, !app.isEmpty,
                let pid = (try? AppDiscovery.resolveRunning(app))?.pid,
-               foreground || stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app) {
+               foreground || (!ActionOptions.usesStrictRoute(step.tool, step.arguments)
+                              && (stepOpensDialog(step, pid: pid) || BatchTool.dialogWasShown(app: app))) {
                 if !focus.ensure(pid: pid) {
                     lines.append("Could not bring \(app) to the front; the steps below ran in the background.")
                 }
@@ -919,6 +921,9 @@ extension ComputerUseToolDispatcher {
             if BatchTool.informationalTools.contains(step.tool), !isPageRead || !isLastStep {
                 // A page read in the middle of a batch keeps its numbered list; the last one becomes the state.
                 lines.append("\(number). \(BatchTool.describe(step)): ok\n\(BatchTool.clipped(result.textContent))")
+            } else if step.tool == "scroll_into_view" || (step.tool == "scroll" && (try? ScrollChunks(step.arguments)) != nil) {
+                // Keep the verified progress line even when general effect reads are disabled.
+                lines.append("\(number). \(BatchTool.describe(step)): \(BatchTool.firstLine(result.textContent))")
             } else {
                 lines.append("\(number). \(BatchTool.describe(step)): ok")
             }

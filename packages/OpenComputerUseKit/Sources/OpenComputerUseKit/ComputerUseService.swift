@@ -1151,8 +1151,8 @@ public final class ComputerUseService {
         guard ["up", "down", "left", "right"].contains(normalized) else {
             throw ComputerUseError.message("Invalid scroll direction: \(direction)")
         }
-        guard pages.isFinite, pages > 0 else {
-            throw ComputerUseError.message("pages must be > 0")
+        guard pages.isFinite, pages > 0, pages <= 100 else {
+            throw ComputerUseError.invalidArguments("pages must be greater than 0 and at most 100")
         }
 
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
@@ -1210,6 +1210,148 @@ public final class ComputerUseService {
 
         pauseBeforeReadBack(0.1, windowID: snapshot.targetWindowID)
         return try actionResult(for: query)
+    }
+
+    func scroll(app query: String, direction: String, elementIndex: String, chunks: ScrollChunks) throws -> ToolCallResult {
+        let direction = direction.lowercased()
+        guard ["up", "down", "left", "right"].contains(direction) else {
+            throw ComputerUseError.invalidArguments("scroll direction must be up, down, left or right")
+        }
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        guard let bounds = snapshot.windowBounds, let window = snapshot.windowElement,
+              let id = snapshot.targetWindowID, let element = record.element,
+              let area = scrollAncestor(of: element, in: window, includingSelf: true) else {
+            throw ComputerUseError.backgroundUnsupported("Choose an accessibility scroll area in the observed window.")
+        }
+        let horizontal = direction == "left" || direction == "right"
+        let barAttribute = horizontal ? kAXHorizontalScrollBarAttribute : kAXVerticalScrollBarAttribute
+        func position() throws -> Double {
+            guard let bar = Self.elementAttribute(area, barAttribute), let value = nativeObservedValue(bar),
+                  let number = Double(value), number.isFinite else {
+                throw ComputerUseError.backgroundUnsupported("This scroll area has no readable scroll position.")
+            }
+            return number
+        }
+        func validate() throws -> TargetedAX.WindowContext {
+            try requireUsableComputerUseSession()
+            let context = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(context.windowElement, window), context.windowBounds == bounds,
+                  SnapshotBuilder.belongsToWindow(area, window: window) else {
+                throw ComputerUseError.stateUnavailable("The scroll window changed. Read it before continuing.")
+            }
+            return context
+        }
+        let outcome = try chunks.run(visible: {
+            let context = try validate()
+            guard let label = chunks.untilVisible else { return false }
+            let matches = try SnapshotBuilder.targetedSearch(
+                .init(text: label, exact: true, role: nil, limit: 20, maxNodes: 500), in: context
+            )
+            let visible = matches.records.filter { candidate in
+                guard let el = candidate.element,
+                      let ancestor = scrollAncestor(of: el, in: window),
+                      CFEqual(ancestor, area) else { return false }
+                return nativeFrameIsInView(el, snapshot: snapshot)
+            }
+            return visible.count == 1 && matches.stopReason == nil
+        }, advance: {
+            _ = try validate()
+            let before = try position()
+            if chunks.unit == .pages {
+                let requested = "AXScroll\(direction.capitalized)ByPage"
+                guard let action = copyActions(for: area)?.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) else {
+                    throw ComputerUseError.backgroundUnsupported("This area exposes no AX page scroll. Try unit points or lines.")
+                }
+                let status = AXUIElementPerformAction(area, action as CFString)
+                guard status == .success else {
+                    throw ComputerUseError.stateUnavailable("AX scroll returned \(status.rawValue). Check the position before trying another step.")
+                }
+            } else {
+                guard let frame = localFrame(of: area, windowBounds: bounds) else {
+                    throw ComputerUseError.stateUnavailable("The scroll area has no current frame.")
+                }
+                let viewport = frame.intersection(CGRect(origin: .zero, size: bounds.size))
+                guard !viewport.isEmpty else {
+                    throw ComputerUseError.stateUnavailable("The scroll area is outside the window.")
+                }
+                let point = try windowPointToGlobalPoint(snapshot: snapshot, point: CGPoint(x: viewport.midX, y: viewport.midY))
+                let location = inputEventPoint(fromScreenStatePoint: point)
+                try BackgroundDragDispatcher.scroll(target: .init(start: location, end: location, windowBounds: bounds, windowID: id, pid: snapshot.app.pid),
+                                                    direction: direction, unit: chunks.unit, size: chunks.size)
+            }
+            // Allow a short asynchronous AX update before treating this chunk as stalled.
+            for _ in 0..<3 {
+                Thread.sleep(forTimeInterval: 0.05)
+                _ = try validate()
+                if try position() != before { return true }
+            }
+            return false
+        })
+        return .text(try outcome.reply(label: chunks.untilVisible))
+    }
+
+    func scrollIntoView(app query: String, elementIndex: String) throws -> ToolCallResult {
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, recoveryPolicy: .readOnly)
+        let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+        guard let element = record.element, let window = snapshot.windowElement, let id = snapshot.targetWindowID else {
+            throw ComputerUseError.backgroundUnsupported("This control has no verifiable Mac window.")
+        }
+        func validateWindow() throws {
+            try requireUsableComputerUseSession()
+            let live = try SnapshotBuilder.resolveTargetWindow(for: snapshot.app, windowID: id)
+            guard CFEqual(live.windowElement, window), live.windowBounds == snapshot.windowBounds,
+                  SnapshotBuilder.belongsToWindow(element, window: window) else {
+                throw ComputerUseError.stateUnavailable("The control or its window changed. Read it again.")
+            }
+        }
+        try validateWindow()
+        if nativeFrameIsInView(element, snapshot: snapshot) { return .text("Control already in view.") }
+        guard let action = matchingAction(requested: "AXScrollToVisible", record: record) else {
+            throw ComputerUseError.backgroundUnsupported("This control exposes no AXScrollToVisible action. Try scroll with until_visible.")
+        }
+        let result = AXUIElementPerformAction(element, action as CFString)
+        guard result == .success else {
+            throw ComputerUseError.stateUnavailable("AXScrollToVisible returned \(result.rawValue). Check the window before retrying.")
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+        try validateWindow()
+        guard nativeFrameIsInView(element, snapshot: snapshot) else {
+            throw ComputerUseError.stateUnavailable("The app accepted the scroll. The control could not be confirmed in view.")
+        }
+        return .text("Control scrolled into view.")
+    }
+
+    private func scrollAncestor(of element: AXUIElement, in window: AXUIElement, includingSelf: Bool = false) -> AXUIElement? {
+        var current: AXUIElement? = includingSelf ? element : copyParent(of: element)
+        for _ in 0..<24 {
+            guard let node = current, !CFEqual(node, window) else { break }
+            if stringValue(of: node, attribute: kAXRoleAttribute) == kAXScrollAreaRole as String { return node }
+            current = copyParent(of: node)
+        }
+        return nil
+    }
+
+    private func nativeFrameIsInView(_ element: AXUIElement, snapshot: AppSnapshot) -> Bool {
+        guard let bounds = snapshot.windowBounds, let window = snapshot.windowElement,
+              let frame = localFrame(of: element, windowBounds: bounds), !frame.isEmpty else { return false }
+        var visible = frame.intersection(CGRect(origin: .zero, size: bounds.size))
+        var current = element
+        for _ in 0..<16 {
+            guard !visible.isEmpty else { return false }
+            guard let area = scrollAncestor(of: current, in: window) else { return true }
+            guard let clip = localFrame(of: area, windowBounds: bounds) else { return false }
+            visible = visible.intersection(clip)
+            current = area
+        }
+        return false
+    }
+
+    private func nativeObservedValue(_ element: AXUIElement) -> String? {
+        guard !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) else { return nil }
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &raw) == .success else { return nil }
+        return (raw as? String) ?? (raw as? NSNumber)?.stringValue
     }
 
     public func drag(app query: String, fromX: Double, fromY: Double, toX: Double, toY: Double, modifiers: [String] = []) throws -> ToolCallResult {
@@ -1987,7 +2129,7 @@ public final class ComputerUseService {
     /// The snapshot an element action runs against. A queried index resolves to
     /// that control's own window context with no snapshot; any other index uses
     /// the normal current snapshot.
-    private func snapshotForAction(app query: String, elementIndex: String?) throws -> AppSnapshot {
+    private func snapshotForAction(app query: String, elementIndex: String?, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
         if let elementIndex, let index = Int(elementIndex), index > TargetedElementRegistry<TargetedElement>.indexBase {
             try requireUsableComputerUseSession()
             let app = try AppDiscovery.resolveRunning(query)
@@ -2007,7 +2149,7 @@ public final class ComputerUseService {
                 throw error
             }
         }
-        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil)
+        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil, recoveryPolicy: recoveryPolicy)
     }
 
     private func registerTargetedElement(record source: ElementRecord, context: TargetedAX.WindowContext,

@@ -82,6 +82,12 @@ public final class ComputerUseToolDispatcher {
         // encoded data stayed alive for the whole session.
         // Every state text the model sees is condensed (LeanOutput); indexes are kept.
         // A batch's state was already condensed when its own read went through here.
+        // Lane 9 actions take the checked route without automatic retargeting or focus borrowing.
+        if ActionOptions.usesStrictRoute(name, arguments) {
+            let result = try autoreleasepool { try dispatchTool(name: name, arguments: arguments, log: log) }
+            return notesInResult ? log.apply(to: LeanOutput.condensed(result)) : LeanOutput.condensed(result)
+        }
+
         // System Settings: a pane's name opens the pane by its link (its sidebar is often unreadable).
         if ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
            let app = arguments["app"] as? String, SettingsPanes.isSettings(app),
@@ -441,7 +447,21 @@ public final class ComputerUseToolDispatcher {
                 app: requireString("app", in: arguments),
                 elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
             )
+        case "scroll_into_view":
+            return try service.scrollIntoView(
+                app: requireString("app", in: arguments),
+                elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log)
+            )
         case "scroll":
+            // Explicit chunks use a pinned scroll area and verify progress after each input.
+            if let chunks = try ScrollChunks(arguments) {
+                return try service.scroll(
+                    app: requireString("app", in: arguments),
+                    direction: requireString("direction", in: arguments),
+                    elementIndex: labelledOrRequiredElementIndex(in: arguments, log: log),
+                    chunks: chunks
+                )
+            }
             return try service.scroll(
                 app: requireString("app", in: arguments),
                 direction: requireString("direction", in: arguments),
