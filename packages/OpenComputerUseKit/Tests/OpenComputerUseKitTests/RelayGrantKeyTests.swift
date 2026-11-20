@@ -47,7 +47,7 @@ final class RelayGrantKeyTests: XCTestCase {
         XCTAssertFalse(encoded.contains("+"))
         XCTAssertFalse(encoded.contains("/"))
         XCTAssertEqual(encoded.count, 43)
-        let raw = try XCTUnwrap(Data(base64URL: encoded))
+        let raw = try XCTUnwrap(Data(relayBase64URL: encoded))
         XCTAssertEqual(raw.count, 32)
         XCTAssertEqual(raw, try store.signingKey().publicKey.rawRepresentation)
     }
@@ -57,14 +57,5 @@ final class RelayGrantKeyTests: XCTestCase {
         XCTAssertEqual(RelayBase64URL.encode(Data([0xFB, 0xFF])), "-_8")
         XCTAssertEqual(RelayBase64URL.encode(Data([0x01])), "AQ")
         XCTAssertEqual(RelayBase64URL.encode(Data()), "")
-    }
-}
-
-private extension Data {
-    /// Decodes unpadded base64url, the inverse of `RelayBase64URL.encode`.
-    init?(base64URL text: String) {
-        var standard = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        while standard.count % 4 != 0 { standard += "=" }
-        self.init(base64Encoded: standard)
     }
 }
