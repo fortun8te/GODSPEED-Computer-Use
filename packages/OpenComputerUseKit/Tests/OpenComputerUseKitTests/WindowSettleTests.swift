@@ -2,6 +2,15 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class WindowSettleTests: XCTestCase {
+    func testIncompleteAXScanCannotConfirmQuiescence() {
+        typealias Signs = WindowSettle.Signs<Int>
+        let clipped = Signs(role: "AXWindow", children: Array(1...WindowSettle.scanNodes), busy: false, loaded: nil)
+        XCTAssertTrue(WindowSettle.busy(from: 0, requireComplete: true) { ids in
+            ids.map { $0 == 0 ? clipped : nil }
+        })
+        XCTAssertTrue(WindowSettle.busy(from: 0, requireComplete: true) { _ in [nil] })
+    }
+
     func testReadDoesNotSettleBeforeDelayedBusySign() {
         var clock: TimeInterval = 0
         let settled = WindowSettle.wait(timeout: 0.5, now: { clock }, sleep: { clock += $0 }) {

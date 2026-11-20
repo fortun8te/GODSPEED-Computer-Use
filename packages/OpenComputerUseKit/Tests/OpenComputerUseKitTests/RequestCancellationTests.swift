@@ -15,6 +15,20 @@ final class RequestCancellationTests: XCTestCase {
         XCTAssertTrue(result.textContent.contains("Steps 1-2 were not run"))
     }
 
+    func testPreDispatchCancellationCarriesNotSentOnTheWire() {
+        let token = RequestCancellation()
+        token.cancel()
+        let dispatcher = ComputerUseToolDispatcher(service: ComputerUseService())
+        let result = RequestCancellation.$current.withValue(token) {
+            dispatcher.callToolAsResult(name: "click", arguments: ["app": "Fixture", "label": "Save"])
+        }
+        XCTAssertTrue(result.isError)
+        XCTAssertEqual(result.failureCode, .cancelled)
+        XCTAssertEqual(result.deliveryState, .notSent)
+        let meta = result.asDictionary["_meta"] as? [String: Any]
+        XCTAssertEqual(meta?["godspeed/delivery_state"] as? String, "not_sent")
+    }
+
     func testCancelDuringHandoffChoiceKeepsEarlierStepAndSkipsTheNext() throws {
         let request = try HandoffTool.parse([
             "app": "Fixture", "window_id": 31, "goal": "Continue",

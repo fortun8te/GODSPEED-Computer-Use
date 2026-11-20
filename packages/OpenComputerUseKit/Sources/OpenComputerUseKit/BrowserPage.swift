@@ -1947,21 +1947,15 @@ final class BrowserPage {
         }
         do {
             return try cdpOnce(method, params, feedback: feedback)
-        } catch let error as BrowserLinkDropped {
-            // The new link starts without what was set up on the old one (focus emulation, accessibility,
-            // the frame guard): forget that it was done, so it is done again.
+        } catch let error as BrowserCommandFailure {
+            let detail = BrowserReply.explain(error.text)
+            // The helper reports a failed command, but older helpers cannot
+            // distinguish an unacknowledged input from a rejected command.
+            guard !StrictBackground.enabled(), indexedGeneration == nil,
+                  Self.isRepeatSafe(method, params) else {
+                throw ComputerUseError.stateUnavailable("browser: \(detail)")
+            }
             if let tabID { BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: tabID) }
-            if indexedGeneration != nil {
-                // Do not send any more commands using the old resolution, even if a caller catches this error.
-                indexedGeneration = -1
-                throw ComputerUseError.message("browser: the tab connection changed; browser read to check what happened before continuing")
-            }
-            // Retry only operations with known replay semantics.
-            guard Self.isRepeatSafe(method, params) else {
-                throw ComputerUseError.message(
-                    "browser: the tab connection dropped and the command may have taken effect. Read the tab before deciding whether to repeat it."
-                )
-            }
             for wait in [0.3, 0.8, 1.5] {
                 try BrowserRequestContext.validateCurrent()
                 guard BrowserCallBudget.remaining() > wait + 0.3 else { break }
@@ -1970,11 +1964,11 @@ final class BrowserPage {
                     let result = try cdpOnce(method, params, feedback: feedback)
                     restoreSetup()
                     return result
-                } catch is BrowserLinkDropped {
+                } catch is BrowserCommandFailure {
                     continue
                 }
             }
-            throw ComputerUseError.message("browser: \(BrowserReply.explain(error.text))")
+            throw ComputerUseError.stateUnavailable("browser: \(detail)")
         }
     }
 
@@ -1994,14 +1988,8 @@ final class BrowserPage {
         _ = try? cdp("Runtime.evaluate", ["expression": "1", "returnByValue": true])
     }
 
-    /// Chrome reported the tab as not attached (or detached mid-command).
-    private struct BrowserLinkDropped: Error { let text: String }
-
-    private static func linkDropped(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        return ["detached while handling", "debugger unattached", "debugger is not attached", "not attached to the tab",
-                "cannot access a chrome-extension"].contains { lower.contains($0) }
-    }
+    /// A structured error returned by the helper or Chrome.
+    private struct BrowserCommandFailure: Error { let text: String }
 
     /// Replay only known observations. A command with an uncertain delivery may already have changed the page.
     static func isRepeatSafe(_ method: String, _ params: [String: Any]) -> Bool {
@@ -2010,10 +1998,6 @@ final class BrowserPage {
              "DOM.getBoxModel", "DOM.resolveNode", "Page.captureScreenshot", "Page.getFrameTree",
              "Page.getNavigationHistory":
             return true
-        case "Input.dispatchMouseEvent":
-            return (params["type"] as? String) == "mouseMoved"
-                && (params["buttons"] as? Int ?? 0) == 0
-                && (params["button"] as? String ?? "none") == "none"
         case "Runtime.evaluate":
             guard let expression = params["expression"] as? String else { return false }
             return expression == "1" || expression == "performance.timeOrigin"
@@ -2071,8 +2055,7 @@ final class BrowserPage {
         let reply = try bridge.callTool("cdp", arguments: arguments, timeout: transportWait, referenceGeneration: indexedGeneration)
         TimingLog.count("browser.cdp_reply_bytes", reply.text.utf8.count)
         if reply.isError {
-            if Self.linkDropped(reply.text) { throw BrowserLinkDropped(text: reply.text) }
-            throw ComputerUseError.message("browser: \(BrowserReply.explain(reply.text))")
+            throw BrowserCommandFailure(text: reply.text)
         }
         guard let data = reply.text.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -2085,8 +2068,7 @@ final class BrowserPage {
         let error = (object["error"] as? [String: Any]) ?? ((object["result"] as? [String: Any])?["error"] as? [String: Any])
         if let error {
             let message = (error["message"] as? String) ?? "error"
-            if Self.linkDropped(message) { throw BrowserLinkDropped(text: message) }
-            throw ComputerUseError.message("browser: \(BrowserReply.explain(message))")
+            throw BrowserCommandFailure(text: message)
         }
         return (object["result"] as? [String: Any]) ?? object
     }
