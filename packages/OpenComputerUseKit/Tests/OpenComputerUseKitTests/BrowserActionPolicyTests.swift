@@ -52,6 +52,16 @@ final class BrowserActionPolicyTests: XCTestCase {
         }
     }
 
+    /// Hint probes ride the same write allowlist as every other command during an owned-tab write.
+    func testOwnedWriteAllowlistGovernsHintProbes() {
+        XCTAssertTrue(BrowserBridge.ownedWriteMethodAllowed("DOM.resolveNode", tabID: 12, ownedTabID: 12))
+        XCTAssertTrue(BrowserBridge.ownedWriteMethodAllowed("Runtime.callFunctionOn", tabID: 12, ownedTabID: 12))
+        XCTAssertFalse(BrowserBridge.ownedWriteMethodAllowed("Runtime.releaseObjectGroup", tabID: 12, ownedTabID: 12))
+        XCTAssertFalse(BrowserBridge.ownedWriteMethodAllowed("Input.dispatchMouseEvent", tabID: 12, ownedTabID: 12))
+        XCTAssertFalse(BrowserBridge.ownedWriteMethodAllowed("Runtime.callFunctionOn", tabID: 13, ownedTabID: 12))
+        XCTAssertFalse(BrowserBridge.ownedWriteMethodAllowed("Runtime.callFunctionOn", tabID: nil, ownedTabID: 12))
+    }
+
     /// A failed tab inventory is an error, not an empty list, and the user's tabs are not read after it.
     func testTabInventoryFailsWhenHelperReportsError() throws {
         let open = try JSONDecoder().decode(ActionPolicy.self, from: Data("{}".utf8))
