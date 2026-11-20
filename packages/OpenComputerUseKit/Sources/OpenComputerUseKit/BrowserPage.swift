@@ -145,6 +145,13 @@ final class BrowserPage {
 
     private var tabID: Int? { tab["tab_id"] as? Int }
 
+    /// True only for a tab this helper opened (`open_tab`). Page hooks (fetch and XHR wrappers, `window.__gs`,
+    /// frame removal) are installed only on these; a tab the user owns gets read-only paths.
+    var ownsTab: Bool {
+        guard let tabID else { return false }
+        return bridge.ownedTabGeneration(tabID) != nil
+    }
+
     private static let staleIndex = ComputerUseError.invalidArguments(
         "browser: the tab or document changed; browser read again before using an element number"
     )
@@ -2043,6 +2050,9 @@ final class BrowserPage {
 
     @discardableResult
     func settle(cap: Int = 800) -> BrowserChange {
+        // The network-idle and mutation counters exist only in the agent's own tabs. Elsewhere there is
+        // nothing to observe without changing the page, so no change is claimed.
+        guard ownsTab else { return .none }
         // Polled from here with quick synchronous reads. A promise that waits inside the page never settled in a
         // background tab (Chrome throttles its timers), so each wait hung until the 15 s command timeout.
         let clock = ProcessInfo.processInfo
@@ -2258,6 +2268,8 @@ final class BrowserPage {
     """
 
     private func guardForeignFrames() {
+        // Installing a page hook changes the user's page, so it happens only in a tab the agent opened.
+        guard ownsTab else { return }
         let key = domainKey("foreign-frame-guard")
         if BrowserPageMemory.shared.isEnabled(key) { return }
         let setup = Self.foreignFrameGuardJS + "\n;" + Self.pageStateJS
