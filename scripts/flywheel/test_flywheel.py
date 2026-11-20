@@ -134,6 +134,48 @@ class FlywheelTests(unittest.TestCase):
             with patch.object(f, "HELPER", helper), self.assertRaises(ValueError):
                 f.writable(alias / "output.jsonl")
 
+    def test_export_learning_labels_only_observed_outcomes(self):
+        rows = [
+            {"kind": "decide", "outcome": "act", "probabilities": {"a": .99}, "run_id": "r"},
+            {"kind": "locate", "verified": True, "run_id": "r"},
+            {"kind": "step", "tool": "click", "target_role": "AXButton", "target_label": "Save",
+             "delivery_state": "delivered", "done_when": "verified", "run_id": "r", "app": "x"},
+            {"kind": "step", "tool": "click", "target_role": "AXButton", "target_label": "Next",
+             "delivery_state": "delivered", "done_when": "unmet", "run_id": "r"},
+            {"kind": "step", "tool": "click", "delivery_state": "delivered", "run_id": "r"},
+            {"kind": "step", "tool": "click", "failure_code": "stuck", "run_id": "r"},
+            {"kind": "step", "tool": "click", "done_when": "weak", "run_id": "r"},
+            {"kind": "episode", "goal": "Save the note", "outcome": "done", "run_id": "r"},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            source, out = Path(temporary) / "src", Path(temporary) / "out.jsonl"
+            source.mkdir()
+            (source / "learning-2026-11-20.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows) + "\n", encoding="utf-8")
+            result = f.export_learning(source, out)
+            written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(result, {"labels": {"done": 1, "look_again": 1, "act": 1, "stuck": 1},
+                                  "skipped": 4, "written": 4})
+        self.assertEqual({row["answer"] for row in written}, {"done", "look_again", "act", "stuck"})
+        done = next(row for row in written if row["answer"] == "done")
+        self.assertEqual(set(done), {"state", "answer", "meta"})
+        self.assertEqual(set(done["meta"]), {"id", "family", "source", "check", "outcome", "variant"})
+        state = json.loads(done["state"])
+        self.assertEqual(set(state), set(f.LIMITS))
+        self.assertEqual(state["goal"], "Save the note")
+        self.assertEqual(state["last_step"], "click AXButton Save")
+
+    def test_export_learning_refuses_live_outputs_and_bad_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "learning-2026-11-20.jsonl").write_text("not json\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                f.export_learning(source, Path(temporary) / "out.jsonl")
+            (source / "learning-2026-11-20.jsonl").write_text("", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                f.export_learning(source, Path.home() / ".godspeed" / "out.jsonl")
+            self.assertFalse((Path(temporary) / "out.jsonl").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
