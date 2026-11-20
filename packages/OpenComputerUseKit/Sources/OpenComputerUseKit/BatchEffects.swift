@@ -1,3 +1,4 @@
+import ApplicationServices
 import Foundation
 
 /// Pure helpers for batch replies: what one step changed on screen, whether the batch is still in the
@@ -287,6 +288,43 @@ enum BatchEffects {
     }
 
     // MARK: - wait step
+
+    /// The cheap check only decides when to take a full verification read.
+    /// Periodic full reads cover labels and dialogs a shallow AX probe can miss.
+    struct WaitReadGate {
+        var nextFullRead: TimeInterval
+        static let fallbackInterval: TimeInterval = 0.75
+
+        mutating func shouldRead(at now: TimeInterval, probe: () -> Bool?) -> Bool {
+            guard now >= nextFullRead || probe() != false else { return false }
+            nextFullRead = now + Self.fallbackInterval
+            return true
+        }
+    }
+
+    static func waitMayBeReady(_ kind: Wait.Kind, app: String, windowID: UInt32?) -> Bool? {
+        guard let app = try? AppDiscovery.resolveRunning(app),
+              let context = try? SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID) else { return nil }
+        switch kind {
+        case .window(let title):
+            if SmartSteps.axText(kAXTitleAttribute, of: context.windowElement)?.localizedCaseInsensitiveContains(title) == true {
+                return true
+            }
+            return SmartSteps.sheetCandidates(pid: app.pid).contains {
+                SmartSteps.axText(kAXTitleAttribute, of: $0)?.localizedCaseInsensitiveContains(title) == true
+            }
+        case .text(let text), .gone(let text):
+            let criteria = TargetedAX.Criteria(text: text, exact: false, role: nil, limit: 1, maxNodes: 32)
+            guard let scan = try? SnapshotBuilder.targetedSearch(criteria, in: context, timeout: 0.06) else { return nil }
+            switch kind {
+            case .text: return !scan.records.isEmpty
+            case .gone: return scan.records.isEmpty
+            default: return nil
+            }
+        case .settle:
+            return !WindowSettle.busy(from: context.windowElement, read: WindowSettle.readAll)
+        }
+    }
 
     /// `{"tool": "wait", "window": "Save"}` (or text, gone, settle: true, timeout_ms).
     struct Wait {

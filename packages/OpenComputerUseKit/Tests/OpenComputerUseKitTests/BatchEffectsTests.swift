@@ -7,6 +7,27 @@ final class BatchEffectsTests: XCTestCase {
         (["App=com.example (pid 1)", "Window: \"\(title)\", App: Example.", "[legend]"] + rows).joined(separator: "\n")
     }
 
+    func testWaitPollsCheaplyAndTakesOneFullReadOnReadiness() {
+        var gate = BatchEffects.WaitReadGate(nextFullRead: 0.75)
+        var probes = 0
+        var fullReads = 0
+        for time in [0.0, 0.2, 0.4] {
+            if gate.shouldRead(at: time, probe: {
+                probes += 1
+                return time == 0.4
+            }) { fullReads += 1 }
+        }
+        XCTAssertEqual(probes, 3)
+        XCTAssertEqual(fullReads, 1)
+    }
+
+    func testWaitStillTakesFullReadOnUnknownOrAtFallbackDeadline() {
+        var gate = BatchEffects.WaitReadGate(nextFullRead: 0.75)
+        XCTAssertTrue(gate.shouldRead(at: 0.2) { nil })
+        XCTAssertFalse(gate.shouldRead(at: 0.5) { false })
+        XCTAssertTrue(gate.shouldRead(at: 0.95) { false })
+    }
+
     func testReusesChangedWindowEvidenceOnlyWithCompleteMatchingScope() {
         let head = "App=test.app (pid 42)\nWindow: \"Editor\", App: Test.\nWindow ID: 17\n"
         let before = head + "1 text field Title = old"
