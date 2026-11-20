@@ -1,6 +1,7 @@
 """Run with python3 -I -m unittest discover -s scripts/flywheel -p 'test_*.py'. Uses synthetic logs in temp folders only."""
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -166,6 +167,24 @@ class MiningTests(unittest.TestCase):
     def test_output_path_must_stay_outside_live_folders(self):
         with self.assertRaises(ValueError):
             f.writable(Path.home() / ".godspeed" / "candidates.json")
+
+    def test_cli_writes_a_new_candidates_file(self):
+        script = Path(__file__).with_name("flywheel.py")
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "log"
+            log.mkdir()
+            rows = []
+            for index in range(3):
+                rows += batch("Charge bob@x.com 7777", run=f"cli-{index}")
+            write_log(log, rows)
+            out = Path(temporary) / "candidates.json"
+            command = [sys.executable, "-I", str(script), "mine-recipes", str(log), "--out", str(out)]
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))[0]["support"], 3)
+            again = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertEqual(again.returncode, 1)
+            self.assertIn("flywheel:", again.stderr)
 
 
 if __name__ == "__main__":
