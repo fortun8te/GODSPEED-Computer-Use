@@ -31,6 +31,11 @@ enum BatchTool {
 
     /// Tools that only read; a batch made only of these never triggers the unchanged-screen note.
     static let readOnlyTools: Set<String> = ["query", "list_apps", "get_app_state"]
+    private static let readOnlyBrowserActions: Set<String> = [
+        "read", "state", "look", "snapshot", "screenshot", "see", "look_at", "location", "info", "page", "page_info",
+        "outline", "frames", "read_text", "link_destination", "control_state", "value", "tabs", "list",
+        "wait", "wait_load", "wait_for", "peek", "read_many", "open_many",
+    ]
 
     /// The structured receipt still contains every step, including its original number and duration.
     static func compactRepeatedSuccesses(_ lines: [String]) -> [String] {
@@ -59,9 +64,47 @@ enum BatchTool {
         return output
     }
 
+    /// Group consecutive successful steps and omit redundant effect details once the goal is verified.
+    /// Keep notices, unconfirmed steps and informational results at their original positions.
+    static func compactVerifiedLines(_ lines: [String]) -> [String] {
+        var output: [String] = []
+        var first: Int?
+        var last: Int?
+        func appendRun() {
+            guard let start = first, let end = last else { return }
+            output.append(start == end ? "Step \(start) ok" : "Steps \(start)–\(end) ok")
+            first = nil
+            last = nil
+        }
+        for line in lines {
+            if line.hasPrefix("   effect: ") || line.hasPrefix("   new: ") || line.hasPrefix("   gone: ")
+                || line.hasPrefix("   screen changed a lot: ") || line == "   no visible change" { continue }
+            if !line.contains("\n"), line.hasSuffix(": ok"), let separator = line.range(of: ". "),
+               let number = Int(line[..<separator.lowerBound]), (1...maxSteps).contains(number) {
+                if let last, last + 1 != number { appendRun() }
+                if first == nil { first = number }
+                last = number
+                continue
+            }
+            appendRun()
+            output.append(line)
+        }
+        appendRun()
+        return output
+    }
+
     struct Step {
         let tool: String
         let arguments: [String: Any]
+
+        var isReadOnly: Bool {
+            let action = (arguments["action"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return BatchTool.readOnlyTools.contains(tool) || tool == BatchTool.waitName
+                || (tool == "browser" && action.map {
+                    BatchTool.readOnlyBrowserActions.contains(ComputerUseToolDispatcher.canonicalBrowserAction($0))
+                } == true)
+                || (tool == "clipboard" && action == "read")
+        }
     }
 
     /// Whether the state this agent last saw for `app` had a sheet or dialog open. Steps in a dialog need the
@@ -386,11 +429,17 @@ final class BatchObservationMemory: @unchecked Sendable {
         return lastStateText[app.lowercased()]
     }
 
-    /// Records the full state text the model was shown for `app`.
+    /// Records the full diff baseline for the last observation delivered to the model.
     func recordShown(app: String, text: String) {
         lock.lock()
         defer { lock.unlock() }
         lastStateText[app.lowercased()] = text
+    }
+
+    func clearShown(app: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        lastStateText[app.lowercased()] = nil
     }
     private var failures: [String: (step: String, count: Int)] = [:]
 
@@ -516,9 +565,21 @@ extension ComputerUseToolDispatcher {
         let steps = try parsedSteps.map { step in
             guard let pinnedWindow, let defaultApp else { return step }
             var args = step.arguments
+            // A wait only reads state. In a window-bound batch it reads the pinned window, so it is safe
+            // unless it waits for a different window to appear.
+            if step.tool == BatchTool.waitName {
+                if args["window"] != nil || BatchEffects.Wait.keyAliases.contains(where: { $0.value == "window" && args[$0.key] != nil }) {
+                    throw ComputerUseError.invalidArguments("A window-bound batch cannot wait for another window. Drop window_id to wait for a new window.")
+                }
+                if let app = args["app"] as? String, app != defaultApp {
+                    throw ComputerUseError.invalidArguments("A wait in a window-bound batch reads its own app.")
+                }
+                args["app"] = defaultApp
+                return BatchTool.Step(tool: step.tool, arguments: args)
+            }
             guard (args["app"] as? String) == defaultApp,
                   ArgumentNormalizer.windowBoundTools.contains(step.tool) else {
-                throw ComputerUseError.invalidArguments("A window-bound batch accepts supported native actions on its specified app. It reads the state after the actions.")
+                throw ComputerUseError.invalidArguments("A window-bound batch accepts \(step.tool) only as one of: \(ArgumentNormalizer.windowBoundTools.sorted().joined(separator: ", ")), wait, on \(defaultApp). Drop window_id to use other steps.")
             }
             if let override = try validatedQueryWindowID(args["window_id"]), override != pinnedWindow {
                 throw ComputerUseError.invalidArguments("A batch step cannot override the pinned window.")
@@ -551,6 +612,10 @@ extension ComputerUseToolDispatcher {
         if hasPinnedSteps && foreground {
             throw ComputerUseError.invalidArguments("A window-bound step requires a background batch.")
         }
+        // Only a validated, mutating batch with a goal and no deterministic check can ask for a hint.
+        let mayUseReferee = Referee.isEnabled && !goal.isEmpty && doneConditions.isEmpty
+            && steps.contains { !$0.isReadOnly }
+        if mayUseReferee { Referee.warmInBackground() }
         let remember = arguments["remember"] as? Bool
         recipeRun.canSave = !hasPinnedSteps && !BatchTool.usesPositionalTargets(steps)
             && (remember == true || (remember != false && !doneConditions.isEmpty))
@@ -586,7 +651,8 @@ extension ComputerUseToolDispatcher {
         // Per-step effects and window continuity (BatchEffects). One extra read of the app per mutating step,
         // switched off for the batch when the app reads slowly or with effects: false.
         // An intermediate snapshot must not replace the observation used by a pinned action.
-        let compactReply = (arguments["compact"] as? Bool) == true
+        // Compact by default whenever a done check is given: a verified goal needs no window dump.
+        let compactReply = (arguments["compact"] as? Bool) ?? !doneConditions.isEmpty
         let effectsOn = !hasPinnedSteps && BatchEffects.isEnabled && ((arguments["effects"] as? Bool) ?? true)
         var effectBudget = BatchEffects.ReadBudget()
         var watchApp: String?
@@ -606,6 +672,7 @@ extension ComputerUseToolDispatcher {
             if optionalEffect, effectBudget.exhausted || clock.systemUptime >= actionDeadline { return nil }
             let began = clock.systemUptime
             var readArguments: [String: Any] = ["app": app, "include_screenshot": NSNumber(value: false)]
+            if let pinnedWindow, app == defaultApp { readArguments["window_id"] = pinnedWindow }
             if settleMs > 0 { readArguments["settle_ms"] = settleMs }
             let read = callToolAsResult(name: "get_app_state", arguments: readArguments)
             let text = read.isError ? nil : LeanOutput.stateText(of: read)
@@ -828,9 +895,7 @@ extension ComputerUseToolDispatcher {
             receipt.steps.append(.init(durationMs: durationMs))
             stepResults.append((BatchTool.describe(step), "ok"))
             let browserAction = ((step.arguments["action"] as? String) ?? "").lowercased()
-            let readsOnly = BatchTool.readOnlyTools.contains(step.tool)
-                || (step.tool == "browser" && ["read", "state", "look", "snapshot", "location", "info", "outline", "frames", "read_text", "link_destination", "control_state", "value", "tabs", "wait", "peek"].contains(browserAction))
-            if !readsOnly {
+            if !step.isReadOnly {
                 changedSomething = true
             }
 
@@ -932,7 +997,7 @@ extension ComputerUseToolDispatcher {
             return args
         }
         // Verification, recovery reads and screenshots share a single tail deadline.
-        let browserObservationDeadline = min(deadline, clock.systemUptime + 8)
+        let browserObservationDeadline = min(deadline, clock.systemUptime + (finalClickChecksPage ? 15 : 8))
         func browserObservation(_ action: String) -> ToolCallResult {
             guard clock.systemUptime < browserObservationDeadline else {
                 return .text("Browser observation time expired. Refresh the tab before resuming.", isError: true)
@@ -942,12 +1007,12 @@ extension ComputerUseToolDispatcher {
             }
         }
         func waitForBrowserEvidence(_ condition: DoneCheck.Condition) -> Bool {
-            let waitDeadline = min(browserObservationDeadline - 1.5, clock.systemUptime + 2)
+            let waitDeadline = min(browserObservationDeadline - 1.5, clock.systemUptime + 6)
             guard waitDeadline - clock.systemUptime > 0.6 else { return false }
             // A submitted form may still be rendering its confirmation. Give the
             // existing event-based wait a short part of the same recovery budget.
             var args = browserVerificationArgs("wait_for")
-            args["timeout"] = 1
+            args["timeout"] = 5
             for (key, value) in condition.arguments { args[key] = value }
             return BrowserCallBudget.withDeadline(waitDeadline) {
                 !callToolAsResult(name: "browser", arguments: args).isError
@@ -1094,7 +1159,7 @@ extension ComputerUseToolDispatcher {
                 ))
             }
             var doneResult = earlyCompletion ?? checkConditions()
-            if !failed, finalClickChecksPage, case .missing(let unmet) = doneResult,
+            if (!failed || ambiguousFinalClick), finalClickChecksPage, case .missing(let unmet) = doneResult,
                let pending = doneConditions.first(where: { unmet.contains($0.summary) }),
                waitForBrowserEvidence(pending) {
                 observation = browserObservation("read")
@@ -1116,7 +1181,7 @@ extension ComputerUseToolDispatcher {
 
         // Explicit checks and interrupted steps already have a concrete recovery result.
         // Reserve the optional referee for successful batches with no declared outcome check.
-        if changedSomething, Referee.isEnabled, !goal.isEmpty, doneConditions.isEmpty, !failed, !stoppedForTime,
+        if changedSomething, mayUseReferee, !failed, !stoppedForTime,
            stuckLine == nil, let observation, !observation.isError {
             let state = LeanOutput.stateText(of: observation) ?? observation.textContent
             let changes = previousShown.flatMap { AXStateDiff.diff(previous: $0, current: state) }
@@ -1158,8 +1223,8 @@ extension ComputerUseToolDispatcher {
         // The final read is taken; hand focus back now rather than after the reply is composed.
         focus.close()
 
-        let replyLines = compactReply && verifiedDone && !failed && !stoppedForTime
-            ? BatchTool.compactRepeatedSuccesses(lines) : lines
+        let compactVerified = compactReply && verifiedDone && !failed && !stoppedForTime
+        let replyLines = compactVerified ? BatchTool.compactVerifiedLines(lines) : lines
         var content: [ToolResultContentItem] = [.text(replyLines.joined(separator: "\n"))]
         if let observation {
             receipt.observation = observation.isError ? .failed : .returned
@@ -1167,14 +1232,16 @@ extension ComputerUseToolDispatcher {
                 && (doneConditions.isEmpty || verifiedDone)
                 ? LeanOutput.condensed(observation, mode: .compactBatch) : observation
             var shown = presented
-            if let memoryKey, !presented.isError, let current = LeanOutput.stateText(of: presented) {
+            if let memoryKey, !presented.isError, LeanOutput.stateText(of: presented) != nil {
                 // Compare with what the model last saw for this app (a get_app_state or the previous batch),
                 // not with reads inside this batch it never saw. After a failure send the full state.
-                let previous = BatchObservationMemory.shared.shownText(app: memoryKey)
-                if !failed, !stoppedForTime, doneConditions.isEmpty || verifiedDone {
-                    shown = LeanOutput.diffed(presented, previous: previous)
-                }
-                BatchObservationMemory.shared.recordShown(app: memoryKey, text: current)
+                shown = LeanOutput.batchNativeObservation(
+                    presented, memory: .shared, app: memoryKey,
+                    allowsDiff: !failed && !stoppedForTime && (doneConditions.isEmpty || verifiedDone),
+                    compactVerified: compactVerified
+                )
+            } else if compactVerified, lastAttemptedStep?.tool == "browser", !presented.isError {
+                shown = LeanOutput.browserHeaderOnly(presented)
             }
             content.append(contentsOf: shown.content)
         }

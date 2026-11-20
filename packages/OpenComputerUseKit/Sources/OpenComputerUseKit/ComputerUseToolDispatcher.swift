@@ -119,6 +119,13 @@ public final class ComputerUseToolDispatcher {
                String(describing: error).contains("no element labelled"),
                let descriptor = try? AppDiscovery.resolveRunning(app),
                let path = MenuItemLookup.path(for: label, pid: descriptor.pid) {
+                // "Delete", "Don't Save", "Quit": usually a dialog button the model expected. Its menu
+                // namesake acts on whatever is selected, so it is never pressed in its place.
+                if MenuItemLookup.isDestructive(label) {
+                    throw ComputerUseError.message(
+                        "No '\(label)' button is on screen, so nothing was clicked. \(path.joined(separator: " > ")) is a menu item that acts on the current selection; if that is what you want, use press_menu {path: \"\(path.joined(separator: " > "))\"}. If you expected a dialog, read the app state first."
+                    )
+                }
                 let pressed = try runWithSmartSteps(name: "press_menu", arguments: ["app": app, "path": path.joined(separator: " > ")], log: log)
                 log.note("'\(label)' is a menu item; pressed \(path.joined(separator: " > ")).")
                 return pressed
@@ -454,11 +461,18 @@ public final class ComputerUseToolDispatcher {
                 modifiers: modifiers ?? []
             )
         case "type_text":
-            return try service.typeText(
-                app: requireString("app", in: arguments),
-                text: requireString("text", in: arguments),
-                keyMethod: try parseKeyMethod(optionalString("key_method", in: arguments))
-            )
+            let app = try requireString("app", in: arguments)
+            let text = try requireString("text", in: arguments)
+            let keyMethod = try parseKeyMethod(optionalString("key_method", in: arguments))
+            // replace: true selects what the focused field holds (cmd+a) before typing, so a search
+            // box or contenteditable that set_value cannot write gets the new text instead of an
+            // appended one. Seen in Discord search (2026-11-19).
+            let replaceRaw = arguments["replace"] ?? arguments["replace_existing"] ?? arguments["clear"] ?? arguments["clear_first"]
+            let replace = (replaceRaw as? Bool) ?? ["1", "true", "yes", "on"].contains(((replaceRaw as? String) ?? "").lowercased())
+            if replace {
+                _ = try service.pressKey(app: app, key: "cmd+a", keyMethod: keyMethod)
+            }
+            return try service.typeText(app: app, text: text, keyMethod: keyMethod)
         case "press_key":
             return try service.pressKey(
                 app: requireString("app", in: arguments),

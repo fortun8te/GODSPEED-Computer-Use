@@ -92,7 +92,7 @@ public enum ToolDefinitions {
                     "foreground": ["type": "boolean", "default": false, "description": "Last resort only: bring the app forward (skipped while the user is using the Mac). Steps, dialogs included, normally work in the background."],
                     "remember": ["type": "boolean", "default": false, "description": "Save these steps as the recipe for goal once they all succeed."],
                     "return_state": ["type": "boolean", "default": true, "description": "False skips the final browser snapshot when a URL-only completion check already passed. Recovery still includes state."],
-                    "compact": ["type": "boolean", "default": false, "description": "Return a smaller final native observation after completion checks."],
+                    "compact": ["type": "boolean", "description": "Smaller final observation. Default: on when done_when is given (a verified goal replies in a few lines)."],
                     "effects": ["type": "boolean", "default": true, "description": "False skips per-step effect reads. Use a pinned window and a final completion check for known sequences."],
                     "screenshot": ["type": "boolean", "default": false, "description": "Also return a screenshot."],
                 ],
@@ -229,13 +229,14 @@ public enum ToolDefinitions {
         ),
         ToolDefinition(
             name: "type_text",
-            description: "Use to type literal text into the focused field; not to replace a field's value (use set_value). Click the field first. Example: {\"app\": \"Notes\", \"text\": \"hello\"}.",
+            description: "Use to type literal text into the focused field; to set a field's whole value use set_value. Click the field first. replace: true selects the focused field's text first (search boxes, chat inputs set_value cannot write). Example: {\"app\": \"Notes\", \"text\": \"hello\"}.",
             annotations: defaultAnnotations(),
             inputSchema: objectSchema(
                 properties: [
                     "window_id": observedWindowIDProperty(),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "text": stringProperty(description: "Text to type"),
+                    "replace": ["type": "boolean", "description": "Select the focused field's existing text first, so the typed text replaces it"],
                     "key_method": keyMethodProperty(),
                 ],
                 required: ["app", "text"]

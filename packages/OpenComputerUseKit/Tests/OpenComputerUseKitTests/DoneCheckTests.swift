@@ -28,6 +28,120 @@ final class DoneCheckTests: XCTestCase {
 
     // MARK: - Parsing
 
+    func testDoneWhenAndWaitAcceptCommonSpellings() throws {
+        XCTAssertEqual(try DoneCheck.parse(["contains": "Saved"]), [.text("Saved")])
+        XCTAssertEqual(try DoneCheck.parse(["url": "/thanks"]), [.urlContains("/thanks")])
+        XCTAssertEqual(try DoneCheck.parse(["field": "Volume", "is": 40]), [.field(label: "Volume", equals: "40")])
+        XCTAssertEqual(try DoneCheck.parse(["absent": "Loading"]), [.gone("Loading")])
+        XCTAssertThrowsError(try DoneCheck.parse(["nonsense": "x"]))
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["until": "Done"]).kind, .text("Done"))
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["dialog": "Export"]).kind, .window("Export"))
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["disappears": "Loading"]).kind, .gone("Loading"))
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["settle": 1]).kind, .settle)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["text": "x", "timeout": 3]).timeoutMs, 3_000)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["text": "x", "timeout": 2500]).timeoutMs, 2_500)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["text": "x", "ms": 700]).timeoutMs, 700)
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["nothing": true]))
+    }
+
+    func testDestructiveLabelsNeverFallThroughToMenuItems() {
+        for label in ["Delete", "Delete…", "Move to Trash", "Don’t Save", "Don't Save", "Quit TextEdit", "Close Window", "Empty Trash", "Send"] {
+            XCTAssertTrue(MenuItemLookup.isDestructive(label), label)
+        }
+        for label in ["Make Plain Text", "Show Fonts", "Select All", "Copy", "Paste", "Bold", "Closed Captions", "Sender Info", "Cuts list"] {
+            XCTAssertFalse(MenuItemLookup.isDestructive(label), label)
+        }
+    }
+
+    func testBrowserActionAliasesMapToRealActions() {
+        XCTAssertEqual(ComputerUseToolDispatcher.canonicalBrowserAction("input"), "type")
+        XCTAssertEqual(ComputerUseToolDispatcher.canonicalBrowserAction("list-tabs"), "tabs")
+        XCTAssertEqual(ComputerUseToolDispatcher.canonicalBrowserAction("list_tabs"), "tabs")
+        XCTAssertEqual(ComputerUseToolDispatcher.canonicalBrowserAction("scroll_down"), "scroll")
+        XCTAssertEqual(ComputerUseToolDispatcher.canonicalBrowserAction("click"), "click")
+        XCTAssertEqual(ComputerUseToolDispatcher.canonicalBrowserAction("nonsense"), "nonsense")
+        // Every alias points at an action the browser tool lists.
+        let listed = Set("open, go, read, screenshot, click, drag, type, fill_field, copy, cut, paste, key, hover, select, check, uncheck, scroll, scroll_into_view, back, forward, reload, wait_for, tabs, use_tab, close_tab, wait, location, info, outline, frames, read_text, link_destination, control_state, value, upload, peek".components(separatedBy: ", "))
+        for (alias, action) in ComputerUseToolDispatcher.browserActionAliases {
+            XCTAssertTrue(listed.contains(action), "\(alias) -> \(action)")
+            XCTAssertFalse(ComputerUseToolDispatcher.knownBrowserActions.contains(alias), "\(alias) shadows a real action")
+            XCTAssertTrue(ComputerUseToolDispatcher.knownBrowserActions.contains(action), "\(alias) -> unknown \(action)")
+        }
+    }
+
+    func testFrozenAppMessageNamesTheAppAndStopsRetries() {
+        XCTAssertTrue(SnapshotBuilder.appLooksFrozen(.cannotComplete))
+        XCTAssertFalse(SnapshotBuilder.appLooksFrozen(.success))
+        XCTAssertFalse(SnapshotBuilder.appLooksFrozen(.noValue))
+        let message = SnapshotBuilder.appNotRespondingMessage(name: "Calculator")
+        XCTAssertTrue(message.hasPrefix("Calculator is not responding"))
+        XCTAssertTrue(message.contains("Do not retry"))
+        XCTAssertTrue(SnapshotBuilder.appNotRespondingMessage(name: nil).hasPrefix("The app"))
+    }
+
+    func testLabeledNumberMatchesRegionalFormatting() {
+        XCTAssertTrue(DoneCheck.containsLabeledNumber("5 text Description: Edit field 6.958", "Edit field 6958"))
+        XCTAssertTrue(DoneCheck.containsLabeledNumber("Edit field 0,25", "edit field 0.25"))
+        XCTAssertFalse(DoneCheck.containsLabeledNumber("Edit field 69.580", "Edit field 6958"))
+        XCTAssertFalse(DoneCheck.containsLabeledNumber("Last Expression 6.958", "Edit field 6958"))
+        XCTAssertFalse(DoneCheck.containsLabeledNumber("Edit field 16,41", "Edit field 1641"))
+    }
+
+    func testNumberMatchesRegionalFormatting() {
+        XCTAssertTrue(DoneCheck.containsNumber("Edit field 1.641", "1641"))
+        XCTAssertTrue(DoneCheck.containsNumber("Edit field 1,641", "1641"))
+        XCTAssertTrue(DoneCheck.containsNumber("Total 1\u{202F}641", "1641"))
+        XCTAssertTrue(DoneCheck.containsNumber("Edit field 0,25", "0.25"))
+        XCTAssertTrue(DoneCheck.containsNumber("Edit field 1.234.567,5", "1234567.5"))
+        XCTAssertTrue(DoneCheck.containsNumber("value −12", "-12"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 16,41", "1641"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 16410", "1641"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 1.6411", "1641"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 1641", "1.641"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 1.641", "Total"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 120", "12"))
+        let calculator = "Window ID: 12573\n\t\t\t4 scroll area ID: StandardInputView;value:120, Secondary Actions: Copy\n\t\t\t\t5 text Description: Edit field 120\n\t\t\t12 button 9 ID: Nine"
+        XCTAssertFalse(DoneCheck.containsNumber(calculator, "12"))
+        XCTAssertFalse(DoneCheck.containsNumber(calculator, "12573"))
+        XCTAssertFalse(DoneCheck.containsNumber(calculator, "4"))
+        XCTAssertTrue(DoneCheck.containsNumber(calculator, "120"))
+        XCTAssertTrue(DoneCheck.containsNumber(calculator, "9"))
+        XCTAssertTrue(DoneCheck.containsNumber("Last Expression 144 ÷ 12", "12"))
+        XCTAssertTrue(DoneCheck.containsNumber("Pages 1-9", "9"))
+        XCTAssertTrue(DoneCheck.containsNumber("row 12 34", "12"))
+        XCTAssertTrue(DoneCheck.containsNumber("row 12 34", "34"))
+        XCTAssertTrue(DoneCheck.containsNumber("Edit field 1.641", "1,641"))
+        XCTAssertFalse(DoneCheck.contains("Edit field 120", "Edit field 12"))
+        XCTAssertTrue(DoneCheck.contains("Edit field 12\nnext", "edit field 12"))
+        XCTAssertTrue(DoneCheck.contains("Saved v2.1 (beta)", "v2.1"))
+        XCTAssertFalse(DoneCheck.contains("Page 112 of 300", "12 of 300"))
+        XCTAssertTrue(DoneCheck.contains("a+b (x)", "+b (x"))
+        XCTAssertTrue(DoneCheck.containsNumber("Date 19.11.2026", "19.11.2026"))
+        XCTAssertTrue(DoneCheck.containsNumber("Host 192.168.1.1 up", "192.168.1.1"))
+        XCTAssertTrue(DoneCheck.containsNumber("Edit field 0,25", "0,25"))
+        XCTAssertFalse(DoneCheck.containsNumber("Host 192.168.1.10", "192.168.1.1"))
+        XCTAssertTrue(DoneCheck.containsNumber("Sum,1.641", "1641"))
+        XCTAssertFalse(DoneCheck.containsNumber("Month 5", "05"))
+        XCTAssertFalse(DoneCheck.containsNumber("Agent 7", "007"))
+        XCTAssertFalse(DoneCheck.containsNumber("Step 1 641", "1641"))
+        XCTAssertTrue(DoneCheck.isPlainNumber("1641"))
+        XCTAssertFalse(DoneCheck.isPlainNumber("Edit field 12"))
+        XCTAssertFalse(DoneCheck.isPlainNumber("12 x 34"))
+        // Plain text targets keep the old substring check.
+        let words = DoneCheck.check([.text("Message sent")], evidence: .init(screenText: "Status: Message sent!", pageURL: { nil }))
+        if case .verified = words {} else { XCTFail("text target") }
+        let number = DoneCheck.check([.text("12")], evidence: .init(screenText: "Edit field 120", pageURL: { nil }))
+        if case .verified = number { XCTFail("12 must not match 120") }
+    }
+
+    func testProcessAndWindowMetadataCannotVerifyANumericGoal() {
+        let state = "App=com.example.Calculator (pid 3962)\nWindow ID: 4765\nCGWindowID: 2657\n4 text Total 36"
+        XCTAssertFalse(DoneCheck.containsNumber(state, "3962"))
+        XCTAssertFalse(DoneCheck.containsNumber(state, "4765"))
+        XCTAssertFalse(DoneCheck.containsNumber(state, "2657"))
+        XCTAssertTrue(DoneCheck.containsNumber(state, "36"))
+    }
+
     func testParsesOneObjectAndAList() throws {
         XCTAssertEqual(try DoneCheck.parse(["text": "Message sent"]), [.text("Message sent")])
         XCTAssertEqual(

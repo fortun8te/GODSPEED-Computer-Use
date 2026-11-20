@@ -59,13 +59,67 @@ enum LeanOutput {
                   windowIDLine(in: previous) == windowIDLine(in: text),
                   let summary = AXStateDiff.diff(previous: previous, current: text, matchIndexes: ElementNumbering.isEnabled)
             else { return item }
-            replaced = true
             // Keep the header line so the model still sees which app and window this is.
             // App, window and the legend line ([w=settable]).
             let header = text.split(separator: "\n", maxSplits: 3).prefix(3).joined(separator: "\n")
-            return .text(header + "\n" + summary)
+            let compact = header + "\n" + summary
+            guard compact.utf8.count < text.utf8.count else { return item }
+            replaced = true
+            return .text(compact)
         }
         return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+    }
+
+    /// Only the state's header (app, window, window ID), with a pointer to the full read.
+    static func headerOnly(_ observation: ToolCallResult) -> ToolCallResult {
+        var replaced = false
+        let content = observation.content.map { item -> ToolResultContentItem in
+            guard !replaced, item.dictionary["type"] as? String == "text",
+                  let text = item.dictionary["text"] as? String, isStateText(text) else { return item }
+            let header = text.split(separator: "\n", maxSplits: 3).prefix(3)
+                .filter { !$0.hasPrefix("[") }.joined(separator: "\n")
+            let compact = header + "\nWindow list omitted (goal verified); get_app_state reads it."
+            guard compact.utf8.count < text.utf8.count else { return item }
+            replaced = true
+            return .text(compact)
+        }
+        return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+    }
+
+    /// A verified browser batch: the page snapshot's first lines (tab, URL) only.
+    static func browserHeaderOnly(_ observation: ToolCallResult) -> ToolCallResult {
+        var replaced = false
+        let content = observation.content.map { item -> ToolResultContentItem in
+            guard !replaced, item.dictionary["type"] as? String == "text",
+                  let text = item.dictionary["text"] as? String, text.split(separator: "\n").count > 6 else { return item }
+            replaced = true
+            let head = text.split(separator: "\n", maxSplits: 3).prefix(3).joined(separator: "\n")
+            return .text(head + "\nPage snapshot omitted (goal verified); browser read shows it.")
+        }
+        return replaced ? ToolCallResult(content: content, isError: observation.isError) : observation
+    }
+
+    static func batchNativeObservation(
+        _ observation: ToolCallResult, memory: BatchObservationMemory, app: String,
+        allowsDiff: Bool, compactVerified: Bool
+    ) -> ToolCallResult {
+        guard !observation.isError, let current = stateText(of: observation) else { return observation }
+        if allowsDiff {
+            let delta = diffed(observation, previous: memory.shownText(app: app))
+            if stateText(of: delta) != current {
+                // The client has the old baseline and received the changes.
+                memory.recordShown(app: app, text: current)
+                return delta
+            }
+        }
+        let shown = compactVerified ? headerOnly(observation) : observation
+        if stateText(of: shown) == current {
+            memory.recordShown(app: app, text: current)
+        } else {
+            // An omitted tree cannot be the baseline for a later “no changes” or diff reply.
+            memory.clearShown(app: app)
+        }
+        return shown
     }
 
     private static func windowIDLine(in state: String) -> Substring? {
