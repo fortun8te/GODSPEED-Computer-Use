@@ -1,11 +1,11 @@
 import Foundation
 
 let computerUseServerInstructions = """
-Use Godspeed for Mac apps and Chrome. Keep actions in the background.
+Use Godspeed for Mac apps and Chrome.
 
 - Mac: compact get_app_state, then batch known actions with an observable done_when. For one step, use its tool. Use unique labels or fresh indexes.
 - Web: browser in its own tab. Use interactive or find to narrow a read. Request screenshots for visual targets that need them.
-- Verify against the result. Model hints are advisory. After a partial failure, read fresh state before retrying uncertain steps. Use receipt.recovery to resume.
+- Verify against the result. Model hints are advisory. After a partial failure, read fresh state before retrying uncertain steps.
 - Use handoff for bounded subtasks and remember only verified reusable batches. Use the private clipboard across apps. Ask before sending, deleting, or purchasing.
 """
 
@@ -15,30 +15,44 @@ public final class StdioMCPServer {
     private let backgroundStateReset: () -> Void
     /// Per-connection record of top-level tool calls.
     private let trajectory: TrajectoryLog
+    private let recordOperations: Bool
 
-    public init(
+    public convenience init(
         service: ComputerUseService = ComputerUseService(),
         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
-        trajectoryEnvironment: [String: String]? = nil
+        trajectoryEnvironment: [String: String]? = nil,
+        recordOperations: Bool = false
     ) {
-        self.service = service
-        self.dispatcher = ComputerUseToolDispatcher(service: service)
+        self.init(dispatcher: ComputerUseToolDispatcher(service: service), backgroundStateReset: backgroundStateReset,
+                  trajectoryEnvironment: trajectoryEnvironment, recordOperations: recordOperations)
+    }
+
+    init(dispatcher: ComputerUseToolDispatcher,
+         backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
+         trajectoryEnvironment: [String: String]? = nil, recordOperations: Bool = false) {
+        self.recordOperations = recordOperations
+        self.service = dispatcher.service
+        self.dispatcher = dispatcher
         self.backgroundStateReset = backgroundStateReset
         self.trajectory = TrajectoryLog(environment: trajectoryEnvironment ?? GodspeedSettings.environment)
     }
 
     public func run() throws {
         defer { endSession() }
-        while let line = readLine(strippingNewline: true) {
-            guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                continue
+        let requests = MCPRequestStream()
+        Thread.detachNewThread {
+            while let line = readLine(strippingNewline: true) {
+                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
+                if !accepted { break }
             }
-
-            // This thread's autorelease pool never drains on its own: each response's encoded
-            // bytes (a screenshot's base64 among them) stayed alive for the whole session.
+            requests.disconnect()
+        }
+        while let request = requests.next() {
             autoreleasepool {
-                if let response = handle(line: line) {
-                    FileHandle.standardOutput.write((response + "\n").data(using: .utf8)!)
+                RequestCancellation.$current.withValue(request.cancellation) {
+                    if let response = withOperationJournal({ handle(line: request.line) }) {
+                        FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                    }
                 }
             }
         }
@@ -73,7 +87,7 @@ public final class StdioMCPServer {
                         "instructions": computerUseServerInstructions,
                     ]
                 )
-            case "notifications/initialized":
+            case "notifications/initialized", "notifications/cancelled":
                 return nil
             case "notifications/turn-ended":
                 endSession()
@@ -94,7 +108,8 @@ public final class StdioMCPServer {
                 let startedAt = Date()
                 let result: ToolCallResult
                 do {
-                    result = try dispatcher.callTool(name: name, arguments: arguments)
+                    let call = { try self.dispatcher.callTool(name: name, arguments: arguments) }
+                    result = try recordOperations ? withOperationJournal(call) : call()
                 } catch {
                     trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt, admissionMs: admissionMs)
                     throw error
@@ -118,23 +133,8 @@ public final class StdioMCPServer {
 
                 return try encodeJSONRPCError(id: id, code: -32601, message: "Method not found: \(method ?? "")")
             }
-        } catch let error as ComputerUseError {
-            let result = ToolCallResult.text(error.errorDescription ?? String(describing: error), isError: error.toolResultIsError)
-            return try? encodeJSONRPCResult(id: id, result: result.asDictionary)
         } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            return try? encodeJSONRPCResult(
-                id: id,
-                result: [
-                    "content": [
-                        [
-                            "type": "text",
-                            "text": message,
-                        ],
-                    ],
-                    "isError": true,
-                ]
-            )
+            return try? encodeJSONRPCResult(id: id, result: ToolCallResult.failure(error).asDictionary)
         }
     }
 
@@ -152,6 +152,7 @@ public final class StdioMCPServer {
     public func endSession() {
         trajectory.sessionEnded()
         service.clearQueryIndexes()
+        service.clearSnapshotRefs()
         BrowserBridge.endClientTurn()
         // The cursor is deliberately left alone here. One `ocu call` is one session, so
         // resetting it made every step of a batch start a new cursor from scratch. The

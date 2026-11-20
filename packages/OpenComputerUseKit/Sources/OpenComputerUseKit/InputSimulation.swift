@@ -207,6 +207,7 @@ enum InputSimulation {
 
     static func typeText(_ text: String, pid: pid_t, authenticated: Bool = false) throws {
         for chunk in keyboardUnicodeChunks(for: text) {
+            try RequestCancellation.check()
             try requireUsableComputerUseSession()
             var mutableChunk = chunk
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
@@ -255,6 +256,53 @@ enum InputSimulation {
         }
 
         return chunks
+    }
+
+    /// Build every release before sending any input. On failure only release keys that went down.
+    static func deliverHeldKey(_ parsed: ParsedKeyPress, hold: TimeInterval,
+                               validate: () throws -> Void, post: (CGEvent) -> Void, release: (CGEvent) -> Void,
+                               pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws {
+        var flags: CGEventFlags = []
+        let modifiers = try parsed.modifiers.map { modifier -> (CGEvent, CGEvent) in
+            flags.insert(modifier.flag)
+            let (down, up) = try heldKeyPair(code: modifier.keyCode, flags: flags)
+            up.flags = flags.subtracting(modifier.flag)
+            return (down, up)
+        }
+        let key = try heldKeyPair(code: parsed.keyCode, flags: flags)
+        let pairs = modifiers + [key]
+        var pressed: [CGEvent] = []
+        defer {
+            for event in pressed.reversed() {
+                event.timestamp = DispatchTime.now().uptimeNanoseconds
+                release(event)
+            }
+        }
+        do {
+            for (down, up) in pairs {
+                try validate()
+                down.timestamp = DispatchTime.now().uptimeNanoseconds
+                post(down)
+                pressed.append(up)
+            }
+            if hold > 0 { pause(hold) }
+            try validate()
+        } catch {
+            if !pressed.isEmpty {
+                throw ComputerUseError.stateUnavailable("Focus changed during the held key. Inspect the app before repeating.")
+            }
+            throw error
+        }
+    }
+
+    private static func heldKeyPair(code: CGKeyCode, flags: CGEventFlags) throws -> (CGEvent, CGEvent) {
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else {
+            throw ComputerUseError.stateUnavailable("Could not prepare the key events.")
+        }
+        down.flags = flags
+        up.flags = flags
+        return (down, up)
     }
 
     static func pressKey(_ specification: String, pid: pid_t, authenticated: Bool = false) throws {
@@ -320,6 +368,12 @@ enum InputSimulation {
         }
     }
 
+    /// Global mouse events that must wait until the user is hands-off (releases are exempt).
+    static func needsHandsOff(_ type: CGEventType) -> Bool {
+        type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown || type == .mouseMoved
+            || type == .leftMouseDragged
+    }
+
     private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, flags: CGEventFlags? = nil) throws {
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
@@ -329,9 +383,9 @@ enum InputSimulation {
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
         applyDragMotionFields(to: event, delta: delta, eventNumber: eventNumber)
         if let flags { event.flags = flags }
-        // A press or move through the global stream lands wherever the user is working: only when they are
+        // A press, move or drag through the global stream lands wherever the user is working: only when they are
         // hands-off. A release always goes out, so no button stays held.
-        if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown || type == .mouseMoved {
+        if needsHandsOff(type) {
             try requireUserHandsOff()
         }
         event.post(tap: .cghidEventTap)

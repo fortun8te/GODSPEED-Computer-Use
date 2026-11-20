@@ -51,6 +51,33 @@ test("the REPL routes clipboard operations to the same native peer as browser ac
   ]);
 });
 
+test("REPL forwards strict background requests and preserves the native refusal code", async () => {
+  const calls = [];
+  const native = { async request(method, params) {
+    assert.equal(method, "tools/call");
+    calls.push(params);
+    return { ...textResult("Approval is required.", true), _meta: { "godspeed/error_code": "APPROVAL_REQUIRED" } };
+  } };
+  const session = new PersistentJavaScriptSession({ native });
+  const result = await session.run(`
+    try {
+      const app = await cua.getApp("com.example.Text", { initialState: false });
+      await app.click(1, { strictBackground: true });
+    } catch (error) {
+      nodeRepl.write(error.code);
+    }
+    const batch = await cua.batch([{ tool: "press_key", key: "Return" }], { strictBackground: true, emit: false });
+    nodeRepl.write(batch.errorCode);
+    const web = await cua.browser("read", { tab_id: 4 }, { strictBackground: true, emit: false });
+    nodeRepl.write(web.errorCode);
+  `);
+  assert.equal(result.isError, false);
+  assert.deepEqual(calls.map(({ name, arguments: args }) => [name, args.strict_background]), [
+    ["click", true], ["batch", true], ["browser", true],
+  ]);
+  assert.equal(result.content.filter(item => item.text === "APPROVAL_REQUIRED").length, 3);
+});
+
 test("normalizes native app-list text across macOS, Linux, and Windows", () => {
   assert.deepEqual(parseListApps([
     "TextEdit — com.apple.TextEdit [frontmost, running, last-used=2026-09-22, uses=42]",
@@ -116,6 +143,55 @@ test("app-bound API composes actions and state in one js call", async () => {
   assert.equal(native.calls[1].arguments.element_index, 7);
   assert.equal(native.calls[1].arguments.click_method, "accessibility");
   assert.ok(result.content.some(item => item.type === "text" && item.text === "state:Text"));
+});
+
+test("routes exact native refs and preserves typed errors", async t => {
+  const calls = [];
+  const native = {
+    async request(method, params) {
+      assert.equal(method, "tools/call");
+      calls.push(params);
+      if (params.arguments.ref === "expired") {
+        return { ...textResult("Read the intended window again.", true), _meta: { "godspeed/error_code": "STALE_REF" } };
+      }
+      return textResult(params.name);
+    },
+  };
+  const session = new PersistentJavaScriptSession({ native });
+  t.after(() => session.close?.());
+  const result = await session.run(`
+    var refApp = await cua.getApp("Text", { initialState: false });
+    await refApp.getAXState({ includeRefs: true, windowId: 17, emit: false });
+    await refApp.click({ ref: "current" }, { windowId: 17 });
+    await refApp.hover({ ref: "current" });
+    await refApp.scroll({ ref: "current" }, "down", 2);
+    await refApp.performSecondaryAction({ ref: "current" }, "AXShowMenu");
+    await refApp.setValue({ ref: "current" }, "Example");
+    await refApp.selectText({ ref: "current" }, "Example");
+    try { await refApp.click({ ref: "expired" }); }
+    catch (error) { nodeRepl.write(error.code); }
+  `);
+  assert.equal(result.isError, false, result.content.at(-1)?.text);
+  assert.equal(result.content.at(-1).text, "STALE_REF");
+  assert.deepEqual(calls, [
+    { name: "get_app_state", arguments: { app: "Text", include_screenshot: false, include_refs: true, window_id: 17 } },
+    { name: "click", arguments: { app: "Text", ref: "current", window_id: 17 } },
+    { name: "hover", arguments: { app: "Text", ref: "current" } },
+    { name: "scroll", arguments: { app: "Text", ref: "current", direction: "down", pages: 2 } },
+    { name: "perform_secondary_action", arguments: { app: "Text", ref: "current", action: "AXShowMenu" } },
+    { name: "set_value", arguments: { app: "Text", ref: "current", value: "Example" } },
+    { name: "select_text", arguments: { app: "Text", ref: "current", text: "Example", prefix: undefined, suffix: undefined, selection: undefined } },
+    { name: "click", arguments: { app: "Text", ref: "expired" } },
+  ]);
+
+  for (const code of [
+    'await refApp.click({ ref: "current", element_index: 3 })',
+    'await refApp.getAXState({ includeRefs: true, includeAX: false })',
+  ]) {
+    const refused = await session.run(code);
+    assert.equal(refused.isError, true);
+  }
+  assert.equal(calls.length, 8);
 });
 
 for (const Session of [PersistentJavaScriptSession, WorkerJavaScriptSession]) {

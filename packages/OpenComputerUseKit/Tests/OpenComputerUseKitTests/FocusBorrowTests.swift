@@ -66,9 +66,10 @@ final class FocusBorrowTests: XCTestCase {
     // MARK: - The setting
 
     func testSettingIsOnByDefaultAndZeroDisables() {
-        XCTAssertTrue(FocusBorrow.isEnabled(environment: [:]))
+        XCTAssertFalse(FocusBorrow.isEnabled(environment: [:]))
         XCTAssertTrue(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "1"]))
         XCTAssertTrue(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "yes"]))
+        XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "typo"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "0"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": " off "]))
     }
@@ -159,6 +160,20 @@ final class FocusBorrowTests: XCTestCase {
         controller.release(lease)
         XCTAssertEqual(controller.openCount, 0)
         XCTAssertFalse(controller.isBorrowed(pid: appA))
+    }
+
+    func testReleaseDoesNotRestorePreviousAppWhileTheUserIsTyping() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+
+        let lease = controller.acquire(pid: appA)
+        XCTAssertTrue(lease.activated)
+        activator.typing = true
+        controller.release(lease)
+
+        XCTAssertEqual(activator.activations, [appA], "focus must not move away from the user's typing")
+        XCTAssertEqual(activator.front, appA)
+        XCTAssertEqual(controller.openCount, 0)
     }
 
     func testStillTypingAtTheEndOfTheWaitDoesNotTakeFocus() {

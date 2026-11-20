@@ -1,7 +1,65 @@
 import XCTest
 @testable import OpenComputerUse
+@testable import OpenComputerUseKit
 
 final class AppAgentProxyTests: XCTestCase {
+    func testRequestOptionsNeverChangeTheProcessEnvironment() throws {
+        let key = "OPEN_COMPUTER_USE_IMAGE_MAX_DIMENSION"
+        let host = ProcessInfo.processInfo.environment[key]
+        for dimension in ["321", "654"] {
+            try AppAgentEnvironment.withOverrides([key: dimension]) {
+                XCTAssertEqual(ImageCaptureConfig.current.maxDimension, Double(dimension).map { CGFloat($0) })
+                XCTAssertEqual(ProcessInfo.processInfo.environment[key], host)
+            }
+        }
+        XCTAssertEqual(ProcessInfo.processInfo.environment[key], host)
+    }
+
+    func testConcurrentRequestsKeepConflictingOptions() {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchGroup()
+        finished.enter()
+        DispatchQueue.global().async {
+            AppAgentEnvironment.withConfiguration([
+                "OPEN_COMPUTER_USE_IMAGE_MAX_DIMENSION": "321",
+                "OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT": "0",
+                "OPEN_COMPUTER_USE_BACKGROUND_ONLY": "1",
+            ]) {
+                entered.signal()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                XCTAssertEqual(ImageCaptureConfig.current.maxDimension, 321)
+                XCTAssertFalse(LeanDefaults.includeScreenshot)
+                XCTAssertTrue(backgroundOnlyMode())
+            }
+            finished.leave()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        AppAgentEnvironment.withConfiguration([
+            "OPEN_COMPUTER_USE_IMAGE_MAX_DIMENSION": "654",
+            "OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT": "1",
+            "OPEN_COMPUTER_USE_BACKGROUND_ONLY": "0",
+        ]) {
+            XCTAssertEqual(ImageCaptureConfig.current.maxDimension, 654)
+            XCTAssertTrue(LeanDefaults.includeScreenshot)
+            XCTAssertFalse(backgroundOnlyMode())
+        }
+        release.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+    }
+
+    func testTimeoutReplyCarriesDeliveryEvenWhenMessagesMatch() {
+        let before = MacOSAppAgentProxy.mcpFailureReply(id: 17, message: "deadline", delivery: .notSent)
+        let after = MacOSAppAgentProxy.mcpFailureReply(id: 17, message: "deadline", delivery: .outcomeUnknown)
+        let notSent = (before["error"] as? [String: Any])?["data"] as? [String: String]
+        let unknown = (after["error"] as? [String: Any])?["data"] as? [String: String]
+        XCTAssertEqual(notSent?["delivery_state"], "not_sent")
+        XCTAssertEqual(notSent?["safe_retry"], "after_correction")
+        XCTAssertEqual(unknown?["delivery_state"], "outcome_unknown")
+        XCTAssertEqual(unknown?["safe_retry"], "reconcile_first")
+        XCTAssertNotNil(unknown?["reconcile"])
+    }
+
     func testCursorNameUsesOnlyKnownClientInitializationMetadata() {
         XCTAssertEqual(
             MacOSAppAgentProxy.knownCursorClientName(initializeLine: #"{"method":"initialize","params":{"clientInfo":{"name":"codex-mcp-client","version":"1.0"}}}"#),

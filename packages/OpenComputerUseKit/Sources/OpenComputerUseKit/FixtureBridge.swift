@@ -95,6 +95,8 @@ public struct FixtureCommand: Codable, Sendable {
     public let selection: String?
     public let prefix: String?
     public let suffix: String?
+    public let rangeStart: Int?
+    public let rangeLength: Int?
 
     public init(
         kind: String,
@@ -108,7 +110,9 @@ public struct FixtureCommand: Codable, Sendable {
         pages: Double? = nil,
         selection: String? = nil,
         prefix: String? = nil,
-        suffix: String? = nil
+        suffix: String? = nil,
+        rangeStart: Int? = nil,
+        rangeLength: Int? = nil
     ) {
         self.kind = kind
         self.identifier = identifier
@@ -122,6 +126,8 @@ public struct FixtureCommand: Codable, Sendable {
         self.selection = selection
         self.prefix = prefix
         self.suffix = suffix
+        self.rangeStart = rangeStart
+        self.rangeLength = rangeLength
     }
 }
 
@@ -129,7 +135,7 @@ public enum FixtureBridge {
     public static let appName = "OpenComputerUseFixture"
     // Optional UUID isolates concurrent smoke sessions; ordinary fixture behavior is unchanged.
     private static var testNamespace: String? {
-        ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_FIXTURE_NAMESPACE"]
+        RequestConfiguration.environment["OPEN_COMPUTER_USE_FIXTURE_NAMESPACE"]
             .flatMap(UUID.init(uuidString:))?.uuidString
     }
 

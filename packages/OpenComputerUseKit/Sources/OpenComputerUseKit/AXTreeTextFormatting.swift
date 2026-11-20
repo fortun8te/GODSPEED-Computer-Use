@@ -10,18 +10,18 @@ enum AXTreeIndentationStyle: String {
     /// only indentation both models read without error; `tab4` packs four levels into one
     /// tab and is opt-in via `OPEN_COMPUTER_USE_AX_INDENTATION=tab4`. Unknown values use the default.
     static var current: Self {
-        Self(rawValue: ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_AX_INDENTATION"] ?? "") ?? .level
+        Self(rawValue: RequestConfiguration.environment["OPEN_COMPUTER_USE_AX_INDENTATION"] ?? "") ?? .level
     }
 }
 
 enum AXTreeTextFormatting {
     /// Compact spellings are the default (fewer tokens per read). Set
     /// `OPEN_COMPUTER_USE_AX_COMPACT=0` to get the older long spellings back.
-    static let compactByDefault: Bool = {
-        let value = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_AX_COMPACT"]?
+    static var compactByDefault: Bool {
+        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_AX_COMPACT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     static func legend(for style: AXTreeIndentationStyle) -> String {
         style == .level ? "[w=settable]" : "[tab=4 w=settable]"

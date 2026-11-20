@@ -4,8 +4,12 @@ import Foundation
 /// Renames a file through Finder's scripting when the accessibility path cannot (Finder's inline name editor
 /// takes no keys while Finder is in the background). Used only after the normal step failed in Finder.
 enum FinderRename {
-    static func attempt(tool: String, arguments: [String: Any]) -> ToolCallResult? {
-        guard let app = arguments["app"] as? String, app.lowercased().contains("finder") || app == "com.apple.finder" else { return nil }
+    static func targetsFinder(_ app: String) -> Bool {
+        (try? AppDiscovery.resolveRunning(app))?.bundleIdentifier?.lowercased() == "com.apple.finder"
+    }
+
+    static func attempt(tool: String, arguments: [String: Any]) throws -> ToolCallResult? {
+        guard let app = arguments["app"] as? String, targetsFinder(app) else { return nil }
         let newName: String
         let target: String
         switch tool {
@@ -36,7 +40,7 @@ enum FinderRename {
             return oldName
         end tell
         """
-        guard let old = AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue else { return nil }
+        guard let old = try AppleEventsGate.send(source, bundle: "com.apple.finder")?.stringValue else { return nil }
         return .text("Renamed \"\(old)\" to \"\(newName)\" (through Finder, in the background). No Return needed.")
     }
 
@@ -54,7 +58,7 @@ enum FinderRename {
 /// a Finder window that is not key and do nothing. ⌘C / ⌘X remember the selected items; ⌘V (or ⌥⌘V) copies or
 /// moves them into the folder the front Finder window shows.
 enum FinderClipboard {
-    static func handle(key normalized: String) -> String? {
+    static func handle(key normalized: String) throws -> String? {
         switch normalized {
         case "cmd+c", "cmd+x":
             let source = """
@@ -74,7 +78,7 @@ enum FinderClipboard {
             let names = paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
             return (move ? "Cut " : "Copied ") + names + ". Open the destination folder, then press cmd+v to " + (move ? "move" : "copy") + " it there."
         case "cmd+o", "cmd+down":
-            return FinderOpen.selection()
+            return try FinderOpen.selection()
         case "cmd+[", "cmd+up":
             let source = """
             tell application id "com.apple.finder"
@@ -82,7 +86,7 @@ enum FinderClipboard {
                 return name of (target of Finder window 1)
             end tell
             """
-            return AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue.map { "Went up to \($0)." }
+            return try AppleEventsGate.send(source, bundle: "com.apple.finder")?.stringValue.map { "Went up to \($0)." }
         case "cmd+shift+n":
             let source = """
             tell application id "com.apple.finder"
@@ -91,7 +95,7 @@ enum FinderClipboard {
                 return name of f
             end tell
             """
-            return AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue
+            return try AppleEventsGate.send(source, bundle: "com.apple.finder")?.stringValue
                 .map { "Made a new folder \"\($0)\" (selected). Now type_text its name; no Return needed." }
         case "cmd+v", "alt+cmd+v":
             guard let pending = PrivateClipboard.current.payload, case .files(let paths, let cut) = pending else { return nil }
@@ -112,7 +116,7 @@ enum FinderClipboard {
                 return POSIX path of (dest as alias)
             end tell
             """
-            guard let dest = AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue else { return nil }
+            guard let dest = try AppleEventsGate.send(source, bundle: "com.apple.finder")?.stringValue else { return nil }
             if move { PrivateClipboard.current.clear(matching: pending) }
             let names = paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
             return (move ? "Moved " : "Copied ") + names + " into " + dest + "."
@@ -125,20 +129,10 @@ enum FinderClipboard {
 /// A click on a label that is not in the window but is an item of the app's menus ("Make Plain Text",
 /// "New Folder", "Duplicate"): the menu path that holds it, top menu first. Nil when no single item matches.
 enum MenuItemLookup {
-    /// Labels that destroy, discard or quit. A click by one of these names never falls through to a menu item.
-    static let destructiveWords: [String] = [
-        "delete", "remove", "erase", "trash", "discard", "don't save", "don’t save", "dont save",
-        "quit", "close", "clear", "cut", "revert", "empty", "log out", "shut down", "restart",
-        "force quit", "uninstall", "reset", "overwrite", "replace", "send", "purchase", "buy",
-    ]
-
+    /// Labels that destroy, discard, send or buy. A click by one of these names never falls through to a menu item.
+    /// The word list is RiskLexicon's, shared with ActionPolicy and ShortcutCache.
     static func isDestructive(_ label: String) -> Bool {
-        let lowered = label.lowercased().replacingOccurrences(of: "…", with: "").replacingOccurrences(of: "...", with: "")
-        let words = lowered.split(whereSeparator: { !$0.isLetter && $0 != "'" && $0 != "’" }).map(String.init)
-        let joined = words.joined(separator: " ")
-        return destructiveWords.contains { word in
-            word.contains(" ") ? joined.contains(word) : words.contains(word)
-        }
+        RiskLexicon.isDestructive(label)
     }
 
     static func path(for label: String, pid: pid_t) -> [String]? {
@@ -181,17 +175,18 @@ enum MenuItemLookup {
 /// Opening in Finder without focus: a double click on a row, or ⌘O / ⌘↓ on the selection. A folder opens in the
 /// same window (as a double click does); a file opens in its app.
 enum FinderOpen {
-    static func item(named label: String) -> String? {
-        run(target: "item \(FinderRename.quoted(label)) of (target of Finder window 1)")
+    static func item(named label: String) throws -> String? {
+        try run(target: "item \(FinderRename.quoted(label)) of (target of Finder window 1)")
     }
 
-    static func selection() -> String? {
-        run(target: "item 1 of (get selection)")
+    static func selection() throws -> String? {
+        try run(target: "item 1 of (get selection)")
     }
 
-    private static func run(target: String) -> String? {
+    private static func run(target: String) throws -> String? {
         let source = """
         tell application id "com.apple.finder"
+            if not (exists \(target)) then return ""
             set t to \(target)
             if class of t is folder or class of t is disk then
                 set target of Finder window 1 to t
@@ -202,6 +197,10 @@ enum FinderOpen {
             end if
         end tell
         """
-        return AppleEventsGate.run(source, bundle: "com.apple.finder")?.stringValue
+        guard let reply = try AppleEventsGate.send(source, bundle: "com.apple.finder") else { return nil }
+        guard let message = reply.stringValue else {
+            throw ComputerUseError.acknowledged("Finder acknowledged the open. Read its state before trying again.")
+        }
+        return message.isEmpty ? nil : message
     }
 }

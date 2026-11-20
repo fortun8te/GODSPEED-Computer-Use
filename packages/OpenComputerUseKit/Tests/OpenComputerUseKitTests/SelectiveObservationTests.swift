@@ -17,6 +17,80 @@ final class SelectiveObservationTests: XCTestCase {
         return SnapshotBuilder.buildFixtureSnapshot(app: app(pid: pid, name: name), state: state, observation: options)
     }
 
+    func testNativeActionReadbackRequestsOneAXReadAndZeroScreenshots() throws {
+        var reads = 0
+        var captures = 0
+        let result = try ComputerUseService().actionResult(for: "ObservationFixture") { options in
+            reads += 1
+            if options.includeScreenshot { captures += 1 }
+            return self.snapshot(options: options)
+        }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(captures, 0)
+        XCTAssertEqual(result.content.filter { $0.dictionary["type"] as? String == "image" }.count, 0)
+        XCTAssertTrue(result.textContent.contains("Input"))
+    }
+
+    func testMenuTraversalIsOptInAndRequiresAX() throws {
+        var menuReads = 0
+        SnapshotObservationOptions.defaults.readMenuBar { menuReads += 1 }
+        SnapshotObservationOptions(includeAX: false, includeMenuBar: true).readMenuBar { menuReads += 1 }
+        XCTAssertEqual(menuReads, 0)
+        SnapshotObservationOptions(includeMenuBar: true).readMenuBar { menuReads += 1 }
+        XCTAssertEqual(menuReads, 1)
+        XCTAssertEqual(try parseOpenComputerUseCLI(arguments: ["snapshot", "TextEdit", "--include-menu-bar", "true"]),
+                       .snapshot(app: "TextEdit", observation: .init(includeMenuBar: true)))
+    }
+
+    func testFrameSamplingDefaultsOnAndCanBeDisabled() {
+        XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: [:]))
+        XCTAssertFalse(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "0"]))
+        XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "1"]))
+    }
+
+    func testOnlyVerifiedSetValueDefersToScheduledRead() {
+        let capture = NativeActionObservation()
+        var reads = 0
+        func readBack() -> ToolCallResult {
+            reads += 1
+            return .text("readback")
+        }
+        ComputerUseService.$actionObservation.withValue(capture) {
+            ComputerUseService.$defersVerifiedSetValueObservation.withValue(true) {
+                XCTAssertEqual(ComputerUseService.verifiedSetValueResult(verified: true, readBack: readBack).textContent, "ok")
+                XCTAssertEqual(reads, 0)
+                XCTAssertNil(capture.read {
+                    reads += 1
+                    return self.snapshot()
+                })
+                XCTAssertEqual(reads, 0)
+                XCTAssertEqual(ComputerUseService.verifiedSetValueResult(verified: false, readBack: readBack).textContent, "readback")
+                XCTAssertEqual(reads, 1)
+            }
+        }
+    }
+
+    func testSmartStepsReuseActionReadbackAndRefreshOnNoChange() throws {
+        let capture = NativeActionObservation()
+        var reads = 0
+        let after = snapshot(options: .init(includeScreenshot: false))
+        _ = try ComputerUseService.$actionObservation.withValue(capture) {
+            try ComputerUseService().actionResult(for: "ObservationFixture") { _ in
+                reads += 1
+                return after
+            }
+        }
+
+        func refresh() -> AppSnapshot? {
+            reads += 1
+            return after
+        }
+        XCTAssertEqual(capture.read(before: ["earlier state"], fallback: refresh)?.treeLines, after.treeLines)
+        XCTAssertEqual(reads, 1)
+        XCTAssertNotNil(capture.read(before: after.treeLines, fallback: refresh))
+        XCTAssertEqual(reads, 2)
+    }
+
     func testEmptyObservationFailsBeforeResolvingApp() {
         XCTAssertThrowsError(try ComputerUseService().getAppState(app: "missing-test-app",
             observation: .init(includeAX: false, includeScreenshot: false))) {
@@ -26,7 +100,7 @@ final class SelectiveObservationTests: XCTestCase {
 
     func testDispatcherRequiresActualJSONBooleans() {
         let dispatcher = ComputerUseToolDispatcher()
-        for key in ["include_ax", "include_screenshot"] {
+        for key in ["include_ax", "include_screenshot", "include_menu_bar"] {
             // "false", 0 and 1 are read as booleans on purpose (ArgumentNormalizer forgives weak models).
             for value: Any in [NSNull(), [], [:]] {
                 XCTAssertThrowsError(try dispatcher.callTool(name: "get_app_state", arguments: ["app": "missing-test-app", key: value])) {

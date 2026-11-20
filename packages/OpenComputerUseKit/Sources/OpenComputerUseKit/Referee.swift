@@ -14,36 +14,36 @@ enum Referee {
         let milliseconds: Int
     }
 
-    static let baseURL: URL? = {
+    static var baseURL: URL? {
         guard let raw = environment("OPEN_COMPUTER_USE_REFEREE_URL"), !raw.isEmpty else { return nil }
         // Without a scheme and host ("127.0.0.1:8765") URL(string:) gives a URL no request can use.
         guard let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else { return nil }
         return url
-    }()
+    }
 
     /// Longest the batch waits for an answer. Default 1500 ms: a warm d1-2B (fp16) answers a 1,000-character
     /// view in about 270 ms; a cold one reloads for about 4 s and is skipped.
-    static let timeout: TimeInterval = {
+    static var timeout: TimeInterval {
         let milliseconds = finiteSetting("OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS", fallback: 1_500, range: 0...30_000)
         return max(50, milliseconds) / 1000
-    }()
+    }
 
     /// Hints below this confidence are left out. Default 0.6.
-    static let minimumConfidence: Double = {
+    static var minimumConfidence: Double {
         finiteSetting("OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE", fallback: 0.6, range: 0...1)
-    }()
+    }
 
     /// "done" hints need at least this confidence. Default 0.86: the lowest value at which the d1-2B
     /// done answers on the eval2 dev split were all right (9 of 9; 0.85 gave 10 of 11). Chosen on dev only.
-    static let doneConfidence: Double = {
+    static var doneConfidence: Double {
         finiteSetting("OPEN_COMPUTER_USE_REFEREE_DONE_CONFIDENCE", fallback: 0.86, range: 0...1)
-    }()
+    }
 
-    /// The state text sent is cut to this many characters. Default 1200: longer views were slower and
+    /// The helper gets at most this many characters of state. Default 1200: longer views were slower and
     /// less accurate in the d1-2B measurements (~270 ms at 1,000 characters, ~1.1 s at 6,000).
-    static let maxViewCharacters: Int = {
+    static var maxViewCharacters: Int {
         max(0, environment("OPEN_COMPUTER_USE_REFEREE_MAX_VIEW").flatMap(Int.init) ?? 1_200)
-    }()
+    }
 
     static var isEnabled: Bool { baseURL != nil }
 
@@ -54,7 +54,7 @@ enum Referee {
     /// cold load (about 2.3 s, longer than the hint timeout). Fire and forget, at most once a minute; the
     /// helper unloads it again after 3 idle minutes. Starts the helper when it is down.
     static func warmInBackground(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard let baseURL else { return }
+        guard RequestInferenceAdmission.withoutExclusive == nil, let baseURL else { return }
         warmLock.lock()
         let due = lastWarm.map { now - $0 >= 60 } ?? true
         if due { lastWarm = now }
@@ -80,21 +80,33 @@ enum Referee {
 
     /// Asks the helper about one batch. `summary` is the short RefereeSummary text (goal, steps, repeated
     /// failures, screen change, dialog, changed lines), not raw screen text.
-    static func decide(goal: String, lastStep: String, result: String, summary: String, remaining: TimeInterval? = nil) -> Verdict? {
+    static func decide(goal: String, lastStep: String, result: String, summary: String,
+                       imageBase64: String? = nil, remaining: TimeInterval? = nil) -> Verdict? {
         guard let baseURL else { return nil }
         let wait = min(timeout, remaining ?? timeout)
         guard wait > 0 else { return nil }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "goal": goal,
             "last_step": lastStep,
             "result": result,
             "view": RefereeSummary.clip(summary, to: maxViewCharacters),
         ]
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait) else {
+        if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
+        let started = ProcessInfo.processInfo.systemUptime
+        let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait)
+        // Learning row (see LearningLog): the view sent and the answer, or a timeout. Never changes the verdict.
+        recordDecision(kind: "decide", view: body["view"] as? String ?? "", options: [], reply: reply,
+                       latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: LearningLog.shared)
+        guard let object = reply else {
             if wait == timeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
+        return verdict(from: object)
+    }
+
+    /// The verdict in a helper reply, or nil when its label or confidence is missing or out of range.
+    static func verdict(from object: [String: Any]) -> Verdict? {
         guard let label = object["label"] as? String,
               ["act", "look_again", "done", "stuck"].contains(label),
               let number = object["confidence"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
@@ -107,39 +119,90 @@ enum Referee {
     }
 
     /// Longest a handoff waits for one ranking from the helper. Default 3000 ms.
-    static let chooseTimeout: TimeInterval = {
+    static var chooseTimeout: TimeInterval {
         let milliseconds = finiteSetting("OPEN_COMPUTER_USE_REFEREE_CHOOSE_TIMEOUT_MS", fallback: 3_000, range: 0...30_000)
         return max(100, milliseconds) / 1000
-    }()
+    }
 
     /// Asks the helper to score candidate actions for a handoff (POST /choose): one probability per option id
     /// plus "none". Nil when the referee is off, down or answers badly, so the handoff escalates instead of guessing.
     /// The handoff needs the helper even when batch hints are off, so it falls back to the default local helper.
-    static var chooseURL: URL? {
-        if let off = environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"), ["0", "false", "off", "no"].contains(off.lowercased()) { return nil }
-        return baseURL ?? URL(string: "http://127.0.0.1:8765")
+    static func localChooseURL(refereeURL: URL?, setting: String?) -> URL? {
+        if let setting, ["0", "false", "off", "no"].contains(setting.lowercased()) { return nil }
+        guard let url = refereeURL ?? URL(string: "http://127.0.0.1:8765"),
+              HelperAutoStarter.isLoopback(url) else { return nil }
+        return url
+    }
+
+    static var handoffURL: URL? {
+        localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"))
+    }
+
+    static func picture(url: URL?, state: String, remaining: TimeInterval?, capture: () -> Data?) -> String? {
+        RefereePicture.attachment(url: url, visionEnabled: VisionFallback.isEnabled, state: state, remaining: remaining,
+            supportsPictures: { url, timeout in
+                HelperHTTP.getJSON(url, timeout: timeout)?["decision_image"] as? String == "v1"
+            }, capture: capture)
     }
 
     static func choose(goal: String, doneWhen: String, history: String, screen: String, options: [(id: String, text: String)],
-                       remaining: TimeInterval? = nil) -> [String: Double]? {
-        guard let baseURL = chooseURL, !options.isEmpty else { return nil }
+                       imageBase64: String? = nil, remaining: TimeInterval? = nil) -> [String: Double]? {
+        guard let baseURL = handoffURL,
+              !options.isEmpty else { return nil }
         let wait = min(chooseTimeout, remaining ?? chooseTimeout)
         guard wait > 0 else { return nil }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "goal": goal,
             "done_when": doneWhen,
             "history": history,
             "screen": RefereeSummary.clip(screen, to: maxViewCharacters),
             "options": options.map { ["id": $0.id, "text": $0.text] },
         ]
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait) else {
+        if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
+        let started = ProcessInfo.processInfo.systemUptime
+        let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait)
+        // Learning row (see LearningLog): the screen sent, the options and the scores, or a timeout.
+        recordDecision(kind: "choose", view: body["screen"] as? String ?? "", options: options, reply: reply,
+                       latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: LearningLog.shared)
+        guard let object = reply else {
             if wait == chooseTimeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
-        guard let probabilities = parseChoose(object),
-              probabilities["none"] != nil,
+        return chooseProbabilities(object, options: options)
+    }
+
+    /// The usable scores of a choose reply: "none" and every option id must be present.
+    static func chooseProbabilities(_ object: [String: Any], options: [(id: String, text: String)]) -> [String: Double]? {
+        guard let probabilities = parseChoose(object), probabilities["none"] != nil,
               options.allSatisfy({ probabilities[$0.id] != nil }) else { return nil }
         return probabilities
+    }
+
+    /// Writes one decide or choose row. The outcome comes from the helper's answer only: decide gives act, hint
+    /// (a line would be shown) or abstain; choose gives act, or abstain when "none" scores highest. No reply is
+    /// timeout and an unusable reply is invalid. Nothing is written unless LearningLog is enabled.
+    static func recordDecision(kind: String, view: String, options: [(id: String, text: String)], reply: [String: Any]?,
+                               latencyMs: Double, log: LearningLog) {
+        guard log.isEnabled else { return }
+        var row = LearningDecisionRow(
+            kind: kind, view: view, options: options.map { LearningOption(id: $0.id, text: $0.text) },
+            latency_ms: latencyMs, model: reply?["model"] as? String
+        )
+        if let reply, kind == "choose" {
+            if let probabilities = chooseProbabilities(reply, options: options) {
+                row.probabilities = probabilities
+                row.outcome = probabilities.max { $0.value < $1.value }?.key == "none" ? "abstain" : "act"
+            } else {
+                row.outcome = "invalid"
+            }
+        } else if let reply, let verdict = verdict(from: reply) {
+            row.label = verdict.label
+            row.confidence = verdict.confidence
+            row.outcome = verdict.label == "act" ? "act" : (hint(for: verdict) != nil ? "hint" : "abstain")
+        } else {
+            row.outcome = reply == nil ? "timeout" : "invalid"
+        }
+        log.append(row)
     }
 
     /// `{"probs": {"a": 0.7, "none": 0.1}}` as a dictionary; nil when it has no usable numbers.
@@ -202,7 +265,27 @@ enum HelperHTTP {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
-        guard let reply = send(request, timeout: timeout) else { return nil }
+        let containsImage = body["image_base64"] != nil
+        let reply: Data?
+        if let withoutExclusive = RequestInferenceAdmission.withoutExclusive {
+            // Never release an active focus borrow or a protected desktop lease.
+            guard !FocusBorrow.shared.isBorrowing, !LockedUseActionScope.requiresScreenCaptureKit else { return nil }
+            do {
+                reply = try withoutExclusive { send(request, timeout: timeout, containsImage: containsImage) }
+            } catch {
+                // The desktop gate was lost. Stop the request so no later step runs on stale observations.
+                RequestCancellation.current?.cancel()
+                return nil
+            }
+        } else {
+            reply = send(request, timeout: timeout, containsImage: containsImage)
+        }
+        guard let reply else { return nil }
+        return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+    }
+
+    static func getJSON(_ url: URL, timeout: TimeInterval) -> [String: Any]? {
+        guard let reply = send(URLRequest(url: url, timeoutInterval: timeout), timeout: timeout) else { return nil }
         return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
     }
 
@@ -211,20 +294,36 @@ enum HelperHTTP {
         send(URLRequest(url: url, timeoutInterval: timeout), timeout: timeout) != nil
     }
 
-    private static func send(_ request: URLRequest, timeout: TimeInterval) -> Data? {
+    private static let imageSession = URLSession(
+        configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil
+    )
+
+    private final class NoRedirects: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
+    private static func send(_ request: URLRequest, timeout: TimeInterval, containsImage: Bool = false) -> Data? {
+        guard !RequestCancellation.requested else { return nil }
         let box = ReplyBox()
         let done = DispatchSemaphore(value: 0)
-        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+        let session = containsImage ? imageSession : URLSession.shared
+        let task = session.dataTask(with: request) { data, response, _ in
             defer { done.signal() }
             guard (response as? HTTPURLResponse)?.statusCode == 200, let data else { return }
             box.set(data)
         }
         task.resume()
-        if done.wait(timeout: .now() + timeout + 0.05) == .timedOut {
-            task.cancel()
-            return nil
+        let deadline = DispatchTime.now() + timeout + 0.05
+        while !RequestCancellation.requested, DispatchTime.now() < deadline {
+            if done.wait(timeout: min(deadline, .now() + .milliseconds(50))) == .success {
+                return RequestCancellation.requested ? nil : box.get()
+            }
         }
-        return box.get()
+        task.cancel()
+        return nil
     }
 }
 
@@ -258,7 +357,8 @@ final class HelperAutoStarter: @unchecked Sendable {
     /// Called after a helper call got no answer. Checks health off the calling thread and starts the
     /// launcher detached when the helper is really down.
     func helperUnreachable(_ baseURL: URL, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard Self.isLoopback(baseURL) else { return }
+        guard RequestInferenceAdmission.withoutExclusive == nil, !RequestCancellation.requested,
+              Self.isLoopback(baseURL) else { return }
         lock.lock()
         let check = !launched && Self.shouldCheck(lastCheck: lastCheck, now: now, cooldown: Self.checkCooldown)
         if check { lastCheck = now }
@@ -304,7 +404,7 @@ final class HelperAutoStarter: @unchecked Sendable {
     }
 
     static func isLoopback(_ url: URL) -> Bool {
-        ["127.0.0.1", "localhost", "::1"].contains(url.host?.lowercased() ?? "")
+        ["127.0.0.1", "localhost", "::1", "[::1]"].contains(url.host?.lowercased() ?? "")
     }
 
     static func shouldCheck(lastCheck: TimeInterval?, now: TimeInterval, cooldown: TimeInterval) -> Bool {

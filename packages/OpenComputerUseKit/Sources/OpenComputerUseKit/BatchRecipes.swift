@@ -1,40 +1,51 @@
 import Foundation
 
-/// Saved step lists that reached a goal, so the same goal can be replayed in one call without the
-/// model planning each step again (workflow memory; Hark's "composite actions" are the same idea).
-///
-/// Saving: a batch with a `goal` and no failed step is saved by itself when its `done_when` was verified
-/// directly (DoneCheck), or when the model passed `remember: true` (`remember: false` opts out). The
-/// referee alone only suggests saving. Steps that target elements by number or coordinates are never saved.
-/// Typed text and set_value values become variables named after the field label (`{{to}}`), with the saved
-/// values kept as defaults; a replay can pass `values` to change them. The cache key is app + goal with
-/// values removed + window title shape, never the values. Each step keeps a self-healing locator
-/// (RecipeLocator) and whether it changed the screen; a replayed step that no longer changes the screen
-/// stops the replay and hands back to the model. A replay that fails twice is dropped. Stored only on this
-/// Mac in `~/.godspeed/recipes.json`; `OPEN_COMPUTER_USE_RECIPES=0` turns recipes off.
+/// Window-scoped workflows stored on this Mac. Only verified champions can replay.
 final class BatchRecipes: @unchecked Sendable {
     static let shared = BatchRecipes()
 
-    static let isEnabled: Bool = {
-        let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_RECIPES"]?
+    static var isEnabled: Bool {
+        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_RECIPES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
-    }()
+    }
 
     static let maxRecipes = 300
-    /// Same bar as the referee's "done" hint, so a save suggestion never appears without that hint.
+    struct Window: Equatable, Codable {
+        let process: String
+        let titleLine: String
+        let id: UInt32
+
+        init?(state: String?) {
+            guard let state, let id = HandoffTool.observedWindowID(in: state) else { return nil }
+            let header = Array(state.split(separator: "\n").prefix(3))
+            guard header[0].contains(" (pid "), header[1].hasPrefix("Window: \""),
+                  let title = BatchEffects.windowTitle(in: state), !title.isEmpty else { return nil }
+            self.process = String(header[0])
+            self.titleLine = String(header[1])
+            self.id = id
+        }
+    }
 
     struct Recipe {
         let app: String
         let goal: String
-        var steps: [Any]
+        let steps: [Any]
         var uses: Int
         var failures: Int
-        /// Variable name to the value it had when saved (the default on replay).
         var params: [String: String] = [:]
-        /// Window title shape the recipe was saved in ("" for older recipes: matches any).
-        var shape: String = ""
+        var slotKinds: [String: SlotKind] = [:]
         var doneWhen: [DoneCheck.Condition] = []
+        var window: Window?
+        var verified = false
+        var version: String?
+        var champion = true
+    }
+
+    enum Lookup {
+        case match(Recipe)
+        case blocked(String)
+        case missing
     }
 
     private let lock = NSLock()
@@ -45,83 +56,132 @@ final class BatchRecipes: @unchecked Sendable {
         self.fileURL = fileURL
     }
 
-    /// The saved recipe for this goal (values removed) in `app` when given, otherwise in any app. `shape`
-    /// is the current window title shape when known; a recipe saved under another shape does not match.
-    func find(app: String?, goal: String, values: [String: String] = [:], shape: String? = nil) -> Recipe? {
+    func lookup(app: String?, goal: String, values: [String: String] = [:], state: String?) -> Lookup {
         lock.lock()
         defer { lock.unlock() }
         reload()
-        let wanted = Self.templateKey(goal, values: Array(values.values))
-        guard !wanted.isEmpty else { return nil }
-        let candidates = app.map { name in recipes.filter { Self.normalize($0.app) == Self.normalize(name) } } ?? recipes
-        var matches = candidates.filter { Self.templateKey($0.goal, values: Array($0.params.values)) == wanted }
-        if let shape, !shape.isEmpty {
-            matches = matches.filter { $0.shape.isEmpty || $0.shape == shape }
-            let exact = matches.filter { $0.shape == shape }
-            if exact.count == 1 { return exact[0] }
+        let candidates = recipes.filter { recipe in
+            recipe.champion && app.map { Self.sameApp(recipe.app, $0) } != false
         }
-        // A goal without an app must not pick arbitrarily between apps.
-        return matches.count == 1 ? matches[0] : nil
+        let exact = candidates.filter { $0.goal.utf8.elementsEqual(goal.utf8) }
+        if exact.isEmpty {
+            // Templates can detect a changed goal, but can never select a recipe to execute.
+            let template = Self.templateKey(goal, values: Array(values.values))
+            if candidates.contains(where: { Self.templateKey($0.goal, values: Array($0.params.values)) == template }) {
+                return .blocked("The saved recipe's goal changed. Confirm the goal and provide fresh steps.")
+            }
+            return .missing
+        }
+        guard exact.contains(where: \.verified) else {
+            return .blocked("The saved recipe is unverified. Provide fresh steps with a deterministic done_when.")
+        }
+        let window = Window(state: state)
+        let matches = exact.filter { $0.window != nil && $0.window == window }
+        guard matches.count == 1, let match = matches.first else {
+            return .blocked("The saved recipe needs its original window. Read the current window and provide fresh steps.")
+        }
+        if let reason = Self.slotProblem(match, values: values) { return .blocked(reason) }
+        guard match.verified, match.version != nil, !match.doneWhen.isEmpty else {
+            return .blocked("The saved recipe is unverified. Provide fresh steps with a deterministic done_when.")
+        }
+        return .match(match)
     }
 
-    func save(app: String, goal: String, steps: [Any], params: [String: String] = [:], shape: String = "",
-              doneWhen: [DoneCheck.Condition] = []) {
-        guard JSONSerialization.isValidJSONObject(steps) else { return }
-        mutate {
-            let appKey = Self.normalize(app)
-        let wanted = Self.templateKey(goal, values: Array(params.values))
-            recipes.removeAll { Self.same($0, appKey: appKey, key: wanted, shape: shape) }
-            recipes.append(Recipe(app: app, goal: goal, steps: steps, uses: 0, failures: 0, params: params, shape: shape, doneWhen: doneWhen))
-            if recipes.count > Self.maxRecipes { recipes.removeFirst(recipes.count - Self.maxRecipes) }
-        }
+    static func sameApp(_ first: String, _ second: String) -> Bool {
+        first.caseInsensitiveCompare(second) == .orderedSame
     }
 
-    /// Records how a replay went; a recipe that failed twice in a row is dropped. `healedSteps` (a replay
-    /// that worked after healing locators) replaces the stored steps.
-    func recordReplay(_ recipe: Recipe, succeeded: Bool, healedSteps: [Any]? = nil) {
-        let appKey = Self.normalize(recipe.app)
-        let key = Self.templateKey(recipe.goal, values: Array(recipe.params.values))
+    /// A new version only becomes champion if there is no verified champion. Keep one challenger.
+    @discardableResult
+    func save(app: String, goal: String, steps: [Any], params: [String: String] = [:],
+              slotKinds: [String: SlotKind] = [:], doneWhen: [DoneCheck.Condition] = [],
+              window: Window? = nil, verified: Bool = false) -> Recipe? {
+        guard let encoded = Self.encodedSteps(steps) else { return nil }
+        var saved: Recipe?
+        let persisted = mutate {
+            var candidate = Recipe(app: app, goal: goal, steps: steps, uses: 0, failures: 0, params: params,
+                                   slotKinds: slotKinds, doneWhen: doneWhen, window: window,
+                                   version: UUID().uuidString)
+            candidate.verified = verified && window != nil && !doneWhen.isEmpty
+                && (try? Self.boundSteps(candidate, values: params)) != nil
+            if let champion = recipes.first(where: { Self.sameGroup($0, candidate) && $0.champion }) {
+                if champion.verified == candidate.verified, champion.params == params, champion.slotKinds == slotKinds,
+                   champion.doneWhen == doneWhen, Self.encodedSteps(champion.steps) == encoded {
+                    saved = champion
+                    return
+                }
+                candidate.champion = candidate.verified && !champion.verified
+                recipes.removeAll { Self.sameGroup($0, candidate) && !$0.champion }
+                if candidate.champion, let index = recipes.firstIndex(where: { Self.sameGroup($0, candidate) }) {
+                    recipes[index].champion = false
+                }
+            }
+            recipes.append(candidate)
+            if recipes.count > Self.maxRecipes {
+                // Discard a challenger before displacing a working champion.
+                recipes.remove(at: recipes.firstIndex(where: { !$0.champion }) ?? 0)
+            }
+            saved = candidate
+        }
+        return persisted ? saved : nil
+    }
+
+    /// A late receipt is only allowed to update the version that actually ran.
+    func recordReplay(_ recipe: Recipe, succeeded: Bool) {
+        guard let version = recipe.version else { return }
         mutate {
-            guard let index = recipes.firstIndex(where: { Self.same($0, appKey: appKey, key: key, shape: recipe.shape) })
-            else { return }
+            guard let index = recipes.firstIndex(where: { $0.version == version }) else { return }
             if succeeded {
                 recipes[index].uses += 1
                 recipes[index].failures = 0
-                if let healedSteps, JSONSerialization.isValidJSONObject(healedSteps) { recipes[index].steps = healedSteps }
             } else {
                 recipes[index].failures += 1
-                if recipes[index].failures >= 2 { recipes.remove(at: index) }
+                guard recipes[index].failures >= 2 else { return }
+                let removed = recipes.remove(at: index)
+                if removed.champion, let fallback = recipes.firstIndex(where: {
+                    Self.sameGroup($0, removed) && $0.verified && $0.doneWhen == removed.doneWhen
+                        && $0.params == removed.params && $0.slotKinds == removed.slotKinds
+                }) {
+                    recipes[fallback].champion = true
+                }
             }
         }
     }
 
+    private static func sameGroup(_ lhs: Recipe, _ rhs: Recipe) -> Bool {
+        sameApp(lhs.app, rhs.app)
+            && lhs.goal.utf8.elementsEqual(rhs.goal.utf8) && lhs.window == rhs.window
+    }
+
+    private static func encodedSteps(_ steps: [Any]) -> Data? {
+        try? JSONSerialization.data(withJSONObject: steps, options: [.sortedKeys])
+    }
+
     /// Every recipe change runs under the in-process lock and a file lock, on the current file contents, so
     /// two agents (threads or processes) never overwrite each other's recipes.
-    private func mutate(_ change: () -> Void) {
+    @discardableResult
+    private func mutate(_ change: () -> Void) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         let folder = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let descriptor = open(fileURL.path + ".lock", O_CREAT | O_RDWR, 0o600)
-        if descriptor >= 0 { flock(descriptor, LOCK_EX) }
-        defer { if descriptor >= 0 { flock(descriptor, LOCK_UN); close(descriptor) } }
-        reload()
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else { return false }
+        defer { flock(descriptor, LOCK_UN) }
+        reload(preserveCorrupt: true)
         change()
-        persist()
-    }
-
-    private static func same(_ r: Recipe, appKey: String, key: String, shape: String) -> Bool {
-        normalize(r.app) == appKey && templateKey(r.goal, values: Array(r.params.values)) == key && r.shape == shape
+        return persist()
     }
 
     /// One-line hint for get_app_state: a recipe exists for this app (the most used one).
-    func hint(app: String) -> String? {
-        guard Self.isEnabled else { return nil }
+    func hint(app: String, state: String?) -> String? {
+        guard Self.isEnabled, let window = Window(state: state) else { return nil }
         lock.lock()
         defer { lock.unlock() }
         reload()
-        let key = Self.normalize(app)
-        let mine = recipes.filter { Self.normalize($0.app) == key }
+        let mine = recipes.filter { $0.verified && $0.champion && $0.window == window && Self.sameApp($0.app, app) }
         guard let top = mine.max(by: { $0.uses < $1.uses }) else { return nil }
         let goal = top.goal.count > 60 ? String(top.goal.prefix(60)) + "…" : top.goal
         return "saved recipe: \(goal)" + (mine.count > 1 ? " (+\(mine.count - 1) more)" : "")
@@ -131,11 +191,13 @@ final class BatchRecipes: @unchecked Sendable {
 
     /// Reads the file again (another agent may have changed it). A file that cannot be read is set aside as
     /// `recipes.json.corrupt` instead of being overwritten by the next save.
-    private func reload() {
+    private func reload(preserveCorrupt: Bool = false) {
         guard let data = try? Data(contentsOf: fileURL) else { recipes = []; return }
         guard let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            try? FileManager.default.removeItem(atPath: fileURL.path + ".corrupt")
-            try? FileManager.default.moveItem(atPath: fileURL.path, toPath: fileURL.path + ".corrupt")
+            if preserveCorrupt {
+                try? FileManager.default.removeItem(atPath: fileURL.path + ".corrupt")
+                try? FileManager.default.moveItem(atPath: fileURL.path, toPath: fileURL.path + ".corrupt")
+            }
             recipes = []
             return
         }
@@ -143,26 +205,35 @@ final class BatchRecipes: @unchecked Sendable {
             guard let app = item["app"] as? String, let goal = item["goal"] as? String, let steps = item["steps"] as? [Any],
                   let doneWhen = try? DoneCheck.parse(item["done_when"])
             else { return nil }
+            let window = (item["window"] as? [String: Any]).flatMap { object in
+                (try? JSONSerialization.data(withJSONObject: object)).flatMap { try? JSONDecoder().decode(Window.self, from: $0) }
+            }
+            let kinds = (item["slot_kinds"] as? [String: String] ?? [:]).compactMapValues(SlotKind.init(rawValue:))
             return Recipe(app: app, goal: goal, steps: steps,
                           uses: (item["uses"] as? Int) ?? 0, failures: (item["failures"] as? Int) ?? 0,
-                          params: (item["params"] as? [String: String]) ?? [:], shape: (item["shape"] as? String) ?? "", doneWhen: doneWhen)
+                          params: (item["params"] as? [String: String]) ?? [:], slotKinds: kinds, doneWhen: doneWhen,
+                          window: window, verified: (item["verified"] as? Bool) == true,
+                          version: item["version"] as? String, champion: (item["champion"] as? Bool) ?? true)
         }
     }
 
-    private func persist() {
-        let array: [[String: Any]] = recipes.map {
-            ["app": $0.app, "goal": $0.goal, "steps": $0.steps, "uses": $0.uses, "failures": $0.failures,
-             "params": $0.params, "shape": $0.shape, "done_when": $0.doneWhen.map(\.arguments)]
+    private func persist() -> Bool {
+        let array: [[String: Any]] = recipes.map { recipe in
+            var item: [String: Any] = [
+                "app": recipe.app, "goal": recipe.goal, "steps": recipe.steps, "uses": recipe.uses, "failures": recipe.failures,
+                "params": recipe.params, "slot_kinds": recipe.slotKinds.mapValues(\.rawValue),
+                "done_when": recipe.doneWhen.map(\.arguments), "verified": recipe.verified, "champion": recipe.champion
+            ]
+            item["version"] = recipe.version
+            if let window = recipe.window, let data = try? JSONEncoder().encode(window) {
+                item["window"] = try? JSONSerialization.jsonObject(with: data)
+            }
+            return item
         }
-        guard let data = try? JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys]) else { return }
-        try? data.write(to: fileURL, options: [.atomic])
+        guard let data = try? JSONSerialization.data(withJSONObject: array, options: [.prettyPrinted, .sortedKeys]),
+              (try? data.write(to: fileURL, options: [.atomic])) != nil else { return false }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-    }
-
-    // MARK: Matching
-
-    static func normalize(_ text: String) -> String {
-        text.lowercased().filter { $0.isLetter || $0.isNumber }
+        return true
     }
 
     static func goalKey(_ text: String) -> String {
@@ -174,8 +245,7 @@ final class BatchRecipes: @unchecked Sendable {
 // MARK: - Pure helpers (parameters, keys, per-step effects)
 
 extension BatchRecipes {
-    /// The goal with values, e-mail addresses, numbers and quoted text taken out, so the same goal with
-    /// different values has the same key.
+    /// A coarse key for detecting possible changes so we can ask for fresh steps.
     static func templateKey(_ goal: String, values: [String] = []) -> String {
         var text = goal
         for value in values.filter({ !$0.trimmingCharacters(in: .whitespaces).isEmpty }).sorted(by: { $0.count > $1.count }) {
@@ -187,18 +257,45 @@ extension BatchRecipes {
         return goalKey(text)
     }
 
-    /// A window title without the document or page part: the text after the last separator, letters
-    /// only, three words at most ("Q3 plan - Pages" and "Notes - Pages" both give "pages").
-    static func windowShape(title: String?) -> String {
-        guard var text = title?.lowercased(), !text.isEmpty else { return "" }
-        for separator in [" \u{2014} ", " \u{2013} ", " - ", " | "] {
-            if let range = text.range(of: separator, options: .backwards) {
-                text = String(text[range.upperBound...])
-                break
+    enum SlotKind: String {
+        case recipient, email, number, path, text
+
+        static func infer(name: String, label: String?, value: String) -> Self {
+            let words = Set(RecipeLocator.tokens(name + " " + (label ?? "")))
+            if !words.isDisjoint(with: ["recipient", "to", "cc", "bcc"]) { return .recipient }
+            if words.contains("email") || words.contains("mail") || Self.email.accepts(value) { return .email }
+            if !words.isDisjoint(with: ["path", "folder", "directory"]) || Self.path.accepts(value) { return .path }
+            if !words.isDisjoint(with: ["number", "quantity", "amount"]) || Self.number.accepts(value) { return .number }
+            return .text
+        }
+
+        func accepts(_ value: String) -> Bool {
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !value.contains("\0") else { return false }
+            switch self {
+            case .recipient: return !value.contains(where: \.isNewline)
+            case .email: return value.range(of: #"\A[^@\s]+@[^@\s]+\.[^@\s]+\z"#, options: .regularExpression) != nil
+            case .number: return DoneCheck.isPlainNumber(value)
+            case .path: return (value.hasPrefix("/") || value.hasPrefix("~/")) && !value.contains(where: \.isNewline)
+            case .text: return true
             }
         }
-        let words = text.split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.allSatisfy(\.isLetter) }
-        return words.prefix(3).joined(separator: " ")
+    }
+
+    static func slotProblem(_ recipe: Recipe, values: [String: String]) -> String? {
+        let expected = Set(recipe.params.keys)
+        let missing = expected.subtracting(values.keys).sorted()
+        if !missing.isEmpty { return "Confirm and provide the recipe slots: \(missing.joined(separator: ", "))." }
+        guard Set(values.keys) == expected, Set(recipe.slotKinds.keys) == expected else {
+            return "The recipe slots differ from the recorded inputs. Confirm the inputs and provide fresh steps."
+        }
+        for name in expected.sorted() {
+            guard let value = values[name], let type = recipe.slotKinds[name], type.accepts(value),
+                  recipe.params[name]?.utf8.elementsEqual(value.utf8) == true else {
+                return "Recipe slot '\(name)' changed or has the wrong type. Confirm it and provide fresh steps."
+            }
+        }
+        return nil
     }
 
     static func parseValues(_ raw: Any?) -> [String: String] {
@@ -226,15 +323,16 @@ extension BatchRecipes {
 
     /// Turns typed text into `{{name}}` variables. `values` (name to value) names a variable when its value
     /// is what was typed; otherwise the field label does.
-    static func parameterize(_ steps: [[String: Any]], values: [String: String]) -> (steps: [[String: Any]], params: [String: String]) {
+    static func parameterize(_ steps: [[String: Any]], values: [String: String]) -> (steps: [[String: Any]], params: [String: String], kinds: [String: SlotKind]) {
         var params: [String: String] = [:]
+        var kinds: [String: SlotKind] = [:]
         var result = steps
         for (i, step) in steps.enumerated() {
             let tool = (step["tool"] as? String) ?? ""
             guard let key = textKey(tool: tool, arguments: step), let text = step[key] as? String,
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !text.contains("{{")
             else { continue }
-            var name = values.first { $0.value == text && params[$0.key] == nil }?.key
+            var name = values.keys.sorted().first { values[$0] == text && params[$0] == nil }
                 ?? variableName(label: step["label"] as? String)
             if params[name] != nil, params[name] != text || name == "text" {
                 var n = 2
@@ -242,27 +340,38 @@ extension BatchRecipes {
                 name = "\(name)_\(n)"
             }
             params[name] = text
+            kinds[name] = SlotKind.infer(name: name, label: step["label"] as? String, value: text)
             result[i][key] = "{{\(name)}}"
         }
-        return (result, params)
+        return (result, params, kinds)
     }
 
-    /// Puts values into `{{name}}` placeholders (a given value wins over the saved default) and removes the
-    /// bookkeeping keys. `ignored` lists given values the recipe has no variable for.
-    static func substitute(_ steps: [Any], params: [String: String], values: [String: String]) -> (steps: [Any], ignored: [String]) {
-        let result: [Any] = steps.map { item in
-            guard var dict = item as? [String: Any] else { return item }
-            for key in dict.keys where key.hasPrefix("_") { dict[key] = nil }
-            for (key, value) in dict {
-                guard var text = value as? String, text.contains("{{") else { continue }
-                for name in params.keys.sorted() {
-                    text = text.replacingOccurrences(of: "{{\(name)}}", with: values[name] ?? params[name] ?? "")
-                }
-                dict[key] = text
+    /// Bind only complete placeholders in typing arguments. Values are never interpolated into targets.
+    static func boundSteps(_ recipe: Recipe, values: [String: String]) throws -> [Any] {
+        if let problem = slotProblem(recipe, values: values) { throw ComputerUseError.invalidArguments(problem) }
+        var used = Set<String>()
+        let steps = try recipe.steps.map { item -> [String: Any] in
+            guard var step = item as? [String: Any], let tool = step["tool"] as? String else {
+                throw ComputerUseError.invalidArguments("The saved recipe has an invalid step.")
             }
-            return dict
+            step = step.filter { !$0.key.hasPrefix("_") }
+            if let key = textKey(tool: tool, arguments: step) {
+                guard let text = step[key] as? String else {
+                    throw ComputerUseError.invalidArguments("The saved typing step needs a text slot. Provide fresh steps.")
+                }
+                if text.isEmpty { return step }
+                guard let name = values.keys.first(where: { text == "{{\($0)}}" }), let value = values[name] else {
+                    throw ComputerUseError.invalidArguments("The saved typing step needs a confirmed slot. Provide fresh steps.")
+                }
+                used.insert(name)
+                step[key] = value
+            }
+            return step
         }
-        return (result, values.keys.filter { params[$0] == nil }.sorted())
+        guard used == Set(values.keys) else {
+            throw ComputerUseError.invalidArguments("The recipe has unused slots. Confirm the inputs and provide fresh steps.")
+        }
+        return steps
     }
 
     // MARK: Per-step effects
@@ -300,8 +409,7 @@ extension BatchRecipes {
 // MARK: - One batch's recipe bookkeeping
 
 extension BatchRecipes {
-    /// Carries a batch's recipe state: the replayed recipe and values, locators captured for saving or
-    /// healed on replay, and the save decision at the end. One per batch call; used from one thread.
+    /// Carries the recipe, recorded targets and save decision for one batch.
     final class Run {
         struct Meta {
             var locator: RecipeLocator.Locator?
@@ -316,13 +424,10 @@ extension BatchRecipes {
         private let app: String?
         private let read: (String) -> String?
         private(set) var recipe: Recipe?
-        private var initialState: String?
+        private(set) var startingState: String?
         private var initialRead = false
         private var replayMeta: [Int: Meta] = [:]
         private var recorded: [Int: RecipeLocator.Locator] = [:]
-        private var healed: [Int: (label: String, locator: RecipeLocator.Locator)] = [:]
-        private var notes: [String] = []
-        private var ignored: [String] = []
         /// The batch's `done_when`, set by the caller. Used to tell whether it was already true before the steps ran.
         var doneWhen: [DoneCheck.Condition] = []
         var canSave = true
@@ -341,65 +446,50 @@ extension BatchRecipes {
 
         private func state(of stepApp: String?, observed: String? = nil) -> String? {
             guard let target = stepApp ?? app else { return nil }
-            if let app, BatchRecipes.normalize(app) != BatchRecipes.normalize(target) { return nil }
+            if let app, !BatchRecipes.sameApp(app, target) { return nil }
             if !initialRead {
                 initialRead = true
-                initialState = observed ?? read(target)
+                startingState = observed ?? read(target)
             }
-            return initialState
+            return startingState
         }
 
-        /// The saved recipe for the goal and values, matched also on the window title shape.
-        func find(app lookupApp: String?) -> Recipe? {
-            let shape = lookupApp.flatMap { state(of: $0) }.map { BatchRecipes.windowShape(title: BatchEffects.windowTitle(in: $0)) }
-            recipe = store.find(app: lookupApp, goal: goal, values: values, shape: shape)
-            return recipe
+        func lookup(app lookupApp: String?) -> Lookup {
+            store.lookup(app: lookupApp, goal: goal, values: values, state: state(of: lookupApp))
         }
 
-        /// The recipe's steps with values put in; locators and effects are kept for the replay.
-        func replaySteps(_ recipe: Recipe) -> [Any] {
+        func replaySteps(_ recipe: Recipe) throws -> [Any] {
+            let steps = try BatchRecipes.boundSteps(recipe, values: values)
             self.recipe = recipe
             for (i, item) in recipe.steps.enumerated() {
                 guard let dict = item as? [String: Any] else { continue }
                 replayMeta[i + 1] = Meta(locator: RecipeLocator.Locator(dictionary: dict["_loc"]), effect: dict["_fx"] as? String)
             }
-            let out = BatchRecipes.substitute(recipe.steps, params: recipe.params, values: values)
-            ignored = out.ignored
-            return out.steps
+            return steps
         }
 
-        /// Called with each step before it runs: records its locator when saving, heals its label on replay.
-        func prepared(_ step: BatchTool.Step, number: Int, before: String?) -> BatchTool.Step? {
-            guard active, recipe != nil || canSave else { return step }
-            let stepApp = (step.arguments["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            // The first read happens before the first step runs: it is the "before" picture for saving
-            // (was done_when already true?) and for secret-field checks, even if no step has a label.
-            let screenBeforeFirstStep = recipe == nil ? state(of: stepApp, observed: before) : nil
-            if recipe == nil {
-                if initialDone == nil { initialDone = wasAlreadyDone() }
-                noteSecret(step, number: number, screen: before ?? screenBeforeFirstStep)
+        /// Always check the freshly selected window before binding a saved step to its ID.
+        func prepareReplay(_ step: BatchTool.Step, number: Int) -> BatchTool.Step? {
+            guard let recipe, let expected = recipe.window, let app,
+                  let fresh = read(app), Window(state: fresh) == expected else { return nil }
+            if !step.isReadOnly {
+                guard let label = step.arguments["label"] as? String, let locator = replayMeta[number]?.locator,
+                      RecipeLocator.confirms(locator, label: label, in: fresh) else { return nil }
             }
-            guard let label = step.arguments["label"] as? String, !label.isEmpty else { return step }
-            if recipe != nil {
-                guard let locator = replayMeta[number]?.locator else { return step }
-                // Later steps need current evidence. A failed read cannot justify healing
-                // a locator from the screen that was visible before the replay.
-                let screen = before ?? (number == 1 ? state(of: stepApp) : (stepApp ?? app).flatMap(read))
-                guard let screen else { return nil }
-                switch RecipeLocator.resolve(locator, label: label, in: screen) {
-                case .found:
-                    return step
-                case .missing:
-                    return nil
-                case .healed(let newLabel, let newLocator):
-                    var arguments = step.arguments
-                    arguments["label"] = newLabel
-                    healed[number] = (newLabel, newLocator)
-                    notes.append("Step \(number): \"\(label)\" is now \"\(newLabel)\"; the recipe is updated if the replay works.")
-                    return BatchTool.Step(tool: step.tool, arguments: arguments)
-                }
-            } else if let screen = before ?? screenBeforeFirstStep,
-                      let locator = RecipeLocator.capture(label: label, in: screen) {
+            return HandoffTool.bindRecipeStep(step, app: app, state: fresh)
+        }
+
+        /// Record the starting screen and locator during an explicit run.
+        func prepared(_ step: BatchTool.Step, number: Int, before: String?) -> BatchTool.Step? {
+            guard active, canSave else { return step }
+            let stepApp = (step.arguments["app"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let screenBeforeFirstStep = state(of: stepApp, observed: before)
+            if initialDone == nil { initialDone = wasAlreadyDone() }
+            let screen = before ?? (number == 1 ? screenBeforeFirstStep : nil) ?? (stepApp ?? app).flatMap(read)
+            noteSecret(step, number: number, screen: screen)
+            if let label = step.arguments["label"] as? String, !label.isEmpty, let screen,
+               Window(state: screen) == Window(state: startingState),
+               let locator = RecipeLocator.capture(label: label, in: screen) {
                 recorded[number] = locator
             }
             return step
@@ -423,57 +513,53 @@ extension BatchRecipes {
             }
         }
 
-        /// True when done_when held on the screen before any step ran, so it proves nothing about these steps.
-        /// Unknown (screen unreadable) counts as true: such a batch is not saved by itself.
+        func alreadySatisfied() -> ToolCallResult? {
+            guard case .weak(let met) = initialCheck() else { return nil }
+            return ToolCallResult(
+                content: [.text("Already satisfied before replay (weak evidence): \(met.joined(separator: ", ")). No steps ran. Not verified: the caller decides whether the goal is met.")],
+                isError: false, batchReceipt: .init(totalSteps: 0, doneCheck: .weakEvidence), deliveryState: .notSent
+            )
+        }
+
+        private func initialCheck() -> DoneCheck.Result {
+            // Before step 1, a change-aware condition cannot have a transition.
+            DoneCheck.check(doneWhen, evidence: .init(screenText: startingState, pageURL: { nil }))
+        }
+
+        /// True when done_when already held before dispatch, or the starting window could not be read.
         private func wasAlreadyDone() -> Bool {
-            let result: Bool
-            if doneWhen.isEmpty {
-                result = false
-            } else if initialState != nil || doneWhen.allSatisfy({ condition in
-                if case .fileExists = condition { return true }
-                return false
-            }) {
-                if case .verified = DoneCheck.check(doneWhen, evidence: DoneCheck.Evidence(screenText: initialState, pageURL: { nil })) {
-                    result = true
-                } else { result = false }
-            } else {
-                result = true
+            if doneWhen.isEmpty { return false }
+            if case .weak = initialCheck() { return true }
+            return startingState == nil
+        }
+
+        func checkReplay(evidence: DoneCheck.Evidence, baseline: BatchCompletion?,
+                         after: BatchCompletion.Observation?) -> DoneCheck.Result {
+            guard let expected = recipe?.window, Window(state: evidence.screenText) == expected else {
+                return .missing(unmet: doneWhen.map(\.summary))
             }
-            return result
+            return DoneCheck.check(doneWhen, evidence: evidence, baseline: baseline, after: after)
         }
 
         /// After each step: a line when a replayed step no longer has the effect it had when saved.
-        func verify(number: Int, total: Int, lines: [String]) -> String? {
+        func verify(number: Int, total: Int, lines: [String], observation: BatchEffects.Receipt?) -> String? {
             guard recipe != nil, number < total else { return nil }
-            return BatchRecipes.replayStop(number: number, total: total, recorded: replayMeta[number]?.effect,
-                                           block: BatchRecipes.block(for: number, in: lines))
+            if observation == .outcomeUnknown {
+                return "Replay stopped after step \(number). Inspect its result before continuing."
+            }
+            var block = BatchRecipes.block(for: number, in: lines)
+            if observation == .noEffectSeen { block.append("no visible change") }
+            return BatchRecipes.replayStop(number: number, total: total, recorded: replayMeta[number]?.effect, block: block)
         }
 
         /// End of the batch: records a replay, or saves a new recipe. Returns the lines to add to the reply.
         func finish(app lastApp: String, steps: [BatchTool.Step], lines: [String], failed: Bool, stopped: Bool,
-                    remember: Bool?, verifiedDone: Bool) -> [String] {
+                    remember: Bool?, verifiedDone: Bool, finalState: String? = nil) -> [String] {
             guard active else { return [] }
             var out: [String] = []
             if let recipe {
-                var stored = recipe.steps
-                if !failed, verifiedDone || doneWhen.isEmpty, !healed.isEmpty {
-                    for (number, fix) in healed where stored.indices.contains(number - 1) {
-                        if var dict = stored[number - 1] as? [String: Any] {
-                            dict["label"] = fix.label
-                            dict["_loc"] = fix.locator.dictionary
-                            stored[number - 1] = dict
-                        }
-                    }
-                }
-                // Cut short by time: neither a success nor a failure of the recipe.
-                // A replay whose done_when did not verify did not reach the goal.
-                let reached = !failed && (doneWhen.isEmpty || verifiedDone)
-                if !stopped {
-                    store.recordReplay(recipe, succeeded: reached, healedSteps: (healed.isEmpty || !reached) ? nil : stored)
-                }
-                out += notes
-                if !ignored.isEmpty { out.append("Ignored values with no variable in this recipe: \(ignored.joined(separator: ", ")).") }
-                return out
+                if !stopped { store.recordReplay(recipe, succeeded: !failed && verifiedDone) }
+                return []
             }
             guard !failed, !stopped else { return [] }
             if !doneWhen.isEmpty && !verifiedDone {
@@ -484,11 +570,20 @@ extension BatchRecipes {
             }
             let positional = BatchTool.usesPositionalTargets(steps)
             let mutating = steps.contains { !BatchTool.readOnlyTools.contains($0.tool) && $0.tool != BatchTool.waitName }
-            let auto = canSave && verifiedDone && remember != false && initialDone == false
-            if canSave, verifiedDone, remember != false, !auto, mutating {
-                out.append("Not saved as a recipe: done_when was already true before these steps ran, so it does not show they worked. Send remember: true to save anyway.")
+            if remember == true, mutating, doneWhen.isEmpty {
+                return ["Recipe was not saved. Mutating steps need a deterministic done_when."]
             }
-            if (remember == true || auto), mutating {
+            let window = Window(state: startingState)
+            let verified: Bool
+            if canSave, verifiedDone, initialDone == false, let window, Window(state: finalState) == window {
+                verified = true
+            } else {
+                verified = false
+            }
+            if verifiedDone, remember != false, !verified, mutating {
+                out.append("The starting state did not prove these steps reached done_when. This run cannot verify a recipe.")
+            }
+            if (remember == true || verified), mutating {
                 if !secretSteps.isEmpty || values.keys.contains(where: { RecipeLocator.looksSecret($0) }) {
                     out.append("Not saved as a recipe: it types into a password or secret field, and those are never stored.")
                     return out
@@ -500,18 +595,26 @@ extension BatchRecipes {
                     return out
                 }
                 let save = buildSave(app: lastApp, steps: steps, lines: lines)
-                store.save(app: lastApp, goal: goal, steps: save.steps, params: save.params, shape: save.shape, doneWhen: doneWhen)
-                let why = remember == true ? "" : " (done_when was verified)"
-                let names = save.params.isEmpty ? "" : " Variables: \(save.params.keys.sorted().joined(separator: ", ")); pass values to change them."
-                out.append("Saved these steps as the recipe for \"\(goal)\"\(why); next time send just the goal to replay them.\(names)")
+                let eligible = steps.enumerated().allSatisfy { offset, step in
+                    HandoffTool.isSafeRecipeStep(step, app: lastApp)
+                        && (step.isReadOnly || recorded[offset + 1] != nil)
+                }
+                guard let saved = store.save(app: lastApp, goal: goal, steps: save.steps, params: save.params,
+                                             slotKinds: save.kinds, doneWhen: doneWhen, window: window,
+                                             verified: verified && eligible) else { return out }
+                let status = !saved.verified ? "unverified" : saved.champion ? "verified" : "verified challenger"
+                out.append("Saved a \(status) recipe for \"\(goal)\".")
+                if saved.verified && saved.champion && !save.params.isEmpty {
+                    out.append("Provide these slots again when replaying: \(save.params.keys.sorted().joined(separator: ", ")).")
+                }
             }
             return out
         }
 
-        private func buildSave(app lastApp: String, steps: [BatchTool.Step], lines: [String]) -> (steps: [Any], params: [String: String], shape: String) {
+        private func buildSave(app lastApp: String, steps: [BatchTool.Step], lines: [String]) -> (steps: [Any], params: [String: String], kinds: [String: SlotKind]) {
             var dicts: [[String: Any]] = steps.map { step in
                 var dict = step.arguments
-                if let stepApp = dict["app"] as? String, BatchRecipes.normalize(stepApp) == BatchRecipes.normalize(lastApp) { dict["app"] = nil }
+                if let stepApp = dict["app"] as? String, BatchRecipes.sameApp(stepApp, lastApp) { dict["app"] = nil }
                 dict["tool"] = step.tool
                 return dict
             }
@@ -521,8 +624,7 @@ extension BatchRecipes {
                 if let locator = recorded[i + 1] { dicts[i]["_loc"] = locator.dictionary }
                 if let kind = BatchRecipes.effectKind(of: BatchRecipes.block(for: i + 1, in: lines)) { dicts[i]["_fx"] = kind }
             }
-            let shape = BatchRecipes.windowShape(title: initialState.flatMap { BatchEffects.windowTitle(in: $0) })
-            return (dicts, parameterized.params, shape)
+            return (dicts, parameterized.params, parameterized.kinds)
         }
     }
 }

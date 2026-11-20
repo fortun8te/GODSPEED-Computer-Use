@@ -114,7 +114,7 @@ final class TrajectoryLog: @unchecked Sendable {
             batchReceipt: result.batchReceipt,
             failureText: result.isError ? primary : nil,
             failureCode: result.isError
-                ? result.batchReceipt?.failureCode ?? result.failureCode ?? Self.failureCode(message: primary) : nil,
+                ? result.batchReceipt?.failureCode ?? result.failureCode ?? .toolError : nil,
             visionUsed: primary.hasPrefix("No accessibility element is labelled ") && primary.contains("found it on screen and clicked at")
         )
     }
@@ -122,7 +122,7 @@ final class TrajectoryLog: @unchecked Sendable {
     /// Records one top-level tool call that threw instead of returning a result.
     func recordFailedToolCall(name: String, arguments: [String: Any], error: Error, startedAt: Date, admissionMs: Double? = nil) {
         guard isEnabled else { return }
-        let isError = (error as? ComputerUseError)?.toolResultIsError ?? true
+        let isError = true
         let message = (error as? ComputerUseError)?.errorDescription
             ?? (error as? LocalizedError)?.errorDescription
             ?? String(describing: error)
@@ -137,7 +137,7 @@ final class TrajectoryLog: @unchecked Sendable {
             startedAt: startedAt,
             admissionMs: admissionMs,
             failureText: message,
-            failureCode: Self.failureCode(error: error, message: message)
+            failureCode: Self.failureCode(error: error)
         )
     }
 
@@ -481,7 +481,16 @@ final class TrajectoryLog: @unchecked Sendable {
         case appNotFound = "app_not_found"
         case permissionDenied = "permission_denied"
         case stateUnavailable = "state_unavailable"
+        case backgroundUnsupported = "BACKGROUND_UNSUPPORTED"
+        case approvalRequired = "APPROVAL_REQUIRED"
+        case actionDenied = "ACTION_DENIED"
+
+        var isActionRefusal: Bool {
+            self == .backgroundUnsupported || self == .approvalRequired || self == .actionDenied
+        }
         case staleState = "stale_state"
+        case staleRef = "STALE_REF"
+        case windowChanged = "WINDOW_CHANGED"
         case timeout
         case cancelled
         case recipeVerification = "recipe_verification"
@@ -489,34 +498,32 @@ final class TrajectoryLog: @unchecked Sendable {
         case internalError = "internal_error"
     }
 
-    static func failureCode(error: Error, message: String) -> FailureCode {
+    static func failureCode(error: Error) -> FailureCode {
         guard let error = error as? ComputerUseError else {
-            return error is CancellationError ? .cancelled : .internalError
+            return (error is CancellationError || error is RequestCancellation.Cancelled) ? .cancelled : .internalError
         }
         switch error {
         case .unsupportedTool: return .unsupportedTool
-        case .invalidArguments: return .invalidArguments
+        case .invalidArguments, .targetNotFound, .ambiguousTarget: return .invalidArguments
         case .appNotFound: return .appNotFound
         case .permissionDenied: return .permissionDenied
         case .stateUnavailable: return .stateUnavailable
-        case .message: return failureCode(message: message)
+        case .staleTarget, .elementGone: return .staleState
+        case .timedOut: return .timeout
+        case .message, .notSent, .acknowledged: return .toolError
+        case .staleRef: return .staleRef
+        case .windowChanged: return .windowChanged
+        case .backgroundUnsupported: return .backgroundUnsupported
+        case .approvalRequired: return .approvalRequired
+        case .actionDenied: return .actionDenied
         }
-    }
-
-    static func failureCode(message: String) -> FailureCode {
-        let firstLine = (message.split(separator: "\n", maxSplits: 1).first ?? "").lowercased()
-        if firstLine.hasPrefix("invalidarguments(") || firstLine.hasPrefix("missing required argument:") { return .invalidArguments }
-        if firstLine.hasPrefix("appnotfound(") { return .appNotFound }
-        if firstLine.hasPrefix("unsupportedtool(") { return .unsupportedTool }
-        if firstLine.hasPrefix("stale:") { return .staleState }
-        if firstLine.hasPrefix("timed out") { return .timeout }
-        return .toolError
     }
 
     struct BatchReceipt {
         enum Stop: String {
             case stepFailure = "step_failure"
             case timeBudget = "time_budget"
+            case cancelled
             case windowChanged = "window_changed"
             case recipeVerification = "recipe_verification"
         }
@@ -531,6 +538,7 @@ final class TrajectoryLog: @unchecked Sendable {
             case notRequested = "not_requested"
             case skipped
             case verified
+            case weakEvidence = "weak_evidence"
             case unmet
         }
 
@@ -538,12 +546,14 @@ final class TrajectoryLog: @unchecked Sendable {
             var failureCode: FailureCode?
             var observation: BatchEffects.Receipt?
             var durationMs: Double? = nil
+            var deliveryState: DeliveryState = .acknowledged
 
             func metadata(number: Int) -> [String: Any] {
                 var fields: [String: Any] = ["n": number, "status": failureCode == nil ? "ok" : "failed"]
                 fields["duration_ms"] = durationMs
                 fields["failure_code"] = failureCode?.rawValue
                 fields["observation"] = observation?.rawValue.replacingOccurrences(of: " ", with: "_")
+                for (key, value) in deliveryState.metadata { fields[key] = value }
                 return fields
             }
         }
@@ -555,6 +565,13 @@ final class TrajectoryLog: @unchecked Sendable {
         var decisionHint = false
         var doneCheck: DoneCheck = .notRequested
 
+        var deliveryState: DeliveryState {
+            // A strong done_when check on fresh evidence reconciles an unacknowledged step (see BatchTool).
+            if doneCheck == .verified, stop == nil { return .verified }
+            if steps.contains(where: { $0.deliveryState == .outcomeUnknown }) { return .outcomeUnknown }
+            return steps.contains { [.acknowledged, .verified].contains($0.deliveryState) } ? .acknowledged : .notSent
+        }
+
         /// Recovery uses expanded step numbers, which can differ from the caller's input array.
         var recovery: [String: Any]? {
             if stop == .timeBudget || stop == .windowChanged {
@@ -562,10 +579,15 @@ final class TrajectoryLog: @unchecked Sendable {
                 return ["action": "refresh_then_continue", "step": steps.count + 1]
             }
             if stop != nil, let last = steps.last, last.failureCode != nil {
-                let action = last.observation == .notSent ? "fix_then_continue" : "inspect_before_retry"
+                let action: String
+                switch last.deliveryState.safeRetry {
+                case .afterCorrection: action = "fix_then_continue"
+                case .reconcileFirst: action = "inspect_before_retry"
+                case .doNotRetry: action = "inspect_result"
+                }
                 return ["action": action, "step": steps.count]
             }
-            if stop != nil || doneCheck == .unmet || observation == .failed {
+            if stop != nil || doneCheck == .unmet || doneCheck == .weakEvidence || observation == .failed {
                 return ["action": "inspect_result"]
             }
             return nil

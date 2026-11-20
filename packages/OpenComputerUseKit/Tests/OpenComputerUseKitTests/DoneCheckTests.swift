@@ -28,6 +28,108 @@ final class DoneCheckTests: XCTestCase {
 
     // MARK: - Parsing
 
+    func testAppearedRequiresACompleteBaselineFromTheSameTarget() throws {
+        let checks = try DoneCheck.parse(["appeared": "Message sent"])
+        let target = BatchCompletion.Target.browser(tab: 7, generation: 1)
+        let before = BatchCompletion.Observation(target: target, screen: "Message ready", canProveAbsence: true)
+        let after = BatchCompletion.Observation(target: target, screen: "Message sent", canProveAbsence: true)
+        let evidence = DoneCheck.Evidence(screenText: nil, pageURL: { nil })
+        func check(_ baseline: BatchCompletion.Observation?, _ current: BatchCompletion.Observation) -> DoneCheck.Result {
+            DoneCheck.check(checks, evidence: evidence,
+                           baseline: BatchCompletion(conditions: checks, startedAt: Date(), before: baseline), after: current)
+        }
+
+        XCTAssertEqual(check(before, after), .verified(met: ["\"Message sent\" appeared"]))
+        XCTAssertEqual(check(nil, after), .missing(unmet: ["\"Message sent\" appeared"]))
+        XCTAssertEqual(check(after, after), .missing(unmet: ["\"Message sent\" appeared"]))
+        var clipped = before
+        clipped.canProveAbsence = false
+        XCTAssertEqual(check(clipped, after), .missing(unmet: ["\"Message sent\" appeared"]))
+        let wrongTab = BatchCompletion.Observation(target: .browser(tab: 8, generation: 1), screen: after.screen,
+                                                  canProveAbsence: true)
+        XCTAssertEqual(check(before, wrongTab), .missing(unmet: ["\"Message sent\" appeared"]))
+    }
+
+    func testTemporalFieldAndURLRequireExactNewValues() throws {
+        let field = try XCTUnwrap(DoneCheck.parse(["field": "Name", "equals": "Ada", "since_start": "changed"]).first)
+        XCTAssertEqual(try DoneCheck.parse(field.arguments), [field])
+        let target = BatchCompletion.Target.native(pid: 12, launch: Date(), window: 6)
+        let before = BatchCompletion.Observation(target: target, screen: "1 text field Name = adam", canProveAbsence: true)
+        var after = BatchCompletion.Observation(target: target, screen: "1 text field Name = Ada", canProveAbsence: true)
+        let baseline = BatchCompletion(conditions: [field], startedAt: Date(), before: before)
+        XCTAssertTrue(baseline.meets(field, after: after))
+        after.screen = "1 text field Name = ada"
+        XCTAssertFalse(baseline.meets(field, after: after))
+        after.screen = "1 text field Name = Ada\n2 text field Name = User"
+        XCTAssertFalse(baseline.meets(field, after: after))
+
+        let url = DoneCheck.Condition.urlChanged("https://example.test/thanks")
+        let tab = BatchCompletion.Target.browser(tab: 12, generation: 6)
+        let origin = BatchCompletion.Observation(target: tab, url: "https://example.test/cart", canProveAbsence: false)
+        let navigation = BatchCompletion(conditions: [url], startedAt: Date(), before: origin)
+        var location = origin
+        location.url = "https://elsewhere.test/thanks"
+        XCTAssertFalse(navigation.meets(url, after: location))
+        location.url = "https://example.test/thanks"
+        XCTAssertTrue(navigation.meets(url, after: location))
+        let reconnect = BatchCompletion.Observation(target: .browser(tab: 12, generation: 7), url: location.url, canProveAbsence: false)
+        XCTAssertFalse(navigation.meets(url, after: reconnect))
+    }
+
+    func testFileChangedRejectsOldArtifactAndChecksContentWhenMetadataLooksTheSame() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let condition = try XCTUnwrap(DoneCheck.parse(["file_changed": url.path]).first)
+        let absent = BatchCompletion(conditions: [condition], startedAt: Date())
+        let old = Date(timeIntervalSince1970: 1_500_000_000)
+
+        try Data("old".utf8).write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+        XCTAssertTrue(absent.meets(condition, after: nil))
+
+        let existing = BatchCompletion(conditions: [condition], startedAt: Date())
+        XCTAssertFalse(existing.meets(condition, after: nil))
+        try Data("new".utf8).write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+        XCTAssertTrue(existing.meets(condition, after: nil))
+    }
+
+    func testWeakMatchDoesNotTurnIntoVerifiedAlongsideATransition() {
+        let checks: [DoneCheck.Condition] = [.appeared("Saved"), .fileExists("/fixture/export.pdf")]
+        let target = BatchCompletion.Target.browser(tab: 7, generation: 1)
+        let before = BatchCompletion.Observation(target: target, screen: "Editing", canProveAbsence: true)
+        let after = BatchCompletion.Observation(target: target, screen: "Saved", canProveAbsence: true)
+        let evidence = DoneCheck.Evidence(screenText: nil, pageURL: { nil }, fileExists: { _ in true })
+        let baseline = BatchCompletion(conditions: checks, startedAt: Date(), before: before)
+        XCTAssertEqual(DoneCheck.check(checks, evidence: evidence, baseline: baseline, after: after),
+                       .weak(met: ["\"Saved\" appeared", "file /fixture/export.pdf exists"]))
+    }
+
+    func testDirectBrowserEvidenceDoesNotVerifyOtherConditions() {
+        let wanted: [DoneCheck.Condition] = [.text("Sent"), .text("Receipt")]
+        let evidence = DoneCheck.Evidence(screenText: nil, pageURL: { "https://example.test" },
+                                          directlyVerified: [.text("Sent")])
+        XCTAssertEqual(DoneCheck.check(wanted, evidence: evidence), .missing(unmet: [wanted[1].summary]))
+    }
+
+    func testDirectCompletionReadsFileAndExactFieldWithoutScreenState() {
+        let conditions: [DoneCheck.Condition] = [.fileExists("/test/file"), .field(label: "Title", equals: "Ready")]
+        var files: [String] = []
+        var fields: [String] = []
+        let result = DoneCheck.directCompletion(conditions, fileExists: {
+            files.append($0)
+            return true
+        }, fieldValue: {
+            fields.append($0)
+            return "Ready"
+        })
+        XCTAssertEqual(result, .weak(met: conditions.map(\.summary)))
+        XCTAssertEqual(files, ["/test/file"])
+        XCTAssertEqual(fields, ["Title"])
+        XCTAssertNil(DoneCheck.directCompletion(conditions, fileExists: { _ in true }, fieldValue: { _ in nil }))
+        XCTAssertNil(DoneCheck.directCompletion([.text("Ready")], fieldValue: { _ in XCTFail("Text requires an observation"); return nil }))
+    }
+
     func testDoneWhenAndWaitAcceptCommonSpellings() throws {
         XCTAssertEqual(try DoneCheck.parse(["contains": "Saved"]), [.text("Saved")])
         XCTAssertEqual(try DoneCheck.parse(["url": "/thanks"]), [.urlContains("/thanks")])
@@ -129,9 +231,9 @@ final class DoneCheckTests: XCTestCase {
         XCTAssertFalse(DoneCheck.isPlainNumber("12 x 34"))
         // Plain text targets keep the old substring check.
         let words = DoneCheck.check([.text("Message sent")], evidence: .init(screenText: "Status: Message sent!", pageURL: { nil }))
-        if case .verified = words {} else { XCTFail("text target") }
+        if case .weak = words {} else { XCTFail("text target") }
         let number = DoneCheck.check([.text("12")], evidence: .init(screenText: "Edit field 120", pageURL: { nil }))
-        if case .verified = number { XCTFail("12 must not match 120") }
+        if case .weak = number { XCTFail("12 must not match 120") }
     }
 
     func testProcessAndWindowMetadataCannotVerifyANumericGoal() {
@@ -169,6 +271,23 @@ final class DoneCheckTests: XCTestCase {
         ])
     }
 
+    func testEveryKeyInOneObjectIsACondition() throws {
+        // One object with several keys means all of them must hold (AND); none is silently dropped.
+        let file = "/tmp/godspeed-done-check-both.pdf"
+        XCTAssertEqual(
+            try DoneCheck.parse(["file_exists": file, "text": "Saved"]),
+            [.fileExists(file), .text("Saved")]
+        )
+        XCTAssertEqual(
+            try DoneCheck.parse(["field": "Name", "equals": "Ada", "since_start": "changed", "text": "Saved"]),
+            [.fieldChanged(label: "Name", equals: "Ada"), .text("Saved")]
+        )
+        XCTAssertEqual(
+            try DoneCheck.parse(["text": "Sent", "gone": "Loading"]),
+            [.text("Sent"), .gone("Loading")]
+        )
+    }
+
     func testExpandsTildeInFileExists() throws {
         let parsed = try DoneCheck.parse(["file_exists": "~/Desktop/out.pdf"])
         XCTAssertEqual(parsed, [.fileExists(NSString(string: "~/Desktop/out.pdf").expandingTildeInPath)])
@@ -191,7 +310,7 @@ final class DoneCheckTests: XCTestCase {
         let screen = "Mail window\n\t3 static text Message sent to Avery"
         XCTAssertEqual(
             DoneCheck.check([.text("message SENT")], evidence: evidence(screen: screen)),
-            .verified(met: ["\"message SENT\" is on screen"])
+            .weak(met: ["\"message SENT\" is on screen"])
         )
         XCTAssertEqual(
             DoneCheck.check([.text("Draft saved")], evidence: evidence(screen: screen)),
@@ -224,7 +343,7 @@ final class DoneCheckTests: XCTestCase {
     func testGoneMeansNoStateLineMentionsTheLabel() {
         XCTAssertEqual(
             DoneCheck.check([.gone("Loading")], evidence: evidence(screen: "Notes window\n\t3 button Save")),
-            .verified(met: ["Loading is gone"])
+            .weak(met: ["Loading is gone"])
         )
         XCTAssertEqual(
             DoneCheck.check([.gone("Loading")], evidence: evidence(screen: "3 sheet Loading")),
@@ -238,7 +357,7 @@ final class DoneCheckTests: XCTestCase {
             [.urlContains("/thanks"), .urlContains("shop")],
             evidence: evidence(screen: "", url: "https://shop.example/thanks?id=4", urlCalls: counter)
         )
-        XCTAssertEqual(result, .verified(met: ["the page URL contains /thanks", "the page URL contains shop"]))
+        XCTAssertEqual(result, .weak(met: ["the page URL contains /thanks", "the page URL contains shop"]))
         XCTAssertEqual(counter.value, 1, "the page is read once for all url conditions")
 
         let untouched = Counter()
@@ -257,7 +376,7 @@ final class DoneCheckTests: XCTestCase {
         let path = "/Users/example/out.pdf"
         XCTAssertEqual(
             DoneCheck.check([.fileExists(path)], evidence: evidence(screen: "", files: [path])),
-            .verified(met: ["file \(path) exists"])
+            .weak(met: ["file \(path) exists"])
         )
         XCTAssertEqual(
             DoneCheck.check([.fileExists(path)], evidence: evidence(screen: "")),

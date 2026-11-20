@@ -244,7 +244,7 @@ final class BrowserDuplicateLabelTests: XCTestCase {
 final class BrowserRepeatSafetyTests: XCTestCase {
     func testOnlyHarmlessCommandsAreSentAgainAfterALinkDrop() {
         XCTAssertTrue(BrowserPage.isRepeatSafe("Accessibility.getFullAXTree", [:]))
-        XCTAssertTrue(BrowserPage.isRepeatSafe("Input.dispatchMouseEvent", ["type": "mouseMoved"]))
+        XCTAssertFalse(BrowserPage.isRepeatSafe("Input.dispatchMouseEvent", ["type": "mouseMoved"]), "Hover can trigger page handlers")
         XCTAssertFalse(BrowserPage.isRepeatSafe("Input.dispatchMouseEvent", ["type": "mousePressed"]))
         XCTAssertFalse(BrowserPage.isRepeatSafe("Input.insertText", ["text": "x"]))
         XCTAssertFalse(BrowserPage.isRepeatSafe("Input.dispatchKeyEvent", ["type": "keyDown"]))

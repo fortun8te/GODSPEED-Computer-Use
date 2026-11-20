@@ -21,15 +21,14 @@ public enum VisualCursorSupport {
 
     public static var isEnabled: Bool { settings.enabled }
 
-    /// Every cursor setting for the current request. The app agent applies a caller's
-    /// OPEN_COMPUTER_USE_* variables only while that request runs, and queued animations
-    /// play after it returned, so they must use the values captured when they were queued.
+    /// Every cursor setting for the current request. Queued animations use the settings
+    /// captured from the request that scheduled them.
     static var settings: VisualCursorSettings {
         if let snapshot = Thread.current.threadDictionary[settingsSnapshotKey] as? VisualCursorSettings {
             return snapshot
         }
         // PURE's Settings > GODSPEED fill in whatever the environment does not set.
-        let environment = GodspeedSettings.merged(ProcessInfo.processInfo.environment)
+        let environment = GodspeedSettings.merged(RequestConfiguration.environment)
         var settings = VisualCursorSettings(environment: environment)
         let client = ClientScope.current
         if environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]?.lowercased() == "auto", client != "main" {
@@ -46,7 +45,7 @@ public enum VisualCursorSupport {
     /// OPEN_COMPUTER_USE_CURSOR_ASYNC (default on): cursor animations are queued on the main thread
     /// and play while the action runs, so the action never waits for them. Order is kept (move, then pulse).
     static var animatesAsync: Bool {
-        let raw = ProcessInfo.processInfo.environment["OPEN_COMPUTER_USE_CURSOR_ASYNC"]?.lowercased() ?? "1"
+        let raw = RequestConfiguration.environment["OPEN_COMPUTER_USE_CURSOR_ASYNC"]?.lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(raw)
     }
 
@@ -78,9 +77,6 @@ public enum VisualCursorSupport {
     }
 
     static func performCursorAnimation(kind: AnimationKind = .other, _ body: @escaping @MainActor () -> Void) {
-        // The app agent temporarily overrides its environment per request. The
-        // main queue can run after those overrides are restored, so capture the
-        // request's cursor setting before dispatching any work.
         let captured = settings
         let client = ClientScope.current
         let perform: @MainActor () -> Void = {
@@ -181,7 +177,7 @@ func visualCursorEnabled(environment: [String: String]) -> Bool {
 
 func defaultVisualCursorInitialTipPosition(
     windowOrigin: CGPoint = .zero,
-    tipAnchor: CGPoint = SoftwareCursorGlyphMetrics.tipAnchor
+    tipAnchor: CGPoint = SoftwareCursorPanelMetrics.tipAnchor
 ) -> CGPoint {
     return CGPoint(
         x: windowOrigin.x + tipAnchor.x,
@@ -272,11 +268,11 @@ func availableCursorAgentName(_ name: String, taken: Set<String>) -> String {
 let visualCursorDefaultSpeedSetting: Double = 4
 
 /// OPEN_COMPUTER_USE_CURSOR_SPEED: how fast the cursor's travel and click pulse play.
-/// Unset or 4 is the OCU Fast default: 60 to 140 ms of travel and a 90 ms pulse. 8 is twice as
+/// Unset or 4 is the default: 150 to 450 ms of travel and a 150 ms pulse. 8 is twice as
 /// fast, 2 half as fast. There is no upper limit; `instant` (also `inf`, `max`) places the cursor
 /// on the target with no travel at all. Anything unreadable means the default.
 /// Returns the playback rate relative to the default timing (setting / 4).
-func visualCursorSpeed(environment: [String: String] = ProcessInfo.processInfo.environment) -> CGFloat {
+func visualCursorSpeed(environment: [String: String] = RequestConfiguration.environment) -> CGFloat {
     let raw = (environment["OPEN_COMPUTER_USE_CURSOR_SPEED"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if ["instant", "inf", "infinity", "max", "teleport"].contains(raw) { return .infinity }
     guard let value = Double(raw), !value.isNaN, value > 0 else { return 1 }
@@ -289,17 +285,18 @@ let visualCursorMinimumAnimatedDuration: TimeInterval = 1.0 / 120.0
 /// How much faster an animation plays when `queuedBehind` others are already waiting, so the cursor
 /// catches up with a fast batch instead of replaying it for seconds afterwards.
 func visualCursorCatchUpFactor(queuedBehind: Int) -> Double {
-    // Floored so a long backlog still glides a little instead of turning every step into a jump.
-    max(0.35, 1 / (1 + 0.6 * Double(max(queuedBehind, 0))))
+    // Floored so a long backlog still glides visibly instead of turning every step into a jump.
+    max(0.6, 1 / (1 + 0.35 * Double(max(queuedBehind, 0))))
 }
 
-/// Seconds one move takes at playback rate `speed`. At 1x a short hop takes about 120 ms and the time rises
-/// gently with distance to at most 300 ms across a whole screen: long enough for the eye to follow the glide,
-/// short enough that it never feels like waiting. Actions never wait for it (the cursor plays asynchronously).
+/// Seconds one move takes at playback rate `speed`. At 1x a short hop takes about 160 ms and the time rises
+/// gently with distance to at most 450 ms across a whole screen: enough frames for the eye to follow the glide
+/// (a full-screen move stays under about 100 pt per 60 Hz frame), short enough that it never feels like
+/// waiting. Actions never wait for it (the cursor plays asynchronously).
 /// Returns 0 (place directly) for instant speed or when the result would be under one frame.
 func visualCursorTravelDuration(distance: CGFloat, speed: CGFloat, queuedBehind: Int = 0) -> TimeInterval {
     guard speed.isFinite, speed > 0, distance.isFinite, distance > 0 else { return 0 }
-    let base = 0.12 + 0.18 * (1 - exp(-Double(distance) / 650))
+    let base = 0.15 + 0.30 * (1 - exp(-Double(distance) / 800))
     let duration = base / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind)
     return duration < visualCursorMinimumAnimatedDuration ? 0 : duration
 }
@@ -342,7 +339,7 @@ func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
     !frame.insetBy(dx: 36, dy: 36).contains(point)
 }
 
-func visualCursorFloats(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+func visualCursorFloats(environment: [String: String] = RequestConfiguration.environment) -> Bool {
     let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.lowercased() ?? "0"
     return ["1", "true", "yes", "on"].contains(raw)
 }
@@ -351,7 +348,7 @@ func visualCursorFloats(environment: [String: String] = ProcessInfo.processInfo.
 /// (OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS, default 3). Long enough that the next call of the
 /// same batch or turn continues from where it is, short enough that it is gone soon after the
 /// work stops. `turn-ended` still clears it at once.
-func visualCursorPostInteractionIdleTimeout(environment: [String: String] = ProcessInfo.processInfo.environment) -> TimeInterval {
+func visualCursorPostInteractionIdleTimeout(environment: [String: String] = RequestConfiguration.environment) -> TimeInterval {
     let raw = (environment["OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard let value = Double(raw), value.isFinite, value >= 0 else { return 3 }
     return max(value, 0.2)
@@ -363,8 +360,15 @@ func visualCursorIdleSwayTimeout() -> TimeInterval {
     6
 }
 
+/// The idle "breathing" of a resting arrow: barely visible (about 2 degrees), so the cursor reads as alive
+/// without rocking.
 func visualCursorIdleRotationAmplitude() -> CGFloat {
-    0.09
+    0.035
+}
+
+/// Angular speed (radians per second) of the idle breathing: one slow cycle every four seconds.
+func visualCursorIdleRotationRate() -> CGFloat {
+    1.6
 }
 
 public struct VisualCursorObservationPoint: Codable, Sendable {
@@ -473,25 +477,133 @@ private struct CursorArtwork {
     let geometry: CursorWindowGeometry
     static let active = CursorArtwork(
         geometry: CursorWindowGeometry(
-            windowSize: SoftwareCursorGlyphMetrics.windowSize,
-            tipAnchor: SoftwareCursorGlyphMetrics.tipAnchor
+            windowSize: SoftwareCursorPanelMetrics.size,
+            tipAnchor: SoftwareCursorPanelMetrics.tipAnchor
         ),
     )
 }
 
 // MARK: - Glide and pose math
 
-/// Short moves use a straight path with a small lean.
-let visualCursorStraightDistance: CGFloat = 160
+/// The glide the overlay plays for one move. Pure, so the offline motion renderer and tests build
+/// exactly what the overlay draws.
+func visualCursorPlanGlide(
+    from start: CGPoint, to target: CGPoint, velocity: CGVector, poseAngle: CGFloat,
+    screenFrame: CGRect?, dragging: Bool, changesDisplay: Bool, route: CursorMotionPath?,
+    at now: CFTimeInterval, speed: CGFloat, queuedBehind: Int, fadesIn: Bool
+) -> CursorGlide {
+    let forward = visualCursorAppKitForwardHeading(renderRotation: poseAngle)
+    let rest = visualCursorAppKitForwardHeading(renderRotation: 0)
+    // A drag travels straight, like the mouse events it draws. Next to a display edge the arc is kept on
+    // screen by the planner (it shortens only the sideways bend), so edge targets glide like any other.
+    return CursorGlide(
+        start: start,
+        end: target,
+        startVelocity: velocity,
+        startForward: CGVector(dx: cos(forward), dy: sin(forward)),
+        restForward: CGVector(dx: cos(rest), dy: sin(rest)),
+        bounds: screenFrame,
+        planned: !dragging && !changesDisplay,
+        route: dragging ? nil : route,
+        startTime: now,
+        speed: speed,
+        queuedBehind: queuedBehind,
+        fadesIn: fadesIn
+    )
+}
+
+/// The glide that replaces `current` when its target window moves mid-flight: it starts at the drawn tip
+/// with the tip's velocity and lands in the time the old glide had left.
+func visualCursorRetargetGlide(
+    _ current: CursorGlide, to moved: CGPoint, at now: CFTimeInterval, poseAngle: CGFloat, speed: CGFloat
+) -> CursorGlide {
+    let forward = visualCursorAppKitForwardHeading(renderRotation: poseAngle)
+    let rest = visualCursorAppKitForwardHeading(renderRotation: 0)
+    let tip = current.point(at: now)
+    let velocity = current.velocity(at: now)
+    let forwardVector = CGVector(dx: cos(forward), dy: sin(forward))
+    let restVector = CGVector(dx: cos(rest), dy: sin(rest))
+    let chord = CGVector(dx: moved.x - tip.x, dy: moved.y - tip.y)
+    // Leave in the direction the tip is already moving, so the turn toward the moved target is a bend, not a
+    // corner. No sideways arc: the target is following a window.
+    let route = hypot(velocity.dx, velocity.dy) > 30 && hypot(moved.x - tip.x, moved.y - tip.y) > 1
+        ? CursorPathPlanner.plan(start: tip, end: moved, bounds: nil, startForward: chord, restForward: chord,
+                                 startTangent: velocity).path
+        : nil
+    return CursorGlide(
+        start: tip, end: moved, startVelocity: velocity,
+        startForward: forwardVector, restForward: restVector,
+        bounds: nil, planned: false, route: route, startTime: now, speed: speed, queuedBehind: 0,
+        fixedDuration: max(current.endTime - now, 0.08)
+    )
+}
+
+/// Where the name tag sits in the cursor window: beside the arrow, just right of its lower edge (the arrow
+/// points up-left, so its body hangs down-right of the tip). Next to a display's right edge it moves to the
+/// left of the tip, and next to the bottom edge above it, so it is never cut off.
+func visualCursorNameTagFrame(width: CGFloat, height: CGFloat, available: CGRect,
+                              tip: CGPoint = SoftwareCursorPanelMetrics.tipAnchor) -> CGRect {
+    var x = tip.x + 17
+    if x + width > available.maxX { x = tip.x - 9 - width }
+    x = min(max(x, available.minX), max(available.minX, available.maxX - width))
+    var y = tip.y - 22 - height / 2
+    if y < available.minY { y = tip.y + 6 }
+    return CGRect(x: x, y: y, width: width, height: height)
+}
+
+/// What the arrow's angle aims for during `glide` at `time` (render rotation, radians). Shared by the
+/// overlay and the offline motion renderer so both draw the same lean.
+func visualCursorGlideTargetAngle(_ glide: CursorGlide, at time: CFTimeInterval, baseHeading: CGFloat) -> CGFloat {
+    // Drags and window following stay upright.
+    if case let .straight(tilt) = glide.shape, tilt == 0 { return 0 }
+    guard let direction = glide.direction(at: time) else { return 0 }
+    let rest = visualCursorAppKitForwardHeading(renderRotation: 0, artworkNeutralHeading: baseHeading)
+    // The lean rises and falls with speed, read slightly ahead so the pose spring's lag puts the arrow
+    // upright as the tip lands rather than after.
+    let lead = min(0.03, glide.duration * 0.12)
+    return visualCursorLean(direction: direction, restForward: CGVector(dx: cos(rest), dy: sin(rest)))
+        * glide.speedFraction(at: min(time + lead, glide.endTime - 0.0001))
+}
+
+/// Moves up to this long travel straight. Longer ones bend in gradually, so there is no visible change of
+/// style at any one distance.
+let visualCursorStraightDistance: CGFloat = 48
+/// From this distance on, a move gets its full bend.
+let visualCursorFullBendDistance: CGFloat = 260
+/// Largest lean (radians) of the arrow into a move that crosses its axis.
+let visualCursorMaxLean: CGFloat = 0.2
+/// The highest start rate (in path lengths per glide duration) the easing accepts without backtracking.
+let visualCursorMaxInitialRate: CGFloat = 2.4
+
+/// Progress (0...1) along the path at normalized time `s`, starting at `initialRate`.
+///
+/// Velocity is v(s) = (1-s)^3 * (r(1+3s) + c s^2) with c = 60 - 24r: it starts at rate r with no jolt, peaks a
+/// little before the middle and lands with zero speed and zero acceleration. With r = 0 this is the asymmetric
+/// minimum-jerk profile of an aimed human pointing move (quick start, longer gentle settle).
+func visualCursorEase(_ s: CGFloat, initialRate: CGFloat = 0) -> CGFloat {
+    let s = s.clamped(to: 0...1)
+    let r = initialRate.clamped(to: 0...visualCursorMaxInitialRate)
+    let c = 60 - 24 * r
+    let s2 = s * s, s3 = s2 * s, s4 = s3 * s, s5 = s4 * s, s6 = s5 * s
+    return r * (s - 2 * s3 + 2 * s4 - 0.6 * s5) + c * (s3 / 3 - 0.75 * s4 + 0.6 * s5 - s6 / 6)
+}
+
+/// d(progress)/d(s) of `visualCursorEase`.
+func visualCursorEaseRate(_ s: CGFloat, initialRate: CGFloat = 0) -> CGFloat {
+    let s = s.clamped(to: 0...1)
+    let r = initialRate.clamped(to: 0...visualCursorMaxInitialRate)
+    let u = 1 - s
+    return u * u * u * (r * (1 + 3 * s) + (60 - 24 * r) * s * s)
+}
 
 /// One cursor glide, a pure function of time so every frame lands exactly on it whatever the frame clock does.
 ///
-/// Long glides use a shallow curve. Short moves, drags, and window following travel straight.
-/// A glide that replaces one in flight carries forward its current speed.
+/// Moves bend into a shallow arc that grows with distance; drags, window following and display changes without
+/// a route travel straight. Position follows the path by arc length, so the easing is the real on-screen speed
+/// even where a path's control points are uneven. A glide that replaces one in flight carries its velocity.
 struct CursorGlide {
     enum Shape {
         case planned(CursorMotionPath)
-        case crossing(CGPoint, firstFraction: CGFloat)
         /// Straight line; `tilt` is the peak lean (radians) into the hop.
         case straight(tilt: CGFloat)
     }
@@ -504,11 +616,19 @@ struct CursorGlide {
     /// Progress rate at the start (1 = the average rate), from a carried velocity.
     let initialRate: CGFloat
     let fadesIn: Bool
+    /// Path length in points.
+    let length: CGFloat
+    /// Highest progress rate the easing reaches; speed fractions are relative to it.
+    private let peakRate: CGFloat
+    /// Cumulative arc length at evenly spaced path parameters, for the arc-length mapping.
+    private let arcTable: [CGFloat]
 
     /// - Parameters:
     ///   - startForward: the arrow's current heading (AppKit).
     ///   - restForward: the arrow's resting heading (AppKit).
-    ///   - planned: false forces a straight path for drags, window following, and screen edges.
+    ///   - planned: false forces a straight path for drags, window following, and screen changes.
+    ///   - crossing: a point on a shared display edge to pass through (straight legs are bent smoothly through it).
+    ///   - route: a ready path (multi-display routes, carried motion); wins over `crossing` and `planned`.
     init(
         start: CGPoint,
         end: CGPoint,
@@ -518,6 +638,7 @@ struct CursorGlide {
         bounds: CGRect?,
         planned: Bool,
         via crossing: CGPoint? = nil,
+        route: CursorMotionPath? = nil,
         startTime: CFTimeInterval,
         speed: CGFloat,
         queuedBehind: Int,
@@ -532,27 +653,42 @@ struct CursorGlide {
         let dy = end.y - start.y
         let distance = hypot(dx, dy)
         let carriedSpeed = hypot(startVelocity.dx, startVelocity.dy)
+        let lean = visualCursorLean(direction: CGVector(dx: dx, dy: dy), restForward: restForward)
 
         var chosen: Shape = .straight(tilt: 0)
-        var length = distance
-        if let crossing {
-            let firstLength = hypot(crossing.x - start.x, crossing.y - start.y)
-            let secondLength = hypot(end.x - crossing.x, end.y - crossing.y)
-            length = firstLength + secondLength
-            if firstLength > 0, secondLength > 0 {
-                chosen = .crossing(crossing, firstFraction: firstLength / length)
-            }
-        } else if planned, distance >= visualCursorStraightDistance {
-            let route = CursorPathPlanner.plan(
-                start: start, end: end, bounds: bounds, startForward: startForward, restForward: restForward
-            )
-            length = route.length
-            chosen = .planned(route.path)
+        if let route, route.start == start, route.end == end {
+            chosen = .planned(route)
+        } else if let crossing, hypot(crossing.x - start.x, crossing.y - start.y) > 0.5,
+                  hypot(end.x - crossing.x, end.y - crossing.y) > 0.5 {
+            chosen = .planned(CursorPathPlanner.through([start, crossing, end], displays: nil))
+        } else if planned, distance > visualCursorStraightDistance {
+            let tangent = carriedSpeed > 30 ? startVelocity : nil
+            chosen = .planned(CursorPathPlanner.plan(
+                start: start, end: end, bounds: bounds, startForward: startForward, restForward: restForward,
+                startTangent: tangent
+            ).path)
         } else if distance > 0.5 {
-            let lean = ((restForward.dx * dy - restForward.dy * dx) / distance).clamped(to: -1...1)
-            chosen = .straight(tilt: planned ? lean / 3 : 0)
+            chosen = .straight(tilt: planned ? lean : 0)
         }
         shape = chosen
+
+        switch chosen {
+        case let .planned(path):
+            var table: [CGFloat] = [0]
+            let samples = 48 * max(path.segments.count, 1)
+            var previous = path.start
+            for index in 1...samples {
+                let point = path.point(at: CGFloat(index) / CGFloat(samples))
+                table.append(table[index - 1] + hypot(point.x - previous.x, point.y - previous.y))
+                previous = point
+            }
+            arcTable = table
+            length = max(table[samples], distance)
+        case .straight:
+            arcTable = []
+            length = distance
+        }
+
         let computed = fixedDuration ?? visualCursorTravelDuration(distance: length, speed: speed, queuedBehind: queuedBehind)
         duration = max(computed, 0.001)
 
@@ -563,13 +699,15 @@ struct CursorGlide {
             let direction: CGVector
             switch chosen {
             case let .planned(path): direction = path.tangent(at: 0)
-            case .straight, .crossing:
-                direction = distance > 0.001 ? CGVector(dx: dx / distance, dy: dy / distance) : .zero
+            case .straight: direction = distance > 0.001 ? CGVector(dx: dx / distance, dy: dy / distance) : .zero
             }
             let along = max(0, startVelocity.dx * direction.dx + startVelocity.dy * direction.dy)
-            rate = (along * CGFloat(duration) / length).clamped(to: 0...3)
+            rate = (along * CGFloat(duration) / length).clamped(to: 0...visualCursorMaxInitialRate)
         }
         initialRate = rate
+        var peak: CGFloat = 0
+        for index in 0...64 { peak = max(peak, visualCursorEaseRate(CGFloat(index) / 64, initialRate: rate)) }
+        peakRate = max(peak, 0.001)
     }
 
     var endTime: CFTimeInterval { startTime + duration }
@@ -580,29 +718,42 @@ struct CursorGlide {
         CGFloat(((time - startTime) / duration).clamped(to: 0...1))
     }
 
-    /// Cubic Hermite easing carries the initial rate and comes to rest at the target.
+    /// Fraction of the path covered at `time`.
     func progress(at time: CFTimeInterval) -> CGFloat {
-        let s = timeFraction(at: time)
-        let remaining = 1 - s
-        return s * s * (3 - 2 * s) + initialRate * s * remaining * remaining
+        visualCursorEase(timeFraction(at: time), initialRate: initialRate)
+    }
+
+    /// Speed at `time` as a fraction of this glide's top speed (0 before the start and after landing).
+    func speedFraction(at time: CFTimeInterval) -> CGFloat {
+        guard time >= startTime, !isFinished(at: time) else { return 0 }
+        return (visualCursorEaseRate(timeFraction(at: time), initialRate: initialRate) / peakRate).clamped(to: 0...1)
     }
 
     func point(at time: CFTimeInterval) -> CGPoint {
         point(progress: progress(at: time))
     }
 
-    func point(progress p: CGFloat) -> CGPoint {
-        func interpolate(_ a: CGPoint, _ b: CGPoint, _ fraction: CGFloat) -> CGPoint {
-            CGPoint(x: a.x + (b.x - a.x) * fraction, y: a.y + (b.y - a.y) * fraction)
+    /// Path parameter at a fraction of the arc length.
+    private func parameter(atArcFraction fraction: CGFloat) -> CGFloat {
+        guard arcTable.count > 1, let total = arcTable.last, total > 0 else { return fraction }
+        let target = fraction.clamped(to: 0...1) * total
+        var low = 0
+        var high = arcTable.count - 1
+        while high - low > 1 {
+            let middle = (low + high) / 2
+            if arcTable[middle] < target { low = middle } else { high = middle }
         }
+        let span = arcTable[high] - arcTable[low]
+        let local = span > 0 ? (target - arcTable[low]) / span : 0
+        return (CGFloat(low) + local) / CGFloat(arcTable.count - 1)
+    }
+
+    func point(progress p: CGFloat) -> CGPoint {
         switch shape {
         case let .planned(path):
-            return p >= 1 ? end : path.point(at: p)
-        case let .crossing(point, first):
-            return p < first ? interpolate(start, point, p / first)
-                : interpolate(point, end, (p - first) / (1 - first))
+            return p >= 1 ? end : path.point(at: parameter(atArcFraction: p))
         case .straight:
-            return interpolate(start, end, p)
+            return CGPoint(x: start.x + (end.x - start.x) * p, y: start.y + (end.y - start.y) * p)
         }
     }
 
@@ -620,13 +771,21 @@ struct CursorGlide {
     /// Path tangent (AppKit) for a planned glide, nil for a straight one.
     func tangent(at time: CFTimeInterval) -> CGVector? {
         guard case let .planned(path) = shape else { return nil }
-        return path.tangent(at: min(progress(at: time), 0.999))
+        return path.tangent(at: parameter(atArcFraction: min(progress(at: time), 0.999)))
     }
 
-    /// Lean (radians) of a straight hop at `time`: up and back down over the hop.
+    /// Direction of travel at `time` (unit, AppKit).
+    func direction(at time: CFTimeInterval) -> CGVector? {
+        if let tangent = tangent(at: time), hypot(tangent.dx, tangent.dy) > 0.001 { return tangent }
+        let dx = end.x - start.x, dy = end.y - start.y
+        let distance = hypot(dx, dy)
+        return distance > 0.5 ? CGVector(dx: dx / distance, dy: dy / distance) : nil
+    }
+
+    /// Lean (radians) of a straight hop at `time`: rises and falls with the hop's speed.
     func tilt(at time: CFTimeInterval) -> CGFloat {
         guard case let .straight(tilt) = shape, tilt != 0 else { return 0 }
-        return tilt * sin(.pi * min(1, progress(at: time)))
+        return tilt * speedFraction(at: time)
     }
 
     /// Opacity while a fresh cursor glides in.
@@ -637,6 +796,17 @@ struct CursorGlide {
     }
 }
 
+/// Peak lean (render rotation, radians) for travel along `direction`: the tip turns toward the travel direction,
+/// most for moves across the arrow's axis and not at all along it, so a move straight along or against the
+/// arrow never flips its lean from side to side.
+func visualCursorLean(direction: CGVector, restForward: CGVector) -> CGFloat {
+    let length = hypot(direction.dx, direction.dy)
+    let restLength = hypot(restForward.dx, restForward.dy)
+    guard length > 0.001, restLength > 0.001 else { return 0 }
+    let across = (restForward.dx * direction.dy - restForward.dy * direction.dx) / (length * restLength)
+    return -visualCursorMaxLean * across
+}
+
 /// The arrow's angle, body offset and fog trail. The angle follows a target the glide gives (its path tangent,
 /// or a scoot's tilt) through a well-damped spring, so it banks smoothly and never flips; body and fog lag
 /// with the tip's true velocity.
@@ -645,8 +815,9 @@ struct CursorPoseDynamics {
     var angleVelocity: CGFloat = 0
     var smoothedVelocity = CGVector(dx: 0, dy: 0)
 
-    /// A critically damped rotation spring with a six-hertz natural frequency.
-    static let angleFrequency: CGFloat = 2 * .pi * 6
+    /// A critically damped rotation spring with an eight-hertz natural frequency: quick enough that the
+    /// arrow is upright when it lands, slow enough to bank smoothly.
+    static let angleFrequency: CGFloat = 2 * .pi * 8
 
     /// Advances the pose toward `targetAngle` and returns the render state for `tip`.
     mutating func advance(
@@ -1183,17 +1354,19 @@ final class CursorStage {
         let existingTip = panel?.isVisible == true ? displayedTipPosition : nil
         let startFrame = existingTip.flatMap { tip in screens.first { $0.frame.contains(tip) }?.frame }
         let changesDisplay = existingTip != nil && startFrame != screenFrame
-        var seam: CGPoint?
+        var route: CursorMotionPath?
         var leavesDisplay = false
         if changesDisplay, let existingTip {
-            leavesDisplay = !CursorPathPlanner.isVisibleTrip(from: existingTip, to: target, displays: screens.map(\.frame))
-            if leavesDisplay, let startFrame, let screenFrame {
-                seam = CursorPathPlanner.crossing(from: existingTip, to: target, between: startFrame, and: screenFrame)
+            let displays = screens.map(\.frame)
+            leavesDisplay = !CursorPathPlanner.isVisibleTrip(from: existingTip, to: target, displays: displays)
+            // Across offset displays the cursor banks through the shared edges (any number of displays).
+            if leavesDisplay, let waypoints = CursorPathPlanner.route(from: existingTip, to: target, displays: displays) {
+                route = CursorPathPlanner.through(waypoints, displays: displays)
             }
         }
         // A real display gap has no point to draw on. Fade in on the
         // destination instead of animating an off-screen pointer.
-        let continuedTip = leavesDisplay && seam == nil ? nil : existingTip
+        let continuedTip = leavesDisplay && route == nil ? nil : existingTip
         let visible = continuedTip != nil
         let start = continuedTip ?? clampTipPosition(visualCursorFreshStartPoint(
             target: target, forward: restingForwardVector(), keptInside: screenFrame ?? .null
@@ -1201,24 +1374,12 @@ final class CursorStage {
         let distance = hypot(target.x - start.x, target.y - start.y)
         let velocity = visible ? tipVelocity : CGVector(dx: 0, dy: 0)
         let dragging = interactionIndicator == CursorInteractionIndicator(feedback: .drag)
-        let nearEdge = screenFrame.map { visualCursorNearDisplayEdge(start, in: $0) || visualCursorNearDisplayEdge(target, in: $0) } ?? false
         let speed = activeSettings.speed
         let instant = reducesMotion || !speed.isFinite || speed <= 0
-        // A drag travels straight, like the mouse events it draws; next to a display edge the arc could
-        // leave the display, so it scoots straight too.
-        let candidate = instant ? nil : CursorGlide(
-            start: start,
-            end: target,
-            startVelocity: nearEdge ? CGVector(dx: 0, dy: 0) : velocity,
-            startForward: forwardVector(renderRotation: visible ? pose.angle : 0),
-            restForward: restingForwardVector(),
-            bounds: screenFrame,
-            planned: !dragging && !nearEdge && !changesDisplay,
-            via: seam,
-            startTime: now,
-            speed: speed,
-            queuedBehind: timeline.count,
-            fadesIn: !visible
+        let candidate = instant ? nil : visualCursorPlanGlide(
+            from: start, to: target, velocity: velocity, poseAngle: visible ? pose.angle : 0,
+            screenFrame: screenFrame, dragging: dragging, changesDisplay: changesDisplay, route: route,
+            at: now, speed: speed, queuedBehind: timeline.count, fadesIn: !visible
         )
         let duration = candidate.map { $0.duration > 0.0011 ? $0.duration : 0 } ?? 0
         trace("move from=(\(Int(start.x)),\(Int(start.y))) to=(\(Int(target.x)),\(Int(target.y))) fresh=\(!visible) ms=\(Int(duration * 1000))")
@@ -1431,7 +1592,7 @@ final class CursorStage {
             // Starts from zero and fades in, so the sway never jolts the resting pose.
             let t = CGFloat(now - swayStart)
             let fadeIn = min(1, t / 0.6)
-            idleOffset = sin(t * 2.4) * visualCursorIdleRotationAmplitude() * fadeIn * fadeIn
+            idleOffset = sin(t * visualCursorIdleRotationRate()) * visualCursorIdleRotationAmplitude() * fadeIn * fadeIn
         }
         // A mark (typing, scroll, drag) stands the arrow upright under it.
         if interactionIndicator != nil, interactionIndicator?.feedback != .drag { idleOffset = 0 }
@@ -1483,7 +1644,7 @@ final class CursorStage {
             || ripple != nil
             || cursorView.indicator != interactionIndicator
             || cursorView.lensEnabled != activeSettings.lensEnabled
-            || cursorView.labelViewport != labelViewport
+        let labelMoved = cursorView.labelViewport != labelViewport
         cursorView.rotation = state.rotation
         cursorView.cursorBodyOffset = state.cursorBodyOffset
         cursorView.fogOffset = state.fogOffset
@@ -1494,10 +1655,17 @@ final class CursorStage {
         cursorView.indicator = interactionIndicator
         cursorView.lensEnabled = activeSettings.lensEnabled
         cursorView.labelViewport = labelViewport
-        if changed || displayedTipPosition == nil { cursorView.needsDisplay = true }
+        // Per frame only the glyph square is redrawn; the wide window's name-tag room is redrawn only when the
+        // tag moves (screen edge) or the cursor appears.
+        if labelMoved || displayedTipPosition == nil {
+            cursorView.needsDisplay = true
+        } else if changed {
+            cursorView.setNeedsDisplay(SoftwareCursorPanelMetrics.glyphRect)
+        }
         displayedTipPosition = state.tipPosition
         tipVelocity = velocity
         writeObservationSnapshot(tipPosition: state.tipPosition, rotation: state.rotation)
+        SoftwareCursorOverlay.frameObserverForTesting?(now, state, press)
     }
 
     private func initialRenderState(at tipPosition: CGPoint) -> CursorVisualRenderState {
@@ -1680,13 +1848,7 @@ final class CursorStage {
                 scheduleStandaloneMoveHide()
                 return
             }
-            let remaining = max(current.endTime - now, 0.08)
-            glide = CursorGlide(
-                start: tip, end: moved, startVelocity: current.velocity(at: now),
-                startForward: forwardVector(renderRotation: pose.angle), restForward: restingForwardVector(),
-                bounds: nil, planned: false, startTime: now, speed: activeSettings.speed, queuedBehind: 0,
-                fixedDuration: remaining
-            )
+            glide = visualCursorRetargetGlide(current, to: moved, at: now, poseAngle: pose.angle, speed: activeSettings.speed)
         } else {
             render(tip: moved, velocity: CGVector(dx: 0, dy: 0), at: now)
         }
@@ -1869,12 +2031,7 @@ final class CursorStage {
 
     /// What the arrow's angle aims for during a glide: the planned path's tangent, or a scoot's tilt.
     private func targetAngle(for glide: CursorGlide, at now: CFTimeInterval) -> CGFloat {
-        if let tangent = glide.tangent(at: now), hypot(tangent.dx, tangent.dy) > 0.001 {
-            // Lean into the move while keeping the cursor recognizable in every direction.
-            let lean = renderRotation(along: tangent).clamped(to: -1 / 3...1 / 3)
-            return lean * sin(.pi * glide.timeFraction(at: now))
-        }
-        return glide.tilt(at: now)
+        visualCursorGlideTargetAngle(glide, at: now, baseHeading: renderBaseHeading)
     }
 
     private func restingForwardVector() -> CGVector {
@@ -2023,6 +2180,9 @@ enum SoftwareCursorOverlay {
     }
 
     static func scheduleHide(after delay: TimeInterval) { current.scheduleHide(after: delay) }
+
+    /// Called with every frame a cursor draws (time, pose, click press). Tests only: records real overlay motion.
+    static var frameObserverForTesting: ((CFTimeInterval, CursorVisualRenderState, CGFloat) -> Void)?
 
     static var hideTimer: Timer? { current.hideTimer }
     static var swayStopTimer: Timer? { current.swayStopTimer }
@@ -2200,9 +2360,13 @@ private final class SoftwareCursorView: NSView {
 
         // The lens: a recent picture of the screen under this window, refreshed while the cursor is shown.
         SoftwareCursorGlyphRenderer.backdrop = nil
+        let glyphRect = SoftwareCursorPanelMetrics.glyphRect
         if let window, window.isVisible, lensEnabled {
-            let frame = window.convertToScreen(convert(bounds, to: nil))
-            SoftwareCursorGlyphRenderer.backdrop = CursorBackdrop.shared.current(for: frame)
+            // Only the glyph part of the window is captured; the side room for the name tag never is.
+            let frame = window.convertToScreen(convert(glyphRect, to: nil))
+            SoftwareCursorGlyphRenderer.backdrop = CursorBackdrop.shared.current(for: frame).map {
+                ($0.image, $0.rect.offsetBy(dx: glyphRect.minX, dy: glyphRect.minY))
+            }
             CursorBackdrop.shared.refreshIfNeeded(windowFrame: frame, windowNumber: window.windowNumber) { [weak self] in
                 DispatchQueue.main.async { self?.needsDisplay = true }
                 // Look again a little later, so text that appears under a resting cursor shows through correctly.
@@ -2214,7 +2378,7 @@ private final class SoftwareCursorView: NSView {
 
         SoftwareCursorGlyphRenderer.tint = tint
         SoftwareCursorGlyphRenderer.draw(
-            in: bounds,
+            in: glyphRect,
             context: context,
             state: SoftwareCursorGlyphRenderState(
                 rotation: rotation,
@@ -2242,14 +2406,11 @@ private final class SoftwareCursorView: NSView {
 
     private func drawAgentLabel() {
         guard let label else { return }
-        let tip = SoftwareCursorGlyphMetrics.tipAnchor
         let padding: CGFloat = 7
         let available = labelViewport ?? bounds.insetBy(dx: 4, dy: 0)
         let width = min(labelWidth, available.width)
         guard width > padding * 2 else { return }
-        let x = min(max(tip.x - width / 2, available.minX), available.maxX - width)
-        let y = tip.y - 40 >= available.minY ? tip.y - 40 : tip.y + 9
-        let frame = CGRect(x: x, y: y, width: width, height: 19)
+        let frame = visualCursorNameTagFrame(width: width, height: 19, available: available)
         let background = NSBezierPath(roundedRect: frame, xRadius: 5, yRadius: 5)
         NSColor(white: 0.085, alpha: 0.93).setFill()
         background.fill()

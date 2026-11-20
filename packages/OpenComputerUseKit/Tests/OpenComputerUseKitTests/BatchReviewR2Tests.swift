@@ -41,10 +41,10 @@ final class BatchReviewR2Tests: XCTestCase {
 
     // Receipts
 
-    func testBareNeedsDoesNotClaimNothingWasSent() {
-        XCTAssertNil(BatchEffects.failureReceipt("Typing finished but the field needs focus to show it"))
-        XCTAssertEqual(BatchEffects.failureReceipt("click needs a label or element_index. Example: click {\"app\": \"Notes\"}"), .notSent)
-        XCTAssertEqual(BatchEffects.failureReceipt("invalidArguments(\"direction must be up or down\")"), .notSent)
+    func testGenericFailuresStayUncertainDespitePhrases() {
+        let result = ToolCallResult.failure(ComputerUseError.message("no text was sent. Example: retry"))
+        XCTAssertEqual(result.deliveryState, .outcomeUnknown)
+        XCTAssertEqual(result.deliveryState.safeRetry, .reconcileFirst)
     }
 
     // Numbering
