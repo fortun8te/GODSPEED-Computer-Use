@@ -987,15 +987,44 @@ public final class ComputerUseService {
                                          remaining: deadline - clock.systemUptime)
         })
         located = candidate
-        guard let candidate, let point = VisionFallback.windowPoint(candidate.fraction, bounds: bounds),
+        guard let candidate, let firstPoint = VisionFallback.windowPoint(candidate.fraction, bounds: bounds),
               clock.systemUptime < deadline, let live = liveWindow(),
-              let fresh = SnapshotBuilder.localWindowImage(live), VisionFallback.sameCapture(original, fresh),
-              let hit = try hitTestElement(at: point, in: snapshot)?.element else { return nil }
-        if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) { secure = true }
-        guard SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
-              let names = visualHitNames(hit, window: live.windowElement),
-              VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names),
-              clock.systemUptime < deadline, liveWindow() != nil else { return nil }
+              let fresh = SnapshotBuilder.localWindowImage(live), VisionFallback.sameCapture(original, fresh) else { return nil }
+
+        // A point is confirmed only when the control under it carries the label and no risky name.
+        func confirms(_ point: CGPoint, _ candidate: VisionFallback.Candidate) -> Bool {
+            guard let hit = try? hitTestElement(at: point, in: snapshot)?.element else { return false }
+            if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) { secure = true }
+            guard SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
+                  let names = visualHitNames(hit, window: live.windowElement) else { return false }
+            return VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names)
+        }
+        // Cascade step 5 (GroundingCascade): when the first model point misses its label, one locate on a
+        // zoomed crop around it. That point is accepted only when it confirms the label too.
+        let chosen: (candidate: VisionFallback.Candidate, point: CGPoint)
+        if confirms(firstPoint, candidate) {
+            chosen = (candidate, firstPoint)
+        } else if candidate.evidence == .model, clock.systemUptime < deadline,
+                  let zoomed = GroundingCascade.secondLook(at: candidate.fraction, locate: { rect in
+                      let width = CGFloat(crop.width), height = CGFloat(crop.height)
+                      let pixels = CGRect(x: rect.minX * width, y: rect.minY * height,
+                                          width: rect.width * width, height: rect.height * height).integral
+                      guard clock.systemUptime < deadline, let sub = crop.cropping(to: pixels),
+                            let jpeg = LocalWindowImage.jpeg(sub) else { return nil }
+                      return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
+                                                   remaining: deadline - clock.systemUptime)
+                  }, verify: { fraction in
+                      guard let zoomPoint = VisionFallback.windowPoint(fraction, bounds: bounds) else { return false }
+                      return confirms(zoomPoint, VisionFallback.Candidate(fraction: fraction, evidence: .zoom))
+                  }),
+                  let zoomPoint = VisionFallback.windowPoint(zoomed, bounds: bounds) {
+            chosen = (VisionFallback.Candidate(fraction: zoomed, evidence: .zoom), zoomPoint)
+            located = chosen.candidate
+        } else {
+            return nil
+        }
+        let point = chosen.point
+        guard clock.systemUptime < deadline, liveWindow() != nil else { return nil }
         verified = true
 
         let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
@@ -1005,9 +1034,11 @@ public final class ComputerUseService {
         // Read back the same window. Delivery has already happened if this read fails.
         let state = try? getAppState(app: query,
             observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false), windowID: id)
+        // The provenance (ocr, model or zoom) is part of the reply, as the cascade names every step.
+        let source = VisionFallback.evidenceName(chosen.candidate.evidence)
         return ToolCallResult(content: [.text(state == nil
-            ? "Clicked the verified on-screen target. Read the window to check the result."
-            : "Clicked the verified on-screen target.")] + (state?.content ?? []),
+            ? "Clicked the verified on-screen target (found by \(source)). Read the window to check the result."
+            : "Clicked the verified on-screen target (found by \(source)).")] + (state?.content ?? []),
             deliveryState: .acknowledged)  // the target was verified; its effect was not
     }
 
