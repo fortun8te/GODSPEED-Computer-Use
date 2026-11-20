@@ -51,6 +51,33 @@ test("the REPL routes clipboard operations to the same native peer as browser ac
   ]);
 });
 
+test("REPL forwards strict background requests and preserves the native refusal code", async () => {
+  const calls = [];
+  const native = { async request(method, params) {
+    assert.equal(method, "tools/call");
+    calls.push(params);
+    return { ...textResult("Approval is required.", true), _meta: { "godspeed/error_code": "APPROVAL_REQUIRED" } };
+  } };
+  const session = new PersistentJavaScriptSession({ native });
+  const result = await session.run(`
+    try {
+      const app = await cua.getApp("com.example.Text", { initialState: false });
+      await app.click(1, { strictBackground: true });
+    } catch (error) {
+      nodeRepl.write(error.code);
+    }
+    const batch = await cua.batch([{ tool: "press_key", key: "Return" }], { strictBackground: true, emit: false });
+    nodeRepl.write(batch.errorCode);
+    const web = await cua.browser("read", { tab_id: 4 }, { strictBackground: true, emit: false });
+    nodeRepl.write(web.errorCode);
+  `);
+  assert.equal(result.isError, false);
+  assert.deepEqual(calls.map(({ name, arguments: args }) => [name, args.strict_background]), [
+    ["click", true], ["batch", true], ["browser", true],
+  ]);
+  assert.equal(result.content.filter(item => item.text === "APPROVAL_REQUIRED").length, 3);
+});
+
 test("normalizes native app-list text across macOS, Linux, and Windows", () => {
   assert.deepEqual(parseListApps([
     "TextEdit — com.apple.TextEdit [frontmost, running, last-used=2026-09-22, uses=42]",
