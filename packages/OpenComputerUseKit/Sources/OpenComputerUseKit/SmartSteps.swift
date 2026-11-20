@@ -602,6 +602,33 @@ enum SmartSteps {
                 return (record, "Found \"\(title)\" by text search.")
             }
         }
+        // Cascade steps 2-3 (GroundingCascade): the local helper ranks a few close controls before OCR or vision.
+        // Values are never ranked: a value must go into the field the model meant, not a guessed control.
+        if !forValue {
+            let options = records.compactMap { record -> GroundingCascade.Option? in
+                guard let name = name(of: record), !name.isEmpty else { return nil }
+                return GroundingCascade.Option(id: String(record.index), text: name)
+            }
+            let decision = GroundingCascade.resolve(label: wanted, options: options) { ranked in
+                Referee.choose(goal: "Click \"\(wanted)\"", doneWhen: "", history: "", screen: snapshot.renderedText,
+                               options: ranked.map { (id: $0.id, text: $0.text) })
+            }
+            switch decision {
+            case .act(let id, let provenance, _, _):
+                if let record = records.first(where: { String($0.index) == id }) {
+                    let how = provenance == .model ? "the local model ranked the close controls and picked" : "used"
+                    return (record, "No element is labelled \"\(wanted)\"; \(how) \"\(name(of: record) ?? "")\" (\(provenance.rawValue)).")
+                }
+            case .offer(let ids):
+                // A risky control is never clicked from a ranking: the close controls go back to the model.
+                let names = ids.compactMap { id in options.first { $0.id == id }?.text }
+                throw ComputerUseError.ambiguousTarget(
+                    "\"\(wanted)\" has no exact match. The close controls are: \(names.joined(separator: ", ")). Give one of these exact labels, or an element_index."
+                )
+            case .abstain:
+                break  // OCR and vision come next, as before
+            }
+        }
         return nil
     }
 
