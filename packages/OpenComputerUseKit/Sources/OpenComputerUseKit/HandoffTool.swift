@@ -515,7 +515,41 @@ enum HandoffTool {
 
     enum Replay: Equatable { case verified, incomplete, uncertain, blocked(String), alreadySatisfied(String), cancelled(String, DeliveryState) }
 
-    static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil) -> Outcome {
+    /// Runs the handoff and writes one `episode` row with its final outcome (see LearningLog). The row is written
+    /// after the outcome is known and cannot change it.
+    static func run(_ request: Request, _ deps: Dependencies, deadline: TimeInterval? = nil,
+                    learning: LearningLog = .shared) -> Outcome {
+        let outcome = runLoop(request, deps, deadline: deadline, learning: learning)
+        learnEpisode(request: request, outcome: outcome, log: learning)
+        return outcome
+    }
+
+    /// One row per handoff: goal, app and the outcome kind. "done" is split by the check that passed.
+    static func learnEpisode(request: Request, outcome: Outcome, log: LearningLog) {
+        guard log.isEnabled else { return }
+        let kind: String
+        switch outcome.kind {
+        case .done: kind = outcome.deliveryState == .verified ? "verified" : "weak"
+        case .stuck: kind = "stuck"
+        case .escalate: kind = "escalate"
+        case .budget: kind = "budget"
+        case .failed: kind = "failed"
+        case .cancelled: kind = "cancelled"
+        }
+        log.append(LearningEpisodeRow(app: request.app, goal: request.goal, outcome: kind))
+    }
+
+    /// One `step` row per action the handoff ran, from the action's own result. Typed values are never written.
+    static func learnStep(app: String, choice: Candidate, result: ActResult, log: LearningLog) {
+        guard log.isEnabled else { return }
+        let failure = result.ok ? nil : (result.refused ? "refused" : "failed")
+        log.append(LearningStepRow(
+            app: app, tool: choice.tool, delivery_state: result.delivery?.rawValue, failure_code: failure
+        ))
+    }
+
+    private static func runLoop(_ request: Request, _ deps: Dependencies, deadline: TimeInterval?,
+                                learning: LearningLog) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
         func hasTime() -> Bool { deps.now() < deadline }
         func readState() -> String? {
@@ -657,6 +691,7 @@ enum HandoffTool {
                 }
                 tried.insert(choice.key)
                 let result = deps.act(choice, state)
+                learnStep(app: request.app, choice: choice, result: result, log: learning)
                 if result.refused {
                     return finish(.failed, result.message, initial: initial, latest: state)
                 }

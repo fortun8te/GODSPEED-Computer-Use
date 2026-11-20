@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import XCTest
 @testable import OpenComputerUseKit
@@ -153,6 +154,162 @@ final class LearningLogTests: XCTestCase {
         let log = LearningLog(directory: directory, enabled: true, imagesEnabled: false)
         XCTAssertNil(log.saveImage(Data([1])))
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    // MARK: Hook rows (each writes only into the temporary folder)
+
+    private func kinds() throws -> [String] {
+        try lines().map { try object($0)["kind"] as? String ?? "" }
+    }
+
+    func testRefereeWritesDecideAndChooseRows() throws {
+        let log = makeLog()
+        let options = [(id: "a", text: "click Save"), (id: "b", text: "click Cancel")]
+        Referee.recordDecision(kind: "choose", view: "Save screen", options: options,
+                               reply: ["probs": ["a": 0.9, "b": 0.05, "none": 0.05], "model": "d1"],
+                               latencyMs: 12, log: log)
+        Referee.recordDecision(kind: "choose", view: "Save screen", options: options, reply: nil, latencyMs: 3_000, log: log)
+        Referee.recordDecision(kind: "decide", view: "view", options: [], reply: ["label": "done", "confidence": 0.95],
+                               latencyMs: 5, log: log)
+        Referee.recordDecision(kind: "decide", view: "view", options: [], reply: ["label": "act", "confidence": 0.9],
+                               latencyMs: 5, log: log)
+        Referee.recordDecision(kind: "decide", view: "view", options: [], reply: ["label": "stuck", "confidence": 0.2],
+                               latencyMs: 5, log: log)
+        let rows = try lines().map { try object($0) }
+        XCTAssertEqual(rows.map { $0["kind"] as? String }, ["choose", "choose", "decide", "decide", "decide"])
+        XCTAssertEqual(rows.map { $0["outcome"] as? String }, ["act", "timeout", "hint", "act", "abstain"])
+        XCTAssertEqual(rows[0]["view"] as? String, "Save screen")
+        XCTAssertEqual(rows[0]["model"] as? String, "d1")
+        XCTAssertNotNil(rows[0]["probabilities"])
+        XCTAssertEqual(rows[2]["label"] as? String, "done")
+    }
+
+    func testRefereeDisabledWritesNothing() {
+        let log = LearningLog(directory: directory, enabled: false, imagesEnabled: true)
+        Referee.recordDecision(kind: "decide", view: "v", options: [], reply: nil, latencyMs: 1, log: log)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testVisionLocateRowRecordsEvidenceAndCropImage() throws {
+        let crop = try XCTUnwrap(makeImage())
+        let log = makeLog()
+        VisionFallback.recordLocate(query: "Save", crop: crop,
+                                    candidate: VisionFallback.Candidate(fraction: CGPoint(x: 0.5, y: 0.25), evidence: .model),
+                                    verified: true, log: log)
+        let row = try object(try lines()[0])
+        XCTAssertEqual(row["kind"] as? String, "locate")
+        XCTAssertEqual(row["evidence"] as? String, "model")
+        XCTAssertEqual(row["verified"] as? Bool, true)
+        XCTAssertEqual(row["point"] as? [Double], [0.5, 0.25])
+        XCTAssertEqual(row["crop_width"] as? Double, 8)
+        let image = try XCTUnwrap(row["image"] as? String)
+        XCTAssertTrue(exists(image))
+    }
+
+    func testVisionLocateMissStillWritesRowWithoutImageWhenImagesOff() throws {
+        let crop = try XCTUnwrap(makeImage())
+        let log = LearningLog(directory: directory, enabled: true, imagesEnabled: false, runID: "r", clock: { Date(timeIntervalSince1970: 0) })
+        VisionFallback.recordLocate(query: "Save", crop: crop, candidate: nil, verified: false, log: log)
+        let row = try object(try lines(day: "1970-01-01")[0])
+        XCTAssertEqual(row["kind"] as? String, "locate")
+        XCTAssertNil(row["point"])
+        XCTAssertNil(row["image"])
+        XCTAssertEqual(row["verified"] as? Bool, false)
+    }
+
+    func testVisionLocateDisabledWritesNothing() throws {
+        let crop = try XCTUnwrap(makeImage())
+        VisionFallback.recordLocate(query: "Save", crop: crop, candidate: nil, verified: false,
+                                    log: LearningLog(directory: directory, enabled: false, imagesEnabled: true))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func testBatchWritesStepAndEpisodeRowsWithoutTypedText() throws {
+        var receipt = TrajectoryLog.BatchReceipt(totalSteps: 2)
+        receipt.steps = [
+            .init(),
+            .init(failureCode: .staleState, observation: .noEffectSeen, deliveryState: .notSent),
+        ]
+        receipt.stop = .stepFailure
+        receipt.doneCheck = .unmet
+        let steps = [
+            BatchTool.Step(tool: "click", arguments: ["label": "Save", "app": "Notes"]),
+            BatchTool.Step(tool: "type_text", arguments: ["text": "hunter2-secret"]),
+        ]
+        BatchTool.learn(receipt: receipt, steps: steps, goal: "Save note", app: "Notes", log: makeLog())
+        let text = try lines().joined(separator: "\n")
+        XCTAssertEqual(try kinds(), ["step", "step", "episode"])
+        let rows = try lines().map { try object($0) }
+        XCTAssertEqual(rows[0]["target_label"] as? String, "Save")
+        XCTAssertEqual(rows[0]["delivery_state"] as? String, "acknowledged")
+        XCTAssertNil(rows[0]["done_when"])
+        XCTAssertEqual(rows[1]["done_when"] as? String, "unmet", "The check belongs to the last step")
+        XCTAssertEqual(rows[1]["verification"] as? String, "no effect seen")
+        XCTAssertEqual(rows[2]["outcome"] as? String, "stopped_step_failure")
+        XCTAssertFalse(text.contains("hunter2-secret"))
+    }
+
+    func testBatchDisabledWritesNothing() {
+        BatchTool.learn(receipt: TrajectoryLog.BatchReceipt(totalSteps: 1), steps: [], goal: "g", app: nil,
+                        log: LearningLog(directory: directory, enabled: false, imagesEnabled: true))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    private func handoffRequest() -> HandoffTool.Request {
+        HandoffTool.Request(app: "x", goal: "Click Export PDF", doneWhen: [.text("Exported")], values: [],
+                            maxSteps: 2, timeBudget: 5)
+    }
+
+    private func handoffDeps(_ request: HandoffTool.Request) -> HandoffTool.Dependencies {
+        let initial = "App=x\nWindow: Export\nWindow ID: 12\n1 button Export PDF"
+        return HandoffTool.Dependencies(
+            readState: { initial },
+            act: { _, _ in .init(ok: true, message: "", delivery: .acknowledged,
+                                 observedState: initial + "\n2 static text Exported") },
+            choose: { _, _, _, _, _ in nil },
+            looksStuck: { _, _, _ in false },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) },
+            replay: { _ in nil },
+            now: { 0 }
+        )
+    }
+
+    func testHandoffWritesStepAndEpisodeRows() throws {
+        let request = handoffRequest()
+        let outcome = HandoffTool.run(request, handoffDeps(request), learning: makeLog())
+        XCTAssertEqual(outcome.kind, .done)
+        XCTAssertEqual(try kinds(), ["step", "episode"])
+        let rows = try lines().map { try object($0) }
+        XCTAssertEqual(rows[0]["delivery_state"] as? String, "acknowledged")
+        XCTAssertEqual(rows[1]["goal"] as? String, "Click Export PDF")
+    }
+
+    func testHandoffDisabledWritesNothing() {
+        let request = handoffRequest()
+        _ = HandoffTool.run(request, handoffDeps(request),
+                            learning: LearningLog(directory: directory, enabled: false, imagesEnabled: true))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    /// A folder that cannot be created (a file sits at its path) must not change what the tool returns.
+    func testLoggingFailureDoesNotChangeToolResult() throws {
+        let blocker = directory!
+        try Data("not a folder".utf8).write(to: blocker)
+        let broken = LearningLog(directory: blocker, enabled: true, imagesEnabled: true, runID: "r")
+        XCTAssertFalse(broken.append(LearningEpisodeRow(goal: "probe")), "The blocked log must fail")
+
+        let request = handoffRequest()
+        let quiet = HandoffTool.run(request, handoffDeps(request),
+                                    learning: LearningLog(directory: blocker, enabled: false, imagesEnabled: false))
+        let failing = HandoffTool.run(request, handoffDeps(request), learning: broken)
+        XCTAssertEqual(failing.kind, quiet.kind)
+        XCTAssertEqual(failing.reply(), quiet.reply())
+        XCTAssertEqual(failing.steps, quiet.steps)
+    }
+
+    private func makeImage() -> CGImage? {
+        CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
+                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.makeImage()
     }
 
     private func makeLog(

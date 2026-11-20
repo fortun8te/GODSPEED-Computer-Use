@@ -15,6 +15,10 @@ final class LearningLog: @unchecked Sendable {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".godspeed/learning", isDirectory: true)
     }
 
+    /// The log the driver's hooks write to. Tests inject their own instance instead, and under XCTest this one
+    /// is always off, so no test can write into the real ~/.godspeed folder.
+    static let shared = LearningLog(enabled: isEnabled(environment: ProcessInfo.processInfo.environment) && NSClassFromString("XCTestCase") == nil)
+
     static func isEnabled(environment: [String: String]) -> Bool {
         !disabledValues.contains(flag(environment[enabledVariable]))
     }
@@ -162,6 +166,9 @@ struct LearningDecisionRow: Codable {
     var outcome: String?
     var latency_ms: Double?
     var model: String?
+    /// The model's own answer for decide (act, look_again, done, stuck) and its confidence.
+    var label: String?
+    var confidence: Double?
 }
 
 /// A grounding call: where the model pointed in a crop.
@@ -178,6 +185,8 @@ struct LearningLocateRow: Codable {
     var confidence: Double?
     var verified: Bool?
     var image: String?
+    /// "ocr" when text recognition found the point, "model" when the grounding model did.
+    var evidence: String?
 }
 
 /// One action step and what was observed after it.
@@ -195,6 +204,8 @@ struct LearningStepRow: Codable {
     var done_when: String?
     var before: String?
     var after: String?
+    /// Step number within the batch.
+    var n: Int?
 }
 
 /// The end of a goal, with its final outcome.
