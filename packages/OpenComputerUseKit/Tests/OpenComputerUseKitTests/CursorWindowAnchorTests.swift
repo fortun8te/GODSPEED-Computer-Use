@@ -7,6 +7,36 @@ import XCTest
 /// the ones the bug was reproduced with: the same window on the built-in
 /// display (`x = -1400`) and on the main display (`x = 600`).
 final class CursorWindowAnchorTests: XCTestCase {
+    func testReleasingOneCursorKeepsOtherWindowSources() {
+        CursorWindowFrameTracker.forgetAll()
+        CursorWindowFrameTracker.installFrameReaderForTesting { id in
+            CGRect(x: CGFloat(id), y: 0, width: 100, height: 100)
+        }
+        defer {
+            CursorWindowFrameTracker.forgetAll()
+            CursorWindowFrameTracker.installFrameReaderForTesting(nil)
+        }
+        CursorWindowFrameTracker.register(windowID: 11, element: nil, owner: "first")
+        CursorWindowFrameTracker.register(windowID: 11, element: nil, owner: "second")
+        CursorWindowFrameTracker.register(windowID: 22, element: nil, owner: "third")
+        _ = CursorWindowFrameTracker.liveFrame(for: 11)
+        _ = CursorWindowFrameTracker.liveFrame(for: 22)
+        CursorWindowFrameTracker.forget(windowID: 11, owner: "first")
+        func read(_ id: CGWindowID) -> CGRect? {
+            let deadline = ProcessInfo.processInfo.systemUptime + 1
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                if let frame = CursorWindowFrameTracker.liveFrame(for: id) { return frame }
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            return nil
+        }
+        XCTAssertEqual(read(11)?.minX, 11)
+        XCTAssertEqual(read(22)?.minX, 22)
+        CursorWindowFrameTracker.forget(windowID: 11, owner: "second")
+        XCTAssertNil(CursorWindowFrameTracker.liveFrame(for: 11))
+        XCTAssertEqual(CursorWindowFrameTracker.liveFrame(for: 22)?.minX, 22)
+    }
+
     private let builtInDisplayFrame = CGRect(x: -1400, y: 200, width: 500, height: 400)
     private let mainDisplayFrame = CGRect(x: 600, y: 200, width: 500, height: 400)
 

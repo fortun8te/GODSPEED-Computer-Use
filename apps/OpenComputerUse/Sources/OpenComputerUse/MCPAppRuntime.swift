@@ -36,6 +36,8 @@ final class MCPAppRuntime: NSObject, NSApplicationDelegate {
                 resetOpenComputerUseVisualCursor()
             }
         }
+        // The first action's cursor should not wait for its window and frame clock to be built.
+        DispatchQueue.main.async { MainActor.assumeIsolated { prewarmOpenComputerUseVisualCursor() } }
         Thread.detachNewThreadSelector(#selector(processStandardIO), toTarget: self, with: nil)
     }
 

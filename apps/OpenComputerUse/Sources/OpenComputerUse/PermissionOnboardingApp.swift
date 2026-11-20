@@ -115,11 +115,6 @@ extension PermissionWindowController: PermissionContentControllerDelegate {
         accessoryPanelController.hide()
     }
 
-    func permissionContentControllerDidRequestRelaunch(_ controller: PermissionContentController) {
-        accessoryPanelController.hide()
-        relaunchCurrentAppBundle()
-    }
-
     func permissionContentControllerDidCompleteAllPermissions(_ controller: PermissionContentController) {
         accessoryPanelController.hide()
         close()
@@ -136,17 +131,7 @@ extension PermissionWindowController: PermissionContentControllerDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func relaunchCurrentAppBundle() {
-        guard let appURL = PermissionSupport.currentAppBundleURL() else {
-            return
-        }
 
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { _, _ in }
-        NSApp.terminate(nil)
-    }
 }
 
 @MainActor
@@ -157,7 +142,6 @@ protocol PermissionContentControllerDelegate: AnyObject {
         sourceFrameInScreen: CGRect?
     )
     func permissionContentControllerDidResolveGuidance(_ controller: PermissionContentController)
-    func permissionContentControllerDidRequestRelaunch(_ controller: PermissionContentController)
     func permissionContentControllerDidCompleteAllPermissions(_ controller: PermissionContentController)
 }
 
@@ -190,17 +174,15 @@ final class PermissionContentController: NSViewController {
     private let cardsContainer = NSStackView()
     private let completionLabel = NSTextField(labelWithString: "All required permissions are enabled.")
     private let refreshTimerInterval: TimeInterval = 0.25
-    private let relaunchPromptDelay: TimeInterval = 1.5
 
     private var activeGuidance: SystemPermissionKind?
     private var refreshTimer: Timer?
     private var diagnostics = PermissionDiagnostics.current()
     private var hasReportedCompletion = false
-    private var requestedPermissions: [SystemPermissionKind: Date] = [:]
     private var renderedState: [CardState] = []
 
     private enum CardState {
-        case granted, guidance, restart, pending
+        case granted, guidance, pending
     }
 
     override func loadView() {
@@ -236,10 +218,6 @@ final class PermissionContentController: NSViewController {
 
         if let activeGuidance, updated.isGranted(activeGuidance) {
             self.activeGuidance = nil
-        }
-
-        for permission in SystemPermissionKind.allCases where updated.isGranted(permission) {
-            requestedPermissions[permission] = nil
         }
 
         refreshUI()
@@ -315,7 +293,6 @@ final class PermissionContentController: NSViewController {
         let orderedPermissions = SystemPermissionKind.allCases
         let states: [CardState] = orderedPermissions.map { permission in
             if diagnostics.isGranted(permission) { return .granted }
-            if restartRequired(for: permission) { return .restart }
             if activeGuidance == permission { return .guidance }
             return .pending
         }
@@ -335,18 +312,12 @@ final class PermissionContentController: NSViewController {
                 continue
             }
 
-            let card = PermissionCardView(permission: permission, diagnostics: diagnostics, restartRequired: state == .restart)
+            let card = PermissionCardView(permission: permission, diagnostics: diagnostics)
             card.onAllow = { [weak self] requestedPermission, sourceFrameInScreen in
                 guard let self else {
                     return
                 }
 
-                if self.restartRequired(for: requestedPermission) {
-                    self.delegate?.permissionContentControllerDidRequestRelaunch(self)
-                    return
-                }
-
-                self.requestedPermissions[requestedPermission] = Date()
                 self.delegate?.permissionContentController(
                     self,
                     didRequestPermission: requestedPermission,
@@ -360,13 +331,7 @@ final class PermissionContentController: NSViewController {
         completionLabel.isHidden = !diagnostics.allGranted
     }
 
-    private func restartRequired(for permission: SystemPermissionKind) -> Bool {
-        guard !diagnostics.isGranted(permission), let requestedAt = requestedPermissions[permission] else {
-            return false
-        }
 
-        return Date().timeIntervalSince(requestedAt) >= relaunchPromptDelay
-    }
 }
 
 @MainActor
@@ -375,13 +340,11 @@ final class PermissionCardView: NSView {
 
     private let permission: SystemPermissionKind
     private let diagnostics: PermissionDiagnostics
-    private let restartRequired: Bool
     private weak var actionButton: PrimaryActionButton?
 
-    init(permission: SystemPermissionKind, diagnostics: PermissionDiagnostics, restartRequired: Bool = false) {
+    init(permission: SystemPermissionKind, diagnostics: PermissionDiagnostics) {
         self.permission = permission
         self.diagnostics = diagnostics
-        self.restartRequired = restartRequired
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         configure()
@@ -430,7 +393,7 @@ final class PermissionCardView: NSView {
         let purpose = permission == .accessibility
             ? "Click and type in macOS apps."
             : "See what’s on screen through screenshots."
-        let subtitle = NSTextField(labelWithString: restartRequired ? "If permission is on, restart to finish." : purpose)
+        let subtitle = NSTextField(labelWithString: purpose)
         subtitle.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         subtitle.textColor = NSColor.secondaryLabelColor
 
@@ -448,7 +411,7 @@ final class PermissionCardView: NSView {
             let done = StatusChipView(text: "Done", foreground: NSColor(calibratedRed: 0.16, green: 0.50, blue: 0.23, alpha: 1), background: NSColor(calibratedRed: 0.93, green: 0.98, blue: 0.94, alpha: 1))
             content.addArrangedSubview(done)
         } else {
-            let button = PrimaryActionButton(title: restartRequired ? "Restart" : "Open Settings", target: self, action: #selector(handleAllow))
+            let button = PrimaryActionButton(title: "Open Settings", target: self, action: #selector(handleAllow))
             actionButton = button
             content.addArrangedSubview(button)
             button.widthAnchor.constraint(equalToConstant: PermissionOnboardingLayout.actionButtonWidth).isActive = true
@@ -558,7 +521,7 @@ final class PermissionAccessoryPanelController {
 
     private enum Layout {
         static let panelWidth: CGFloat = 530
-        static let panelHeight: CGFloat = 109
+        static let panelHeight: CGFloat = 124
         static let screenHorizontalInset: CGFloat = 16
         static let screenBottomInset: CGFloat = 12
         static let windowBottomOverlap: CGFloat = 6
@@ -988,7 +951,7 @@ final class PermissionAccessoryPanelController {
 final class PermissionAccessoryPanelView: NSView {
     private let onBack: () -> Void
     private let instructionLabel = NSTextField(labelWithString: "")
-    private let manualLabel = NSTextField(labelWithString: "Or use + in System Settings to select the app.")
+    private let manualLabel = NSTextField(wrappingLabelWithString: "")
     private let dragTileView = DraggableAppTileView()
 
     init(onBack: @escaping () -> Void) {
@@ -1018,7 +981,7 @@ final class PermissionAccessoryPanelView: NSView {
         arrow.translatesAutoresizingMaskIntoConstraints = false
         arrow.image = NSImage(systemSymbolName: "arrow.up", accessibilityDescription: nil)
         arrow.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-        arrow.contentTintColor = .secondaryLabelColor
+        arrow.contentTintColor = Branding.permissionAccent
         arrow.setAccessibilityElement(false)
 
         instructionLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
@@ -1030,7 +993,7 @@ final class PermissionAccessoryPanelView: NSView {
         manualLabel.font = NSFont.systemFont(ofSize: 11)
         manualLabel.textColor = .secondaryLabelColor
         manualLabel.translatesAutoresizingMaskIntoConstraints = false
-        manualLabel.lineBreakMode = .byTruncatingTail
+        manualLabel.maximumNumberOfLines = 2
         manualLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         dragTileView.translatesAutoresizingMaskIntoConstraints = false
@@ -1077,7 +1040,11 @@ final class PermissionAccessoryPanelView: NSView {
 
     func configure(permission: SystemPermissionKind) {
         let pane = permission == .accessibility ? "Accessibility" : "Screen & System Audio Recording"
-        instructionLabel.stringValue = "Drag the app into \(pane)"
+        let app = PermissionSupport.currentBundleDisplayName()
+        instructionLabel.stringValue = "Drag \(app) into \(pane)"
+        manualLabel.stringValue = permission == .accessibility
+            ? "Already on? Remove the old entry with −, then add the app again with +."
+            : "You can also add the app with +. If prompted, choose Quit & Reopen."
     }
 
     @objc
@@ -1141,9 +1108,9 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
 
     override func draw(_ dirtyRect: NSRect) {
         let tile = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10)
-        (pointerInside ? NSColor.selectedControlColor : NSColor.controlBackgroundColor).setFill()
+        (pointerInside ? Branding.permissionAccent.withAlphaComponent(0.14) : NSColor.controlBackgroundColor).setFill()
         tile.fill()
-        NSColor.separatorColor.setStroke()
+        (pointerInside ? Branding.permissionAccent : NSColor.separatorColor).setStroke()
         tile.stroke()
 
         icon.draw(in: CGRect(x: 8, y: 5, width: 32, height: 32))
@@ -1152,7 +1119,7 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
         style.lineBreakMode = .byTruncatingTail
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
-            .foregroundColor: pointerInside ? NSColor.selectedControlTextColor : NSColor.labelColor,
+            .foregroundColor: NSColor.labelColor,
             .paragraphStyle: style,
         ]
         title.draw(in: CGRect(x: 46, y: 11, width: max(0, bounds.width - 82), height: 20), withAttributes: attributes)
@@ -1163,7 +1130,7 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
                 grip.appendOval(in: CGRect(x: x, y: y, width: 2.5, height: 2.5))
             }
         }
-        (pointerInside ? NSColor.selectedControlTextColor : NSColor.secondaryLabelColor).setFill()
+        (pointerInside ? Branding.permissionAccent : NSColor.secondaryLabelColor).setFill()
         grip.fill()
     }
 
@@ -1196,6 +1163,11 @@ final class DraggableAppTileView: NSView, NSDraggingSource {
 
 @MainActor
 enum Branding {
+    static var permissionAccent: NSColor {
+        PermissionSupport.currentBundleDisplayName() == PermissionSupport.developmentBundleDisplayName
+            ? .systemRed : .controlAccentColor
+    }
+
     static func makeAppIconImage(size: CGFloat) -> NSImage {
         let dimensions = NSSize(width: size, height: size)
         guard let bundleURL = PermissionSupport.currentAppBundleURL() else {
@@ -1327,11 +1299,8 @@ final class PrimaryActionButton: NSButton {
     }
 
     private func updateAppearance() {
-        layer?.backgroundColor = (
-            isHighlighted
-            ? NSColor(calibratedRed: 0.05, green: 0.45, blue: 0.94, alpha: 1)
-            : NSColor(calibratedRed: 0.06, green: 0.49, blue: 0.99, alpha: 1)
-        ).cgColor
+        let accent = Branding.permissionAccent
+        layer?.backgroundColor = (isHighlighted ? accent.blended(withFraction: 0.16, of: .black) ?? accent : accent).cgColor
         alphaValue = isEnabled ? 1 : 0.45
     }
 }

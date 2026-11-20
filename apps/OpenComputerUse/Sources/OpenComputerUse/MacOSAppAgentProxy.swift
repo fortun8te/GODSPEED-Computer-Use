@@ -169,10 +169,15 @@ enum MacOSAppAgentProxy {
     @MainActor
     private static func proxyMCP(client initialClient: AppAgentSocketClient, socketPath: String) throws {
         var client = initialClient
-        let environment = proxiedEnvironment(mcpSession: UUID())
+        var environment = proxiedEnvironment(mcpSession: UUID())
+        var canIdentifyClient = environment[cursorNameEnvironmentKey] == nil
         while let line = readLine(strippingNewline: true) {
             guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 continue
+            }
+            if canIdentifyClient {
+                canIdentifyClient = false
+                environment[cursorNameEnvironmentKey] = knownCursorClientName(initializeLine: line)
             }
 
             // No run loop drains this thread's autorelease pool either: one per request.
@@ -203,6 +208,24 @@ enum MacOSAppAgentProxy {
                     client = try connectOrLaunchAgent(socketPath: socketPath)
                 }
             }
+        }
+    }
+
+    /// Use a fixed product label for recognized MCP clients. Unknown client
+    /// metadata stays private and falls back to a numbered cursor.
+    static func knownCursorClientName(initializeLine line: String) -> String? {
+        guard let message = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              message["method"] as? String == "initialize",
+              let params = message["params"] as? [String: Any],
+              let clientInfo = params["clientInfo"] as? [String: Any],
+              let name = clientInfo["name"] as? String else { return nil }
+        switch name.lowercased() {
+        case "codex", "codex-cli", "codex-mcp-client", "codex-tui": return "Codex"
+        case "claude-code": return "Claude Code"
+        case "claude-ai", "claude-desktop": return "Claude"
+        case "cursor", "cursor-vscode": return "Cursor"
+        case "opencode": return "OpenCode"
+        default: return nil
         }
     }
 
@@ -262,7 +285,6 @@ private struct CLIProxyResponse {
 private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
     private let socketPath: String
     private var listener: AppAgentSocketListener?
-    private var idleTimer: DispatchSourceTimer?
     private var turnEndedObserver: NSObjectProtocol?
 
     private init(socketPath: String) {
@@ -292,20 +314,13 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Idle exit: no connected client for the configured time (default 15 min, 0 = never). The next
-        // `mcp` call relaunches the agent. Checked on the main queue; the accept loop refuses clients
-        // once the decision is made, so nobody connects to an agent that is going away.
-        let idle = AgentIdleClock(idleLimit: AgentIdlePolicy.configuredIdleExitSeconds())
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 5, repeating: 5)
-        timer.setEventHandler {
-            guard idle.shouldExit() else { return }
+        // The first action's cursor should not wait for its window and frame clock to be built.
+        DispatchQueue.main.async { MainActor.assumeIsolated { prewarmOpenComputerUseVisualCursor() } }
+        let idle = AgentIdleClock(idleLimit: AgentIdlePolicy.configuredIdleExitSeconds()) {
             Task { @MainActor in
                 NSApp.terminate(nil)
             }
         }
-        timer.resume()
-        idleTimer = timer
 
         do {
             let listener = try AppAgentSocketListener(path: socketPath, idle: idle)
@@ -322,7 +337,6 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
         if let turnEndedObserver {
             DistributedNotificationCenter.default().removeObserver(turnEndedObserver)
         }
-        idleTimer?.cancel()
         listener?.stop()
     }
 
@@ -336,30 +350,53 @@ private final class MacOSAppAgentRuntime: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Thread-safe wrapper around the pure `AgentIdleTimer`: connections come in on accept threads, the
-/// idle check runs on the main queue.
+/// Arms one deadline while no clients are connected. The lock orders disarm, rearm and expiry
+/// against socket admissions so an expired deadline cannot stop a newly active agent.
 private final class AgentIdleClock: @unchecked Sendable {
     private let lock = NSLock()
     private var timer: AgentIdleTimer
+    private let source = DispatchSource.makeTimerSource(queue: .main)
 
-    init(idleLimit: TimeInterval) {
+    init(idleLimit: TimeInterval, onExit: @escaping @Sendable () -> Void) {
         timer = AgentIdleTimer(idleLimit: idleLimit, now: ProcessInfo.processInfo.systemUptime)
+        schedule(now: ProcessInfo.processInfo.systemUptime)
+        source.setEventHandler { [weak self] in
+            if self?.expire() == true { onExit() }
+        }
+        source.resume()
     }
+
+    deinit { source.cancel() }
 
     /// False when the agent is exiting; the caller closes the connection.
     func clientConnected() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return timer.clientConnected()
+        guard timer.clientConnected() else { return false }
+        if timer.connectedClients == 1 { source.schedule(deadline: .distantFuture) }
+        return true
     }
 
     func clientDisconnected() {
         lock.lock(); defer { lock.unlock() }
-        timer.clientDisconnected(now: ProcessInfo.processInfo.systemUptime)
+        let now = ProcessInfo.processInfo.systemUptime
+        timer.clientDisconnected(now: now)
+        if timer.connectedClients == 0 { schedule(now: now) }
     }
 
-    func shouldExit() -> Bool {
+    private func expire() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return timer.shouldExit(now: ProcessInfo.processInfo.systemUptime)
+        let now = ProcessInfo.processInfo.systemUptime
+        if timer.shouldExit(now: now) { return true }
+        schedule(now: now)
+        return false
+    }
+
+    private func schedule(now: TimeInterval) {
+        guard let delay = timer.nextExitDelay(now: now) else {
+            source.schedule(deadline: .distantFuture)
+            return
+        }
+        source.schedule(deadline: .now() + min(delay, 31_536_000), leeway: .milliseconds(500))
     }
 }
 
@@ -782,6 +819,7 @@ private final class AppAgentConnection: @unchecked Sendable {
 
 /// The environment key that names the agent a proxy works for.
 private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
+private let cursorNameEnvironmentKey = "OPEN_COMPUTER_USE_CURSOR_NAME"
 
 /// Only canonical browser reads enter the shared route. Browser batches can
 /// contain native actions, and browser mutations still need exclusive admission.

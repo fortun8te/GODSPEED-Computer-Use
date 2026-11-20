@@ -3,12 +3,10 @@ import Foundation
 let computerUseServerInstructions = """
 Use Godspeed for Mac apps and Chrome. Keep actions in the background.
 
-- Mac: get_app_state, then batch 2–10 known actions with app, goal and an observable done_when. Use one app tool for a single action. Target unique labels or identifiers. Get fresh state before using an index or screenshot coordinates.
-- Web: use browser in its own tab. Use read with find on dense pages. Request a screenshot for visual targets the page state cannot describe.
-- Use the final state in the reply to check the goal. A Check hint is advisory. After a partial failure, read fresh state before retrying. Never replay a step that already changed the app.
-- Use save_as for supported documents and open for apps or files. Use file tools for files without an active GUI session.
-- Use remember: true only for a verified repeatable batch. Use handoff for a bounded subtask with a checkable finish.
-- Use the private clipboard for copy, cut and paste between apps and Chrome. Ask before sending, deleting, or purchasing.
+- Mac: compact get_app_state, then batch known actions with an observable done_when. For one step, use its tool. Use unique labels or fresh indexes.
+- Web: browser in its own tab. Use interactive or find to narrow a read. Request screenshots for visual targets that need them.
+- Verify against the result. Model hints are advisory. After a partial failure, read fresh state before retrying uncertain steps. Use receipt.recovery to resume.
+- Use handoff for bounded subtasks and remember only verified reusable batches. Use the private clipboard across apps. Ask before sending, deleting, or purchasing.
 """
 
 public final class StdioMCPServer {
@@ -47,13 +45,14 @@ public final class StdioMCPServer {
     }
 
     public func handle(line: String, toolListingEnvironment: [String: String]? = nil, admissionMs: Double? = nil) -> String? {
+        var id: Any?
         do {
             guard let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
                 return try encodeJSONRPCError(id: nil, code: -32700, message: "Invalid JSON-RPC payload")
             }
 
             let method = payload["method"] as? String
-            let id = payload["id"]
+            id = payload["id"]
             let params = payload["params"] as? [String: Any] ?? [:]
 
             switch method {
@@ -120,14 +119,10 @@ public final class StdioMCPServer {
                 return try encodeJSONRPCError(id: id, code: -32601, message: "Method not found: \(method ?? "")")
             }
         } catch let error as ComputerUseError {
-            let payload = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
-            let id = payload?["id"]
             let result = ToolCallResult.text(error.errorDescription ?? String(describing: error), isError: error.toolResultIsError)
             return try? encodeJSONRPCResult(id: id, result: result.asDictionary)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            let payload = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
-            let id = payload?["id"]
             return try? encodeJSONRPCResult(
                 id: id,
                 result: [

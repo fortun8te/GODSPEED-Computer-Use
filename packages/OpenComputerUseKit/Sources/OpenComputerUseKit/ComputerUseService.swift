@@ -124,12 +124,20 @@ func screenStatePointToAppKitGlobalPoint(
     fromScreenStatePoint point: CGPoint,
     screenMappings: [VisualCursorScreenMapping] = currentVisualCursorScreenMappings()
 ) -> CGPoint {
-    guard let mapping = screenMappings.first(where: { $0.screenStateFrame.contains(point) }) else {
+    guard point.x.isFinite, point.y.isFinite else { return point }
+    func distance(to mapping: VisualCursorScreenMapping) -> CGFloat {
+        let frame = mapping.screenStateFrame
+        let dx = point.x - point.x.clamped(to: frame.minX...frame.maxX)
+        let dy = point.y - point.y.clamped(to: frame.minY...frame.maxY)
+        return hypot(dx, dy)
+    }
+    guard let mapping = screenMappings.first(where: { $0.screenStateFrame.contains(point) })
+        ?? screenMappings.min(by: { distance(to: $0) < distance(to: $1) }) else {
         return point
     }
 
-    let localX = point.x - mapping.screenStateFrame.minX
-    let localY = point.y - mapping.screenStateFrame.minY
+    let localX = (point.x - mapping.screenStateFrame.minX).clamped(to: 0...mapping.screenStateFrame.width)
+    let localY = (point.y - mapping.screenStateFrame.minY).clamped(to: 0...mapping.screenStateFrame.height)
 
     return CGPoint(
         x: mapping.appKitFrame.minX + localX,
@@ -1281,7 +1289,7 @@ public final class ComputerUseService {
         }
     }
 
-    private func deliverText(app query: String, text: String, keyMethod: KeyMethod, snapshot: AppSnapshot) throws -> ToolCallResult {
+    private func deliverText(app query: String, text: String, keyMethod: KeyMethod, snapshot: AppSnapshot, autoFocused: Bool = false) throws -> ToolCallResult {
         if let windowID = Self.requiredWindowID {
             let focused = try requireBoundInputFocus(in: snapshot)
             if keyMethod == .auto, try typeTextUsingAccessibility(text, on: focused, pid: snapshot.app.pid) {
@@ -1325,6 +1333,10 @@ public final class ComputerUseService {
             focused = Self.currentInputFocus(pid: snapshot.app.pid)
         }
         guard let focused else {
+            // Nothing has focus, but the window has exactly one place to type: focus it and type there.
+            if !autoFocused, focusSoleEditableTextElement(in: snapshot) {
+                return try withAutoFocusNote(deliverText(app: query, text: text, keyMethod: keyMethod, snapshot: snapshot, autoFocused: true))
+            }
             // A background calculator has no focused element at all; its keypad still takes keys.
             if try typeOnKeypad(text, snapshot: snapshot, focused: nil) {
                 pauseBeforeReadBack(0.15, windowID: snapshot.targetWindowID)
@@ -1342,6 +1354,11 @@ public final class ComputerUseService {
             // app's window, as a person typing would. The SkyLight route reaches a background window too.
             // Only where loose keys are safe: plain characters (no Return or Tab, which press default buttons),
             // not inside a web page (letters are shortcuts there), into the window that holds the focus now.
+            // First: a window with exactly one place to type gets the text there (the most common miss in real
+            // sessions was typing with a button or list focused while the window had a single text area).
+            if !autoFocused, focusSoleEditableTextElement(in: snapshot) {
+                return try withAutoFocusNote(deliverText(app: query, text: text, keyMethod: keyMethod, snapshot: snapshot, autoFocused: true))
+            }
             guard try typeOnKeypad(text, snapshot: snapshot, focused: focused) else {
                 throw ComputerUseError.stateUnavailable(
                     "type_text requires a focused editable text element. Click a text entry area first, or use set_value on a settable text element."
@@ -1801,7 +1818,13 @@ public final class ComputerUseService {
             throw ComputerUseError.stateUnavailable("element \(elementIndex) has no backing accessibility object")
         }
 
-        guard try isSettableForSetValue(element: element, attribute: kAXValueAttribute) else {
+        // Some fields refuse a direct value or even the question (web and Electron editors answer the settable
+        // check with an error). A text field is then filled the way a person does it: focus, select all, type.
+        let settable = (try? isSettableForSetValue(element: element, attribute: kAXValueAttribute)) ?? false
+        guard settable else {
+            if let typed = try typeIntoUnsettableTextField(app: query, element: element, record: record, value: value, pid: snapshot.app.pid) {
+                return typed
+            }
             throw ComputerUseError.message(nonSettableSetValueErrorMessage + setValueFallbackHint)
         }
 
@@ -2657,6 +2680,32 @@ public final class ComputerUseService {
         var settable: DarwinBoolean = false
         let result = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
         return result == .success && settable.boolValue
+    }
+
+    /// set_value's fallback for a text field whose value cannot be written directly. Returns nil when the element
+    /// is not a plain, non-secure text field or will not take focus, so the caller reports the original problem.
+    private func typeIntoUnsettableTextField(app query: String, element: AXUIElement, record: ElementRecord, value: String, pid: pid_t) throws -> ToolCallResult? {
+        guard Self.typingRoles.contains(SmartSteps.roleKey(record.role)),
+              !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)),
+              Self.isFocusableTextTarget(element) || Self.isEditableTextTarget(element),
+              AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success
+        else { return nil }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.3
+        var focused = false
+        repeat {
+            Thread.sleep(forTimeInterval: 0.03)
+            if let now = Self.currentInputFocus(pid: pid), Self.focus(now, isWithin: element) { focused = true }
+        } while !focused && ProcessInfo.processInfo.systemUptime < deadline
+        guard focused else { return nil }
+        _ = try pressKey(app: query, key: "cmd+a")
+        let result = value.isEmpty ? try pressKey(app: query, key: "Delete") : try typeText(app: query, text: value)
+        guard !result.isError else { return result }
+        var note = "This field does not take a value directly, so its text was selected and the new value typed."
+        if let readBack = stringValue(of: element, attribute: kAXValueAttribute),
+           readBack.trimmingCharacters(in: .whitespacesAndNewlines) != value.trimmingCharacters(in: .whitespacesAndNewlines) {
+            note += " The field now reads differently from the value; check it in the state below."
+        }
+        return ToolCallResult(content: [.text(note)] + result.content, isError: false)
     }
 
     private func isSettableForSetValue(element: AXUIElement, attribute: String) throws -> Bool {
@@ -3636,5 +3685,78 @@ public final class ComputerUseService {
             content.append(.screenshotImage(screenshotData))
         }
         return ToolCallResult(content: content)
+    }
+}
+
+
+extension ComputerUseService {
+    /// Roles a person types into.
+    static let typingRoles: Set<String> = ["textfield", "textarea", "searchfield", "combobox"]
+
+    /// True when exactly one enabled, settable, non-secure text element is in the observed window and it now has
+    /// keyboard focus. Two or more candidates: nothing is focused, since the text could land in the wrong one.
+    func focusSoleEditableTextElement(in snapshot: AppSnapshot) -> Bool {
+        let candidates = snapshot.elements.values.compactMap { record -> AXUIElement? in
+            guard Self.typingRoles.contains(SmartSteps.roleKey(record.role)), let element = record.element else { return nil }
+            return element
+        }
+        var editable = candidates.filter(Self.isEditableTextTarget)
+        // Web and Electron editors (contenteditable chat and search boxes) expose a text role whose value is
+        // not settable. When no settable field exists, a single focusable, enabled, non-secure text element is
+        // the place to type.
+        if editable.isEmpty {
+            editable = candidates.filter(Self.isFocusableTextTarget)
+        }
+        guard editable.count == 1, let field = editable.first else { return false }
+        guard AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success else { return false }
+        // Web views report the new focus a little later than native fields.
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.3
+        repeat {
+            Thread.sleep(forTimeInterval: 0.03)
+            if let now = Self.currentInputFocus(pid: snapshot.app.pid), Self.focus(now, isWithin: field) { return true }
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        return false
+    }
+
+    /// The focused element is the field itself or sits inside it (a contenteditable's inner paragraph).
+    static func focus(_ focused: AXUIElement, isWithin field: AXUIElement) -> Bool {
+        var current: AXUIElement? = focused
+        for _ in 0..<6 {
+            guard let element = current else { return false }
+            if CFEqual(element, field) { return true }
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parent) == .success,
+                  let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            current = (parent as! AXUIElement)
+        }
+        return false
+    }
+
+    static func isFocusableTextTarget(_ element: AXUIElement) -> Bool {
+        var enabled: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled) == .success,
+           (enabled as? Bool) == false { return false }
+        var subrole: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole) == .success,
+           (subrole as? String) == "AXSecureTextField" { return false }
+        var settable = DarwinBoolean(false)
+        return AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable) == .success && settable.boolValue
+    }
+
+    static func isEditableTextTarget(_ element: AXUIElement) -> Bool {
+        var enabled: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXEnabledAttribute as CFString, &enabled) == .success,
+           (enabled as? Bool) == false { return false }
+        var subrole: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole) == .success,
+           (subrole as? String) == "AXSecureTextField" { return false }
+        var settable = DarwinBoolean(false)
+        return AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success && settable.boolValue
+    }
+
+    func withAutoFocusNote(_ result: ToolCallResult) -> ToolCallResult {
+        guard !result.isError else { return result }
+        return ToolCallResult(content: [.text("Nothing editable had focus; typed into the window's only text field.")] + result.content,
+                              isError: result.isError)
     }
 }

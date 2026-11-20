@@ -5,6 +5,46 @@ import XCTest
 final class LockedUseDispatchTests: XCTestCase {
     private enum Revoked: Error { case lease }
 
+    func testStatusIdentifiesUnpackagedLockedUse() {
+        // SwiftPM's test host has no embedded Locked Use component package.
+        let diagnostics = LockedUseDiagnostics.current()
+        XCTAssertNil(diagnostics.bundledPluginVersion)
+        XCTAssertFalse(diagnostics.available)
+        XCTAssertEqual(diagnostics.stage, "not-packaged")
+        XCTAssertTrue(diagnostics.blockers.contains { $0.contains("Godspeed build") })
+        XCTAssertFalse(diagnostics.blockers.contains { $0.contains("locked-use enable") })
+    }
+
+    func testSerializedBrowserTransportRejectsLockedAndUnavailableSessions() throws {
+        for state in [LockedUseSession.State.locked, .unavailable] {
+            let unavailable = LockedUseSession(state: state, userID: nil, auditSessionID: nil)
+            try withBrowserRequestEnvironment(["OPEN_COMPUTER_USE_BROWSER": "1"]) {
+                try BrowserRequestContext.withDesktopValidation(session: { unavailable }) {
+                    XCTAssertEqual(BrowserRequestContext.environment["OPEN_COMPUTER_USE_BROWSER"], "1")
+                    XCTAssertThrowsError(try BrowserRequestContext.validateCurrent()) { error in
+                        guard let driverError = error as? ComputerUseError, case .stateUnavailable = driverError else {
+                            return XCTFail("Expected desktop unavailability, received \(error)")
+                        }
+                    }
+                }
+            }
+        }
+        XCTAssertNil(BrowserRequestContext.current)
+    }
+
+    func testParallelBrowserTransportRetainsItsOwnValidator() throws {
+        try withBrowserRequestEnvironment([:], validate: { throw Revoked.lease }) {
+            try BrowserRequestContext.withDesktopValidation(session: {
+                XCTFail("Parallel checks own session admission")
+                return LockedUseSession(state: .locked, userID: nil, auditSessionID: nil)
+            }) {
+                XCTAssertThrowsError(try BrowserRequestContext.validateCurrent()) { error in
+                    XCTAssertTrue(error is Revoked)
+                }
+            }
+        }
+    }
+
     func testColdHandshakeBudgetDoesNotExtendActionOrGuardDeadlines() {
         XCTAssertEqual(LockedUseIPCEndpoint.agent.timeout(operation: .begin, firstReply: true), 8)
         XCTAssertEqual(LockedUseIPCEndpoint.observer.timeout(operation: .status, firstReply: true), 8)

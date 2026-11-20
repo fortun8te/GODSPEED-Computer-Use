@@ -11,6 +11,11 @@ public func withBrowserRequestEnvironment<T>(
     )
 }
 
+/// Require an available desktop at each transport boundary of a serialized GUI request.
+public func withBrowserDesktopValidation<T>(_ body: () throws -> T) rethrows -> T {
+    try BrowserRequestContext.withDesktopValidation(body)
+}
+
 struct BrowserRequestContext: Sendable {
     let environment: [String: String]
     let validate: (@Sendable () throws -> Void)?
@@ -30,6 +35,17 @@ struct BrowserRequestContext: Sendable {
 
     static func validateCurrent() throws {
         try current?.validate?()
+    }
+
+    static func withDesktopValidation<T>(
+        session: @escaping @Sendable () -> LockedUseSession = LockedUseSession.current,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let existing = current
+        return try withContext(.init(
+            environment: existing?.environment ?? GodspeedSettings.environment,
+            validate: existing?.validate ?? { try requireUsableComputerUseSession(session()) }
+        ), body)
     }
 }
 
@@ -666,7 +682,16 @@ extension ComputerUseToolDispatcher {
             throw ComputerUseError.message(BrowserBridge.notInstalledMessage)
         }
         let bridge = BrowserBridge.shared
-        let action = ((arguments["action"] as? String) ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        var arguments = arguments
+        let action = Self.canonicalBrowserAction(((arguments["action"] as? String) ?? "").trimmingCharacters(in: .whitespaces).lowercased())
+        if let direction = Self.browserScrollDirection[((arguments["action"] as? String) ?? "").lowercased()], arguments["direction"] == nil {
+            arguments["direction"] = direction
+        }
+        if !action.isEmpty, !Self.knownBrowserActions.contains(action) {
+            throw ComputerUseError.invalidArguments(
+                "browser action must be one of: open, go, read, screenshot, click, drag, type, fill_field, copy, cut, paste, key, hover, select, check, uncheck, scroll, scroll_into_view, back, forward, reload, wait_for, tabs, use_tab, close_tab, wait, location, info, outline, frames, read_text, link_destination, control_state, value, upload, peek"
+            )
+        }
         // Actions that name no tab; every other action works in the explicit tab, else the current one.
         let tabless: Set<String> = ["open", "new_tab", "open_tab", "tabs", "list", "peek", "read_many", "open_many", "close_tab"]
         var tab: [String: Any] = [:]
@@ -676,6 +701,34 @@ extension ComputerUseToolDispatcher {
         return try BrowserBridge.$implicitTabGeneration.withValue(implicit?.generation) {
             return try browserAction(action, arguments: arguments, bridge: bridge, tab: tab)
         }
+    }
+
+    /// Spellings models reach for, mapped to the action that does it. Real sessions failed on these.
+    static let browserActionAliases: [String: String] = [
+        "input": "type", "enter_text": "type", "fill_in": "type",
+        "keypress": "key", "keys": "key", "hotkey": "key",
+        "select_option": "select", "pick": "select",
+        "get_text": "read_text", "extract_text": "read_text", "text": "read_text",
+        "get_state": "read", "observe": "read", "find": "read", "get_page": "read",
+        "list_tabs": "tabs", "get_tabs": "tabs",
+        "close": "close_tab",
+        "switch_tab": "use_tab", "focus_tab": "use_tab", "activate_tab": "use_tab",
+        "open_url": "go", "goto_url": "go", "load": "go", "navigate_to": "go",
+        "scroll_down": "scroll", "scroll_up": "scroll", "scroll_page": "scroll",
+        "capture": "screenshot", "take_screenshot": "screenshot",
+        "refresh": "reload", "go_back": "back", "go_forward": "forward",
+        "wait_for_text": "wait_for", "wait_for_selector": "wait_for", "wait_for_element": "wait_for",
+        "url": "location", "current_url": "location", "get_url": "location",
+        "hover_over": "hover", "mouse_over": "hover",
+    ]
+    static let browserScrollDirection: [String: String] = ["scroll_down": "down", "scroll_up": "up"]
+
+    /// Every action `browserAction` handles (its switch cases). Checked first, so an unknown action says so
+    /// instead of asking for a tab.
+    static let knownBrowserActions: Set<String> = ["back", "check", "choose", "claim", "claim_tab", "click", "close_tab", "control_state", "copy", "cut", "drag", "files", "fill", "fill_field", "forward", "frames", "go", "goto", "hover", "info", "key", "link_destination", "list", "location", "look", "look_at", "navigate", "new_tab", "open", "open_many", "open_tab", "outline", "page", "page_info", "paste", "peek", "press", "press_key", "read", "read_many", "read_text", "reload", "screenshot", "scroll", "scroll_into_view", "see", "select", "snapshot", "state", "switch", "tabs", "tap", "tick", "type", "type_text", "uncheck", "untick", "upload", "use_tab", "value", "visit", "wait", "wait_for", "wait_load"]
+
+    static func canonicalBrowserAction(_ action: String) -> String {
+        browserActionAliases[action.replacingOccurrences(of: "-", with: "_").replacingOccurrences(of: " ", with: "_")] ?? action
     }
 
     private func browserAction(
@@ -895,7 +948,7 @@ extension ComputerUseToolDispatcher {
 
         case "open", "new_tab", "open_tab":
             let url = try Self.navigationURL(arguments["url"])
-            let opened = try bridge.callTool("open_tab", arguments: [:], timeout: 10)
+            let opened = try bridge.callTool("open_tab", arguments: url.map { ["initial_url": $0] } ?? [:], timeout: 10)
             guard !opened.isError else { return finish([opened]) }
             guard let newID = BrowserReply.createdTabID(in: opened.text) else {
                 throw ComputerUseError.stateUnavailable("browser: open may have created a tab, but returned no tab ID. List tabs before retrying.")
@@ -905,25 +958,35 @@ extension ComputerUseToolDispatcher {
                 bridge.currentTab = newID
                 return .text("opened a blank tab (id \(newID))")
             }
-            // Keep the allocated tab ID even when attaching or navigating fails.
-            let navigation: (text: String, isError: Bool)
-            do {
-                navigation = try bridge.callTool("navigate", arguments: ["tab_id": newID, "url": url], timeout: 15)
-            } catch {
-                let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-                throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but navigation was not confirmed. Inspect that tab before retrying. \(reason)")
-            }
-            if let error = BrowserReply.navigationError(in: navigation.text) ?? (navigation.isError ? BatchTool.firstLine(navigation.text) : nil) {
-                throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but navigation was not confirmed. Inspect that tab before retrying. \(error)")
+            if !BrowserReply.acceptedInitialNavigation(in: opened.text) {
+                // Keep the allocated tab ID even when attaching or navigating fails.
+                let navigation: (text: String, isError: Bool)
+                do {
+                    navigation = try bridge.callTool("navigate", arguments: ["tab_id": newID, "url": url], timeout: 15)
+                } catch {
+                    let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but navigation was not confirmed. Inspect that tab before retrying. \(reason)")
+                }
+                if let error = BrowserReply.navigationError(in: navigation.text) ?? (navigation.isError ? BatchTool.firstLine(navigation.text) : nil) {
+                    throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but navigation was not confirmed. Inspect that tab before retrying. \(error)")
+                }
             }
             let fresh = BrowserPage(bridge: bridge, tab: ["tab_id": newID])
-            guard fresh.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
+            // Chrome can confirm that an exact new tab finished loading without attaching
+            // a debugger just to evaluate document.readyState.
+            var loaded = false
+            if Self.defersBrowserNavigationObservation, BrowserReply.acceptedInitialNavigation(in: opened.text),
+               BrowserCallBudget.remaining() > 3,
+               let tabs = try? bridge.callTool("tabs", arguments: [:], timeout: 2), !tabs.isError {
+                loaded = BrowserReply.completedTab(in: tabs.text, id: newID, expectedURL: url)
+            }
+            guard loaded || fresh.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
                 throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but the requested page did not become ready. Inspect that tab before retrying.")
             }
             bridge.currentTab = newID
+            if Self.defersBrowserNavigationObservation { return .text("opened tab \(newID)") }
             fresh.settle()
             fresh.prime()
-            if Self.defersBrowserNavigationObservation { return .text("opened tab \(newID)") }
             // The page comes with the reply, so the model needs no separate read before acting.
             if let read = try? fresh.read(find: nil, full: false) { return .text("opened. " + read) }
             return .text("opened \(fresh.title(try? fresh.location()))")

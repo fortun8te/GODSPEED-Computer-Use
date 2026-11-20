@@ -270,6 +270,12 @@ enum SnapshotBuilder {
 
         var rootWindow: AXUIElement
         guard let resolvedFocusedWindow = focusedWindow else {
+            // A launching app can also miss one answer: only a finished launch that misses twice is frozen.
+            if app.runningApplication.isFinishedLaunching,
+               !Self.appAnswersAccessibility(pid: app.pid),
+               { Thread.sleep(forTimeInterval: 0.3); return !Self.appAnswersAccessibility(pid: app.pid) }() {
+                throw ComputerUseError.stateUnavailable(Self.appNotRespondingMessage(name: app.runningApplication.localizedName))
+            }
             throw ComputerUseError.stateUnavailable(computerUseNoWindowFoundMessage + FocusBorrow.retryHint(pid: app.pid))
         }
         rootWindow = resolvedFocusedWindow
@@ -2880,4 +2886,27 @@ func targetedRoleEquals(_ actual: String?, _ wanted: String) -> Bool {
         return r
     }
     return normalize(actual) == normalize(wanted)
+}
+
+extension SnapshotBuilder {
+    /// True when the app answers one accessibility question within half a second. A frozen app
+    /// (seen with Calculator after a day open) shows no windows and never answers, so "open a document"
+    /// advice would send the agent in circles.
+    static func appAnswersAccessibility(pid: pid_t, timeout: Float = 0.5) -> Bool {
+        let element = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(element, timeout)
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+        return !appLooksFrozen(error)
+    }
+
+    static func appLooksFrozen(_ error: AXError) -> Bool {
+        error == .cannotComplete
+    }
+
+    static func appNotRespondingMessage(name: String?) -> String {
+        let app = name.flatMap { $0.isEmpty ? nil : $0 } ?? "The app"
+        return "\(app) is not responding (no window and no accessibility answer within 0.5 s), so it looks frozen. "
+            + "Do not retry the same step. Ask the user before quitting it; once it is restarted, use open {app} and read it again."
+    }
 }

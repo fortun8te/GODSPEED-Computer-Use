@@ -111,16 +111,17 @@ final class BrowserPageTests: XCTestCase {
 
     func testParseNumbersControlsAndSkipsIgnoredAndUnnamed() {
         let parse = BrowserPage.parseAX(page())
-        XCTAssertEqual(parse.controls.map(\.name), ["Home", "Email", "Pay"])
-        XCTAssertEqual(parse.controls.map(\.index), [1, 2, 3])
-        XCTAssertEqual(parse.controls.map(\.backendNodeID), [11, 12, 15])
+        // The icon-only button is kept (labelled later by a hint); the ignored one is not.
+        XCTAssertEqual(parse.controls.map(\.name), ["Home", "Email", "", "Pay"])
+        XCTAssertEqual(parse.controls.map(\.index), [1, 2, 3, 4])
+        XCTAssertEqual(parse.controls.map(\.backendNodeID), [11, 12, 14, 15])
         XCTAssertEqual(parse.controls[1].value, "sam@x.com")
         XCTAssertEqual(parse.texts, ["# Welcome", "  Hello there"])
     }
 
     func testParseMarksControlsInsideAnotherFrame() {
         let parse = BrowserPage.parseAX(page())
-        XCTAssertEqual(parse.controls.map(\.inFrame), [false, false, true])
+        XCTAssertEqual(parse.controls.map(\.inFrame), [false, false, false, true])
         XCTAssertEqual(parse.framedControls, 1)
     }
 
@@ -160,7 +161,8 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(lines[1], "Controls:")
         XCTAssertEqual(lines[2], "1 link Home")
         XCTAssertEqual(lines[3], "2 textbox Email = sam@x.com")
-        XCTAssertEqual(lines[4], "3 button Pay")
+        XCTAssertEqual(lines[4], "3 button (no label)")
+        XCTAssertEqual(lines[5], "4 button Pay")
         XCTAssertTrue(lines.contains { $0.hasPrefix("(1 of these sit inside an iframe") })
         let textIndex = lines.firstIndex(of: "Text:")
         XCTAssertNotNil(textIndex)
@@ -192,11 +194,18 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(parse.texts, [])
     }
 
-    func testEmptyControlsAreNotNumberedUnlessTheyAreFields() {
-        let raw = [ax("button", "", backend: 1), ax("textbox", "", backend: 2, value: "typed")]
+    func testIconOnlyClickablesAreKeptAndOtherEmptyControlsAreNot() {
+        let raw = [ax("button", "", backend: 1), ax("textbox", "", backend: 2, value: "typed"), ax("slider", "", backend: 3)]
         let parse = BrowserPage.parseAX(raw)
-        XCTAssertEqual(parse.controls.map(\.role), ["textbox"])
-        XCTAssertEqual(parse.controls.first?.index, 1)
+        XCTAssertEqual(parse.controls.map(\.role), ["button", "textbox"])
+        XCTAssertEqual(parse.unnamedControls, 1)
+        XCTAssertEqual(parse.controls.first?.renderedLine(numbered: true), "1 button (no label)")
+        var hinted = parse.controls[0]
+        hinted.hint = "icon:trash; in:Invoice 12"
+        XCTAssertEqual(hinted.renderedLine(numbered: true), "1 button (icon:trash; in:Invoice 12)")
+        XCTAssertTrue(BrowserPage.hint(hinted.hint, matches: BrowserPage.normalize("trash")))
+        XCTAssertTrue(BrowserPage.hint(hinted.hint, matches: BrowserPage.normalize("icon:trash")))
+        XCTAssertFalse(BrowserPage.hint(hinted.hint, matches: BrowserPage.normalize("invoice")))
     }
 
     // MARK: - Label matching
@@ -429,6 +438,13 @@ final class BrowserPageTests: XCTestCase {
         let listing = #"{"result":[{"id":3,"url":"https://a.com","title":"A","active":true},{"id":9,"url":"chrome://x"},{"id":4}]}"#
         XCTAssertEqual(BrowserReply.tabIDs(in: listing), [3, 9])
         XCTAssertEqual(BrowserReply.tabIDs(in: "not json"), [])
+    }
+
+    func testReadyTabRequiresExactTabAddressAndCompletion() {
+        let listing = #"{"result":[{"id":9,"url":"https://example.test/form","status":"complete"},{"id":10,"url":"https://example.test/form","status":"loading"}]}"#
+        XCTAssertTrue(BrowserReply.completedTab(in: listing, id: 9, expectedURL: "https://example.test/form"))
+        XCTAssertFalse(BrowserReply.completedTab(in: listing, id: 10, expectedURL: "https://example.test/form"))
+        XCTAssertFalse(BrowserReply.completedTab(in: listing, id: 9, expectedURL: "https://example.test/other"))
     }
 
     func testOpenedTabIDReadsTheTabObject() {

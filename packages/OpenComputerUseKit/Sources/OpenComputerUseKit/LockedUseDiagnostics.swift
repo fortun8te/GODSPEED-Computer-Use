@@ -70,6 +70,15 @@ public struct LockedUseSession: Equatable, Codable, Sendable {
 }
 
 public struct LockedUseDiagnostics: Codable, Sendable {
+    public static let unpackagedMessage = "This Godspeed build requires a normally unlocked Mac for GUI actions."
+
+    public static var currentBundlePluginVersion: String? {
+        let url = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/LockedUse/OCULockAuth.bundle")
+        guard let version = Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              !version.isEmpty else { return nil }
+        return version
+    }
+
     public let schemaVersion: Int
     public let stage: String
     public let enabled: Bool
@@ -96,6 +105,7 @@ public struct LockedUseDiagnostics: Codable, Sendable {
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: pluginsPath)) ?? []
         let ownPlugin = "OCULockAuth.bundle"
         let others = entries.filter { $0.hasSuffix(".bundle") && $0 != ownPlugin && $0 != "OCULockProbe.bundle" }.sorted()
+        let bundledVersion = currentBundlePluginVersion
         let configuration = try? LockedUseBrokerConfiguration.loadInstalled()
         let policyIntact = (try? LockedUseAuthorizationRules.installedRulesObserved()) == true
         let identity = try? LockedUseSigningIdentity.current()
@@ -107,29 +117,36 @@ public struct LockedUseDiagnostics: Codable, Sendable {
         } ?? false
         var available = false
         var guardianPermissions: [String: Bool] = [:]
-        if let configuration, let team = try? LockedUseSigningIdentity.current().teamIdentifier,
-           let evidence = try? LockedUseComponentValidation.current(team: team) {
-            _ = evidence
+        if bundledVersion != nil, let configuration, let team = identity?.teamIdentifier,
+           (try? LockedUseComponentValidation.current(team: team)) != nil {
             guardianPermissions = installedGuardianPermissions()
             available = configuration.enabled && policyIntact && approved
                 && AXIsProcessTrusted() && CGPreflightScreenCaptureAccess()
                 && guardianPermissions["accessibility"] == true && guardianPermissions["inputMonitoring"] == true
         }
+        let stage: String
+        if bundledVersion == nil { stage = "not-packaged" }
+        else if available { stage = "enabled" }
+        else { stage = configuration == nil ? "not-installed" : "unavailable" }
+        let blockers: [String]
+        if available { blockers = [] }
+        else if bundledVersion == nil { blockers = [unpackagedMessage] }
+        else {
+            blockers = ["Run ocu locked-use enable and complete permissions for Open Computer Use and OCU Guardian. Installation, client approval, signed components and authentication policy must be intact."]
+        }
         return .init(
-            schemaVersion: 1, stage: available ? "enabled" : configuration == nil ? "not-installed" : "unavailable", enabled: configuration?.enabled ?? false, available: available,
+            schemaVersion: 1, stage: stage, enabled: bundledVersion != nil && configuration?.enabled == true, available: available,
             clientApproved: approved, authenticationPolicyIntact: policyIntact,
             session: .current(), accessibility: AXIsProcessTrusted(),
             screenRecording: CGPreflightScreenCaptureAccess(), inputMonitoring: CGPreflightListenEventAccess(),
             installedPluginVersion: Bundle(url: URL(fileURLWithPath: pluginsPath + "/" + ownPlugin))?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
-            bundledPluginVersion: Bundle(url: Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/LockedUse/OCULockAuth.bundle"))?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+            bundledPluginVersion: bundledVersion,
             pluginInstalled: entries.contains(ownPlugin),
             brokerInstalled: FileManager.default.fileExists(atPath: "/Library/Application Support/OpenComputerUse/LockedUse/OCULockService"),
             guardianAccessibility: guardianPermissions["accessibility"],
             guardianInputMonitoring: guardianPermissions["inputMonitoring"],
             otherAuthorizationPlugins: others,
-            blockers: available ? [] : [
-                "Run ocu locked-use enable and complete permissions for Open Computer Use and OCU Guardian. Installation, client approval, signed components and authentication policy must be intact."
-            ]
+            blockers: blockers
         )
     }
 
@@ -189,6 +206,9 @@ func requireUsableComputerUseSession(_ session: LockedUseSession = .current()) t
         try LockedUseActionScope.validate()
         return
     case .locked:
+        guard LockedUseDiagnostics.currentBundlePluginVersion != nil else {
+            throw ComputerUseError.stateUnavailable("The Mac is locked. " + LockedUseDiagnostics.unpackagedMessage)
+        }
         throw ComputerUseError.stateUnavailable("The Mac is locked and this GUI request has no active Locked Use lease. Enable and validate Locked Use in the signed app, or unlock normally; run `ocu locked-use status --json` for diagnostics.")
     case .unavailable:
         throw ComputerUseError.stateUnavailable("No completed GUI session for the current console user is available. Computer Use cannot operate a login, switched-user, or unknown session.")

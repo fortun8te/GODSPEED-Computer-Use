@@ -56,6 +56,22 @@ final class LifecycleTests: XCTestCase {
         XCTAssertTrue(timer.shouldExit(now: 110))
     }
 
+    func testExitDeadlineDisarmsDuringConnectionsAndRearmsAfterTheLastOne() {
+        var timer = AgentIdleTimer(idleLimit: 10, now: 0)
+        XCTAssertEqual(timer.nextExitDelay(now: 3), 7)
+        XCTAssertTrue(timer.clientConnected())
+        XCTAssertTrue(timer.clientConnected())
+        XCTAssertNil(timer.nextExitDelay(now: 9))
+        timer.clientDisconnected(now: 10)
+        XCTAssertNil(timer.nextExitDelay(now: 10))
+        timer.clientDisconnected(now: 12)
+        XCTAssertEqual(timer.nextExitDelay(now: 12), 10)
+        XCTAssertEqual(timer.nextExitDelay(now: 22), 0)
+        XCTAssertTrue(timer.shouldExit(now: 22))
+        XCTAssertNil(timer.nextExitDelay(now: 22))
+        XCTAssertNil(AgentIdleTimer(idleLimit: 0, now: 0).nextExitDelay(now: 22))
+    }
+
     func testZeroLimitNeverExits() {
         var timer = AgentIdleTimer(idleLimit: 0, now: 0)
         XCTAssertFalse(timer.shouldExit(now: 1_000_000_000))

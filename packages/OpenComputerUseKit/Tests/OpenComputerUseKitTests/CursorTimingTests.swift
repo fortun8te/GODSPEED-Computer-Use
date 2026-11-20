@@ -62,11 +62,11 @@ final class CursorTimingTests: XCTestCase {
         let hop = visualCursorTravelDuration(distance: 40, speed: 1)
         let typical = visualCursorTravelDuration(distance: 400, speed: 1)
         let far = visualCursorTravelDuration(distance: 3000, speed: 1)
-        XCTAssertGreaterThanOrEqual(hop, 0.06)
-        XCTAssertLessThan(hop, 0.075)
-        XCTAssertGreaterThan(typical, 0.09)
-        XCTAssertLessThan(typical, 0.12)
-        XCTAssertLessThanOrEqual(far, 0.14)
+        XCTAssertGreaterThanOrEqual(hop, 0.12)
+        XCTAssertLessThan(hop, 0.14)
+        XCTAssertGreaterThan(typical, 0.18)
+        XCTAssertLessThan(typical, 0.22)
+        XCTAssertLessThanOrEqual(far, 0.30)
         XCTAssertLessThan(hop, typical)
         XCTAssertLessThan(typical, far)
     }
@@ -80,7 +80,7 @@ final class CursorTimingTests: XCTestCase {
         XCTAssertEqual(visualCursorTravelDuration(distance: 0, speed: 1), 0)
         XCTAssertEqual(visualCursorTravelDuration(distance: .nan, speed: 1), 0)
         XCTAssertEqual(visualCursorClickPulseDuration(speed: .infinity), 0)
-        XCTAssertEqual(visualCursorClickPulseDuration(speed: 1), 0.09, accuracy: 1e-9)
+        XCTAssertEqual(visualCursorClickPulseDuration(speed: 1), 0.15, accuracy: 1e-9)
     }
 
     func testQueuedActionsMakeTheCursorCatchUp() {
@@ -88,7 +88,7 @@ final class CursorTimingTests: XCTestCase {
         let behind = visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 4)
         XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: -1), alone)
         XCTAssertLessThan(behind, alone / 2)
-        XCTAssertLessThan(visualCursorClickPulseDuration(speed: 1, queuedBehind: 4), 0.045)
+        XCTAssertLessThan(visualCursorClickPulseDuration(speed: 1, queuedBehind: 4), 0.06)
         // A long backlog speeds up but still glides (floored at 35%) instead of turning every step into a jump.
         XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 100), alone * 0.35, accuracy: 1e-9)
         XCTAssertGreaterThan(visualCursorTravelDuration(distance: 40, speed: 1, queuedBehind: 100), 0)
@@ -165,6 +165,7 @@ final class CursorTimingTests: XCTestCase {
             let second = CGPoint(x: center.x + 140, y: center.y + 60)
             SoftwareCursorOverlay.moveCursor(to: first, in: nil)
             SoftwareCursorOverlay.pulseClick(at: first, clickCount: 1, mouseButton: .left, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let panel = try XCTUnwrap(SoftwareCursorOverlay.overlayPanelForTesting)
 
             // One `ocu call` is one session. Ending it used to reset the cursor, so the next
@@ -174,6 +175,7 @@ final class CursorTimingTests: XCTestCase {
             XCTAssertTrue(panel.isVisible, "the cursor must outlive the session that moved it")
 
             SoftwareCursorOverlay.moveCursor(to: second, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             XCTAssertTrue(SoftwareCursorOverlay.overlayPanelForTesting === panel, "still the same single panel")
 
             let lines = try moves(in: file)
@@ -194,6 +196,7 @@ final class CursorTimingTests: XCTestCase {
         try withTrace { file, center in
             let started = CACurrentMediaTime()
             SoftwareCursorOverlay.moveCursor(to: center, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let took = CACurrentMediaTime() - started
             let line = try XCTUnwrap(try moves(in: file).first)
             XCTAssertTrue(line.contains("fresh=true"))
@@ -207,9 +210,11 @@ final class CursorTimingTests: XCTestCase {
 
     func testInstantSpeedPlacesTheCursorWithoutAnimating() throws {
         try withTrace(speed: "instant") { file, center in
+            SoftwareCursorOverlay.prewarm()  // as the app does at startup
             let started = CACurrentMediaTime()
             SoftwareCursorOverlay.moveCursor(to: center, in: nil)
             SoftwareCursorOverlay.pulseClick(at: center, clickCount: 2, mouseButton: .left, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             XCTAssertLessThan(CACurrentMediaTime() - started, 0.05)
             let panel = try XCTUnwrap(SoftwareCursorOverlay.overlayPanelForTesting)
             XCTAssertTrue(panel.isVisible)
@@ -229,6 +234,7 @@ final class CursorTimingTests: XCTestCase {
         try withTrace { _, center in
             SoftwareCursorOverlay.moveCursor(to: center, in: nil)
             SoftwareCursorOverlay.pulseClick(at: center, clickCount: 1, mouseButton: .left, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let panel = try XCTUnwrap(SoftwareCursorOverlay.overlayPanelForTesting)
             XCTAssertTrue(panel.isVisible)
             RunLoop.main.run(until: Date().addingTimeInterval(0.8))
