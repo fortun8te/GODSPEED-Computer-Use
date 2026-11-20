@@ -32,6 +32,20 @@ final class BatchReceiptsTests: XCTestCase {
         XCTAssertTrue(result.isError, "a batch that did not complete is an error")
     }
 
+    func testCancelAfterDeliveryNamesTheStepAsSent() {
+        let click = "3. click \"Save\""
+        XCTAssertEqual(BatchEffects.cancelledStepLine(number: 3, description: "click \"Save\"", delivery: .notSent),
+                       click + ": cancelled during step")
+        for delivered in [DeliveryState.acknowledged, .verified] {
+            let line = BatchEffects.cancelledStepLine(number: 3, description: "click \"Save\"", delivery: delivered)
+            XCTAssertTrue(line.hasPrefix(click + ": sent"), line)
+            XCTAssertFalse(line.contains("cancelled during step"), line)
+        }
+        let unknown = BatchEffects.cancelledStepLine(number: 3, description: "click \"Save\"", delivery: .outcomeUnknown)
+        XCTAssertTrue(unknown.hasPrefix(click + ": sent, outcome unknown"), unknown)
+        XCTAssertFalse(unknown.contains("cancelled during step"), unknown)
+    }
+
     func testLineAppendsReceiptToFirstLineOnly() {
         XCTAssertEqual(BatchEffects.line("2. click \"Save\": ok", receipt: .noEffectSeen), "2. click \"Save\": ok - no effect seen")
         XCTAssertEqual(BatchEffects.line("2. query: ok\nrow", receipt: .notSent), "2. query: ok - not sent\nrow")
