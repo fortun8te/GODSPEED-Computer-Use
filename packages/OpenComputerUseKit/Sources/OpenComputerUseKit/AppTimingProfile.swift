@@ -27,11 +27,20 @@ public final class AppTimingProfiles: @unchecked Sendable {
         var profile = profiles[app] ?? AppTimingProfile(bundleID: app)
         body(&profile); profiles[app] = profile
     }
+    /// Lowest AX timeout, used for unresponsive apps. Also the latency under which a call counts as a fast success.
+    static let floorTimeout: TimeInterval = 0.05
     public init() {}
 
     public func record(app: String, axLatencyMs: Double) {
         guard axLatencyMs.isFinite, axLatencyMs >= 0 else { return }
-        mutate(app) { $0.axLatenciesMs = Array(($0.axLatenciesMs + [axLatencyMs]).suffix(64)) }
+        mutate(app) { profile in
+            profile.axLatenciesMs = Array((profile.axLatenciesMs + [axLatencyMs]).suffix(64))
+            // A call that answers within the floor proves the app is responsive again.
+            if axLatencyMs / 1000 < AppTimingProfiles.floorTimeout {
+                profile.unresponsiveUntil = nil
+                profile.timeoutDates = []
+            }
+        }
     }
     public func recordTimeout(app: String, now: Date = Date()) {
         lock.lock(); defer { lock.unlock() }
@@ -49,9 +58,9 @@ public final class AppTimingProfiles: @unchecked Sendable {
     public func messagingTimeout(for app: String, now: Date = Date()) -> TimeInterval {
         lock.lock(); defer { lock.unlock() }
         guard let p = profiles[app] else { return 0.25 }
-        if let until = p.unresponsiveUntil, now < until { return 0.05 }
+        if let until = p.unresponsiveUntil, now < until { return AppTimingProfiles.floorTimeout }
         guard p.axLatenciesMs.count >= 8 else { return 0.25 }
-        return min(1, max(0.05, p.p95AXLatencyMs * 3 / 1000))
+        return min(1, max(AppTimingProfiles.floorTimeout, p.p95AXLatencyMs * 3 / 1000))
     }
     public func settleBudget(for app: String) -> TimeInterval {
         lock.lock(); defer { lock.unlock() }
