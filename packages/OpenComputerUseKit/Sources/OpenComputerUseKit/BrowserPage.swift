@@ -47,6 +47,24 @@ struct BrowserNode: Sendable {
     }
 }
 
+/// Where a navigation ended up against the address that was asked for. Only `arrived` confirms that address.
+enum BrowserNavigationResult: Equatable, Sendable {
+    /// The requested address loaded. `newDocument` is false when the same document was still in place.
+    case arrived(finalURL: String, newDocument: Bool)
+    /// The page loaded on another origin than the one requested (a login or redirect target).
+    case redirected(finalURL: String)
+    /// Chrome's error page (chrome-error://, net::ERR_*) replaced the requested page.
+    case errorPage(finalURL: String)
+    case timedOut
+}
+
+/// One stage of a navigation, as `BrowserRules.navigationStage` reads it.
+enum NavigationStage: Equatable {
+    case arrived
+    case redirected
+    case errorPage
+}
+
 /// What an action did to the page, in the one short line the model reads after it.
 enum BrowserChange: Equatable, Sendable {
     case navigated(String)
@@ -144,6 +162,13 @@ final class BrowserPage {
     static let textBudget = 2_500
 
     private var tabID: Int? { tab["tab_id"] as? Int }
+
+    /// True only for a tab this helper opened (`open_tab`). Page hooks (fetch and XHR wrappers, `window.__gs`,
+    /// frame removal) are installed only on these; a tab the user owns gets read-only paths.
+    var ownsTab: Bool {
+        guard let tabID else { return false }
+        return bridge.ownedTabGeneration(tabID) != nil
+    }
 
     private static let staleIndex = ComputerUseError.invalidArguments(
         "browser: the tab or document changed; browser read again before using an element number"
@@ -1071,7 +1096,7 @@ final class BrowserPage {
     /// hit-test). Says so when something else lies on top of every probed point (a banner, a dialog, a
     /// stretched link). For frames, use the browser's box geometry. In the main document
     /// a missing hit test is a refusal, since an unverified box could target another control.
-    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
+    func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
         if let placement {
             return try precisePoint(of: node, placement: placement)
         }
@@ -1107,7 +1132,14 @@ final class BrowserPage {
         }
         if kind == "frame" {
             reveal(node)
-            return try center(of: node)
+            let point = try center(of: node)
+            // The page's own hit test at the point decides. An overlay or a stale frame that is there instead is
+            // refused before any input is sent.
+            guard frameHitIsIntended(node, at: point) else {
+                let message = "browser: another element is at the click point inside the frame, so no click was sent. Reveal the control and read the tab again."
+                throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
+            }
+            return point
         }
         let message = "browser: could not confirm an unobstructed click point.\(delivery) Reveal the control and read the tab again."
         throw beforeFirstAction ? ComputerUseError.notSent(message) : ComputerUseError.stateUnavailable(message)
@@ -1143,6 +1175,20 @@ final class BrowserPage {
 
     private func reveal(_ node: BrowserNode) {
         _ = try? cdp("DOM.scrollIntoViewIfNeeded", ["backendNodeId": node.backendNodeID])
+    }
+
+    /// Chrome's hit test at a point of the main page: true when the element there is the control or sits inside it.
+    /// Any failure to answer is false, so an unverified click is never sent.
+    private func frameHitIsIntended(_ node: BrowserNode, at point: CGPoint) -> Bool {
+        guard let hit = try? cdp("DOM.getNodeForLocation", [
+            "x": Int(point.x), "y": Int(point.y), "includeUserAgentShadowDOM": true,
+        ]), let hitID = hit["backendNodeId"] as? Int else { return false }
+        if hitID == node.backendNodeID { return true }
+        guard let resolved = try? cdp("DOM.resolveNode", ["backendNodeId": hitID]),
+              let hitObject = (resolved["object"] as? [String: Any])?["objectId"] as? String else { return false }
+        // Runs in the control's own frame: a descendant of the control counts as the control.
+        return (try? callOnNode(node, "function(hit){return this===hit||this.contains(hit);}",
+                                objectArguments: [hitObject])) as? Bool == true
     }
 
     private func center(of node: BrowserNode) throws -> CGPoint {
@@ -1203,9 +1249,11 @@ final class BrowserPage {
             }
         }
         let (head, last) = keyEvents ? BrowserRules.splitForTyping(text) : (text, nil)
-        let document = !keyEvents && node != nil ? try? documentIdentity() : nil
+        let document = node != nil ? try? documentIdentity() : nil
         var expected = replace ? text : nil
-        if !keyEvents, !replace, let node, document != nil {
+        // An append is confirmed only against the exact value the insert should produce, so the field is read
+        // before the text goes in (this also covers text that already appears in the field).
+        if !replace, let node, document != nil {
             expected = (try? callOnNode(node, """
                 function (text) {
                   if (!this.matches('input,textarea') || this.type === 'password' ||
@@ -1252,6 +1300,10 @@ final class BrowserPage {
         }
         if let actual, let expected, actual == expected {
             outcome.deliveryState = .verified
+        }
+        if !replace, node != nil, outcome.note == nil,
+           let note = BrowserRules.appendNote(expected: expected, actual: actual) {
+            outcome.note = note
         }
         if watchSuggestions { outcome.options = comboOptions() }
         return outcome
@@ -1984,6 +2036,10 @@ final class BrowserPage {
     /// stays at the same address, a short while.
     @discardableResult
     func waitLoad(changedFrom old: String?, expect: String? = nil, timeout: TimeInterval) -> Bool {
+        if let expect {
+            if case .arrived = navigationOutcome(from: old, expected: expect, timeout: timeout) { return true }
+            return false
+        }
         let clock = ProcessInfo.processInfo
         let start = clock.systemUptime
         let deadline = start + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
@@ -1993,10 +2049,7 @@ final class BrowserPage {
                 if let here = try? location(),
                    here.readyState == "interactive" || here.readyState == "complete" {
                     let elapsed = clock.systemUptime - start
-                    if let expect {
-                        if BrowserRules.sameAddress(here.href, expect)
-                            || (elapsed > 4 && here.href != old && BrowserRules.isWebAddress(here.href)) { return true }
-                    } else if old == nil || here.href != old || elapsed > 1.5 {
+                    if old == nil || here.href != old || elapsed > 1.5 {
                         return true
                     }
                 }
@@ -2005,6 +2058,35 @@ final class BrowserPage {
                 Thread.sleep(forTimeInterval: min(0.12, remaining))
             }
             return false
+        }
+    }
+
+    /// Waits for `expected` after a navigation that began at `old`. Only `.arrived` confirms the address. An error
+    /// page or a load that ends on another origin is reported as it is, without waiting out the time limit.
+    func navigationOutcome(from old: String?, expected: String, timeout: TimeInterval) -> BrowserNavigationResult {
+        let clock = ProcessInfo.processInfo
+        let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
+        let startingDocument = try? documentIdentity()
+        return BrowserCallBudget.withDeadline(deadline) {
+            while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
+                do { try BrowserRequestContext.validateCurrent() } catch { return .timedOut }
+                if let here = try? location(),
+                   let stage = BrowserRules.navigationStage(expected: expected, from: old, href: here.href,
+                                                            readyState: here.readyState) {
+                    switch stage {
+                    case .arrived:
+                        let current = try? documentIdentity()
+                        let newDocument = current != nil && startingDocument != nil && current != startingDocument
+                        return .arrived(finalURL: here.href, newDocument: newDocument)
+                    case .redirected: return .redirected(finalURL: here.href)
+                    case .errorPage: return .errorPage(finalURL: here.href)
+                    }
+                }
+                let remaining = deadline - clock.systemUptime - 0.3
+                if remaining <= 0 { break }
+                Thread.sleep(forTimeInterval: min(0.12, remaining))
+            }
+            return .timedOut
         }
     }
 
@@ -2043,6 +2125,9 @@ final class BrowserPage {
 
     @discardableResult
     func settle(cap: Int = 800) -> BrowserChange {
+        // The network-idle and mutation counters exist only in the agent's own tabs. Elsewhere there is
+        // nothing to observe without changing the page, so no change is claimed.
+        guard ownsTab else { return .none }
         // Polled from here with quick synchronous reads. A promise that waits inside the page never settled in a
         // background tab (Chrome throttles its timers), so each wait hung until the 15 s command timeout.
         let clock = ProcessInfo.processInfo
@@ -2143,7 +2228,7 @@ final class BrowserPage {
                 if let urlContains {
                     if let place = try? location(),
                        place.readyState == "interactive" || place.readyState == "complete",
-                       place.href.localizedCaseInsensitiveContains(urlContains) { return true }
+                       BrowserRules.urlContains(place.href, urlContains) { return true }
                 } else if let text {
                     let remaining = deadline - clock.systemUptime
                     let milliseconds = Int(min(1.0, max(0, remaining - 0.05)) * 1000)
@@ -2258,6 +2343,8 @@ final class BrowserPage {
     """
 
     private func guardForeignFrames() {
+        // Installing a page hook changes the user's page, so it happens only in a tab the agent opened.
+        guard ownsTab else { return }
         let key = domainKey("foreign-frame-guard")
         if BrowserPageMemory.shared.isEnabled(key) { return }
         let setup = Self.foreignFrameGuardJS + "\n;" + Self.pageStateJS
@@ -2575,6 +2662,18 @@ enum BrowserRules {
         return spaces(actual).contains(spaces(typed))
     }
 
+    /// Note for an append whose result is not confirmed: `expected` is the field value the insert should have
+    /// produced, `actual` what the field reads back as. Nil only when the field is exactly that value.
+    static func appendNote(expected: String?, actual: String?) -> String? {
+        guard let expected else {
+            return "(could not confirm the field grew by the typed text; read the field before relying on it)"
+        }
+        guard let actual else {
+            return "(the field could not be read back after typing; read it before relying on it)"
+        }
+        return actual == expected ? nil : "(the field did not grow by exactly the typed text; read it before sending more)"
+    }
+
     /// Scroll words accepted for `direction`, or nil when the word is not one.
     static func scrollDirection(_ raw: String) -> String? {
         switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
@@ -2621,6 +2720,31 @@ enum BrowserRules {
     static func isWebAddress(_ address: String) -> Bool {
         guard let url = URLComponents(string: address), let scheme = url.scheme?.lowercased() else { return false }
         return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
+    }
+
+    /// `url_contains`: the part must appear in the host or the path. The scheme, query and fragment do not count, so
+    /// a page at /login?next=/cart does not match "/cart".
+    static func urlContains(_ address: String, _ part: String) -> Bool {
+        let wanted = part.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !wanted.isEmpty, let url = URLComponents(string: address), let host = url.host else { return false }
+        return (host + url.path).lowercased().contains(wanted)
+    }
+
+    /// Scheme, host and port of a web address, or nil when it is not one.
+    static func origin(_ address: String) -> String? {
+        guard isWebAddress(address), let url = URLComponents(string: address),
+              let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return nil }
+        return "\(scheme)://\(host):\(url.port ?? (scheme == "https" ? 443 : 80))"
+    }
+
+    /// Where a navigation that began at `old` stands against the requested address. Nil while it is still pending.
+    static func navigationStage(expected: String, from old: String?, href: String, readyState: String) -> NavigationStage? {
+        if href.hasPrefix("chrome-error://") || href.contains("net::ERR") { return .errorPage }
+        guard old == nil || href != old else { return nil }
+        guard readyState == "interactive" || readyState == "complete" else { return nil }
+        if sameAddress(href, expected) { return .arrived }
+        if origin(href) != origin(expected) { return .redirected }
+        return nil
     }
 
     /// Match the origin and the requested path boundary. Paths and query values are case-sensitive.

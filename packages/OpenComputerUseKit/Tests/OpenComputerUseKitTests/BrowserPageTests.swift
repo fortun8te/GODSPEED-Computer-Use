@@ -472,6 +472,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(BrowserRules.fieldMatches(actual: "", typed: "x", replaced: false))
     }
 
+    func testAppendIsConfirmedOnlyWhenTheFieldGrewByExactlyTheText() {
+        // The text already sat in the field: a dropped insert must not look like a success.
+        XCTAssertNotNil(BrowserRules.appendNote(expected: "a worldworld", actual: "a world"))
+        XCTAssertNil(BrowserRules.appendNote(expected: "a worldworld", actual: "a worldworld"))
+        // Without a known expected value nothing can be confirmed, so the reply must say so.
+        XCTAssertNotNil(BrowserRules.appendNote(expected: nil, actual: "hello"))
+        XCTAssertNotNil(BrowserRules.appendNote(expected: "hello!", actual: nil))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {
@@ -865,5 +874,130 @@ extension BrowserPageTests {
         XCTAssertFalse(BrowserPage.matchesUploadSelection([["wrong.txt", 4]], expected: expected))
         XCTAssertFalse(BrowserPage.matchesUploadSelection([["fixture.txt", 5]], expected: expected))
         XCTAssertFalse(BrowserPage.matchesUploadSelection(nil, expected: expected))
+    }
+}
+
+/// A stand-in OBU helper that records every CDP command it receives and answers each request. `open_tab`
+/// answers with `openTabID`, which makes that tab one the agent opened.
+enum RecordingBrowserHelper {
+    /// `replies`: a substring of a request line and the CDP reply (JSON text) to send when it matches.
+    static func make(directory: URL, openTabID: Int, replies: [(match: String, text: String)] = []) throws -> (helper: URL, log: URL) {
+        let log = directory.appendingPathComponent("requests.log")
+        let helper = directory.appendingPathComponent("obu")
+        let cases = replies.map { "*'\($0.match)'*) text='\($0.text)' ;;" }.joined(separator: "\n            ")
+        let script = #"""
+        #!/bin/sh
+        LOG='\#(log.path)'
+        touch "$LOG"
+        while IFS= read -r line; do
+          case "$line" in *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'; continue ;; esac
+          id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p')
+          [ -n "$id" ] || continue
+          printf '%s\n' "$line" >> "$LOG"
+          case "$line" in
+            *'"name":"open_tab"'*) text='{\"result\":{\"tab\":{\"id\":\#(openTabID)}}}' ;;
+            \#(cases)
+            *) text='{}' ;;
+          esac
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$text"
+        done
+        """#
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        return (helper, log)
+    }
+}
+
+extension BrowserPageTests {
+    func testPageHooksStayOutOfTabsTheAgentDidNotOpen() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (helper, log) = try RecordingBrowserHelper.make(directory: directory, openTabID: 99)
+        let bridge = BrowserBridge(sessionID: "user-tab-hooks-\(UUID().uuidString)", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        // The tab is listed, not opened by the agent: it belongs to the user.
+        _ = try bridge.callTool("tabs", arguments: [:], timeout: 3)
+        BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
+        let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertFalse(sent.contains("Page.addScriptToEvaluateOnNewDocument"), "a user tab must not get page hooks")
+        XCTAssertFalse(sent.contains("__gs"), "a user tab must not get window.__gs")
+    }
+
+    func testPageHooksInstallInTheTabTheAgentOpened() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (helper, log) = try RecordingBrowserHelper.make(directory: directory, openTabID: 12)
+        let bridge = BrowserBridge(sessionID: "agent-tab-hooks-\(UUID().uuidString)", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
+        let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertTrue(sent.contains("Page.addScriptToEvaluateOnNewDocument"))
+    }
+
+    func testUrlContainsMatchesTheHostAndPathNotTheQuery() {
+        XCTAssertFalse(BrowserRules.urlContains("https://a.test/login?next=/cart", "/cart"))
+        XCTAssertFalse(BrowserRules.urlContains("https://a.test/login#cart", "cart"))
+        XCTAssertTrue(BrowserRules.urlContains("https://a.test/cart?x=1", "/cart"))
+        XCTAssertTrue(BrowserRules.urlContains("https://Shop.test/a", "shop.test"))
+        XCTAssertTrue(BrowserRules.urlContains("https://a.test/checkout/done", "a.test/checkout"))
+    }
+
+    func testNavigationStageNamesArrivalRedirectsAndErrorPagesOnly() {
+        let expected = "https://a.test/order/done"
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: expected,
+                                                    readyState: "complete"), .arrived)
+        // A page that is still loading, or the same address as before the click, is not a result yet.
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: expected,
+                                                  readyState: "loading"))
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/",
+                                                  readyState: "complete"))
+        // Still on the requested origin but not yet at the requested page: keep waiting.
+        XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/cart",
+                                                  readyState: "complete"))
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://login.b.test/sso",
+                                                    readyState: "complete"), .redirected)
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "chrome-error://chromewebdata/",
+                                                    readyState: "complete"), .errorPage)
+    }
+
+    func testClickInsideAFrameNeedsTheIntendedElementAtThePoint() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let frameProbe = #"{\"result\":{\"result\":{\"value\":[\"frame\"]}}}"#
+        let box = #"{\"result\":{\"model\":{\"content\":[10,20,30,20,30,40,10,40]}}}"#
+        let object = #"{\"result\":{\"object\":{\"objectId\":\"handle\"}}}"#
+        func helper(hitting backendNodeID: Int) throws -> (BrowserBridge, () -> Void) {
+            let (helper, _) = try RecordingBrowserHelper.make(directory: directory, openTabID: 12, replies: [
+                (#""method":"Runtime.callFunctionOn""#, frameProbe),
+                (#""method":"DOM.getBoxModel""#, box),
+                (#""method":"DOM.resolveNode""#, object),
+                (#""method":"DOM.getNodeForLocation""#, #"{\"result\":{\"backendNodeId\":\#(backendNodeID)}}"#),
+            ])
+            let bridge = BrowserBridge(sessionID: "frame-click-\(UUID().uuidString)", launchEnvironment: [
+                "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+            ])
+            return (bridge, { bridge.shutdown() })
+        }
+        let control = BrowserNode(index: 4, role: "button", name: "Pay", value: "", backendNodeID: 101)
+        // Another element sits at the click point: the click must be refused, not reported as sent.
+        let (covered, stopCovered) = try helper(hitting: 777)
+        defer { stopCovered() }
+        _ = try covered.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        let page = BrowserPage(bridge: covered, tab: ["tab_id": 12])
+        XCTAssertThrowsError(try page.clickPoint(of: control))
+        // The intended control (or something inside it) is at the point: the click point is returned.
+        let (intended, stopIntended) = try helper(hitting: 101)
+        defer { stopIntended() }
+        _ = try intended.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
+        let point = try BrowserPage(bridge: intended, tab: ["tab_id": 12]).clickPoint(of: control)
+        XCTAssertEqual(point, CGPoint(x: 20, y: 30))
     }
 }
