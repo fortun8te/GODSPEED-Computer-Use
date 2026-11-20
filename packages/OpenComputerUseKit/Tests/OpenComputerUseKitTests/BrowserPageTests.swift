@@ -472,6 +472,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertFalse(BrowserRules.fieldMatches(actual: "", typed: "x", replaced: false))
     }
 
+    func testAppendIsConfirmedOnlyWhenTheFieldGrewByExactlyTheText() {
+        // The text already sat in the field: a dropped insert must not look like a success.
+        XCTAssertNotNil(BrowserRules.appendNote(expected: "a worldworld", actual: "a world"))
+        XCTAssertNil(BrowserRules.appendNote(expected: "a worldworld", actual: "a worldworld"))
+        // Without a known expected value nothing can be confirmed, so the reply must say so.
+        XCTAssertNotNil(BrowserRules.appendNote(expected: nil, actual: "hello"))
+        XCTAssertNotNil(BrowserRules.appendNote(expected: "hello!", actual: nil))
+    }
+
     // MARK: - Scroll and history
 
     func testScrollDirectionAcceptsWordsAndRefusesTheRest() {

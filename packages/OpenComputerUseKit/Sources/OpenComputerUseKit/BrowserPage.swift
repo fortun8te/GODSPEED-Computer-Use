@@ -1249,9 +1249,11 @@ final class BrowserPage {
             }
         }
         let (head, last) = keyEvents ? BrowserRules.splitForTyping(text) : (text, nil)
-        let document = !keyEvents && node != nil ? try? documentIdentity() : nil
+        let document = node != nil ? try? documentIdentity() : nil
         var expected = replace ? text : nil
-        if !keyEvents, !replace, let node, document != nil {
+        // An append is confirmed only against the exact value the insert should produce, so the field is read
+        // before the text goes in (this also covers text that already appears in the field).
+        if !replace, let node, document != nil {
             expected = (try? callOnNode(node, """
                 function (text) {
                   if (!this.matches('input,textarea') || this.type === 'password' ||
@@ -1298,6 +1300,10 @@ final class BrowserPage {
         }
         if let actual, let expected, actual == expected {
             outcome.deliveryState = .verified
+        }
+        if !replace, node != nil, outcome.note == nil,
+           let note = BrowserRules.appendNote(expected: expected, actual: actual) {
+            outcome.note = note
         }
         if watchSuggestions { outcome.options = comboOptions() }
         return outcome
@@ -2654,6 +2660,18 @@ enum BrowserRules {
     static func fieldMatches(actual: String, typed: String, replaced: Bool) -> Bool {
         if replaced { return spaces(actual) == spaces(typed) }
         return spaces(actual).contains(spaces(typed))
+    }
+
+    /// Note for an append whose result is not confirmed: `expected` is the field value the insert should have
+    /// produced, `actual` what the field reads back as. Nil only when the field is exactly that value.
+    static func appendNote(expected: String?, actual: String?) -> String? {
+        guard let expected else {
+            return "(could not confirm the field grew by the typed text; read the field before relying on it)"
+        }
+        guard let actual else {
+            return "(the field could not be read back after typing; read it before relying on it)"
+        }
+        return actual == expected ? nil : "(the field did not grow by exactly the typed text; read it before sending more)"
     }
 
     /// Scroll words accepted for `direction`, or nil when the word is not one.
