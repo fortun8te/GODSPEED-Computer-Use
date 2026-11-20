@@ -5,6 +5,26 @@ import XCTest
 /// Before/after fixtures: each test reads the reply with the setting on and off.
 final class SemanticChangesRepliesTests: XCTestCase {
     private let header = "App=com.apple.Notes (pid 4242)\nWindow: \"Notes\", App: Notes.\n[w=settable]"
+    private var savedMinimum = 0
+
+    // The fixtures are small; production skips the summary on diffs under 400 bytes (see the last test).
+    override func setUp() {
+        super.setUp()
+        savedMinimum = LeanOutput.semanticSummaryMinDiffLength
+        LeanOutput.semanticSummaryMinDiffLength = 0
+    }
+
+    override func tearDown() {
+        LeanOutput.semanticSummaryMinDiffLength = savedMinimum
+        super.tearDown()
+    }
+
+    func testShortDiffsAreSentWithoutASummaryLine() {
+        LeanOutput.semanticSummaryMinDiffLength = 400
+        let reply = LeanOutput.semanticDiffReply(header: "H", diff: "Changed:\n+ 4 text field To = b", before: "1 text field To = a",
+                                                 after: "1 text field To = b")
+        XCTAssertEqual(reply, "H\nChanged:\n+ 4 text field To = b")
+    }
 
     private func tree(_ lines: [String]) -> String {
         ([header] + lines).joined(separator: "\n")
