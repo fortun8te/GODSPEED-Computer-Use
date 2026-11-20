@@ -251,7 +251,7 @@ enum BatchTool {
             // {"tool": "wait", "seconds": 1}: a plain pause is a settle wait.
             if tool == waitName, arguments["window"] == nil, arguments["text"] == nil, arguments["gone"] == nil, arguments["settle"] == nil {
                 if let seconds = (arguments["seconds"] as? Double) ?? (arguments["seconds"] as? Int).map(Double.init) {
-                    arguments["timeout_ms"] = Int(seconds * 1000)
+                    arguments["timeout_ms"] = try BatchEffects.Wait.milliseconds(seconds, perUnit: 1000)
                 }
                 arguments["settle"] = true
                 arguments.removeValue(forKey: "seconds")

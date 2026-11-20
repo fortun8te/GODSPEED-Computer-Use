@@ -3,6 +3,14 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class BatchEffectsTests: XCTestCase {
+    func testWaitTimeoutFromHugeOrNonFiniteSecondsIsClampedNotTrapped() throws {
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": 1e30]).timeoutMs, BatchEffects.Wait.maxTimeoutMs)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": -1e30]).timeoutMs, 100)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": 2]).timeoutMs, 2_000)
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": "nan"]))
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": "inf"]))
+    }
+
     private func state(_ rows: [String], title: String = "Settings") -> String {
         (["App=com.example (pid 1)", "Window: \"\(title)\", App: Example.", "[legend]"] + rows).joined(separator: "\n")
     }

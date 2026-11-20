@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import XCTest
 @testable import OpenComputerUseKit
@@ -233,5 +234,38 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertEqual(steps[1].arguments["action"] as? String, "scroll_into_view")
         let error = ComputerUseError.backgroundUnsupported("Test refusal")
         XCTAssertEqual(TrajectoryLog.failureCode(error: error), .backgroundUnsupported)
+    }
+
+    func testGlobalPointerStepIsRefusedBeforeTheAppIsRaisedWhenTheUserIsActive() {
+        FocusBorrowController.idleSecondsForTests = 0
+        defer { FocusBorrowController.idleSecondsForTests = nil }
+        var raised: [pid_t] = []
+        let app = RunningAppDescriptor(name: "Fixture", bundleIdentifier: nil, pid: 4242, runningApplication: NSRunningApplication.current)
+        XCTAssertThrowsError(try raiseForGlobalPointerInput(app, prepare: { raised.append($0.pid) }))
+        XCTAssertEqual(raised, [], "a refused global pointer step must not raise the app")
+    }
+
+    func testGlobalPointerStepRaisesTheAppWhenTheUserIsHandsOff() throws {
+        FocusBorrowController.idleSecondsForTests = .infinity
+        defer { FocusBorrowController.idleSecondsForTests = nil }
+        var raised: [pid_t] = []
+        let app = RunningAppDescriptor(name: "Fixture", bundleIdentifier: nil, pid: 4242, runningApplication: NSRunningApplication.current)
+        try raiseForGlobalPointerInput(app, prepare: { raised.append($0.pid) })
+        XCTAssertEqual(raised, [4242])
+    }
+
+    func testGlobalMouseEventsThatMoveOrPressAreGuardedExceptReleases() {
+        XCTAssertTrue(InputSimulation.needsHandsOff(.mouseMoved))
+        XCTAssertTrue(InputSimulation.needsHandsOff(.leftMouseDown))
+        XCTAssertTrue(InputSimulation.needsHandsOff(.leftMouseDragged), "a drag moves the real pointer too")
+        XCTAssertFalse(InputSimulation.needsHandsOff(.leftMouseUp), "a release always goes out so no button stays held")
+    }
+
+    func testBatchToolWaitSecondsAreClampedBeforeTheMillisecondConversion() throws {
+        let huge = try BatchTool.parseSteps([["tool": "wait", "seconds": 1e16]], defaultApp: "Fixture")
+        XCTAssertEqual(huge.first?.arguments["timeout_ms"] as? Int, BatchEffects.Wait.maxTimeoutMs)
+        let normal = try BatchTool.parseSteps([["tool": "wait", "seconds": 2]], defaultApp: "Fixture")
+        XCTAssertEqual(normal.first?.arguments["timeout_ms"] as? Int, 2_000)
+        XCTAssertThrowsError(try BatchTool.parseSteps([["tool": "wait", "seconds": Double.nan]], defaultApp: "Fixture"))
     }
 }
