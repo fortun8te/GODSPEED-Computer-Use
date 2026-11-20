@@ -367,6 +367,18 @@ The fork's page cursor reacts to acknowledged browser movement, press, drag, dro
 
 Use independent browser connections for concurrent reads. Browser writes and native input retain exclusive admission while the app agent applies process-wide settings. A shared budget caps active preview loads, and each helper has one rescheduled idle timer. Compare end-to-end fixture timings and slow runs before promoting the candidate.
 
+## JavaScript page API
+
+In the REPL, `cua.browser.page(tabId?, { strictBackground? })` returns a Playwright-style page for one tab. Each method maps to one browser action, so policy and `strictBackground` apply as they do to raw calls. Methods: `goto`, `click`, `fill`, `type`, `press`, `hover`, `selectOption`, `check`, `uncheck`, `waitForText`, `waitForURL`, `waitForLoadState`, `textContent`, `title`, `url`, `screenshot`, and the locators `getByRole(role, { name })`, `getByLabel`, `getByText`, each with `click`, `fill`, `isVisible` and `textContent`.
+
+Targets are visible labels. CSS selectors and `locator(selector)` return `UNSUPPORTED`, since the browser actions take no selectors. Matching is exact by default: a label or locator first reads the page for controls with that exact name, and returns `TARGET_NOT_FOUND` or `AMBIGUOUS_TARGET` before sending anything. Pass `exact: false` to use the browser's looser label matching. Locators are not cached. Each action reads the page again. `screenshot()` runs only when called. `waitForText` and `waitForURL` take `timeout` in milliseconds, up to 30000. A wait the page does not satisfy throws `TIMEOUT`.
+
+Errors carry `error.code`. Driver codes pass through unchanged, including `STALE_REF`, `APPROVAL_REQUIRED` and `BACKGROUND_UNSUPPORTED`. Local codes are `UNSUPPORTED`, `INVALID_ARGUMENT`, `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `TIMEOUT`, `PARSE_FAILED` and `TOOL_ERROR`. Browser actions target tabs, so `windowId` is `UNSUPPORTED`.
+
+Precise additions: `click({anchor, offset, modifiers, clickCount, button})` (Playwright `Meta`, `Shift`, `Alt`, `Control` map to `cmd`, `shift`, `alt`, `ctrl`), `hover({dwellMs})` up to 2000 ms, `dragTo(target, {steps, holdMs, verify})`, `scrollIntoViewIfNeeded()`, `selectText({start, length} | text)`, `mouse.wheel(dx, dy)` as point-unit chunks, `scroll({direction, unit, amount, maxSteps, untilVisible})`, `keyboard.press(key, {holdMs})`, `zoom("in" | "out")`, `goBack()` and `goForward()`. Browser clicks have no coordinates, so `click({position})` is `UNSUPPORTED`.
+
+The same precision applies to `cua.app(name)` (no state read): `scroll({direction, unit, amount, maxSteps, untilVisible, target})`, `click(target, {anchor, offset, modifiers, clickCount, button})`, `drag(from, to, {steps, holdMs, verify})` where each end is `[x, y]`, a label or an element number, `hover(target, {dwellMs})`, `selectText(target, {start, length} | text)`, `waitFor(label, {condition, timeout, fromValue})` (timeout in seconds, 1 to 30), `pressKey(key, {holdMs})` and `gesture(name, {target | menuPath})`. Limits match the driver; anything outside them throws `INVALID_ARGUMENT` before a call is sent. Shared mapping lives in `scripts/node-repl/precise-actions.mjs`.
+
 ## Precise clicks
 
 Use `anchor` with `center`, `left`, `right`, `top` or `bottom` on a control. Optional `offset_x` and `offset_y` move right and down from that point. The target point must still hit the control. Mac offsets are window points. Chrome offsets are CSS pixels. Chrome needs the control in the main frame for precise clicks.
