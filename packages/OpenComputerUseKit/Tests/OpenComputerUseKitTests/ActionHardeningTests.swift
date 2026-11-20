@@ -3,6 +3,14 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class ActionHardeningTests: XCTestCase {
+    func testClickPlacementUsesAnInsetEdgeAndRejectsOutOfBoundsOffsets() throws {
+        let frame = CGRect(x: 100, y: 50, width: 80, height: 6)
+        XCTAssertEqual(try ClickPlacement(["anchor": "right", "offset_x": -3]).point(in: frame), CGPoint(x: 176, y: 53))
+        XCTAssertThrowsError(try ClickPlacement(["offset_x": true]))
+        XCTAssertThrowsError(try ClickPlacement(["anchor": "right", "offset_x": 4]).point(in: frame))
+        XCTAssertTrue(ActionOptions.usesStrictRoute("click", ["modifiers": ["shift"]]))
+    }
+
     func testScrollChunksStopAtTheFirstStalledPosition() throws {
         let chunks = try XCTUnwrap(ScrollChunks(["unit": "points", "step_size": 30, "max_steps": 12]))
         var attempts = 0

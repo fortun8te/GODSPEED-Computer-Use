@@ -135,7 +135,10 @@ public enum ToolDefinitions {
                     "interactive": ["type": "boolean", "default": false, "description": "read: show controls and their references without surrounding page text. Leave off to read or verify page text."],
                     "index": integerProperty(description: "Element number from read"),
                     "mouse_button": stringProperty(description: "click: pointer button, default left.", enumValues: ["left", "right", "middle"]),
-                    "click_count": integerProperty(description: "click: 1 by default, or 2 for a left double-click."),
+                    "click_count": integerProperty(description: "click: 1 by default. Left button also accepts 2 or 3."),
+                    "anchor": stringProperty(description: "Click point on a control.", enumValues: ["center", "left", "right", "top", "bottom"]),
+                    "offset_x": numberProperty(description: "Click offset right from the anchor."),
+                    "offset_y": numberProperty(description: "Click offset down from the anchor."),
                     "modifiers": ["type": "array", "items": ["type": "string", "enum": ["alt", "ctrl", "cmd", "shift"]],
                                   "description": "click or drag: optional modifier keys."],
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
@@ -208,6 +211,10 @@ public enum ToolDefinitions {
                     "x": numberProperty(description: "X pixel from a screenshot"),
                     "y": numberProperty(description: "Y pixel from a screenshot"),
                     "click_count": integerProperty(description: "1 to 32, default 1. sky_click allows 1 or 2."),
+                    "anchor": stringProperty(description: "Click point on a control.", enumValues: ["center", "left", "right", "top", "bottom"]),
+                    "offset_x": numberProperty(description: "Click offset right from the anchor."),
+                    "offset_y": numberProperty(description: "Click offset down from the anchor."),
+                    "modifiers": ["type": "array", "items": ["type": "string"], "description": "Click with cmd, shift, alt or ctrl."],
                     "mouse_button": stringProperty(
                         description: "Default left.",
                         enumValues: ["left", "right", "middle"]

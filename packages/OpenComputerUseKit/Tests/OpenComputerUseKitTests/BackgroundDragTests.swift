@@ -60,6 +60,26 @@ final class BackgroundDragTests: XCTestCase {
         }
     }
 
+    func testPreciseClickPairsPreserveModifiersAndRecheckTarget() throws {
+        let probe = Probe()
+        let flags: CGEventFlags = [.maskCommand, .maskShift]
+        var checks = 0
+        try BackgroundDragDispatcher.click(target: target, button: .left, count: 3, flags: flags,
+                                            io: probe.io, validateSession: {}) { checks += 1 }
+        XCTAssertEqual(checks, 3)
+        XCTAssertEqual(probe.events.map(\.type), [.leftMouseDown, .leftMouseUp, .leftMouseDown, .leftMouseUp, .leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(probe.events.map { $0.getIntegerValueField(.mouseEventClickState) }, [1, 1, 2, 2, 3, 3])
+        XCTAssertTrue(probe.events.allSatisfy { $0.flags == flags })
+        XCTAssertFalse(probe.lifecycle.contains("activate"))
+
+        let stale = Probe()
+        XCTAssertThrowsError(try BackgroundDragDispatcher.click(target: target, button: .left, count: 2,
+            flags: [], io: stale.io, validateSession: {}) {
+            if !stale.events.isEmpty { throw ComputerUseError.stateUnavailable("Control moved.") }
+        }) { XCTAssertTrue($0.localizedDescription.contains("Sent 1 of 2")) }
+        XCTAssertEqual(stale.events.map(\.type), [.leftMouseDown, .leftMouseUp])
+    }
+
     func testHoverPostsOneMoveWithoutFocusOrButtonEvents() throws {
         let probe = Probe()
         try BackgroundDragDispatcher.hover(target: target, io: probe.io, validateSession: {})

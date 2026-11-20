@@ -218,9 +218,11 @@ enum BatchTool {
             let browserName = isWeb ? (webSpellings[lowered] ?? lowered) : lowered
             let tabHover = lowered == "hover" && defaultApp == nil
                 && !arguments.keys.contains(where: { ["app", "application", "app_name", "appName", "bundle_id", "bundleId", "target_app", "program", "application_name"].contains($0) })
-            if known.contains("browser"), lowered != "browser",
-               browserOnly.contains(lowered) || tabHover || (lowered == "scroll_into_view" && defaultApp == nil && arguments["app"] == nil)
-                   || (isWeb && browserShared.contains(browserName)) {
+            // An explicit web step must never fall through to a native app when Chrome is unavailable.
+            if lowered != "browser",
+               (isWeb && browserShared.contains(browserName)) || (known.contains("browser")
+                   && (browserOnly.contains(lowered) || tabHover
+                       || (lowered == "scroll_into_view" && defaultApp == nil && arguments["app"] == nil))) {
                 arguments["web"] = nil
                 if arguments["action"] == nil {
                     arguments["action"] = ["goto": "go", "navigate": "go"][browserName] ?? browserName

@@ -135,6 +135,60 @@ enum BackgroundDragDispatcher {
         io.post(event, target.pid)
     }
 
+    static func click(target: BackgroundDragTarget, button: MouseButtonKind, count: Int, flags: CGEventFlags,
+                      io: BackgroundDragIO = .system(),
+                      validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
+                      validateHit: () throws -> Void) throws {
+        try validateSession()
+        try target.validateGeometry()
+        guard (1...3).contains(count), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Multiple clicks need the left button and a count of 1 to 3.")
+        }
+        guard io.windowLocationCapability.isAvailable else {
+            throw ComputerUseError.backgroundUnsupported("This Mac cannot address click events to the target window.")
+        }
+        dispatchLock.lock()
+        defer { dispatchLock.unlock() }
+        try io.validateWindow(target)
+        func prepare(_ type: CGEventType, beat: Int, group: Int64?) throws -> CGEvent {
+            guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target.start, mouseButton: button.cgButton) else {
+                throw ComputerUseError.stateUnavailable("Could not prepare a window-addressed click.")
+            }
+            event.flags = flags
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(beat))
+            if let group { event.setIntegerValueField(.mouseEventNumber, value: group) }
+            event.setIntegerValueField(windowNumberField, value: Int64(target.windowID))
+            try io.setWindowLocation(event, CGPoint(x: target.start.x - target.windowBounds.minX,
+                                                    y: target.start.y - target.windowBounds.minY))
+            return event
+        }
+        let pairs = try (1...count).map { beat in
+            let group = InputSimulation.dragGestureEventNumber()
+            return try (prepare(button.downEvent, beat: beat, group: group), prepare(button.upEvent, beat: beat, group: group))
+        }
+        var sent = 0
+        do {
+            for (press, release) in pairs {
+                try validateSession()
+                try io.validateWindow(target)
+                try validateHit()
+                try validateSession()
+                try io.validateWindow(target)
+                press.timestamp = DispatchTime.now().uptimeNanoseconds
+                io.post(press, target.pid)
+                release.timestamp = DispatchTime.now().uptimeNanoseconds
+                io.release(release, target)
+                sent += 1
+                if sent < count { io.pause(0.05) }
+            }
+        } catch {
+            if sent > 0 {
+                throw ComputerUseError.stateUnavailable("Sent \(sent) of \(count) clicks. Inspect the window before repeating.")
+            }
+            throw error
+        }
+    }
+
     static func scroll(target: BackgroundDragTarget, direction: String, unit: ScrollChunks.Unit, size: Int,
                        io: BackgroundDragIO = .system(),
                        validateSession: () throws -> Void = { try requireUsableComputerUseSession() }) throws {

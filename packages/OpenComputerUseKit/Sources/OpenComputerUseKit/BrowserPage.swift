@@ -650,6 +650,24 @@ final class BrowserPage {
     """
 
     /// Chrome's own name search: fast, and it does not read the whole page.
+    func resolveExact(label: String?, index: Int?) throws -> BrowserNode {
+        if let index { return try resolve(label: nil, index: index) }
+        guard let label, !Self.normalize(label).isEmpty else {
+            throw ComputerUseError.invalidArguments("Give an exact label or a reference from browser read.")
+        }
+        let matches = try exactNamedControls(label)
+        guard matches.count == 1, let node = matches.first else {
+            throw ComputerUseError.stateUnavailable("Expected one control named '\(label)'. Found \(matches.count). Read the tab for a reference.")
+        }
+        return node
+    }
+
+    private func exactNamedControls(_ label: String) throws -> [BrowserNode] {
+        let matches = try queryNamed(label).filter { Self.normalize($0.name) == Self.normalize(label) }
+        var seen: Set<Int> = []
+        return matches.filter { seen.insert($0.backendNodeID).inserted }
+    }
+
     private func queryNamed(_ label: String) throws -> [BrowserNode] {
         Self.namedCandidates(try queryNamedRaw(label))
     }
@@ -758,14 +776,16 @@ final class BrowserPage {
         }
     }
 
-    func click(_ node: BrowserNode, button: PointerButton = .left, count: Int = 1, modifiers: Int = 0) throws {
-        guard (1...2).contains(count) else { throw ComputerUseError.invalidArguments("browser click count must be 1 or 2") }
+    func click(_ node: BrowserNode, button: PointerButton = .left, count: Int = 1, modifiers: Int = 0, placement: ClickPlacement? = nil) throws {
+        guard (1...3).contains(count), button == .left || count == 1 else {
+            throw ComputerUseError.invalidArguments("Multiple clicks need the left button and a count of 1 to 3.")
+        }
         restoreSetup()
-        let document = count == 2 ? try documentIdentity() : nil
-        if count == 2, document == nil {
+        let document = count > 1 ? try documentIdentity() : nil
+        if count > 1, document == nil {
             throw ComputerUseError.stateUnavailable("browser: could not bind the double-click to the current document")
         }
-        let firstPoint = try clickPoint(of: node, beforeFirstAction: true)
+        let firstPoint = try clickPoint(of: node, beforeFirstAction: true, placement: placement)
         // The press already carries the verified point. A separate mouse-move can stall a
         // background tab before the click is sent. Explicit hover still delivers movement.
         let remaining = BrowserCallBudget.remaining()
@@ -778,7 +798,7 @@ final class BrowserPage {
                     guard try documentIdentity() == document else {
                         throw ComputerUseError.stateUnavailable("browser: the first click changed the document")
                     }
-                    point = try clickPoint(of: node)
+                    point = try clickPoint(of: node, placement: placement)
                 }
                 guard BrowserCallBudget.remaining() > 2 else {
                     throw ComputerUseError.stateUnavailable("browser click ran out of time before the next press")
@@ -859,11 +879,46 @@ final class BrowserPage {
         try send("mouseReleased", end, 0, 1)
     }
 
+    private func precisePoint(of node: BrowserNode, placement: ClickPlacement) throws -> CGPoint {
+        let result = try callOnNode(node, """
+        function(fx,fy,dx,dy){
+          if(window!==window.top)return ['frame'];
+          if(!this.isConnected)return [];
+          const r=this.getBoundingClientRect(), ix=Math.min(1,r.width/2), iy=Math.min(1,r.height/2);
+          const x=r.left+ix+(r.width-2*ix)*fx+dx, y=r.top+iy+(r.height-2*iy)*fy+dy;
+          if(x<r.left||x>=r.right||y<r.top||y>=r.bottom)return ['offset'];
+          let hit=document.elementFromPoint(x,y);
+          for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(x,y))&&next!==hit;)hit=next;
+          for(let n=hit;n;n=n.parentNode||n.host){
+            if(n===this){
+              if(window.__gs){__gs.seen=__gs.mut;__gs.href=location.href;__gs.nav=false;}
+              return ['ok',x,y];
+            }
+          }
+          return [];
+        }
+        """, arguments: [placement.fraction.x, placement.fraction.y, placement.offset.x, placement.offset.y]) as? [Any]
+        if result?.first as? String == "frame" {
+            throw ComputerUseError.backgroundUnsupported("Precise hit testing is unavailable inside this frame.")
+        }
+        if result?.first as? String == "offset" {
+            throw ComputerUseError.invalidArguments("Click offsets place the point outside the control.")
+        }
+        guard let result, result.count == 3, result[0] as? String == "ok",
+              let x = BrowserRules.number(result[1]), let y = BrowserRules.number(result[2]) else {
+            throw ComputerUseError.stateUnavailable("The precise point is out of view or covered. Reveal the control before continuing.")
+        }
+        return CGPoint(x: x, y: y)
+    }
+
     /// Where on the element to click: a point of its visible part that really reaches it (`elementFromPoint`
     /// hit-test). Says so when something else lies on top of every probed point (a banner, a dialog, a
     /// stretched link). For frames, use the browser's box geometry. In the main document
     /// a missing hit test is a refusal, since an unverified box could target another control.
-    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false) throws -> CGPoint {
+    private func clickPoint(of node: BrowserNode, beforeFirstAction: Bool = false, placement: ClickPlacement? = nil) throws -> CGPoint {
+        if let placement {
+            return try precisePoint(of: node, placement: placement)
+        }
         func probe() -> [Any] {
             let remaining = BrowserCallBudget.remaining()
             // Resolving the node and hit-testing it are separate Chrome calls.
