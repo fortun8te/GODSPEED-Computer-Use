@@ -359,6 +359,41 @@ final class BrowserBridge: @unchecked Sendable {
         }
     }
 
+    /// Pipelines optional read-only hint commands on the already selected
+    /// connection. Missed replies are discarded and cannot affect later calls.
+    func hintCommands(
+        tab: [String: Any], commands: [(String, [String: Any])], generation: Int, deadline: TimeInterval
+    ) throws -> [[String: Any]?] {
+        try withToolConnection {
+            guard process?.isRunning == true, generation == helperGeneration else { return [] }
+            var requests: [Int] = []
+            defer { if let last = requests.last { responses.discard(through: last) } }
+            for (method, params) in commands {
+                try BrowserRequestContext.validateCurrent()
+                let remaining = deadline - TimingLog.now()
+                guard remaining > 0 else { break }
+                var args = tab
+                args["method"] = method
+                args["params"] = params
+                args["timeout_ms"] = max(1, Int(remaining * 1000))
+                let id = nextID
+                nextID += 1
+                requests.append(id)
+                try send(["jsonrpc": "2.0", "id": id, "method": "tools/call",
+                          "params": ["name": "cdp", "arguments": args]])
+            }
+            return requests.map { id in
+                guard let message = responses.wait(for: id, timeout: max(0, deadline - TimingLog.now())),
+                      let result = message["result"] as? [String: Any],
+                      let reply = try? toolReply(result), !reply.isError,
+                      let object = try? JSONSerialization.jsonObject(with: Data(reply.text.utf8)) as? [String: Any],
+                      object["error"] == nil else { return nil }
+                let payload = (object["result"] as? [String: Any]) ?? object
+                return payload["error"] == nil ? payload : nil
+            }
+        }
+    }
+
     func closeOpenedTab(_ id: Int) throws {
         try withToolConnection {
             guard process?.isRunning == true, openedTabs.contains(id) else {
@@ -406,6 +441,10 @@ final class BrowserBridge: @unchecked Sendable {
         _ name: String, arguments: [String: Any], timeout: TimeInterval
     ) throws -> (text: String, isError: Bool) {
         let result = try request(method: "tools/call", params: ["name": name, "arguments": arguments], timeout: timeout)
+        return try toolReply(result)
+    }
+
+    private func toolReply(_ result: [String: Any]) throws -> (text: String, isError: Bool) {
         guard let content = result["content"] as? [[String: Any]],
               content.allSatisfy({ item in
                   guard let type = item["type"] as? String else { return false }
@@ -617,12 +656,14 @@ private final class BrowserBridgeResponses: @unchecked Sendable {
     private let condition = NSCondition()
     private var pending = Data()
     private var messages: [Int: [String: Any]] = [:]
+    private var discardedThrough = 0
     private var closed = false
 
     func reset() {
         condition.lock()
         pending = Data()
         messages = [:]
+        discardedThrough = 0
         closed = false
         condition.unlock()
     }
@@ -634,7 +675,7 @@ private final class BrowserBridgeResponses: @unchecked Sendable {
             let line = Data(pending[pending.startIndex..<newline])
             pending = Data(pending[pending.index(after: newline)...])
             if let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-               let id = (object["id"] as? NSNumber)?.intValue {
+               let id = (object["id"] as? NSNumber)?.intValue, id > discardedThrough {
                 messages[id] = object
             }
         }
@@ -647,6 +688,13 @@ private final class BrowserBridgeResponses: @unchecked Sendable {
         closed = true
         condition.broadcast()
         condition.unlock()
+    }
+
+    func discard(through id: Int) {
+        condition.lock()
+        defer { condition.unlock() }
+        discardedThrough = max(discardedThrough, id)
+        messages = messages.filter { $0.key > discardedThrough }
     }
 
     func wait(for id: Int, timeout: TimeInterval) -> [String: Any]? {
