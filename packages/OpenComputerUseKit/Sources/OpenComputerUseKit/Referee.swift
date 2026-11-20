@@ -270,7 +270,13 @@ enum HelperHTTP {
         if let withoutExclusive = RequestInferenceAdmission.withoutExclusive {
             // Never release an active focus borrow or a protected desktop lease.
             guard !FocusBorrow.shared.isBorrowing, !LockedUseActionScope.requiresScreenCaptureKit else { return nil }
-            reply = withoutExclusive { send(request, timeout: timeout, containsImage: containsImage) }
+            do {
+                reply = try withoutExclusive { send(request, timeout: timeout, containsImage: containsImage) }
+            } catch {
+                // The desktop gate was lost. Stop the request so no later step runs on stale observations.
+                RequestCancellation.current?.cancel()
+                return nil
+            }
         } else {
             reply = send(request, timeout: timeout, containsImage: containsImage)
         }

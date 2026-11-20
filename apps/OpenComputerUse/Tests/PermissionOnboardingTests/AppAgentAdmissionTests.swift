@@ -215,23 +215,48 @@ final class AppAgentAdmissionTests: XCTestCase {
         }
     }
 
-    func testInferenceReleasesExclusiveAndDiscardsAnInterleavedResult() throws {
+    func testInferenceReleasesExclusiveAndCancelsWhenAnInterleavedRequestRan() throws {
         let gate = AppAgentAdmission(environment: [:])
         let token = RequestCancellation()
         try RequestCancellation.$current.withValue(token) {
             try gate.withAdmission(.exclusive) {
                 let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
-                let result = outside {
+                XCTAssertThrowsError(try outside {
                     do {
                         try gate.withAdmission(.exclusive, timeout: 0) {}
                     } catch { XCTFail("Inference still owned desktop admission: \(error)") }
                     return Data([1])
-                }
-                XCTAssertNil(result)
+                }) { error in XCTAssertTrue(error is AppAgentAdmission.AdmissionLost, "\(error)") }
                 XCTAssertTrue(token.isCancelled)
             }
         }
         try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testInferenceThrowsInsteadOfContinuingWhenTheGateIsHeldPastTwoSeconds() throws {
+        let gate = AppAgentAdmission(environment: [:])
+        let token = RequestCancellation()
+        let holding = DispatchGroup()
+        try RequestCancellation.$current.withValue(token) {
+            try gate.withAdmission(.exclusive) {
+                let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
+                let acquired = DispatchSemaphore(value: 0)
+                XCTAssertThrowsError(try outside {
+                    holding.enter()
+                    DispatchQueue.global().async {
+                        defer { holding.leave() }
+                        try? gate.withAdmission(.exclusive, timeout: 10) {
+                            acquired.signal()
+                            Thread.sleep(forTimeInterval: 2.5)
+                        }
+                    }
+                    XCTAssertEqual(acquired.wait(timeout: .now() + 5), .success)
+                    return Data([1])
+                }) { error in XCTAssertTrue(error is AppAgentAdmission.AdmissionLost, "\(error)") }
+                XCTAssertTrue(token.isCancelled)
+            }
+        }
+        XCTAssertEqual(holding.wait(timeout: .now() + 10), .success)
     }
 
     func testCancellingTwentyQueuedClientsReleasesTheirTickets() throws {
