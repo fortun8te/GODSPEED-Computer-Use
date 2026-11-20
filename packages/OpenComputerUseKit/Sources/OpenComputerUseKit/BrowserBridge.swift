@@ -1641,6 +1641,11 @@ extension ComputerUseToolDispatcher {
         if raw.lowercased().hasPrefix("data:") {
             throw ComputerUseError.invalidArguments("browser cannot verify data URLs through the tab helper. Serve the fixture on localhost and pass its HTTP URL.")
         }
+        // Browser-internal pages and script URLs are refused here, whether or not origin checks are on.
+        let privileged = ["chrome:", "chrome-extension:", "javascript:"]
+        if privileged.contains(where: { raw.lowercased().hasPrefix($0) }) {
+            throw ComputerUseError.invalidArguments("browser only opens HTTP or HTTPS addresses. Use an address that starts with http:// or https://.")
+        }
         return browserURL(raw)
     }
 

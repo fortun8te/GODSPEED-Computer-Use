@@ -52,6 +52,16 @@ final class BrowserActionPolicyTests: XCTestCase {
         }
     }
 
+    /// Privileged schemes are refused even when origin checks are off; ordinary web addresses still pass.
+    func testNavigationRefusesPrivilegedSchemesWithoutOriginChecks() throws {
+        for raw in ["file:///etc/hosts", "chrome://settings", "chrome-extension://abc/page.html",
+                    "javascript:alert(1)", "JavaScript:alert(1)", "data:text/html,hi"] {
+            XCTAssertThrowsError(try ComputerUseToolDispatcher.navigationURL(raw), raw)
+        }
+        XCTAssertEqual(try ComputerUseToolDispatcher.navigationURL("https://example.com/a"), "https://example.com/a")
+        XCTAssertEqual(try ComputerUseToolDispatcher.navigationURL("example.com"), "https://example.com")
+    }
+
     /// Hint probes ride the same write allowlist as every other command during an owned-tab write.
     func testOwnedWriteAllowlistGovernsHintProbes() {
         XCTAssertTrue(BrowserBridge.ownedWriteMethodAllowed("DOM.resolveNode", tabID: 12, ownedTabID: 12))
