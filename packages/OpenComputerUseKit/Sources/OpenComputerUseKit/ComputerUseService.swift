@@ -724,6 +724,7 @@ func shouldPreferContainingWebRowAXClickCandidate(
 public final class ComputerUseService {
     @TaskLocal static var requiredWindowID: CGWindowID?
     @TaskLocal static var awaitsModalTextFocus = false
+    @TaskLocal static var actionObservation: NativeActionObservation?
 
     private var snapshotsByApp: [String: AppSnapshot] = [:]
     private var invalidatedSnapshotAliases: Set<String> = []
@@ -778,6 +779,7 @@ public final class ComputerUseService {
         let options = SnapshotObservationOptions(includeAX: true, includeScreenshot: false)
         let snapshot = try refresh?(options)
             ?? refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: options)
+        Self.actionObservation?.record(snapshot)
         return snapshotResult(for: snapshot, style: .actionResult)
     }
 

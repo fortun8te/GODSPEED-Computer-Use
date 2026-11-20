@@ -36,6 +36,27 @@ final class SelectiveObservationTests: XCTestCase {
         XCTAssertTrue(WindowSettle.frameSamplingEnabled(environment: ["OPEN_COMPUTER_USE_SETTLE_BY_FRAME": "1"]))
     }
 
+    func testSmartStepsReuseActionReadbackAndRefreshOnNoChange() throws {
+        let capture = NativeActionObservation()
+        var reads = 0
+        let after = snapshot(options: .init(includeScreenshot: false))
+        _ = try ComputerUseService.$actionObservation.withValue(capture) {
+            try ComputerUseService().actionResult(for: "ObservationFixture") { _ in
+                reads += 1
+                return after
+            }
+        }
+
+        func refresh() -> AppSnapshot? {
+            reads += 1
+            return after
+        }
+        XCTAssertEqual(capture.read(before: ["earlier state"], fallback: refresh)?.treeLines, after.treeLines)
+        XCTAssertEqual(reads, 1)
+        XCTAssertNotNil(capture.read(before: after.treeLines, fallback: refresh))
+        XCTAssertEqual(reads, 2)
+    }
+
     func testEmptyObservationFailsBeforeResolvingApp() {
         XCTAssertThrowsError(try ComputerUseService().getAppState(app: "missing-test-app",
             observation: .init(includeAX: false, includeScreenshot: false))) {

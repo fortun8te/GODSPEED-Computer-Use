@@ -847,6 +847,27 @@ private final class OpenOutcome: @unchecked Sendable {
     var error: Error?
 }
 
+/// Carries the exact snapshot built by a service action through the synchronous dispatcher.
+final class NativeActionObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var snapshot: AppSnapshot?
+
+    func record(_ snapshot: AppSnapshot) {
+        lock.withLock { self.snapshot = snapshot }
+    }
+
+    func read(before: [String]? = nil, fallback: () -> AppSnapshot?) -> AppSnapshot? {
+        let captured = lock.withLock { snapshot }
+        // An early no-change read may precede a delayed effect. Leave the existing
+        // fresh-read and retry decision in place for this case.
+        if let captured, captured.treeLines != before,
+           DoneCheck.supportsAbsenceCheck(captured.treeLines.joined(separator: "\n")) {
+            return captured
+        }
+        return fallback()
+    }
+}
+
 /// Notes one call collects while it runs: healing notes go before the reply, a dialog line after it.
 final class SmartLog {
     private var leading: [String] = []
