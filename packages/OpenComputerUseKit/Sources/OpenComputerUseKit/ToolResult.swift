@@ -36,6 +36,7 @@ public struct ToolCallResult: @unchecked Sendable {
     let batchReceipt: TrajectoryLog.BatchReceipt?
     let failureCode: TrajectoryLog.FailureCode?
     let browserObservationURL: String?
+    let browserEvidenceScope: BrowserEvidenceScope?
     let browserFullObservationText: String?
     let browserContinuationTabID: Int?
     let browserPreviewPages: [[String: Any]]?
@@ -48,13 +49,15 @@ public struct ToolCallResult: @unchecked Sendable {
         content: [ToolResultContentItem], isError: Bool,
         batchReceipt: TrajectoryLog.BatchReceipt? = nil, failureCode: TrajectoryLog.FailureCode? = nil,
         browserObservationURL: String? = nil, browserContinuationTabID: Int? = nil,
-        browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil
+        browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil,
+        browserEvidenceScope: BrowserEvidenceScope? = nil
     ) {
         self.content = content
         self.isError = isError
         self.batchReceipt = batchReceipt
         self.failureCode = failureCode
         self.browserObservationURL = browserObservationURL
+        self.browserEvidenceScope = browserEvidenceScope
         self.browserFullObservationText = browserFullObservationText
         self.browserContinuationTabID = browserContinuationTabID
         self.browserPreviewPages = browserPreviewPages

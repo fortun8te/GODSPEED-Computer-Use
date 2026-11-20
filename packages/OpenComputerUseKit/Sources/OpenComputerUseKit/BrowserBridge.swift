@@ -711,6 +711,7 @@ private final class BrowserBridgeResponses: @unchecked Sendable {
 
 extension ComputerUseToolDispatcher {
     @TaskLocal static var defersBrowserNavigationObservation = false
+    @TaskLocal static var bindsBrowserWaitEvidence = false
     @TaskLocal static var clipsBrowserStepObservation = false
 
     /// The `browser` tool: a handful of OBU abilities behind one verb, so a model sees one extra tool.
@@ -841,7 +842,7 @@ extension ComputerUseToolDispatcher {
             )
             return ToolCallResult(
                 content: [.text(snapshot.text)], isError: false, browserObservationURL: snapshot.verifiedURL,
-                browserFullObservationText: snapshot.fullText
+                browserFullObservationText: snapshot.fullText, browserEvidenceScope: snapshot.evidenceScope
             )
 
         case "screenshot", "see", "look_at":
@@ -974,9 +975,15 @@ extension ComputerUseToolDispatcher {
             let seconds = Swift.min(30, Swift.max(1, Self.browserTabID(arguments["timeout"]) ?? 10))
             let what = urlPart.map { "URL containing \"\($0)\"" } ?? "\"\(wantedText ?? label ?? "")\""
             let expected = condition.map { "\(what) is \($0.rawValue)" } ?? what
+            let generation = bridge.referenceGeneration
+            let before = Self.bindsBrowserWaitEvidence && wantedText != nil ? try? page.documentIdentity() : nil
             guard page.waitFor(text: wantedText, label: wantedText == nil ? label : nil,
                                urlContains: urlPart, controlCondition: condition, timeout: TimeInterval(seconds)) else {
                 throw ComputerUseError.stateUnavailable("browser: could not confirm \(expected) before the wait ended. Read the tab before continuing.")
+            }
+            if let before, let place = try? page.location(), (try? page.documentIdentity()) == before,
+               let scope = page.evidenceScope(document: before, generation: generation, url: place.href) {
+                return ToolCallResult(content: [.text("confirmed \(expected)")], isError: false, browserEvidenceScope: scope)
             }
             return .text("confirmed \(expected)")
 

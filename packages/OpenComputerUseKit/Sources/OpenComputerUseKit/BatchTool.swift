@@ -1045,16 +1045,19 @@ extension ComputerUseToolDispatcher {
                 callToolAsResult(name: "browser", arguments: browserVerificationArgs(action))
             }
         }
-        func waitForBrowserEvidence(_ condition: DoneCheck.Condition) -> Bool {
+        func waitForBrowserEvidence(_ condition: DoneCheck.Condition) -> ToolCallResult? {
             let waitDeadline = min(browserObservationDeadline - 1.5, clock.systemUptime + 6)
-            guard waitDeadline - clock.systemUptime > 0.6 else { return false }
+            guard waitDeadline - clock.systemUptime > 0.6 else { return nil }
             // A submitted form may still be rendering its confirmation. Give the
             // existing event-based wait a short part of the same recovery budget.
             var args = browserVerificationArgs("wait_for")
             args["timeout"] = 5
             for (key, value) in condition.arguments { args[key] = value }
             return BrowserCallBudget.withDeadline(waitDeadline) {
-                !callToolAsResult(name: "browser", arguments: args).isError
+                Self.$bindsBrowserWaitEvidence.withValue(true) {
+                    let result = callToolAsResult(name: "browser", arguments: args)
+                    return result.isError ? nil : result
+                }
             }
         }
         let pageURL: () -> String? = {
@@ -1088,14 +1091,16 @@ extension ComputerUseToolDispatcher {
                 }
             }
         }
-        var browserTextChecks: [DoneCheck.Condition] = []
+        var browserTextChecks: [(DoneCheck.Condition, BrowserEvidenceScope)] = []
+        func recordBrowserTextCheck(_ condition: DoneCheck.Condition, from check: ToolCallResult) {
+            if case .text(let text) = condition, !DoneCheck.isPlainNumber(text), let scope = check.browserEvidenceScope {
+                browserTextChecks.append((condition, scope))
+            }
+        }
         var observation = trailingObservation
         if !unconfirmedOpen, earlyCompletion == nil, observation == nil, lastAttemptedStep?.tool == "browser" {
             if unconfirmedFinalClick, let condition = doneConditions.first {
-                if waitForBrowserEvidence(condition),
-                   case .text(let text) = condition, !DoneCheck.isPlainNumber(text) {
-                    browserTextChecks.append(condition)
-                }
+                if let check = waitForBrowserEvidence(condition) { recordBrowserTextCheck(condition, from: check) }
             }
             observation = browserObservation("read")
         }
@@ -1217,16 +1222,14 @@ extension ComputerUseToolDispatcher {
                         return pageURL()
                     },
                     supportsAbsence: lastAttemptedStep?.tool != "browser",
-                    directlyVerified: observation?.browserObservationURL?.isEmpty == false ? browserTextChecks : []
+                    directlyVerified: browserTextChecks.filter { $0.1 == observation?.browserEvidenceScope }.map(\.0)
                 ))
             }
             var doneResult = earlyCompletion ?? TimingLog.measure("batch.final_check", checkConditions)
             if (!failed || ambiguousFinalClick), finalClickChecksPage, case .missing(let unmet) = doneResult,
                let pending = doneConditions.first(where: { unmet.contains($0.summary) }),
-               waitForBrowserEvidence(pending) {
-                if case .text(let text) = pending, !DoneCheck.isPlainNumber(text) {
-                    browserTextChecks.append(pending)
-                }
+               let check = waitForBrowserEvidence(pending) {
+                recordBrowserTextCheck(pending, from: check)
                 observation = browserObservation("read")
                 doneResult = checkConditions()
             }
