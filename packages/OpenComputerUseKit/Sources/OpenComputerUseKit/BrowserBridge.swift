@@ -1203,7 +1203,7 @@ extension ComputerUseToolDispatcher {
             if let raw = arguments["condition"] {
                 guard label != nil, wantedText == nil, urlPart == nil,
                       let name = raw as? String, let parsed = BrowserPage.ControlCondition(rawValue: name) else {
-                    throw ComputerUseError.invalidArguments("browser wait_for condition needs a label and one of visible, enabled, checked, unchecked")
+                    throw ComputerUseError.invalidArguments("browser wait_for condition needs a label and one of visible, enabled, checked, unchecked, exists")
                 }
                 condition = parsed
             } else {
@@ -1211,7 +1211,9 @@ extension ComputerUseToolDispatcher {
             }
             let seconds = Swift.min(30, Swift.max(1, Self.browserTabID(arguments["timeout"]) ?? 10))
             let what = urlPart.map { "URL containing \"\($0)\"" } ?? "\"\(wantedText ?? label ?? "")\""
-            let expected = condition.map { "\(what) is \($0.rawValue)" } ?? what
+            // A bare label waits for a visible control (ACT-04), and the timeout message says so.
+            let effective = condition ?? (wantedText == nil && urlPart == nil ? BrowserPage.ControlCondition.visible : nil)
+            let expected = effective.map { "\(what) is \($0.rawValue)" } ?? what
             let generation = bridge.referenceGeneration
             let before = Self.bindsBrowserWaitEvidence && wantedText != nil ? try? page.documentIdentity() : nil
             guard page.waitFor(text: wantedText, label: wantedText == nil ? label : nil,
