@@ -484,7 +484,8 @@ final class BrowserBridge: @unchecked Sendable {
                 // opened, but Chrome remembers each session tab's origin. Only an agent-origin tab qualifies;
                 // a claimed user tab never does.
                 try startIfNeeded()
-                let listed = try? requestTool("tabs", arguments: [:], timeout: max(0.5, min(3, BrowserCallBudget.remaining() - 1)))
+                // A freshly started helper authenticates first, so allow the same time as any tab listing.
+                let listed = try? requestTool("tabs", arguments: [:], timeout: min(10, max(1, BrowserCallBudget.remaining() - 3)))
                 guard let listed, !listed.isError, BrowserReply.agentOriginTabIDs(in: listed.text).contains(id) else {
                     throw ComputerUseError.invalidArguments("browser close_tab requires a tab opened by this browser connection")
                 }
