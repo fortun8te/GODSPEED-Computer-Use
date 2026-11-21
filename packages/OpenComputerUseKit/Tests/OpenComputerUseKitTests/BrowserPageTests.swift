@@ -825,6 +825,53 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNil(bridge.currentTab)
     }
 
+    /// A restarted helper has forgotten its opened tabs; Chrome's per-tab origin restores ownership.
+    private func closeAfterRestart(origin: String) throws -> (error: Error?, log: String) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("obu")
+        let script = #"""
+        #!/bin/sh
+        log="$(dirname "$0")/calls.log"
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+        IFS= read -r notification
+        IFS= read -r request
+        case "$request" in *'"name":"tabs"'*) echo tabs >> "$log";; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"result\":[{\"id\":12,\"origin\":\"ORIGIN\"}]}"}]}}'
+        IFS= read -r request
+        case "$request" in *Page.close*) echo close >> "$log";; *) exit 1 ;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{}"}]}}'
+        IFS= read -r request
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"result\":[]}"}]}}'
+        """#.replacingOccurrences(of: "ORIGIN", with: origin)
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let bridge = BrowserBridge(sessionID: "close-restart-test", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        var failure: Error?
+        do { try bridge.closeOpenedTab(12) } catch { failure = error }
+        let log = (try? String(contentsOf: directory.appendingPathComponent("calls.log"), encoding: .utf8)) ?? ""
+        return (failure, log)
+    }
+
+    func testCloseAfterHelperRestartUsesChromeAgentOrigin() throws {
+        let outcome = try closeAfterRestart(origin: "agent")
+        XCTAssertNil(outcome.error)
+        XCTAssertEqual(outcome.log, "tabs\nclose\n")
+    }
+
+    func testCloseAfterHelperRestartNeverClosesAClaimedUserTab() throws {
+        let outcome = try closeAfterRestart(origin: "user")
+        guard case .invalidArguments? = outcome.error as? ComputerUseError else {
+            return XCTFail("expected a refusal, got \(String(describing: outcome.error))")
+        }
+        XCTAssertEqual(outcome.log, "tabs\n")
+    }
+
     func testPeekWorkersApplyRequestValidationBeforeLaunchingTheirHelpers() throws {
         let environment = [
             "OPEN_COMPUTER_USE_BROWSER": "1",

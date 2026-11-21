@@ -479,8 +479,16 @@ final class BrowserBridge: @unchecked Sendable {
 
     func closeOpenedTab(_ id: Int) throws {
         try withToolConnection {
-            guard process?.isRunning == true, openedTabs.contains(id) else {
-                throw ComputerUseError.invalidArguments("browser close_tab requires a tab opened by this browser connection")
+            if process?.isRunning != true || !openedTabs.contains(id) {
+                // A helper restart (idle stop, lost reply, grant renewal) forgets which tabs this session
+                // opened, but Chrome remembers each session tab's origin. Only an agent-origin tab qualifies;
+                // a claimed user tab never does.
+                try startIfNeeded()
+                let listed = try? requestTool("tabs", arguments: [:], timeout: max(0.5, min(3, BrowserCallBudget.remaining() - 1)))
+                guard let listed, !listed.isError, BrowserReply.agentOriginTabIDs(in: listed.text).contains(id) else {
+                    throw ComputerUseError.invalidArguments("browser close_tab requires a tab opened by this browser connection")
+                }
+                openedTabs.insert(id)
             }
             // The regular OBU MCP exposes scoped CDP. Its IAB close_tab uses this same Chrome operation.
             // Send it once without the BrowserPage CDP recovery path, which can dismiss page prompts.
@@ -1252,7 +1260,7 @@ extension ComputerUseToolDispatcher {
 
         case "open", "new_tab", "open_tab":
             let url = try Self.navigationURL(arguments["url"])
-            let opened = try bridge.callTool("open_tab", arguments: url.map { ["initial_url": $0] } ?? [:], timeout: 10)
+            let opened = try bridge.callTool("open_tab", arguments: url.map { ["initial_url": $0] } ?? [:], timeout: 20)
             guard !opened.isError else { return finish([opened]) }
             guard let newID = BrowserReply.createdTabID(in: opened.text) else {
                 throw ComputerUseError.stateUnavailable("browser: open may have created a tab, but returned no tab ID. List tabs before retrying.")
