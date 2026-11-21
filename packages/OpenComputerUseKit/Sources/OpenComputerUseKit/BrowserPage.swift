@@ -2980,6 +2980,13 @@ enum BrowserReply {
         return ids.count == tabs.count ? ids : nil
     }
 
+    /// Session tabs that Chrome records as opened by the agent (not claimed from the user).
+    static func agentOriginTabIDs(in text: String) -> Set<Int> {
+        guard let envelope = json(text) as? [String: Any], envelope["error"] == nil,
+              let tabs = envelope["result"] as? [[String: Any]] else { return [] }
+        return Set(tabs.compactMap { $0["origin"] as? String == "agent" ? $0["id"] as? Int : nil })
+    }
+
     static func completedTab(in text: String, id: Int, expectedURL: String) -> Bool {
         guard let envelope = json(text) as? [String: Any], envelope["error"] == nil,
               let tabs = envelope["result"] as? [[String: Any]],
