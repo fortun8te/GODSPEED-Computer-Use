@@ -386,7 +386,10 @@ See the [macOS capability audit](macos-capabilities.md) for the boundary between
 
 The public Godspeed package requires a signed-in, unlocked desktop for app controls, browser tools and screenshots. Its MCP connection can still answer `ping` and `tools/list` while the Mac is awake and the agent is running. For jobs that can run outside the desktop, use the app's supported API or command-line tools. After an interrupted desktop batch, unlock normally, read the current app state and resume from the last confirmed result.
 
-The local `OpenComputerUse locked-use status --json` command reports `not-packaged` on this build. Apple Screen Sharing provides authenticated remote desktop access when it is enabled in System Settings. [Apple Screen Sharing guide](https://support.apple.com/en-sg/guide/mac-help/mh14066/mac)
+Run `OpenComputerUse locked-use status --json` to check the installed build. The public package reports `not-packaged`.
+
+If the physical Mac needs to stay locked during GUI jobs, an Apple Silicon macOS guest is an option to test. Install Godspeed in the guest, grant its normal permissions there, and run the MCP client or its stdio launcher in the guest. Keep the guest desktop unlocked and the host awake for the job. Guest permissions, performance, and operation during host lock need a live check before relying on this setup. [Apple's macOS virtualization guide](https://developer.apple.com/documentation/virtualization/running-macos-in-a-virtual-machine-on-apple-silicon)
+
 
 ### Browser feedback and parallel jobs
 
