@@ -24,7 +24,10 @@ COMMON = {
     "suite_revision", "scenario", "model", "harness", "host", "config",
 }
 DRIVER = {"name", "version", "config"}
-METRICS = {"duration_ms", "agent_calls", "input_tokens", "output_tokens"}
+CORE_METRICS = {"duration_ms", "agent_calls", "input_tokens", "output_tokens"}
+OPTIONAL_METRICS = {"cached_input_tokens", "cache_write_input_tokens", "reasoning_output_tokens",
+                    "uncached_input_tokens"}
+METRICS = CORE_METRICS | OPTIONAL_METRICS
 ROW_FIELDS = {
     "schema", "suite", "task", "seed", "mode", "identity", "driver", "status",
     "checker_pass", "gui_only", "undisturbed", "metrics",
@@ -112,10 +115,20 @@ def validate_row(row, suite):
     validate_labels(row["identity"], COMMON, "identity")
     validate_labels(row["driver"], DRIVER, "driver")
     require(row["status"] in ("scored", "harness_error"), "invalid status")
-    keys(row["metrics"], METRICS, "metrics")
-    for metric, value in row["metrics"].items():
+    metrics = row["metrics"]
+    require(isinstance(metrics, dict) and CORE_METRICS <= metrics.keys() <= METRICS, "invalid metrics fields")
+    for metric, value in metrics.items():
         require(value is None or (type(value) is int and value >= 0),
                 f"{metric} must be null or a nonnegative integer")
+    total_input, cached = metrics["input_tokens"], metrics.get("cached_input_tokens")
+    if total_input is not None and cached is not None:
+        require(cached <= total_input, "cached input exceeds total input")
+        fresh = total_input - cached
+        require(metrics.get("uncached_input_tokens") in (None, fresh), "uncached input does not match total minus cached")
+        metrics["uncached_input_tokens"] = fresh
+    reasoning = metrics.get("reasoning_output_tokens")
+    if reasoning is not None and metrics["output_tokens"] is not None:
+        require(reasoning <= metrics["output_tokens"], "reasoning exceeds total output")
     if row["status"] == "scored":
         require(type(row["checker_pass"]) is bool and type(row["gui_only"]) is bool,
                 "scored trials need explicit checker and GUI-only outcomes")
@@ -201,7 +214,7 @@ def summarize(mode, schedule, baseline, candidate):
                   / (2 ** discordant))
     metric_deltas = {}
     for metric in sorted(METRICS):
-        pairs = [(a["metrics"][metric], b["metrics"][metric]) for a, b in zip(old, new)]
+        pairs = [(a["metrics"].get(metric), b["metrics"].get(metric)) for a, b in zip(old, new)]
         deltas = [b - a for a, b in pairs if a is not None and b is not None]
         metric_deltas[metric] = {
             "median_candidate_minus_baseline": median(deltas) if len(deltas) == len(keys) else None,

@@ -3,6 +3,7 @@ import Foundation
 /// Errors from restoring saved bandit state.
 public enum RouteBanditError: Error, Equatable {
     case unsupportedVersion(Int)
+    case invalidSnapshot
 }
 
 /// Learns which already-allowed delivery route works best for each app and action kind.
@@ -153,6 +154,19 @@ public final class RouteBandit: @unchecked Sendable {
     public func restore(_ data: Data) throws {
         let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
         guard snapshot.version == 1 else { throw RouteBanditError.unsupportedVersion(snapshot.version) }
+        let maxCount = Int.max / 4
+        guard snapshot.apps.values.allSatisfy({ actions in
+            actions.values.allSatisfy { key in
+                (0...maxCount).contains(key.choices) && (0...key.choices).contains(key.explorations)
+                    && key.arms.values.allSatisfy { arm in
+                        (0...maxCount).contains(arm.successes) && (0...maxCount).contains(arm.failures)
+                            && (0...arm.failures).contains(arm.streak)
+                            && (0...(arm.successes + arm.failures)).contains(arm.latencyCount)
+                            && arm.latencySum.isFinite && arm.latencySum >= 0
+                            && arm.benchedUntil.isFinite
+                    }
+            }
+        }) else { throw RouteBanditError.invalidSnapshot }
         lock.lock()
         defer { lock.unlock() }
         apps = snapshot.apps
@@ -319,6 +333,19 @@ public final class ParameterTuner: @unchecked Sendable {
     public func restore(_ data: Data) throws {
         let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
         guard snapshot.version == 1 else { throw RouteBanditError.unsupportedVersion(snapshot.version) }
+        let expected = makeState()
+        let n = expected.candidates.count
+        guard snapshot.apps.values.allSatisfy({ state in
+            state.candidates == expected.candidates && state.defaultIndex == expected.defaultIndex
+                && state.alive.count == n && state.alive.contains(true)
+                && state.trials.count == n && state.successes.count == n && state.latencySum.count == n
+                && state.round >= 0 && state.round < n
+                && state.trials.indices.allSatisfy { index in
+                    (0..<Int.max).contains(state.trials[index])
+                        && (0...state.trials[index]).contains(state.successes[index])
+                        && state.latencySum[index].isFinite && state.latencySum[index] >= 0
+                }
+        }) else { throw RouteBanditError.invalidSnapshot }
         lock.lock()
         defer { lock.unlock() }
         apps = snapshot.apps

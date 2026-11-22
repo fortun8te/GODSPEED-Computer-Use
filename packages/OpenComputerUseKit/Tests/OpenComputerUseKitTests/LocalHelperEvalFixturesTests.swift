@@ -73,28 +73,33 @@ final class LocalHelperEvalFixturesTests: XCTestCase {
                     "legacy": request(screen: baseline), "focused": request(screen: focused)]
         }
 
-        let visuals = try JSONDecoder().decode([Visual].self, from: Data(contentsOf: directory.appendingPathComponent("visual.json")))
-        let screenshots: [[String: Any]] = try visuals.map { row in
-            let bytes = try Data(contentsOf: directory.appendingPathComponent(row.image))
-            let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil))
-            let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
-            let crop = try XCTUnwrap(LocalWindowImage.downscaled(image))
-            let jpeg = try XCTUnwrap(LocalWindowImage.jpeg(crop))
-            let started = ProcessInfo.processInfo.systemUptime
-            var ambiguous = false
-            let candidate = VisionFallback.candidate(scan: { accurate in
-                let scan = LocalOCR.scan(crop, label: row.query, level: accurate ? .accurate : .fast)
-                if case .ambiguous = scan { ambiguous = true }
-                return scan
-            }, locate: { nil })
-            let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
-            var values: [String: Any] = [
-                "id": row.id, "legacy": bytes.base64EncodedString(), "crop": jpeg.base64EncodedString(),
-                "query": row.query, "ocr_ms": elapsed, "ambiguous": ambiguous,
-            ]
-            values["box"] = row.box
-            values["ocr_point"] = candidate.map { [$0.fraction.x, $0.fraction.y] }
-            return values
+        let screenshots: [[String: Any]]
+        if ProcessInfo.processInfo.environment["GODSPEED_LOCAL_EVAL_INCLUDE_SCREENSHOTS"] == "0" {
+            screenshots = []
+        } else {
+            let visuals = try JSONDecoder().decode([Visual].self, from: Data(contentsOf: directory.appendingPathComponent("visual.json")))
+            screenshots = try visuals.map { row in
+                let bytes = try Data(contentsOf: directory.appendingPathComponent(row.image))
+                let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil))
+                let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+                let crop = try XCTUnwrap(LocalWindowImage.downscaled(image))
+                let jpeg = try XCTUnwrap(LocalWindowImage.jpeg(crop))
+                let started = ProcessInfo.processInfo.systemUptime
+                var ambiguous = false
+                let candidate = VisionFallback.candidate(scan: { accurate in
+                    let scan = LocalOCR.scan(crop, label: row.query, level: accurate ? .accurate : .fast)
+                    if case .ambiguous = scan { ambiguous = true }
+                    return scan
+                }, locate: { nil })
+                let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
+                var values: [String: Any] = [
+                    "id": row.id, "legacy": bytes.base64EncodedString(), "crop": jpeg.base64EncodedString(),
+                    "query": row.query, "ocr_ms": elapsed, "ambiguous": ambiguous,
+                ]
+                values["box"] = row.box
+                values["ocr_point"] = candidate.map { [$0.fraction.x, $0.fraction.y] }
+                return values
+            }
         }
 
         let data = try JSONSerialization.data(withJSONObject: ["decisions": decisions, "screenshots": screenshots])

@@ -41,6 +41,29 @@ enum DoneCheck {
             return needsTemporalScreen || needsTemporalURL
         }
 
+        /// Capture a pre-action observation for presence checks too, so a value that
+        /// becomes true during the batch can be reported as verified rather than weak.
+        var needsVerificationBaseline: Bool {
+            switch self {
+            case .fileExists, .text, .field, .gone, .urlContains: return true
+            default: return requiresBaseline
+            }
+        }
+
+        var needsVerificationScreen: Bool {
+            switch self {
+            case .text, .field, .gone, .appeared, .disappeared, .fieldChanged: return true
+            default: return false
+            }
+        }
+
+        var needsVerificationURL: Bool {
+            switch self {
+            case .urlContains, .urlChanged: return true
+            default: return false
+            }
+        }
+
         var arguments: [String: String] {
             switch self {
             case .fileExists(let path): return ["file_exists": path]
@@ -283,6 +306,9 @@ enum DoneCheck {
 
     /// The temporal form requires one readable exact field on each side.
     static func exactFieldValue(_ screen: String, label: String) -> String? {
+        if HandoffTool.sameLabel(label, "Edit field"), let display = BatchTool.calculatorDisplay(screen) {
+            return display.input
+        }
         let matches = HandoffTool.parseControls(screen).filter {
             HandoffTool.fieldRoles.contains($0.role) && HandoffTool.sameLabel($0.label, label)
         }
@@ -294,6 +320,9 @@ enum DoneCheck {
     static func fieldEquals(_ text: String, label: String, value: String) -> Bool {
         let needle = label.trimmingCharacters(in: .whitespaces).lowercased()
         guard !needle.isEmpty else { return false }
+        if needle == "edit field", let display = BatchTool.calculatorDisplay(text) {
+            return display.input == value.trimmingCharacters(in: .whitespaces)
+        }
         let paddedNeedle = " " + needle + " "
         let expected = value.trimmingCharacters(in: .whitespaces).lowercased()
         for line in text.split(separator: "\n") {
@@ -386,7 +415,9 @@ enum DoneCheck {
             let groups = intPart.split(omittingEmptySubsequences: false, whereSeparator: { group.contains($0) })
             guard !groups.isEmpty, groups.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else { continue }
             if groups.count > 1 {
-                guard groups[0].count <= 3, groups.dropFirst().allSatisfy({ $0.count == 3 }) else { continue }
+                // A localized thousands group has no leading zero: "0.125" is a decimal.
+                guard groups[0].count <= 3, groups[0].first != "0",
+                      groups.dropFirst().allSatisfy({ $0.count == 3 }) else { continue }
             }
             // Leading zeros stay significant: "05" is not "5".
             let digits = groups.joined()
@@ -405,7 +436,7 @@ enum DoneCheck {
         }
         let pattern = (first.isNumber ? #"(?<![0-9])"# : "")
             + NSRegularExpression.escapedPattern(for: needle)
-            + (last.isNumber ? #"(?![0-9])"# : "")
+            + (last.isNumber ? #"(?![0-9]|[.,'\x{00A0}\x{202F}][0-9])"# : "")
         return haystack.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
     }
 }

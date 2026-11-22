@@ -13,6 +13,10 @@ enum LeanOutput {
         case compactBatch
     }
 
+    static var usesCompactReads: Bool {
+        StrictBackground.enabledFlag(GodspeedSettings.environment["OPEN_COMPUTER_USE_COMPACT_READS"])
+    }
+
     static var condenses: Bool { flag("OPEN_COMPUTER_USE_CONDENSE") }
     static var diffsBatchReads: Bool { flag("OPEN_COMPUTER_USE_BATCH_DIFF") }
     /// `OPEN_COMPUTER_USE_SEMANTIC_REPLIES=0` sends change-only replies exactly as before (no `Changes:` line).
@@ -54,7 +58,7 @@ enum LeanOutput {
     /// `observation` with its state text replaced by the change summary against `previous`, when the
     /// change is small enough; otherwise unchanged.
     static func diffed(_ observation: ToolCallResult, previous: String?) -> ToolCallResult {
-        guard diffsBatchReads, let previous, !previous.isEmpty else { return observation }
+        guard diffsBatchReads, let previous, let windowID = windowIDLine(in: previous) else { return observation }
         // Element numbers are stable across reads (ElementNumbering), so an unchanged line keeps its number
         // and a change summary is always safe to apply. Numbers are part of a line's identity in the diff.
         var replaced = false
@@ -62,7 +66,7 @@ enum LeanOutput {
             guard !replaced, item.dictionary["type"] as? String == "text",
                   let text = item.dictionary["text"] as? String, isStateText(text),
                   previous.split(separator: "\n").prefix(2).elementsEqual(text.split(separator: "\n").prefix(2)),
-                  windowIDLine(in: previous) == windowIDLine(in: text),
+                  windowIDLine(in: text) == windowID,
                   let summary = AXStateDiff.diff(previous: previous, current: text, matchIndexes: ElementNumbering.isEnabled)
             else { return item }
             // Keep the header line so the model still sees which app and window this is.
@@ -136,21 +140,17 @@ enum LeanOutput {
         allowsDiff: Bool, compactVerified: Bool
     ) -> ToolCallResult {
         guard !observation.isError, let current = stateText(of: observation) else { return observation }
-        if allowsDiff {
-            let delta = diffed(observation, previous: memory.shownText(app: app))
-            if stateText(of: delta) != current {
-                // The client has the old baseline and received the changes.
-                memory.recordShown(app: app, text: current)
-                return delta
+        if compactVerified {
+            let header = headerOnly(observation)
+            if stateText(of: header) != current {
+                // A verified goal can return a receipt without an AX delta. The caller did not see
+                // the resulting tree, so a future delta cannot use it as a baseline.
+                memory.clearShown(app: app)
+                return header
             }
         }
-        let shown = compactVerified ? headerOnly(observation) : observation
-        if stateText(of: shown) == current {
-            memory.recordShown(app: app, text: current)
-        } else {
-            // An omitted tree cannot be the baseline for a later “no changes” or diff reply.
-            memory.clearShown(app: app)
-        }
+        let shown = allowsDiff ? diffed(observation, previous: memory.shownText(app: app)) : observation
+        memory.recordShown(app: app, text: current)
         return shown
     }
 

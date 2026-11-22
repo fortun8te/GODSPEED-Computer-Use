@@ -50,6 +50,18 @@ final class DoneCheckTests: XCTestCase {
         XCTAssertEqual(check(before, wrongTab), .missing(unmet: ["\"Message sent\" appeared"]))
     }
 
+    func testRegionalNumberDoneCheckCanProveItChangedDuringTheBatch() throws {
+        let checks = try DoneCheck.parse(["text": "Edit field 69104"])
+        XCTAssertTrue(checks.first?.needsVerificationBaseline == true)
+        let target = BatchCompletion.Target.native(pid: 12, launch: Date(), window: 6)
+        let before = BatchCompletion.Observation(target: target, screen: "Edit field 10", canProveAbsence: true)
+        let after = BatchCompletion.Observation(target: target, screen: "Edit field 69.104", canProveAbsence: true)
+        let baseline = BatchCompletion(conditions: checks, startedAt: Date(), before: before)
+        XCTAssertEqual(DoneCheck.check(checks, evidence: .init(screenText: after.screen, pageURL: { nil }),
+                                       baseline: baseline, after: after),
+                       .verified(met: ["\"Edit field 69104\" is on screen"]))
+    }
+
     func testTemporalFieldAndURLRequireExactNewValues() throws {
         let field = try XCTUnwrap(DoneCheck.parse(["field": "Name", "equals": "Ada", "since_start": "changed"]).first)
         XCTAssertEqual(try DoneCheck.parse(field.arguments), [field])
@@ -189,6 +201,43 @@ final class DoneCheckTests: XCTestCase {
         XCTAssertFalse(DoneCheck.containsLabeledNumber("Edit field 16,41", "Edit field 1641"))
     }
 
+    func testFileChangedDetectsLargeReplacementWithPreservedMetadata() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let original = folder.appendingPathComponent("original")
+        let replacement = folder.appendingPathComponent("replacement")
+        let modified = Date(timeIntervalSince1970: 1_700_000_000)
+        for path in [original, replacement] {
+            try Data().write(to: path)
+            let handle = try FileHandle(forWritingTo: path)
+            try handle.truncate(atOffset: 17 * 1024 * 1024)
+            try handle.close()
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: path.path)
+        }
+        let condition = DoneCheck.Condition.fileChanged(original.path)
+        let baseline = BatchCompletion(conditions: [condition], startedAt: Date())
+        XCTAssertFalse(baseline.meets(condition, after: nil))
+        XCTAssertEqual(rename(replacement.path, original.path), 0)
+        XCTAssertTrue(baseline.meets(condition, after: nil))
+    }
+
+    func testHandoffCanVerifyACalculatorDisplayChange() {
+        let condition = DoneCheck.Condition.field(label: "Edit field", equals: "8")
+        let prefix = "App=com.apple.calculator (pid 1)\n5 text Description: Edit field "
+        XCTAssertTrue(HandoffTool.becameTrue([condition], before: prefix + "48 ÷ 6", after: prefix + "8"))
+        XCTAssertFalse(HandoffTool.becameTrue([condition], before: prefix + "8", after: prefix + "8"))
+        XCTAssertFalse(HandoffTool.becameTrue([condition], before: prefix + "0", after: prefix + "80"))
+    }
+
+    func testLabeledNumberDoesNotConfirmThePrefixOfADecimal() {
+        XCTAssertFalse(DoneCheck.textMatches("5 text Description: Edit field 12.50", "Edit field 12"))
+        XCTAssertFalse(DoneCheck.textMatches("Edit field 12,50", "Edit field 12"))
+        XCTAssertFalse(DoneCheck.textMatches("Edit field 12\u{202F}500", "Edit field 12"))
+        XCTAssertTrue(DoneCheck.textMatches("Edit field 12.50", "Edit field 12.5"))
+        XCTAssertTrue(DoneCheck.textMatches("Saved 12. Next item", "Saved 12"))
+    }
+
     func testNumberMatchesRegionalFormatting() {
         XCTAssertTrue(DoneCheck.containsNumber("Edit field 1.641", "1641"))
         XCTAssertTrue(DoneCheck.containsNumber("Edit field 1,641", "1641"))
@@ -197,6 +246,9 @@ final class DoneCheckTests: XCTestCase {
         XCTAssertTrue(DoneCheck.containsNumber("Edit field 1.234.567,5", "1234567.5"))
         XCTAssertTrue(DoneCheck.containsNumber("value −12", "-12"))
         XCTAssertFalse(DoneCheck.containsNumber("Edit field 16,41", "1641"))
+        XCTAssertFalse(DoneCheck.containsNumber("Edit field 0.125", "125"))
+        XCTAssertFalse(DoneCheck.textMatches("Edit field 0,125", "Edit field 125"))
+        XCTAssertTrue(DoneCheck.textMatches("Edit field 0,125", "Edit field 0.125"))
         XCTAssertFalse(DoneCheck.containsNumber("Edit field 16410", "1641"))
         XCTAssertFalse(DoneCheck.containsNumber("Edit field 1.6411", "1641"))
         XCTAssertFalse(DoneCheck.containsNumber("Edit field 1641", "1.641"))

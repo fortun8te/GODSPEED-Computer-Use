@@ -162,6 +162,22 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertFalse(controller.isBorrowed(pid: appA))
     }
 
+    func testClosingAnotherBorrowCannotRestoreARefusedTarget() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        activator.refuse = [appA]
+        let refused = controller.acquire(pid: appA)
+        XCTAssertFalse(refused.activated)
+        XCTAssertFalse(controller.isBorrowed(pid: appA))
+        activator.refuse = []
+        let open = controller.acquire(pid: appB)
+        XCTAssertTrue(open.activated)
+        controller.release(open)
+        controller.release(refused)
+        XCTAssertEqual(activator.activations, [appA, appB, user])
+        XCTAssertEqual(activator.front, user)
+    }
+
     func testReleaseDoesNotRestorePreviousAppWhileTheUserIsTyping() {
         let activator = FakeActivator(front: user, alive: [user, appA])
         let controller = FocusBorrowController(activator: activator)
@@ -194,7 +210,8 @@ final class FocusBorrowTests: XCTestCase {
     func testSessionHandsFocusBackAfterTwoApps() {
         let activator = FakeActivator(front: user, alive: [user, appA, appB])
         let controller = FocusBorrowController(activator: activator)
-        let session = FocusBorrowSession(controller: controller, enabled: true)
+        let session = FocusBorrowSession(controller: controller, enabled: true,
+                                         backgroundOnly: { false }, secondsSinceUserInput: { .infinity })
 
         XCTAssertTrue(session.ensure(pid: appA))
         XCTAssertTrue(session.ensure(pid: appA), "the same app again keeps its one lease")
@@ -206,6 +223,21 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertEqual(controller.openCount, 0)
         XCTAssertEqual(activator.front, user)
         XCTAssertEqual(activator.activations.last, user)
+    }
+
+    func testSessionStaysInBackgroundAfterReturningFocusForUserInput() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        var idle: TimeInterval = .infinity
+        let session = FocusBorrowSession(controller: controller, enabled: true,
+                                         backgroundOnly: { false }, secondsSinceUserInput: { idle })
+        XCTAssertTrue(session.ensure(pid: appA))
+        idle = -1
+        XCTAssertFalse(session.ensure(pid: appB))
+        XCTAssertEqual(activator.front, user)
+        idle = .infinity
+        XCTAssertFalse(session.ensure(pid: appB))
+        XCTAssertEqual(activator.activations, [appA, user])
     }
 
     func testDisabledSessionNeverTouchesFocus() {

@@ -31,6 +31,14 @@ final class HandoffToolTests: XCTestCase {
 
     // MARK: Parsing
 
+    func testRichTreeVisualRetryOnlyForUncertainScores() {
+        let ids = ["save", "close"]
+        XCTAssertFalse(HandoffTool.needsVisualTieBreak(["save": 0.95, "close": 0.02, "none": 0.03], optionIDs: ids))
+        XCTAssertTrue(HandoffTool.needsVisualTieBreak(["save": 0.47, "close": 0.46, "none": 0.07], optionIDs: ids))
+        XCTAssertTrue(HandoffTool.needsVisualTieBreak(["save": 0.11, "close": 0.09, "none": 0.80], optionIDs: ids))
+        XCTAssertFalse(HandoffTool.needsVisualTieBreak(["none": 1.0], optionIDs: ids))
+    }
+
     func testParsesControls() {
         let found = controls()
         XCTAssertEqual(found.map(\.index), [1, 2, 3, 4, 5, 6, 7])
@@ -168,11 +176,16 @@ final class HandoffToolTests: XCTestCase {
 
     func testEscalatesBelowProbabilityOrMargin() {
         let cands = fakeCandidates()
-        if case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.55, "none": 0.1]) { XCTFail("0.55 is under 0.6") }
+        if case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.55, "none": 0.1]) { XCTFail("0.55 is under 0.70") }
         if case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.65, cands[1].id: 0.5]) { XCTFail("margin 0.15") }
         if case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.7, "none": 0.6]) { XCTFail("none is close") }
         if case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.3, "none": 0.7]) { XCTFail("none wins") }
-        guard case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.8, cands[1].id: 0.6]) else { return XCTFail("margin 0.2 is enough") }
+        if case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.8, cands[1].id: 0.6]) {
+            XCTFail("margin 0.20 is below 0.35")
+        }
+        guard case .act = HandoffTool.decide(candidates: cands, probabilities: [cands[0].id: 0.75, "none": 0.25]) else {
+            return XCTFail("a high score and clear lead should act")
+        }
     }
 
     func testEscalatesWithoutRefereeOrCandidatesOrOnRisk() {
@@ -282,15 +295,50 @@ final class HandoffToolTests: XCTestCase {
         let app = FakeApp()
         let outcome = HandoffTool.run(request(), app.deps(choose: { options in
             // type first, then Save
-            let pickText = app.name.isEmpty ? "type" : "click \"Save\""
+            let pickText = app.name.isEmpty ? "fill" : "click \"Save\""
             return self.pick([pickText])(options)
         }))
         XCTAssertEqual(outcome.kind, .done)
-        XCTAssertEqual(app.acts, ["type \"Ann\" into \"Name\"", "click \"Save\""])
+        XCTAssertEqual(app.acts, ["fill \"Name\"", "click \"Save\""])
         XCTAssertEqual(outcome.steps.count, 2)
         XCTAssertEqual(app.chooseCalls, 2, "ambiguous steps have one local scoring request each")
-        XCTAssertTrue(outcome.reply().hasPrefix("Weak evidence:"))
-        XCTAssertTrue(outcome.reply().contains("Changes:"))
+        XCTAssertTrue(outcome.reply().hasPrefix("Done:"))
+        XCTAssertFalse(outcome.reply(compact: true).contains("Changes:"))
+    }
+
+    func testLearningLinksChooserToReadbackWithoutStoringScreenContentInOutcome() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = LearningLog(directory: directory, enabled: true, imagesEnabled: false)
+        let app = FakeApp()
+        let deps = app.deps { options in
+            let pickText = app.name.isEmpty ? "fill" : "click \"Save\""
+            let scores = self.pick([pickText])(options)!
+            Referee.recordDecision(kind: "choose", view: "fixture", options: options,
+                                   reply: ["probs": scores], latencyMs: 1, log: log)
+            return scores
+        }
+        XCTAssertEqual(HandoffTool.run(request(), deps, learning: log).kind, .done)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .first { $0.pathExtension == "jsonl" })
+        let rows = try String(contentsOf: file, encoding: .utf8).split(separator: "\n").map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
+        }
+        let choices = rows.filter { $0["kind"] as? String == "choose" }
+        let results = rows.filter { $0["kind"] as? String == "choice_outcome" }
+        XCTAssertEqual(choices.count, 2)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(results.compactMap { $0["readback"] as? String }, ["changed", "goal_verified"])
+        let ids = try choices.map { try XCTUnwrap($0["decision_id"] as? String) }
+        XCTAssertEqual(Set(ids).count, 2)
+        XCTAssertTrue(ids.allSatisfy { UUID(uuidString: $0) != nil })
+        for (choice, result) in zip(choices, results) {
+            XCTAssertEqual(choice["decision_id"] as? String, result["decision_id"] as? String)
+            XCTAssertEqual(choice["episode_id"] as? String, result["episode_id"] as? String)
+            XCTAssertNotNil(result["selected_option_id"])
+            XCTAssertNil(result["view"])
+            XCTAssertNil(result["after"])
+        }
     }
 
     func testFillsAnExplicitTwoFieldGoalWithoutCallingTheLocalChecker() {
@@ -306,6 +354,60 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(app.acts.count, 2)
         XCTAssertEqual(app.chooseCalls, 0)
         XCTAssertEqual(app.reads, 3)
+    }
+
+    func testGuardedLineEndingIsAddedOnlyWhenMissing() throws {
+        for (kind, ending) in [("lf", "\n"), ("crlf", "\r\n")] {
+            let request = try HandoffTool.parse([
+                "app": "TextEdit", "goal": "Edit the draft", "line_ending": kind,
+                "expected_values": ["Document": "Before" + ending],
+                "values": ["Document": "After"],
+                "done_when": ["field": "Document", "equals": "After" + ending],
+            ])
+            XCTAssertEqual(request.expectedValues["Document"], "Before" + ending)
+            XCTAssertEqual(request.values.first?.value, "After" + ending)
+            XCTAssertEqual(request.doneWhen, [.field(label: "Document", equals: "After" + ending)])
+        }
+    }
+
+    func testGuardedEditReturnsVerifiedReceiptAfterExactReadback() {
+        let app = FakeApp()
+        app.name = "Before"
+        let conditions: [DoneCheck.Condition] = [.field(label: "Name", equals: "After")]
+        let request = HandoffTool.Request(
+            app: "x", goal: "Update name", doneWhen: conditions, values: [("Name", "After")],
+            maxSteps: 5, timeBudget: 10, expectedValues: ["Name": "Before"]
+        )
+        var deps = app.deps(choose: { _ in nil })
+        deps.check = { HandoffTool.check(conditions, screen: $0) }
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .done)
+        XCTAssertEqual(outcome.deliveryState, .verified)
+        XCTAssertEqual(app.name, "After")
+        XCTAssertEqual(app.chooseCalls, 0)
+    }
+
+    func testGuardedEditsStopBeforeAnyWriteWhenOneFieldChanged() {
+        let app = FakeApp()
+        app.name = "Before"
+        app.email = "changed@example.test"
+        let conditions: [DoneCheck.Condition] = [
+            .field(label: "Name", equals: "After"),
+            .field(label: "Email", equals: "after@example.test"),
+        ]
+        let request = HandoffTool.Request(
+            app: "x", goal: "Update contact fields", doneWhen: conditions,
+            values: [("Name", "After"), ("Email", "after@example.test")],
+            maxSteps: 5, timeBudget: 10,
+            expectedValues: ["Name": "Before", "Email": "before@example.test"]
+        )
+        var deps = app.deps(choose: { _ in nil })
+        deps.check = { HandoffTool.check(conditions, screen: $0) }
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .escalate)
+        XCTAssertTrue(app.acts.isEmpty)
+        XCTAssertEqual(app.chooseCalls, 0)
+        XCTAssertEqual(app.name, "Before")
     }
 
     func testExactFieldCheckCannotBeSatisfiedByAnotherFieldOrDuplicate() {
@@ -352,25 +454,37 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(reads, 2)
     }
 
-    func testUnknownDeliveryReadsOnceAndNeverRepeats() {
+    func testUnknownDeliveryReadsOnceAndNeverRepeats() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let log = LearningLog(directory: folder, enabled: true, imagesEnabled: false)
         let app = FakeApp()
-        var deps = app.deps(choose: pick(["type"]))
+        var deps = app.deps(choose: pick(["fill"]))
         deps.act = { candidate, _ in
             app.acts.append(candidate.text)
             app.saved = true
             return HandoffTool.ActResult(ok: false, message: "transport interrupted")
         }
-        let outcome = HandoffTool.run(request(), deps)
+        let outcome = HandoffTool.run(request(), deps, learning: log)
         XCTAssertEqual(outcome.kind, .escalate)
         XCTAssertEqual(outcome.deliveryState, .outcomeUnknown)
         XCTAssertEqual(app.acts.count, 1)
         XCTAssertEqual(app.reads, 2)
         XCTAssertEqual(app.chooseCalls, 1)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .first { $0.pathExtension == "jsonl" })
+        let observation = try String(contentsOf: file, encoding: .utf8).split(separator: "\n")
+            .map { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+            .compactMap { $0 }
+            .filter { $0["kind"] as? String == "choice_outcome" }
+        XCTAssertEqual(observation.count, 1)
+        XCTAssertEqual(observation.first?["readback"] as? String, "changed")
+        XCTAssertEqual(observation.first?["delivery_state"] as? String, DeliveryState.outcomeUnknown.rawValue)
     }
 
     func testUncertainRecipeReadsBackWithoutTryingAnotherAction() {
         let app = FakeApp()
-        var deps = app.deps(choose: pick(["type"]))
+        var deps = app.deps(choose: pick(["fill"]))
         deps.replay = { _ in .uncertain }
         XCTAssertEqual(HandoffTool.run(request(), deps).kind, .escalate)
         XCTAssertEqual(app.reads, 2)
@@ -445,33 +559,33 @@ final class HandoffToolTests: XCTestCase {
 
     func testStuckAfterTwoNoChangeSteps() {
         let app = FakeApp()
-        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["type", "Save", "scroll"]), changes: false))
+        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["fill", "Save", "scroll"]), changes: false))
         XCTAssertEqual(outcome.kind, .stuck)
         XCTAssertLessThanOrEqual(app.acts.count, 3)
     }
 
     func testStuckFromCheckerModel() {
         let app = FakeApp()
-        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["type", "Next"]), stuck: true))
+        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["fill", "Next"]), stuck: true))
         XCTAssertEqual(outcome.kind, .stuck)
         XCTAssertEqual(app.acts.count, 2, "the checker is asked from the second step")
     }
 
     func testStopsOnTimeBudgetAndStepCap() {
         let slow = FakeApp()
-        let timed = HandoffTool.run(request(budget: 5), slow.deps(choose: pick(["type", "scroll"]), stepSeconds: 10))
+        let timed = HandoffTool.run(request(budget: 5), slow.deps(choose: pick(["fill", "scroll"]), stepSeconds: 10))
         XCTAssertEqual(timed.kind, .budget)
         XCTAssertEqual(slow.acts.count, 1)
         XCTAssertEqual(slow.reads, 1, "the initial state is the only read when an action uses the budget")
         let capped = FakeApp()
-        let steps = HandoffTool.run(request(maxSteps: 1), capped.deps(choose: pick(["type"])))
+        let steps = HandoffTool.run(request(maxSteps: 1), capped.deps(choose: pick(["fill"])))
         XCTAssertEqual(steps.kind, .budget)
         XCTAssertEqual(capped.acts.count, 1)
     }
 
     func testSpentReplayBudgetDoesNotStartNewReadOrAction() {
         let app = FakeApp()
-        var deps = app.deps(choose: pick(["type"]))
+        var deps = app.deps(choose: pick(["fill"]))
         deps.replay = { _ in app.clock += 5; return .incomplete }
         let outcome = HandoffTool.run(request(budget: 5), deps)
         XCTAssertEqual(outcome.kind, .budget)
@@ -485,7 +599,7 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(outcome.kind, .done)
         XCTAssertEqual(app.chooseCalls, 0)
         let failed = FakeApp()
-        let continued = HandoffTool.run(request(), failed.deps(choose: pick(["type", "Save"]), replay: false))
+        let continued = HandoffTool.run(request(), failed.deps(choose: pick(["fill", "Save"]), replay: false))
         XCTAssertEqual(continued.kind, .done, "a recipe that did not finish falls back to the loop")
     }
 

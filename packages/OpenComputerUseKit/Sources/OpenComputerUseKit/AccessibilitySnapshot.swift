@@ -53,8 +53,12 @@ enum SnapshotMode {
 /// OPEN_COMPUTER_USE_BACKGROUND_ONLY=1: the user keeps working on this Mac. Nothing OCU does may
 /// bring an app or window in front of their work or take focus: no unhide, activate or raise to
 /// read or click, no foreground launch, no Raise action, no physical-pointer fallback.
+enum BackgroundContinuation {
+    @TaskLocal static var required = false
+}
+
 func backgroundOnlyMode(environment: [String: String] = GodspeedSettings.environment) -> Bool {
-    StrictBackground.enabled(environment: environment)
+    BackgroundContinuation.required || StrictBackground.enabled(environment: environment)
         || StrictBackground.enabledFlag(environment["OPEN_COMPUTER_USE_BACKGROUND_ONLY"])
 }
 
@@ -2715,7 +2719,7 @@ extension SnapshotBuilder {
         let scan = batchScan(element)
         guard scan.role == record.role,
               displayIdentifier(scan.identifier) == record.identifier,
-              targetedRecordMatches(criteria, role: scan.role, title: scan.title, description: scan.description, value: scan.value),
+              targetedRecordMatches(criteria, role: scan.role, title: scan.title, description: scan.description, value: scan.value, identifier: scan.identifier),
               let frame = scan.globalFrame, !frame.isEmpty, frame.intersects(bounds) else {
             throw ComputerUseError.stateUnavailable("Query target changed or its current position is unavailable; run query again")
         }
@@ -2816,7 +2820,7 @@ extension SnapshotBuilder {
             if node == root { clip = scan.globalFrame }
             let visible = scan.globalFrame.map { frame in frame.isEmpty || clip.map { frame.intersects($0) } ?? true } ?? true
             if visible, criteria.text != nil, [scan.title, scan.description, scan.value].contains(where: { ($0?.count ?? 0) > 1000 }) { textTruncated = true }
-            let matches = visible && targetedRecordMatches(criteria, role: scan.role, title: scan.title, description: scan.description, value: scan.value)
+            let matches = visible && targetedRecordMatches(criteria, role: scan.role, title: scan.title, description: scan.description, value: scan.value, identifier: scan.identifier)
             if matches { records[node] = makeRecord(node.element, scan: scan, windowBounds: context.windowBounds) }
             return (matches, visible)
         }, children: { node, remaining in
@@ -2945,13 +2949,14 @@ func targetedRecordMatches(
     role: String?,
     title: String?,
     description: String?,
-    value: String?
+    value: String?,
+    identifier: String? = nil
 ) -> Bool {
     if let wantedRole = criteria.role, !targetedRoleEquals(role, wantedRole) {
         return false
     }
     if let wantedText = criteria.text, !wantedText.isEmpty {
-        let fields = [title, description, value]
+        let fields = [title, description, value, identifier]
         let hit = fields.contains { field in
             guard let field else { return false }
             if criteria.exact {

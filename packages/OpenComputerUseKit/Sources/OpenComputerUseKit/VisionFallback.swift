@@ -4,6 +4,8 @@ import ImageIO
 
 /// Optional grounding for an unambiguous labelled miss. The returned point is a suggestion.
 enum VisionFallback {
+    // Keep OCR and the targeted second look at their original resolution.
+    static let overviewMaxSide = 640
     /// Read per request (L6): the settings file and each caller's options can change it.
     static var baseURL: URL? { localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]) }
 
@@ -99,16 +101,44 @@ enum VisionFallback {
         return CFEqual(left, right)
     }
 
+    // A client timeout cannot interrupt MLX inference. Avoid piling requests onto
+    // the same helper while it may still be working on a previous image.
+    private static let locateLock = NSLock()
+    nonisolated(unsafe) private static var locateInFlight = Set<URL>()
+    nonisolated(unsafe) private static var retryAfter: [URL: TimeInterval] = [:]
+
+    private static func beginLocate(_ url: URL) -> Bool {
+        locateLock.lock()
+        defer { locateLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        retryAfter = retryAfter.filter { $0.value > now }
+        guard retryAfter[url] == nil else { return false }
+        return locateInFlight.insert(url).inserted
+    }
+
+    private static func endLocate(_ url: URL, answered: Bool) {
+        locateLock.lock()
+        defer { locateLock.unlock() }
+        locateInFlight.remove(url)
+        if !answered { retryAfter[url] = ProcessInfo.processInfo.systemUptime + 15 }
+    }
+
     /// Where `query` is in the image, as fractions of its width and height, or nil.
     static func locate(imageBase64: String, query: String, remaining: TimeInterval? = nil) -> CGPoint? {
         guard let baseURL else { return nil }
         let wait = min(timeout, remaining ?? timeout)
-        guard wait > 0 else { return nil }
+        guard wait > 0, beginLocate(baseURL) else { return nil }
+        var answered = false
+        defer { endLocate(baseURL, answered: answered) }
         let body: [String: Any] = ["image_base64": imageBase64, "query": query]
-        guard let object = HelperHTTP.postJSON(baseURL.appendingPathComponent("locate"), body: body, timeout: wait) else {
+        let started = ProcessInfo.processInfo.systemUptime
+        let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("locate"), body: body, timeout: wait)
+        ToolTelemetry.current?.recordHelper("locate", startedAt: started, image: true, reply: reply)
+        guard let object = reply else {
             if wait == timeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
         }
+        answered = true
         return location(in: object)
     }
 

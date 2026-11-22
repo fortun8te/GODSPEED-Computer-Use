@@ -34,7 +34,18 @@ enum RefereeView {
     static func build(state: String, goal: String, doneWhen: String = "", optionIndexes: [Int] = [],
                       limit: Int = 1_200) -> String {
         guard limit > 0 else { return "" }
+        return build(rows: parse(state), goal: goal, doneWhen: doneWhen, optionIndexes: optionIndexes, limit: limit)
+    }
+
+    static func prepare(state: String, goal: String, doneWhen: String, optionIndexes: [Int] = [],
+                        limit: Int) -> (text: String, thin: Bool) {
         let rows = parse(state)
+        return (build(rows: rows, goal: goal, doneWhen: doneWhen, optionIndexes: optionIndexes, limit: limit),
+                isThin(rows))
+    }
+
+    private static func build(rows: [Row], goal: String, doneWhen: String, optionIndexes: [Int], limit: Int) -> String {
+        guard limit > 0 else { return "" }
         let byIndex = Dictionary(rows.indices.compactMap { position in
             rows[position].index.map { ($0, position) }
         }, uniquingKeysWith: { first, _ in first })
@@ -107,8 +118,9 @@ enum RefereeView {
         return (lines + [RefereeSummary.clip(note, to: noteRoom)]).joined(separator: "\n")
     }
 
-    static func isThin(_ state: String) -> Bool {
-        let rows = parse(state)
+    static func isThin(_ state: String) -> Bool { isThin(parse(state)) }
+
+    private static func isThin(_ rows: [Row]) -> Bool {
         let actionable = rows.filter { controls.contains($0.role) }
         let labelled = actionable.filter { !$0.label.isEmpty }.count
         let detailedRegions = Set(rows.compactMap { row in

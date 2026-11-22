@@ -68,12 +68,14 @@ enum NavigationStage: Equatable {
 /// What an action did to the page, in the one short line the model reads after it.
 enum BrowserChange: Equatable, Sendable {
     case navigated(String)
+    case navigationUnconfirmed
     case changed
     case none
 
     var line: String {
         switch self {
         case .navigated(let url): return "navigated to \(url)"
+        case .navigationUnconfirmed: return "navigation started but the destination was not confirmed"
         case .changed: return "page changed"
         case .none: return "no change"
         }
@@ -2220,9 +2222,10 @@ final class BrowserPage {
         guard let value = last else { return .none }
         if (value["nav"] as? Bool) == true {
             // A page unload started but did not finish within the cap: wait for the new page.
-            waitLoad(changedFrom: value["seenHref"] as? String, timeout: 20)
-            prime()
-            if let here = try? location() { return .navigated(here.href) }
+            let loaded = waitLoad(changedFrom: value["seenHref"] as? String, timeout: 20)
+            if loaded { prime() }
+            let address = loaded ? (try? location())?.href : nil
+            return BrowserRules.changeAfterUnload(value, loadedAddress: address)
         }
         return BrowserRules.change(value)
     }
@@ -2463,10 +2466,12 @@ final class BrowserPage {
         }
     }
 
-    /// What every action relies on in the agent's background tab: the page behaves as focused (so clicks and
-    /// keys are processed), and other extensions' frames are removed.
+    /// Agent-owned background tabs emulate page focus so input works without activating Chrome. Claimed user
+    /// tabs keep their real focus state; only agent-owned tabs receive page hooks or frame cleanup.
     private func restoreSetup() {
-        enableOnce("Emulation.setFocusEmulationEnabled", ["enabled": true])
+        if ownsTab {
+            enableOnce("Emulation.setFocusEmulationEnabled", ["enabled": true])
+        }
         guardForeignFrames()
     }
 
@@ -2652,6 +2657,16 @@ enum BrowserRules {
         if let before = value["seenHref"] as? String, !before.isEmpty, !href.isEmpty, before != href { return .navigated(href) }
         if let mut = number(value["mut"] ?? 0), let seen = number(value["seen"] ?? 0), mut != seen { return .changed }
         return .none
+    }
+
+    static func changeAfterUnload(_ observation: [String: Any], loadedAddress: String?) -> BrowserChange {
+        if let before = observation["seenHref"] as? String, !before.isEmpty,
+           let loadedAddress, !loadedAddress.isEmpty, loadedAddress != before {
+            return .navigated(loadedAddress)
+        }
+        let observed = change(observation)
+        if case .navigated = observed { return observed }
+        return .navigationUnconfirmed
     }
 
     /// Identity of a control across reads: its role and name (a re-rendered list keeps these).

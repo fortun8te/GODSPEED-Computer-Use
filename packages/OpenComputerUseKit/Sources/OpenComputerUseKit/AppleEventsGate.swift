@@ -3,8 +3,8 @@ import CoreServices
 import Foundation
 
 /// Whether GODSPEED may send Apple Events to an app right now, without ever blocking on the macOS consent
-/// prompt. The first use of an app asks the user once, in the background; until they answer, callers fall
-/// back to their non-scripted path instead of waiting (a waiting prompt held every other agent's calls).
+/// prompt. Outside background-only mode the first use may ask once; pending consent uses the
+/// non-scripted path instead of waiting. Background-only requests never trigger the prompt.
 enum AppleEventsGate {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var asked: Set<String> = []
@@ -14,12 +14,14 @@ enum AppleEventsGate {
         guard let desc = target.aeDesc else { return false }
         let status = AEDeterminePermissionToAutomateTarget(desc, typeWildCard, typeWildCard, false)
         if status == noErr { return true }
-        if status == OSStatus(errAEEventWouldRequireUserConsent) {
+        if status == OSStatus(errAEEventWouldRequireUserConsent), !backgroundOnlyMode() {
             let first = lock.withLock { asked.insert(bundle).inserted }
             if first {
                 // Ask once, off this thread: the answer applies to later calls.
                 Thread.detachNewThread {
-                    _ = AEDeterminePermissionToAutomateTarget(desc, typeWildCard, typeWildCard, true)
+                    let promptTarget = NSAppleEventDescriptor(bundleIdentifier: bundle)
+                    guard let promptDescriptor = promptTarget.aeDesc else { return }
+                    _ = AEDeterminePermissionToAutomateTarget(promptDescriptor, typeWildCard, typeWildCard, true)
                 }
             }
         }

@@ -103,6 +103,16 @@ final class LearningLogTests: XCTestCase {
         XCTAssertFalse(text.contains("PIN"))
     }
 
+    func testDutchPasswordFieldsAreRedactedInStepsAndViews() throws {
+        let log = makeLog()
+        XCTAssertTrue(log.append(LearningStepRow(tool: "type_text", target_label: "Wachtwoord", after: "private")))
+        XCTAssertTrue(log.append(LearningDecisionRow(view: "2 text field Wachtwoord = hidden\n3 text field Name = Visible")))
+        let rows = try lines()
+        XCTAssertFalse(rows[0].contains("private"))
+        XCTAssertFalse(rows[1].contains("hidden"))
+        XCTAssertTrue(rows[1].contains("Name = Visible"))
+    }
+
     func testCodeFieldKeepsLabelAndRedactsValues() throws {
         let log = makeLog()
         XCTAssertTrue(log.append(LearningStepRow(
@@ -182,6 +192,47 @@ final class LearningLogTests: XCTestCase {
         XCTAssertEqual(rows[0]["model"] as? String, "d1")
         XCTAssertNotNil(rows[0]["probabilities"])
         XCTAssertEqual(rows[2]["label"] as? String, "done")
+    }
+
+    func testChooserCaptureKeepsContextAndScrubsSuppliedValues() throws {
+        let log = makeLog()
+        let value = "private-example-number-418"
+        LearningLog.$suppliedValues.withValue([value]) {
+            Referee.recordDecision(
+                kind: "choose", view: "Save screen", options: [(id: "a", text: "Click Save")],
+                reply: nil, latencyMs: 2, log: log,
+                chooserContext: LearningChooserContext(goal: "Save the draft",
+                    done_when: "Record shows " + value, history: "Entered " + value, image_supplied: true)
+            )
+        }
+        let row = try XCTUnwrap(lines().first)
+        XCTAssertFalse(row.contains(value))
+        let context = try XCTUnwrap(try object(row)["chooser_context"] as? [String: Any])
+        XCTAssertEqual(context["goal"] as? String, "Save the draft")
+        XCTAssertEqual(context["image_supplied"] as? Bool, true)
+        XCTAssertTrue((context["history"] as? String)?.contains("Entered") == true)
+        XCTAssertEqual(Set(context.keys), ["goal", "done_when", "history", "image_supplied"])
+    }
+
+    func testChooserCaptureRedactsBeforeClippingAndHandlesOverlappingValues() {
+        let secret = "sensitive portion of a long field"
+        let goal = String(repeating: "x", count: 481) + " " + secret
+        let capture = LearningLog.$suppliedValues.withValue(["sensitive", secret]) {
+            Referee.chooserCaptureContext(goal: goal, doneWhen: secret, history: secret, imageSupplied: false)
+        }
+        XCTAssertTrue(capture.goal.hasSuffix(LearningScrubber.redacted))
+        XCTAssertEqual(capture.done_when, LearningScrubber.redacted)
+        XCTAssertEqual(capture.history, LearningScrubber.redacted)
+    }
+
+    func testChooserCaptureIgnoresUnknownScoresAndRecordsTiesAsAbstention() throws {
+        let log = makeLog()
+        Referee.recordDecision(kind: "choose", view: "Fixture", options: [(id: "a", text: "Click Save")],
+                               reply: ["probs": ["a": 0.5, "none": 0.5, "unrequested": 1.0]],
+                               latencyMs: 1, log: log)
+        let row = try object(try XCTUnwrap(lines().first))
+        XCTAssertEqual(row["outcome"] as? String, "abstain")
+        XCTAssertEqual(row["probabilities"] as? [String: Double], ["a": 0.5, "none": 0.5])
     }
 
     func testRefereeDisabledWritesNothing() {
@@ -309,7 +360,9 @@ final class LearningLogTests: XCTestCase {
         XCTAssertEqual(rows[0]["window"] as? [String: String], window)
         XCTAssertEqual(rows[1]["window"] as? [String: String], window)
         XCTAssertNotNil(rows[1]["done"] as? String)
-        XCTAssertNil(rows[1]["done_when"], "Handoffs carry no done_when list, only their result")
+        XCTAssertEqual(rows[1]["done_when"] as? [[String: String]], LearningDoneWhen.rows(request.doneWhen))
+        XCTAssertNotNil(rows[0]["episode_id"] as? String)
+        XCTAssertEqual(rows[0]["episode_id"] as? String, rows[1]["episode_id"] as? String)
     }
 
     func testBatchDisabledWritesNothing() {

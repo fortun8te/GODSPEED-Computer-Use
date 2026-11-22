@@ -17,7 +17,7 @@ public enum ComputerUseError: Error, LocalizedError {
     case timedOut(String, delivery: DeliveryState)
     case acknowledged(String)
     case staleRef
-    case windowChanged(UInt32)
+    case windowChanged(UInt32, detail: String? = nil)
     case backgroundUnsupported(String)
     case approvalRequired(String)
     case actionDenied(String)
@@ -47,8 +47,9 @@ public enum ComputerUseError: Error, LocalizedError {
             return "invalidArguments(\"\(message)\")"
         case .staleRef:
             return "STALE_REF. Nothing was sent. Run get_app_state with include_refs=true."
-        case .windowChanged(let id):
-            return "WINDOW_CHANGED. Observed window \(id) changed or is unavailable. Nothing was sent. Read the intended window again."
+        case .windowChanged(let id, let detail):
+            let message = "WINDOW_CHANGED. Observed window \(id) changed or is unavailable. Nothing was sent. Read the intended window again."
+            return detail.map { message + " Diagnostic: " + $0 } ?? message
         }
     }
 

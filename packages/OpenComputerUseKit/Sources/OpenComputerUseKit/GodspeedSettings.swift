@@ -15,6 +15,7 @@ import Foundation
 ///       "helper_url": "http://127.0.0.1:8765",
 ///       "recipes": true,                   -> OPEN_COMPUTER_USE_RECIPES
 ///       "browser": true,                   -> OPEN_COMPUTER_USE_BROWSER
+///       "background_only": true,            -> OPEN_COMPUTER_USE_BACKGROUND_ONLY
 ///       "strict_background": true          -> OPEN_COMPUTER_USE_STRICT_BACKGROUND
 ///     }
 ///
@@ -44,6 +45,9 @@ enum GodspeedSettings {
         func flag(_ key: String) -> String? {
             (settings[key] as? Bool).map { $0 ? "1" : "0" }
         }
+        if let value = settings["gsd1_url"] as? String {
+            variables["OPEN_COMPUTER_USE_GSD1_URL"] = value
+        }
         if let value = flag("cursor_visible") { variables["OPEN_COMPUTER_USE_VISUAL_CURSOR"] = value }
         if let color = settings["cursor_color"] as? String, !color.isEmpty, color.lowercased() != "default" {
             variables["OPEN_COMPUTER_USE_CURSOR_COLOR"] = color
@@ -65,6 +69,8 @@ enum GodspeedSettings {
         if let value = flag("cursor_lens") { variables["OPEN_COMPUTER_USE_CURSOR_LENS"] = value }
         if let value = flag("recipes") { variables["OPEN_COMPUTER_USE_RECIPES"] = value }
         if let value = flag("strict_background") { variables["OPEN_COMPUTER_USE_STRICT_BACKGROUND"] = value }
+        if let value = flag("compact_reads") { variables["OPEN_COMPUTER_USE_COMPACT_READS"] = value }
+        if let value = flag("background_only") { variables["OPEN_COMPUTER_USE_BACKGROUND_ONLY"] = value }
         if let value = flag("relay_grant") { variables["OPEN_COMPUTER_USE_RELAY_GRANT"] = value }
         if let value = flag("browser") { variables["OPEN_COMPUTER_USE_BROWSER"] = value }
         return variables

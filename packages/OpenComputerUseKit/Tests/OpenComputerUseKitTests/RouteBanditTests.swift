@@ -189,6 +189,20 @@ final class RouteBanditTests: XCTestCase {
         XCTAssertEqual(try tunerRestored.jsonData(), tunerData)
     }
 
+    func testRestoreRejectsInvalidRouteCountsAndInconsistentTunerArrays() throws {
+        let bandit = RouteBandit()
+        let invalidRoute = Data(#"{"version":1,"apps":{"app":{"query":{"choices":0,"explorations":0,"arms":{"ax":{"successes":-2,"failures":0,"streak":0,"latencySum":0,"latencyCount":0,"benchedUntil":0}}}}}}"#.utf8)
+        XCTAssertThrowsError(try bandit.restore(invalidRoute)) { error in
+            XCTAssertEqual(error as? RouteBanditError, .invalidSnapshot)
+        }
+        let tuner = ParameterTuner(bounds: .init(min: 0, max: 4, defaultValue: 0))
+        let invalidTuner = Data(#"{"version":1,"apps":{"app":{"candidates":[0,1,2,3,4],"defaultIndex":0,"alive":[true],"trials":[],"successes":[],"latencySum":[],"round":0}}}"#.utf8)
+        XCTAssertThrowsError(try tuner.restore(invalidTuner)) { error in
+            XCTAssertEqual(error as? RouteBanditError, .invalidSnapshot)
+        }
+        XCTAssertEqual(tuner.value(app: "app"), 0)
+    }
+
     func testRestoreRejectsUnknownVersion() {
         let bandit = RouteBandit(clock: { 0 })
         let data = Data(#"{"version":9,"apps":{}}"#.utf8)

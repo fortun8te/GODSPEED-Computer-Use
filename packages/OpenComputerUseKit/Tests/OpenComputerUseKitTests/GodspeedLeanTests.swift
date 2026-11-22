@@ -589,7 +589,7 @@ final class GodspeedLeanTests: XCTestCase {
 
     func testDiffAlwaysAppliesWithStableNumbers() throws {
         // A new element takes a new number; the old ones keep theirs, so the diff lists only what changed.
-        let before = "App=X\nWindow: w\n[legend]\n\t1 button Save\n\t2 text field To = a (w:str)"
+        let before = "App=X\nWindow: w\nWindow ID: 17\n[legend]\n\t1 button Save\n\t2 text field To = a (w:str)"
             + (10...25).map { "\n\t\($0) button Another control \($0)" }.joined()
         let after = before + "\n\t3 button New"
         let observation = ToolCallResult(content: [.text(after)], isError: false)
@@ -598,6 +598,13 @@ final class GodspeedLeanTests: XCTestCase {
         XCTAssertFalse(diffed.textContent.contains("button Save"), diffed.textContent)
         XCTAssertEqual(LeanOutput.leadingIndex("\t\t12 button Send"), "12")
         XCTAssertNil(LeanOutput.leadingIndex("Window: w"))
+    }
+
+    func testDiffWithoutAWindowIdentityReturnsFullState() {
+        let before = "App=X\nWindow: Same title\n[legend]"
+            + (10...25).map { "\n\t\($0) button Control \($0)" }.joined()
+        let after = before + "\n\t26 button New"
+        XCTAssertEqual(LeanOutput.diffed(.text(after), previous: before).textContent, after)
     }
 
     func testIndexMatchingTreatsAReplacedElementAsAChange() throws {

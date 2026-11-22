@@ -30,7 +30,10 @@ public struct ToolDefinition: @unchecked Sendable {
 
 public enum ToolDefinitions {
     public static var all: [ToolDefinition] {
-        configured(virtualDisplayEnabled: VirtualDisplayConfig.current.enabled)
+        configured(virtualDisplayEnabled: VirtualDisplayConfig.current.enabled,
+                   backgroundOnly: backgroundOnlyMode(),
+                   leanListing: leanListingEnabled(GodspeedSettings.environment),
+                   gsd1Enabled: LocalDecisionTool.baseURL() != nil)
     }
 
     public static func isKnown(_ name: String) -> Bool {
@@ -38,29 +41,71 @@ public enum ToolDefinitions {
     }
 
     static func available(environment: [String: String]) -> [ToolDefinition] {
-        configured(
+        let settings = GodspeedSettings.merged(environment)
+        return configured(
             virtualDisplayEnabled: VirtualDisplayConfig.load(environment: environment).enabled,
-            browserAvailable: BrowserBridge.executablePath(environment: GodspeedSettings.merged(environment)) != nil
+            browserAvailable: BrowserBridge.executablePath(environment: settings) != nil,
+            backgroundOnly: backgroundOnlyMode(environment: settings),
+            leanListing: leanListingEnabled(settings),
+            gsd1Enabled: LocalDecisionTool.baseURL(environment: settings) != nil
         )
     }
 
+    private static func leanListingEnabled(_ environment: [String: String]) -> Bool {
+        StrictBackground.enabledFlag(environment["OPEN_COMPUTER_USE_LEAN_TOOL_LIST"])
+    }
+
+    // Specialized tools remain callable inside a batch. Keep direct entry points
+    // for observation, native actions, local handoff and browser work.
+    static let batchOnlyTools: Set<String> = [
+        "gesture", "hover", "perform_secondary_action", "scroll_into_view", "wait_for"
+    ]
+
+    private static let leanDescriptions: [String: String] = [
+        "App name or bundle identifier": "App name or bundle ID.",
+        "Window ID from get_app_state or query; refuses if the target changed.": "Pin the Window ID from a read.",
+        "Exact ref from get_app_state with include_refs. Use instead of label, index or pixels.": "Exact ref from get_app_state include_refs. Replaces other targets.",
+        "Visible name, e.g. \"Send\". Instead of element_index.": "Visible name instead of element_index.",
+    ]
+
     static func configured(
-        virtualDisplayEnabled: Bool, browserAvailable: Bool = BrowserBridge.isAvailable
+        virtualDisplayEnabled: Bool, browserAvailable: Bool = BrowserBridge.isAvailable,
+        backgroundOnly: Bool = false, leanListing: Bool = false, gsd1Enabled: Bool = false
     ) -> [ToolDefinition] {
         // `browser` is listed only when Open Browser Use is installed.
-        let definitions = definitions.filter { $0.name != "browser" || browserAvailable }
+        let definitions = definitions.filter { tool in
+            (tool.name != "browser" || browserAvailable)
+                && (tool.name != LocalDecisionTool.name || gsd1Enabled)
+                && (!leanListing || !batchOnlyTools.contains(tool.name))
+        }
         return definitions.map { tool in
             var schema = tool.inputSchema
             var properties = schema["properties"] as? [String: Any] ?? [:]
             if !virtualDisplayEnabled, tool.name == "get_app_state" {
                 properties.removeValue(forKey: "window_placement")
             }
-            properties["strict_background"] = [
-                "type": "boolean",
-                "description": "Background only: no app activation, borrowed focus or pointer movement. Nested steps inherit it."
-            ]
+            if backgroundOnly { properties.removeValue(forKey: "foreground") }
+            let description = leanListing && tool.name == BatchTool.name
+                ? tool.description + " Also supports gesture, hover, perform_secondary_action, scroll_into_view and wait_for as steps."
+                : tool.description
+            if !backgroundOnly {
+                properties["strict_background"] = [
+                    "type": "boolean",
+                    "description": "Accessibility-only mode. Also disables background keys, menu commands, drag and app or file opening. Nested steps inherit it."
+                ]
+            }
+            if leanListing {
+                for key in ["app", "window_id", "ref", "label"] {
+                    if var property = properties[key] as? [String: Any],
+                       let description = property["description"] as? String,
+                       let replacement = leanDescriptions[description] {
+                        property["description"] = replacement
+                        properties[key] = property
+                    }
+                }
+            }
             schema["properties"] = properties
-            return ToolDefinition(name: tool.name, description: tool.description, annotations: tool.annotations, inputSchema: schema)
+            return ToolDefinition(name: tool.name, description: description, annotations: tool.annotations, inputSchema: schema)
         }
     }
 
@@ -97,9 +142,9 @@ public enum ToolDefinitions {
                     "foreground": ["type": "boolean", "default": false, "description": "Last resort only: bring the app forward (skipped while the user is using the Mac). Steps, dialogs included, normally work in the background."],
                     "remember": ["type": "boolean", "default": false, "description": "Save completed steps as a recipe. Mutating steps require a passing done_when."],
                     "values": ["type": "object", "description": "Explicit recipe slot names and values. Missing or changed values require confirmation before replay."],
-                    "return_state": ["type": "boolean", "default": true, "description": "False can skip the final tree when a direct file, field, or URL check supplies enough evidence. Presence-only matches stay weak. Recovery still includes state."],
-                    "compact": ["type": "boolean", "description": "Smaller final observation. Default: on when done_when is given (a verified goal replies in a few lines)."],
-                    "effects": ["type": "boolean", "default": true, "description": "False skips per-step effect reads. Use a pinned window and a final completion check for known sequences."],
+                    "return_state": ["type": "boolean", "description": "True explicitly requests the final state. False can skip reading it when direct evidence verifies completion. Recovery still includes state."],
+                    "compact": ["type": "boolean", "description": "Smaller receipt and final observation. Default: on for click sequences or batches with done_when. A verified result may omit the implicit tree. Explicit compact:true can also summarize verified step metadata. Recovery keeps individual step receipts."],
+                    "effects": ["type": "boolean", "description": "False skips per-step effect reads. Calculator label sequences default to a final display read. True requests intermediate effects where supported."],
                     "screenshot": ["type": "boolean", "default": false, "description": "Also return a screenshot."],
                 ],
                 required: []
@@ -116,11 +161,29 @@ public enum ToolDefinitions {
                     "goal": stringProperty(description: "One bounded subtask, one sentence"),
                     "done_when": ["type": ["object", "array"], "description": "Required. Check text, exact field and value, a missing label, or a file. Supply one check or a list."],
                     "values": ["type": "object", "description": "Text to type, field name to text: {\"Name\": \"Ann\"}", "additionalProperties": ["type": "string"]],
+                    "line_ending": stringProperty(description: "Optional lf or crlf. Include this ending in guarded values and exact checks when omitted."),
+                    "document_path": stringProperty(description: "Optional absolute document path that the guarded window must show."),
+                    "expected_values": ["type": "object", "description": "Optional current text for fields you intend to replace. Handoff stops if the expected value does not match.", "additionalProperties": ["type": "string"]],
                     "max_steps": ["type": "integer", "default": 15, "maximum": 30],
                     "time_budget_s": ["type": "number", "default": 60, "maximum": 300],
                 ],
                 required: ["app", "goal", "done_when"]
             )
+        ),
+        ToolDefinition(
+            name: LocalDecisionTool.name,
+            description: "Use to score options locally. Action ranks observed controls, Read picks the next evidence read, and Recover advises after independently checked delivery. Keep actions and verification in their existing tools.",
+            annotations: ["readOnlyHint": true],
+            inputSchema: objectSchema(properties: [
+                "role": stringProperty(description: "Decision role", enumValues: LocalDecisionTool.roles),
+                "state": ["type": ["object", "string"], "description": "Observed evidence for the selected role."],
+                "question": objectSchema(properties: [
+                    "type": stringProperty(description: "Typed choice", enumValues: ["choice"]),
+                    "instructions": stringProperty(description: "What the options should decide"),
+                    "criteria": ["type": "object", "additionalProperties": ["type": "string"],
+                                 "description": "Option IDs mapped to their descriptions."],
+                ], required: ["type", "instructions", "criteria"]),
+            ], required: ["role", "state", "question"])
         ),
         ToolDefinition(
             name: "browser",
@@ -157,7 +220,8 @@ public enum ToolDefinitions {
                     "to_y": numberProperty(description: "Drag destination viewport Y from screenshot."),
                     "to_label": stringProperty(description: "drag: destination label in the same tab"),
                     "to_index": integerProperty(description: "drag: destination element number from read"),
-                    "text": stringProperty(description: "type: text to enter. wait_for: text to wait for"),
+                    "text": stringProperty(description: "type or direct paste: content to insert. wait_for: text to wait for."),
+                    "format": stringProperty(description: "Direct paste format. Defaults to text when text is supplied. Markdown and HTML require a labeled or indexed rich-text editor.", enumValues: ["text", "markdown", "html"]),
                     "start": integerProperty(description: "select_text start in UTF-16 units."),
                     "length": integerProperty(description: "select_text length in UTF-16 units."),
                     "prefix": stringProperty(description: "Text immediately before a repeated selection."),
@@ -328,6 +392,8 @@ public enum ToolDefinitions {
             inputSchema: objectSchema(
                 properties: [
                     "app": stringProperty(description: "App name or bundle identifier"),
+                    "file_path": stringProperty(description: "For Finder File > Duplicate or File > Rename, the absolute path of one file."),
+                    "new_name": stringProperty(description: "For path-based Finder Rename, the new filename in the same folder."),
                     "path": stringProperty(description: "Menu title, then items down to the command: \"File > Save\", or [\"File\", \"Save\"]."),
                 ],
                 required: ["app", "path"]

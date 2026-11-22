@@ -3,6 +3,28 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class RefereePictureTests: XCTestCase {
+    func testPreparedEvidenceKeepsTheSameTextAndVisionDecision() {
+        for state in ["Window: Example\nWindow ID: 7\n1 button Choose",
+                      "Window: Example\nWindow ID: 7\n1 button Save\n2 button Refresh\n3 button Next"] {
+            let prepared = RefereeView.prepare(state: state, goal: "Save record", doneWhen: "Saved", optionIndexes: [1], limit: 450)
+            XCTAssertEqual(prepared.thin, RefereeView.isThin(state))
+            XCTAssertEqual(prepared.text, RefereeView.build(state: state, goal: "Save record", doneWhen: "Saved", optionIndexes: [1], limit: 450))
+        }
+    }
+
+    func testCapabilityCacheReusesPositiveAndNegativeAnswersButRetriesFailureSoon() {
+        let cache = RefereePictureCapabilityCache()
+        let first = URL(string: "http://127.0.0.1:8765/health")!
+        let second = URL(string: "http://127.0.0.1:8766/health")!
+        XCTAssertTrue(cache.supports(first, now: 0) { true })
+        XCTAssertTrue(cache.supports(first, now: 10) { XCTFail("fresh cache performed HTTP"); return nil })
+        XCTAssertFalse(cache.supports(second, now: 10) { nil })
+        XCTAssertFalse(cache.supports(second, now: 10.5) { XCTFail("transient failure should briefly cool down"); return nil })
+        XCTAssertFalse(cache.supports(second, now: 12) { false })
+        XCTAssertFalse(cache.supports(second, now: 22) { XCTFail("known unsupported is cached"); return nil })
+        XCTAssertFalse(cache.supports(first, now: 30) { false })
+    }
+
     func testOptionalPictureRequiresThinBoundWindowAndOptInLoopbackCapability() throws {
         let thin = "App=fixture.sketch (pid 1)\nWindow: Sketch\nWindow ID: 24\n0 canvas\n1 button"
         let rich = "App=fixture.Finder (pid 2)\nWindow: Finder\nWindow ID: 25\n1 button Back\n2 button Share\n3 button Search"

@@ -243,7 +243,8 @@ final class RecipeSafetyTests: XCTestCase {
         _ = try run.replaySteps(recipe)
         let step = BatchTool.Step(tool: "click", arguments: ["app": "Safari", "label": "Save"])
         let originalBinding = try XCTUnwrap(run.prepareReplay(step, number: 1))
-        XCTAssertEqual(originalBinding.arguments["window_id"] as? UInt32, 14)
+        XCTAssertEqual(originalBinding.step.arguments["window_id"] as? UInt32, 14)
+        XCTAssertEqual(originalBinding.state, original)
         live = changed[1]
         XCTAssertNil(run.prepareReplay(step, number: 1))
     }
@@ -333,8 +334,9 @@ final class RecipeSafetyTests: XCTestCase {
         let controls = HandoffTool.parseControls("\t1 text field Password = (w:str)\n\t2 text field Name = (w:str)\n\t3 button Save")
         let out = HandoffTool.candidates(goal: "save login", doneSummary: "", values: [("Password", "hunter2"), ("Name", "bob")],
                                          controls: controls, tried: [], typedAny: false, scrollsDone: 0)
-        XCTAssertFalse(out.contains { $0.text.contains("hunter2") })
-        XCTAssertTrue(out.contains { $0.text.contains("bob") })
+        XCTAssertFalse(out.contains { $0.arguments["value"] as? String == "hunter2" })
+        XCTAssertTrue(out.contains { $0.arguments["value"] as? String == "bob" && $0.targetLabel == "Name" })
+        XCTAssertFalse(out.contains { $0.text.contains("hunter2") || $0.text.contains("bob") })
     }
 
     func testReturnIsRiskyNextToASendButton() {

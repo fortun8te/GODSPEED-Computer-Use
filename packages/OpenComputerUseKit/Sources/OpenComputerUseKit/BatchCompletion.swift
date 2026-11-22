@@ -21,19 +21,29 @@ struct BatchCompletion {
         let modified: Date
         let size: UInt64
         let digest: SHA256.Digest?
+        let inode: UInt64
+        let device: UInt64
+
+        func changed(from previous: Artifact, since start: Date) -> Bool {
+            inode != previous.inode || device != previous.device || size != previous.size
+                || (modified > previous.modified && modified >= start)
+                || (digest != nil && previous.digest != nil && digest != previous.digest)
+        }
 
         private struct Metadata: Equatable {
             let modified: Date
             let size: UInt64
             let inode: UInt64
+            let device: UInt64
         }
 
         private static func attributes(_ path: String) throws -> Metadata? {
             let values = try FileManager.default.attributesOfItem(atPath: path)
             guard values[.type] as? FileAttributeType == .typeRegular,
                   let date = values[.modificationDate] as? Date, let size = values[.size] as? NSNumber,
-                  let inode = values[.systemFileNumber] as? NSNumber else { return nil }
-            return Metadata(modified: date, size: size.uint64Value, inode: inode.uint64Value)
+                  let inode = values[.systemFileNumber] as? NSNumber,
+                  let device = values[.systemNumber] as? NSNumber else { return nil }
+            return Metadata(modified: date, size: size.uint64Value, inode: inode.uint64Value, device: device.uint64Value)
         }
 
         enum Sample {
@@ -63,6 +73,7 @@ struct BatchCompletion {
                     let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
                     var opened = stat()
                     guard fstat(fd, &opened) == 0, opened.st_ino == metadata.inode,
+                          UInt64(UInt32(bitPattern: opened.st_dev)) == metadata.device,
                           opened.st_mode & S_IFMT == S_IFREG else { return .unavailable }
                     var hash = SHA256()
                     var remaining = metadata.size
@@ -78,7 +89,8 @@ struct BatchCompletion {
                     digest = nil
                 }
                 guard try attributes(path) == metadata else { return .unavailable }
-                return .file(Artifact(modified: metadata.modified, size: metadata.size, digest: digest))
+                return .file(Artifact(modified: metadata.modified, size: metadata.size, digest: digest,
+                                      inode: metadata.inode, device: metadata.device))
             } catch {
                 return .unavailable
             }
@@ -110,9 +122,7 @@ struct BatchCompletion {
             case .absent: return true
             case .unavailable: return false
             case .file(let previous):
-                return current.size != previous.size
-                    || (current.modified > previous.modified && current.modified >= startedAt)
-                    || (previous.digest != nil && current.digest != nil && previous.digest != current.digest)
+                return current.changed(from: previous, since: startedAt)
             }
         }
         guard let before, let after, before.target == after.target else { return false }
@@ -154,9 +164,7 @@ struct BatchCompletion {
             case .absent: return true
             case .unavailable: return false
             case .file(let previous):
-                return current.size != previous.size
-                    || (current.modified > previous.modified && current.modified >= startedAt)
-                    || (previous.digest != nil && current.digest != nil && previous.digest != current.digest)
+                return current.changed(from: previous, since: startedAt)
             }
         default:
             return false
@@ -174,9 +182,11 @@ struct BatchCompletion {
             guard !screen.isEmpty else { return nil }
             let complete = DoneCheck.supportsAbsenceCheck(snapshot.treeLines.joined(separator: "\n"))
                 && !screen.contains { $0.count >= defaultTextLimit && $0.contains("...") }
+            let appHeader = running.bundleIdentifier == "com.apple.calculator"
+                ? "App=com.apple.calculator (pid \(running.pid))\n" : ""
             return Observation(
                 target: .native(pid: running.pid, launch: launch, window: id),
-                screen: screen.joined(separator: "\n"), canProveAbsence: complete
+                screen: appHeader + screen.joined(separator: "\n"), canProveAbsence: complete
             )
         }
     }

@@ -13,7 +13,28 @@ Run `swift test --filter CompactVerifiedReplyTests` to reproduce the reply check
 
 A local MCP handshake with all 19 tools advertised sent 673 bytes of startup instructions, down from 1,001. The serialized `tools/list` response fell from 24,054 to 22,575 bytes. Tool names and supported actions stayed available in both runs.
 
-In the disposable four-task fixture, placing the accessibility read inside each batch cut tool calls from eight to four per set and reduced returned text from 5,757 to 2,033 bytes. The compact route verified 12 of 12 tasks across three sets and took a median 4.38 seconds. The separate-read route verified 11 of 12 and took a median 2.77 seconds. [Fixture, commands and failure details](four-task-benchmark.md)
+### Native fixture: compact versus separate reads
+
+Three sets per mode on Godspeed 1.1.10. A disposable AppKit window checked each task outcome independently. Reply sizes are UTF-8 text bytes, and timing excludes fixture setup and grading.
+
+| Measure | Separate read + batch | Read inside compact batch |
+| --- | ---: | ---: |
+| Independently verified tasks | 11/12 | 12/12 |
+| MCP calls per four-task set | 8 | 4 |
+| Reply text per set | 5,757 B | 2,033 B |
+| Median driver time | 2.77 s | 4.38 s |
+
+```text
+Reply text per set, relative to the separate-read mode
+Separate read       ████████████████████  5,757 B
+Compact batch       ███████               2,033 B
+```
+
+Moving the read into the batch halved calls and cut response text by 65% in this fixture. The compact batch took longer at the median. [Fixture, commands and failure details](four-task-benchmark.md)
+
+### Structured receipts and token accounting
+
+Explicitly compact, verified batches can summarize per-step metadata. In an offline 40-step serialization test, the receipt metadata fell from 3,923 bytes to 128 bytes. Failed, incomplete, and uncertain steps retain detailed receipts. Byte counts describe the response payload. For actual model input, use the host's token usage receipts and separate total input, cache reads, cache writes, output, and reasoning where reported. Missing fields stay unreported.
 
 The app agent used to check for idle exit every five seconds. It now arms a single deadline after the last client disconnects. `swift test --filter LifecycleTests` covers deadline changes as clients connect and disconnect. Whole-machine CPU, GPU and power measurements are pending.
 
@@ -52,10 +73,25 @@ An isolated Chrome trial on November 18 verified three outcomes in 21 Godspeed c
 
 Use the same model, prompt, app state, and checks. Alternate runs and report task success, wall time, tool calls, and input and output tokens. Keep standalone, parallel, and helper-assisted runs identifiable. [Verification plan](exec-plans/active/20261118-godspeed-workflow-reliability.md)
 
-## Aside comparison
+## Public macOS comparison
 
-The matched public target is the Scale suite with Sonnet 5.5: 87/90 passes, 37/40 of them in the background, with a 15.1-second median and 7 median agent calls. Preserve the complete trial schedule and the GUI and background-disturbance checks. Godspeed has no matched result yet. [Scale trial catalog](https://huggingface.co/spaces/earakely-scale/CuaDriverBench-AgentEnv/blob/main/data/catalog.json)
+These results come from the [Scale CUA Driver Benchmark catalog](https://huggingface.co/spaces/earakely-scale/CuaDriverBench-AgentEnv/resolve/main/data/catalog.json). The rows below use the same macOS schedule and Claude Sonnet 5.5 model. The 40 background trials include simulated user activity. Driver names identify the tool in this evaluation, so the Codex Computer Use row refers to its driver under these conditions.
 
-In the same catalog, CUA Driver passes 66/90 overall and 23/40 background. A separate four-task customer comparison used Calculator, TextEdit and two Finder tasks. It is a useful smoke-test shape alongside the full Scale suite. [Scale results data](https://huggingface.co/spaces/earakely-scale/CuaDriverBench-AgentEnv/resolve/main/data/catalog.json)
+| Tool | Foreground | Background | Total |
+| --- | ---: | ---: | ---: |
+| Aside | 50/50 | 37/40 | 87/90 |
+| CUA Driver | 43/50 | 23/40 | 66/90 |
+| Codex Computer Use | 26/50 | 11/40 | 37/90 |
+| Godspeed | — | — | No matched result |
 
-Use `python3 scripts/godspeed-benchmark-compare.py --suite scale-bench-v2 baseline.jsonl candidate.jsonl` to compare normalized trial receipts offline. The script checks matching configurations and all 90 trial slots before scoring. It does not execute the benchmark. The separate `aside-internal` profile requires a predeclared schedule.
+```text
+Background passes on the public macOS schedule (one full block = two passes)
+Aside                ██████████████████▌  37 / 40
+CUA Driver           ███████████▌         23 / 40
+Codex Computer Use   █████▌               11 / 40
+Godspeed                                 unmeasured
+```
+
+The public catalog also reports other model configurations. Keep each configuration separate when comparing tools. Godspeed’s four-task AppKit measurements above use a different fixture and measure driver output and timing. An equivalent Godspeed Scale score requires the full trial schedule and the same model, task states, GUI-only rules, and background disturbance checks.
+
+Use `python3 scripts/godspeed-benchmark-compare.py --suite scale-bench-v2 baseline.jsonl candidate.jsonl` to compare normalized trial receipts offline. The script checks matching configurations and all 90 trial slots before scoring. The separate `aside-internal` profile requires a predeclared schedule.

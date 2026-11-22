@@ -3,6 +3,23 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class BatchEffectsTests: XCTestCase {
+    func testResumeEffectBaselineRequiresACompleteQuietReadOfTheSameWindow() {
+        let observed = "App=x (pid 7)\nWindow: Work\nWindow ID: 42\n1 button Save"
+        XCTAssertEqual(BatchEffects.Watch.resumeSignature(state: observed, liveWindowID: 42, quiet: true)?.id, 42)
+        XCTAssertNil(BatchEffects.Watch.resumeSignature(state: observed, liveWindowID: 43, quiet: true))
+        XCTAssertNil(BatchEffects.Watch.resumeSignature(state: observed, liveWindowID: 42, quiet: false))
+        XCTAssertNil(BatchEffects.Watch.resumeSignature(state: observed + "\n[Accessibility tree truncated: limit]",
+                                                         liveWindowID: 42, quiet: true))
+    }
+
+    func testWaitClampsLargeMillisecondsAndHonorsExplicitSeconds() throws {
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_ms": 1e30]).timeoutMs, 30_000)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_seconds": 75]).timeoutMs, 30_000)
+        XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout": 75]).timeoutMs, 100)
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_ms": true]))
+        XCTAssertThrowsError(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_ms": "not a wait"]))
+    }
+
     func testWaitTimeoutFromHugeOrNonFiniteSecondsIsClampedNotTrapped() throws {
         XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": 1e30]).timeoutMs, BatchEffects.Wait.maxTimeoutMs)
         XCTAssertEqual(try BatchEffects.Wait(arguments: ["window": "Save", "timeout_s": -1e30]).timeoutMs, 100)
@@ -121,6 +138,17 @@ final class BatchEffectsTests: XCTestCase {
     func testWindowTitleParsing() {
         XCTAssertEqual(BatchEffects.windowTitle(in: state([], title: "My \"Doc\"")), "My \"Doc\"")
         XCTAssertEqual(BatchEffects.dialog(in: state(["\t4 dialog (modal) Export As: Secondary Actions: Press"])), "dialog Export As:")
+    }
+
+    func testWaitTextUsesTheSameNumericBoundariesAsCompletion() throws {
+        var appears = try BatchEffects.Wait(arguments: ["text": "Edit field 12"])
+        let nonmatch = "Window ID: 12\n12 text Description: Edit field 12.5"
+        XCTAssertFalse(appears.isMet(state: nonmatch))
+        var gone = try BatchEffects.Wait(arguments: ["gone": "Edit field 12"])
+        XCTAssertTrue(gone.isMet(state: nonmatch))
+        var number = try BatchEffects.Wait(arguments: ["text": "12"])
+        XCTAssertFalse(number.isMet(state: nonmatch))
+        XCTAssertTrue(number.isMet(state: "Edit field 12"))
     }
 
     func testWaitConditions() throws {

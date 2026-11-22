@@ -5,7 +5,7 @@ final class BatchRecipes: @unchecked Sendable {
     static let shared = BatchRecipes()
 
     static var isEnabled: Bool {
-        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_RECIPES"]?
+        let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_RECIPES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1"
         return !["0", "false", "no", "off"].contains(value)
     }
@@ -469,14 +469,15 @@ extension BatchRecipes {
         }
 
         /// Always check the freshly selected window before binding a saved step to its ID.
-        func prepareReplay(_ step: BatchTool.Step, number: Int) -> BatchTool.Step? {
+        func prepareReplay(_ step: BatchTool.Step, number: Int) -> (step: BatchTool.Step, state: String)? {
             guard let recipe, let expected = recipe.window, let app,
                   let fresh = read(app), Window(state: fresh) == expected else { return nil }
             if !step.isReadOnly {
                 guard let label = step.arguments["label"] as? String, let locator = replayMeta[number]?.locator,
                       RecipeLocator.confirms(locator, label: label, in: fresh) else { return nil }
             }
-            return HandoffTool.bindRecipeStep(step, app: app, state: fresh)
+            guard let bound = HandoffTool.bindRecipeStep(step, app: app, state: fresh) else { return nil }
+            return (bound, fresh)
         }
 
         /// Record the starting screen and locator during an explicit run.
