@@ -2,6 +2,10 @@
 
 The v1.1.12 development ZIP targets Apple Silicon and macOS 14 or later. You need no Xcode installation to run the ZIP. Source builds need Xcode with Swift 6.2 or newer. Chrome and the local decision models are optional.
 
+[![Rendered Godspeed setup walkthrough showing the installer in Terminal](media/setup-poster.png)](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-walkthrough.mp4)
+
+[Watch the 12-second setup walkthrough](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-walkthrough.mp4) or follow the commands below.
+
 ## Download and install
 
 1. Download and run the installer from a terminal.
@@ -50,13 +54,15 @@ Look for `arm64` in the binary architecture. Before an upgrade, let active Godsp
 
 Open a fresh session after registering the MCP launcher. Check that your client lists Godspeed and tools such as `get_app_state` and `batch`.
 
-For a terminal protocol check, run the [MCP smoke test](../scripts/tests/godspeed-mcp-smoke.py) with Python 3 from a source checkout:
+If the tools are missing or you want a quick sanity check, download and run **Godspeed Doctor**:
 
 ```sh
-python3 scripts/tests/godspeed-mcp-smoke.py
+curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/godspeed-doctor.sh && bash godspeed-doctor.sh
 ```
 
-It keeps the connection open until both initialization and the tool list arrive. It sends no UI action. For a first live check, use a disposable app window with the Mac unlocked. Ask the agent to read it before acting and check a visible result after its first action.
+It checks the app signature, binary architecture, MCP initialization, and tool list. The check sends no UI actions and leaves your settings in place. Use `--app` or `--launcher` for a custom install path. A `Chrome tool listed` result means the CLI was found. Run `obu ping` to check the extension connection.
+
+For a first live check, use a disposable app window with the Mac unlocked. Ask the agent to read it before acting and check a visible result after its first action.
 
 If the wrapper cannot find the app, check that you installed one copy where expected. For a nonstandard app location set `GODSPEED_APP` to the absolute app bundle path in the MCP client’s environment. If an old connection stopped responding after an upgrade, start a fresh client session.
 

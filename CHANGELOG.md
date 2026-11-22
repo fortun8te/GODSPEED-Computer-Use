@@ -18,6 +18,10 @@
 - Optional typed `local_decision` recommendations for the three role-specific checkpoints. The installed helper keeps one tuned model loaded at a time across clients.
 - Benchmark accounting reports fresh input, cached input, cache writes, output, and reasoning when the host provides those fields.
 
+### Setup follow-up
+
+- Added a rendered setup walkthrough and Godspeed Doctor, a terminal check for app signing and MCP connectivity.
+
 ## 1.1.11
 
 - Background-first MCP tools for native Mac apps and Chrome, with cursor identity per connection.
