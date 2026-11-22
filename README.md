@@ -10,6 +10,8 @@ Godspeed is an open-source Model Context Protocol (MCP) server for Mac app and C
   · <a href="CHANGELOG.md">Changelog</a>
 </p>
 
+![Live macOS recording of the Godspeed cursor completing a checklist, then Calculator and TextEdit](docs/media/godspeed-demo.gif)
+
 ## Install
 
 **Apple Silicon · macOS 14 or later.** The app is a development preview with ad hoc signing. [Permissions and signing guide](docs/INSTALL.md#signing-and-permissions)
