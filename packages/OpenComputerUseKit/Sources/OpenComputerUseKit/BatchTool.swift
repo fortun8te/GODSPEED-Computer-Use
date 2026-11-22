@@ -1197,14 +1197,20 @@ extension ComputerUseToolDispatcher {
                     }
                 }
             }
-            let defersNavigationRead = step.tool == "browser" && isLastStep
+            let nextStep = steps.dropFirst(number).first
+            // The explicit read supplies the page evidence. Keep click delivery,
+            // authorization and tab tracking, but skip the speculative text diff.
+            let nextReadsBrowser = nextStep?.tool == "browser"
+                && (nextStep?.arguments["action"] as? String) == "read"
+                && Self.browserTabID(nextStep?.arguments["tab_id"]) == Self.browserTabID(step.arguments["tab_id"])
+            let defersNavigationRead = step.tool == "browser"
+                && (isLastStep || ((step.arguments["action"] as? String) == "click" && nextReadsBrowser))
             var stepArguments = step.arguments
             if isLastStep, step.tool == "get_app_state", wantsScreenshot {
                 stepArguments["include_screenshot"] = true
             }
             // A directly verified AX write can use the next explicit read or
             // the batch's final screenshot read. Other writes keep readback.
-            let nextStep = steps.dropFirst(number).first
             let nextReadsSameApp = nextStep?.tool == "get_app_state"
                 && (nextStep?.arguments["app"] as? String) == stepApp
                 && (nextStep?.arguments["include_ax"] as? Bool) != false
