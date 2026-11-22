@@ -136,7 +136,7 @@ final class CursorMotionQualityTests: XCTestCase {
         let room = CGRect(origin: .zero, size: SoftwareCursorPanelMetrics.size).insetBy(dx: 4, dy: 0)
         // Default: right of the arrow, centred a little below the tip (beside the arrow's body).
         let tag = visualCursorNameTagFrame(width: 70, height: 19, available: room)
-        XCTAssertGreaterThan(tag.minX, tip.x + 10)
+        XCTAssertEqual(tag.minX, tip.x + 21, accuracy: 0.01)
         XCTAssertLessThan(tag.midY, tip.y)
         XCTAssertGreaterThan(tag.maxY, tip.y - 22)
         // Near a display's right edge (the window is clipped just past the arrow), it moves to the left of the tip.
