@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.fortun8te/godspeed",
+  "description": "Local macOS computer use MCP for Apple Silicon. Control Mac apps and Chrome.",
+  "version": "1.1.12",
+  "repository": {
+    "url": "https://github.com/fortun8te/godspeed",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/fortun8te/godspeed/releases/download/v1.1.12/Godspeed-macOS-arm64.mcpb",
+      "fileSha256": "a6f1c2104ac64bdd46a47721cf94d5f52cae6438cf81566075fe287bb4015acd",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
