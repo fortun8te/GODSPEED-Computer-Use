@@ -2,10 +2,6 @@
 
 The v1.1.12 development ZIP targets Apple Silicon and macOS 14 or later. You need no Xcode installation to run the ZIP. Source builds need Xcode with Swift 6.2 or newer. Chrome and the local decision models are optional.
 
-[![Rendered Godspeed setup walkthrough showing the installer in Terminal](media/setup-poster.png)](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-walkthrough.mp4)
-
-[Watch the 12-second setup walkthrough](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-walkthrough.mp4) or follow the commands below.
-
 ## Download and install
 
 1. Download and run the installer from a terminal.
@@ -60,7 +56,7 @@ If the tools are missing or you want a quick sanity check, download and run **Go
 curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/godspeed-doctor.sh && bash godspeed-doctor.sh
 ```
 
-It checks the app signature, binary architecture, MCP initialization, and tool list. The check sends no UI actions and leaves your settings in place. Use `--app` or `--launcher` for a custom install path. A `Chrome tool listed` result means the CLI was found. Run `obu ping` to check the extension connection.
+It checks the app signature, binary architecture, MCP initialization, and tool list. The check sends no UI actions and leaves your settings in place. Use `--app` or `--launcher` for a custom install path. A `Chrome tool listed` result means the CLI was found. Run the Chrome setup check below to verify the extension connection.
 
 For a first live check, use a disposable app window with the Mac unlocked. Ask the agent to read it before acting and check a visible result after its first action.
 
@@ -70,22 +66,20 @@ If the wrapper cannot find the app, check that you installed one copy where expe
 
 Native app tools work on their own. Chrome needs the [Open Browser Use CLI and extension](https://github.com/iFurySt/open-browser-use#quick-start).
 
-1. With Node.js and npm available, install the CLI and run its setup.
+1. Run the optional setup script with Node.js 18 or newer. It installs the Chrome CLI for your user and opens the extension setup.
 
    ```sh
-   npm install -g open-browser-use
-   obu setup
+   curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-godspeed-chrome.sh
+   bash setup-godspeed-chrome.sh
    ```
 
-   Setup registers the native messaging host and opens the Chrome Web Store. Install or enable the extension in the profile you will use. Restart Chrome if it asks you to.
-
-2. Open that Chrome profile and verify the bridge.
+2. Approve Open Browser Use in the Chrome profile you plan to use. If an agent is setting up Godspeed, this is the step to hand back to the person using the Mac.
 
    ```sh
-   obu ping
+   bash setup-godspeed-chrome.sh --check
    ```
 
-3. Reconnect your MCP client. Confirm that `tools/list` includes `browser`, then try a read in a disposable tab.
+3. When the check reports a connection, start a fresh MCP session and try a read in a disposable Chrome tab.
 
 If npm installed the long executable name only, try `open-browser-use setup` and `open-browser-use ping`. If the CLI works in your terminal and the MCP client omits `browser`, the client may have a different shell path. Use `command -v obu` (or `command -v open-browser-use`) and set `OPEN_COMPUTER_USE_OBU_BIN` to that executable’s **absolute path** in your client’s MCP environment. Remove or correct a stale path before reconnecting. If `ping` itself fails, check that the extension is enabled in the current profile and rerun setup.
 

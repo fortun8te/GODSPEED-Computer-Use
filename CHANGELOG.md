@@ -20,7 +20,7 @@
 
 ### Setup follow-up
 
-- Added a rendered setup walkthrough and Godspeed Doctor, a terminal check for app signing and MCP connectivity.
+- Added Godspeed Doctor to check app signing and MCP connectivity, and a separate Chrome setup command.
 
 ## 1.1.11
 
