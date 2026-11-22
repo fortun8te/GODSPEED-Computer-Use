@@ -2,8 +2,8 @@
 # Install the optional Chrome bridge for the current macOS user.
 set -euo pipefail
 
-if [[ $# -gt 1 || ( $# -eq 1 && "$1" != --check ) ]]; then
-  echo "Usage: $0 [--check]" >&2
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != --check && "$1" != --no-open ) ]]; then
+  echo "Usage: $0 [--no-open | --check]" >&2
   exit 2
 fi
 
@@ -31,5 +31,10 @@ if ! command -v npm >/dev/null || ! node -e 'process.exit(Number(process.version
   exit 1
 fi
 npm install --global --prefix "$HOME/.local" open-browser-use@1.1.0
-"$bridge" setup
+if [[ "${1:-}" == --no-open ]]; then
+  "$bridge" setup --no-open
+else
+  "$bridge" setup
+fi
+echo "Open Browser Use: https://chromewebstore.google.com/detail/bgjoihaepiejlfjinojjfgokghnodnhd"
 echo "Approve the extension in the Chrome profile you plan to use, then rerun this script with --check."

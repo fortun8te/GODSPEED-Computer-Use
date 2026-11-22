@@ -73,7 +73,7 @@ Native app tools work on their own. Chrome needs the [Open Browser Use CLI and e
    bash setup-godspeed-chrome.sh
    ```
 
-2. Approve Open Browser Use in the Chrome profile you plan to use. If an agent is setting up Godspeed, this is the step to hand back to the person using the Mac.
+2. Approve Open Browser Use in the Chrome profile you plan to use. Agents can run `bash setup-godspeed-chrome.sh --no-open` to install and register the helper in the background, then ask the user to approve the [Chrome extension](https://chromewebstore.google.com/detail/bgjoihaepiejlfjinojjfgokghnodnhd).
 
    ```sh
    bash setup-godspeed-chrome.sh --check
