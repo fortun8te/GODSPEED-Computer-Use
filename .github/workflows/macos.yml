@@ -44,6 +44,7 @@ jobs:
           root="$(mktemp -d)"
           ./scripts/install-godspeed.sh --archive dist/godspeed/Godspeed-macOS-arm64.zip --app-dir "$root/apps" --launcher-dir "$root/bin"
           GODSPEED_APP="$root/apps/GODSPEED.app" python3 scripts/tests/godspeed-mcp-smoke.py --launcher "$root/bin/godspeed-mcp" --direct
+          OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY=1 ./scripts/godspeed-doctor.sh --app "$root/apps/GODSPEED.app" --launcher "$root/bin/godspeed-mcp"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: github.event_name == 'workflow_dispatch'
         with:

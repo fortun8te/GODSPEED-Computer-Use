@@ -1,35 +1,43 @@
 <p align="center"><img src="assets/app-icons/godspeed-1024.png" width="88" alt="Godspeed's red glass cursor icon"></p>
 <h1 align="center">Godspeed</h1>
 <p align="center">Background computer use for macOS and Chrome.<br>Accessibility-first desktop automation for Codex, Claude Code, and other MCP clients.</p>
-<p align="center"><a href="#install">Install</a> · <a href="#how-it-works">How it works</a> · <a href="docs/benchmarks.md">Benchmarks</a> · <a href="CHANGELOG.md">Changelog</a></p>
 
-Godspeed lets an agent read a Mac window, find controls by name, and run a sequence of actions with a final check. It serves those tools over the Model Context Protocol (MCP). With the supplied background launcher, Godspeed keeps the user’s physical pointer free and refuses actions that require taking focus.
 
-![Two Godspeed cursor paths rendered on a simulated desktop from the production motion planner](docs/media/cursor-motion.gif)
+Godspeed reads controls, runs related actions in batches, and checks what changed. Its background launcher protects your focus and keeps your physical pointer free.
 
-*Motion rendered from Godspeed’s production cursor planner on a simulated desktop.*
+<p align="center">
+  <a href="https://github.com/fortun8te/godspeed/releases/tag/v1.1.12"><strong>Download for Apple Silicon</strong></a>
+  · <a href="docs/INSTALL.md">Setup guide</a>
+  · <a href="docs/benchmarks.md">Benchmarks</a>
+  · <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+![Godspeed cursor gliding between controls on a simulated desktop](docs/media/cursor-motion.gif)
+
+*Motion rendered from the production cursor planner.* [Watch the 12-second setup walkthrough](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-walkthrough.mp4).
 
 ## Install
 
-The **v1.1.12 development download** targets **Apple Silicon Macs running macOS 14 or later**. It includes the app and a stable MCP launcher. It uses ad hoc signing. See the [installation guide](docs/INSTALL.md) for macOS permissions, Gatekeeper, upgrades, and source builds.
-
-Download the installer from the release, then run it:
+**Apple Silicon · macOS 14 or later.** The app is a development preview with ad hoc signing. [Permissions and signing guide](docs/INSTALL.md#signing-and-permissions)
 
 ```sh
 curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/install-godspeed.sh && bash install-godspeed.sh
 ```
 
-The installer shows download progress and checks the archive’s SHA-256 before installing. Open **GODSPEED.app** from `~/Applications` and follow its permission screen. Register the MCP launcher with your client, then open a fresh agent session.
+1. Open **GODSPEED.app** from `~/Applications` and follow the permission screen.
+2. Connect your MCP client and start a fresh session.
 
-```sh
-# Codex
-codex mcp add godspeed -- "$HOME/.local/bin/godspeed-mcp"
+   ```sh
+   # Codex
+   codex mcp add godspeed -- "$HOME/.local/bin/godspeed-mcp"
 
-# Claude Code
-claude mcp add --scope user godspeed -- "$HOME/.local/bin/godspeed-mcp"
-```
+   # Claude Code
+   claude mcp add --scope user godspeed -- "$HOME/.local/bin/godspeed-mcp"
+   ```
 
-For Chrome, add the optional [Open Browser Use](https://github.com/iFurySt/open-browser-use#quick-start) helper and extension. The [Chrome setup guide](docs/INSTALL.md#chrome-setup) covers installation, enrollment, and how to check the extension bridge.
+3. Ask your agent to read a disposable Calculator window before trying an action.
+
+[Check the connection](docs/INSTALL.md#first-mcp-check) · [Set up Chrome](docs/INSTALL.md#chrome-setup) · [Build from source](docs/INSTALL.md#build-from-source)
 
 ## How it works
 
