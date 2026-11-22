@@ -39,17 +39,27 @@ enum LocalDecisionTool {
               let data = try? JSONSerialization.data(withJSONObject: body), data.count <= 64 * 1024 else {
             throw ComputerUseError.invalidArguments("The typed decision must fit within 64 KiB.")
         }
+        let metricPrefix = "gsd1_" + role
+        let telemetry = ToolTelemetry.current
         let deadline = BrowserCallBudget.activeRemaining ?? 8
         guard deadline > 0.25 else {
+            telemetry?.add("\(metricPrefix)_skipped_deadline")
             return .text("No local recommendation. The request deadline is too close.", deliveryState: .notSent)
         }
         let start = ProcessInfo.processInfo.systemUptime
         let reply = score(baseURL.appendingPathComponent("gsd1").appendingPathComponent("score"), body, min(deadline, 8))
-        ToolTelemetry.current?.recordHelper("gsd1_" + role, startedAt: start, image: false, reply: reply)
+        telemetry?.recordHelper(metricPrefix, startedAt: start, image: false, reply: reply)
         if reply == nil, baseURL.port == 18765 { starter.helperUnreachable(baseURL) }
         guard let reply, reply["model"] as? String == "gsd1-" + role,
               let probabilities = Referee.parseChoose(reply),
               Set(probabilities.keys) == Set(options.keys) else {
+            if reply == nil {
+                telemetry?.add("\(metricPrefix)_unavailable")
+            } else if reply?[HelperHTTP.busyResponseKey] as? Bool == true {
+                telemetry?.add("\(metricPrefix)_busy")
+            } else {
+                telemetry?.add("\(metricPrefix)_invalid_scores")
+            }
             return .text("No local recommendation. The helper was busy, unavailable or returned invalid scores.", deliveryState: .notSent)
         }
         let ranked = probabilities.sorted {
@@ -57,8 +67,10 @@ enum LocalDecisionTool {
         }
         guard let first = ranked.first, first.value >= HandoffTool.minProbability,
               first.value - (ranked.dropFirst().first?.value ?? 0) >= HandoffTool.minMargin else {
+            telemetry?.add("\(metricPrefix)_abstained")
             return .text("No clear local recommendation. Check the current evidence.", deliveryState: .notSent)
         }
+        telemetry?.add("\(metricPrefix)_suggested")
         return .text("GSD1 \(role) suggests \(first.key) (\(HandoffTool.percent(first.value))).",
                      deliveryState: .notSent)
     }

@@ -3098,6 +3098,10 @@ enum BrowserReply {
         return BrowserPage.find("errorText", in: value) as? String
     }
 
+    static func isExtensionPanelBlock(_ text: String) -> Bool {
+        text.lowercased().contains("cannot access a chrome-extension")
+    }
+
     /// One short line that says what went wrong and what to do next.
     static func explain(_ text: String) -> String {
         let lower = text.lowercased()
@@ -3107,8 +3111,8 @@ enum BrowserReply {
         if lower.contains("cannot find context") || lower.contains("execution context was destroyed") || lower.contains("navigated") {
             return "the page changed while acting; browser read again"
         }
-        if lower.contains("cannot access a chrome-extension") {
-            return "another Chrome extension (a coupon finder or a password helper) has put its own panel into this page, and Chrome then blocks outside control of the tab. Tell the user: in Chrome, set that extension's Site access to \"On click\" (Extensions, Details). Then browser open the page again"
+        if isExtensionPanelBlock(lower) {
+            return "Chrome blocked this tab while an extension panel was open. Ask the user to dismiss the panel or review that extension’s site access. Then read the same tab by tab_id before retrying the action."
         }
         if lower.contains("no tab with") || lower.contains("tab not found") || lower.contains("no such tab") || lower.contains("tab was closed") {
             return "that tab is closed; browser tabs, then browser open the page again or use_tab with a tab_id from that list"

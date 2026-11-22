@@ -791,6 +791,59 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertNil(BrowserRequestContext.current)
     }
 
+    func testOpenReportsTheOwnedTabIDForCleanup() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try RecordingBrowserHelper.make(directory: directory, openTabID: 12)
+        let environment = [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": fixture.helper.path,
+        ]
+
+        try ClientScope.with("open-receipt-\(UUID().uuidString)") {
+            try withBrowserRequestEnvironment(environment) {
+                defer { BrowserBridge.shared.shutdown() }
+                let dispatcher = ComputerUseToolDispatcher(actionPolicyURL: directory.appendingPathComponent("action-policy.json"))
+                let reply = try dispatcher.runBrowser(arguments: ["action": "open"])
+                XCTAssertEqual(reply.browserContinuationTabID, 12)
+                XCTAssertEqual(BrowserBridge.shared.currentTab, 12)
+            }
+        }
+    }
+
+    func testSelectingAnAgentTabDoesNotClaimItAsAUserTab() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try RecordingBrowserHelper.make(directory: directory, openTabID: 12, replies: [
+            (#""name":"tabs""#, #"{\"result\":[{\"id\":12,\"origin\":\"agent\"}]}"#),
+            ("Runtime.evaluate", #"{\"result\":{\"result\":{\"value\":[\"https://example.test\",\"Example\",\"complete\"]}}}"#),
+        ])
+        let environment = [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": fixture.helper.path,
+        ]
+
+        try ClientScope.with("use-tab-origin-\(UUID().uuidString)") {
+            try withBrowserRequestEnvironment(environment) {
+                let bridge = BrowserBridge.shared
+                defer { bridge.shutdown() }
+                let dispatcher = ComputerUseToolDispatcher(actionPolicyURL: directory.appendingPathComponent("action-policy.json"))
+                let reply = try dispatcher.runBrowser(arguments: ["action": "use_tab", "tab_id": 12])
+                XCTAssertFalse(reply.isError)
+                XCTAssertEqual(bridge.currentTab, 12)
+                let log = try String(contentsOf: fixture.log, encoding: .utf8)
+                XCTAssertFalse(log.contains(#""name":"claim_tab""#))
+            }
+        }
+    }
+
+    func testExtensionPanelRecoveryKeepsTheExistingTab() {
+        let explanation = BrowserReply.explain("Cannot access a chrome-extension:// URL of a different extension")
+        XCTAssertTrue(explanation.contains("same tab"))
+        XCTAssertFalse(explanation.contains("open the page again"))
+        XCTAssertFalse(BrowserReply.isExtensionPanelBlock("extension is not connected"))
+    }
+
     func testCloseVerifiesAnUncertainReplyWithoutResending() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

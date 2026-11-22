@@ -10,9 +10,7 @@ Godspeed lets Codex, Claude Code, and other MCP clients read and control Mac app
   · <a href="CHANGELOG.md">Changelog</a>
 </p>
 
-[![Godspeed verifies a Calculator result on macOS](docs/media/godspeed-demo-poster.png)](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/godspeed-demo.mp4)
-
-[Watch the 12-second demo](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/godspeed-demo.mp4). It uses live Calculator and TextEdit window captures and a separate capture of the Godspeed cursor. [Remotion source](https://github.com/fortun8te/godspeed/releases/download/v1.1.12/godspeed-remotion-source.zip)
+![Godspeed’s cursor in motion, a verified Calculator result, and an edited TextEdit checklist](docs/media/godspeed-demo.gif)
 
 ## Install
 

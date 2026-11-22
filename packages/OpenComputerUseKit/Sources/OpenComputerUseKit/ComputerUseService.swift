@@ -1919,9 +1919,9 @@ public final class ComputerUseService {
                 Thread.sleep(forTimeInterval: 0.05)
             } while ProcessInfo.processInfo.systemUptime < deadline
             guard let editor else {
-                throw FocusBorrow.focusRequiredError(
-                    "The Go to Folder dialog did not expose a focused text field. Read the dialog before retrying.",
-                    pid: snapshot.app.pid, unsent: false)
+                throw ComputerUseError.notSent(
+                    "The Go to Folder dialog did not expose a focused text field. Read the open panel before retrying."
+                )
             }
             // Keys go to this editor, so it must belong to the window that was read. (An unnamed sheet is expected here:
             // this path exists to type into the one dialog the batch opened.)
@@ -2210,12 +2210,22 @@ public final class ComputerUseService {
         let role = values[0] as? String
         let subrole = values[1] as? String
         let sheets = values[2] as? [AXUIElement] ?? []
+        let windowIsModal = role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog"
+        guard sheets.count <= 1 else { return nil }
+        let start = windowIsModal ? window : sheets.first
         let modal: AXUIElement?
-        if role == "AXSheet" || subrole == "AXDialog" || subrole == "AXSystemDialog" {
-            modal = window
+        if let start {
+            guard let deepest = deepestUniqueSheet(start, children: { element in
+                if CFEqual(element, window) { return sheets }
+                var value: CFTypeRef?
+                let status = AXUIElementCopyAttributeValue(element, "AXSheets" as CFString, &value)
+                if status == .noValue || status == .attributeUnsupported { return [] }
+                guard status == .success else { return nil }
+                return value as? [AXUIElement]
+            }) else { return nil }
+            modal = deepest
         } else {
-            guard sheets.count <= 1 else { return nil }
-            modal = sheets.first
+            modal = nil
         }
         if let modal {
             let modalFocus = elementAttribute(modal, kAXFocusedUIElementAttribute)
@@ -2233,6 +2243,18 @@ public final class ComputerUseService {
             }
         }
         return requireModal ? nil : appFocus
+    }
+
+    // AppKit can attach the path editor as a second sheet inside an open panel.
+    // Ambiguous, unreadable or cyclic trees must not send input to an outer field.
+    static func deepestUniqueSheet<Element>(_ root: Element, children: (Element) -> [Element]?) -> Element? {
+        var current = root
+        for _ in 0..<8 {
+            guard let sheets = children(current), sheets.count <= 1 else { return nil }
+            guard let child = sheets.first else { return current }
+            current = child
+        }
+        return nil
     }
 
     /// "Command+Shift+N", "META+SHIFT+N", "⌘⇧N" → "cmd+shift+n": modifiers by one name, in a fixed order.
