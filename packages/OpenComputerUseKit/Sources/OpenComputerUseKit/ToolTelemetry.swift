@@ -7,6 +7,7 @@ final class ToolTelemetry: @unchecked Sendable {
     private var counters: [String: Double] = [:]
 
     func add(_ key: String, _ value: Double = 1) {
+        guard value.isFinite, value >= 0 else { return }
         lock.lock()
         defer { lock.unlock() }
         counters[key, default: 0] += value
@@ -27,14 +28,17 @@ final class ToolTelemetry: @unchecked Sendable {
         }
     }
 
+    func snapshot() -> [String: Double] {
+        lock.lock()
+        defer { lock.unlock() }
+        return counters
+    }
+
     func reply(_ result: ToolCallResult, startedAt: Date) -> [String: Any] {
         add("wall_ms", max(0, Date().timeIntervalSince(startedAt) * 1_000))
-        lock.lock()
-        let metrics = counters
-        lock.unlock()
         var reply = result.asDictionary
         var metadata = reply["_meta"] as? [String: Any] ?? [:]
-        metadata["godspeed/telemetry"] = metrics
+        metadata["godspeed/telemetry"] = snapshot()
         reply["_meta"] = metadata
         return reply
     }

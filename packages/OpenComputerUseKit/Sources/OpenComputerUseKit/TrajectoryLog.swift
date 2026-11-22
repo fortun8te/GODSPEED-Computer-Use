@@ -86,7 +86,8 @@ final class TrajectoryLog: @unchecked Sendable {
 
     /// Records one top-level tool call that returned a result. Argument values for secure targets and
     /// secure lines in the result text are redacted; the screenshot bytes are never stored.
-    func recordToolCall(name: String, arguments: [String: Any], result: ToolCallResult, startedAt: Date, admissionMs: Double? = nil) {
+    func recordToolCall(name: String, arguments: [String: Any], result: ToolCallResult, startedAt: Date,
+                        admissionMs: Double? = nil, telemetry: [String: Double] = [:]) {
         guard isEnabled else { return }
         let screenshotReturned = result.content.contains { $0.dictionary["type"] as? String == "image" }
         let primary = result.primaryText ?? ""
@@ -110,6 +111,9 @@ final class TrajectoryLog: @unchecked Sendable {
             screenshotReturned: screenshotReturned,
             startedAt: startedAt,
             admissionMs: admissionMs,
+            telemetry: telemetry,
+            deliveryState: result.deliveryState,
+            handoffMetrics: result.handoffMetrics,
             receipts: receipts,
             batchReceipt: result.batchReceipt,
             failureText: result.isError ? primary : nil,
@@ -120,7 +124,8 @@ final class TrajectoryLog: @unchecked Sendable {
     }
 
     /// Records one top-level tool call that threw instead of returning a result.
-    func recordFailedToolCall(name: String, arguments: [String: Any], error: Error, startedAt: Date, admissionMs: Double? = nil) {
+    func recordFailedToolCall(name: String, arguments: [String: Any], error: Error, startedAt: Date,
+                              admissionMs: Double? = nil, telemetry: [String: Double] = [:]) {
         guard isEnabled else { return }
         let isError = true
         let message = (error as? ComputerUseError)?.errorDescription
@@ -136,6 +141,8 @@ final class TrajectoryLog: @unchecked Sendable {
             screenshotReturned: false,
             startedAt: startedAt,
             admissionMs: admissionMs,
+            telemetry: telemetry,
+            deliveryState: ToolCallResult.delivery(of: error),
             failureText: message,
             failureCode: Self.failureCode(error: error)
         )
@@ -146,7 +153,7 @@ final class TrajectoryLog: @unchecked Sendable {
         submitCall(
             name: name, arguments: [:], isError: true, resultText: "", resultTruncated: false,
             screenshotReturned: false, startedAt: Date(), admissionMs: admissionMs,
-            admissionTimedOut: true, failureCode: .timeout
+            admissionTimedOut: true, deliveryState: .notSent, failureCode: .timeout
         )
     }
 
@@ -183,6 +190,9 @@ final class TrajectoryLog: @unchecked Sendable {
         startedAt: Date,
         admissionMs: Double? = nil,
         admissionTimedOut: Bool = false,
+        telemetry: [String: Double] = [:],
+        deliveryState: DeliveryState,
+        handoffMetrics: [String: Int]? = nil,
         receipts: Receipts? = nil,
         batchReceipt: BatchReceipt? = nil,
         failureText: String? = nil,
@@ -209,6 +219,9 @@ final class TrajectoryLog: @unchecked Sendable {
         }
         if admissionTimedOut { object["admission_timed_out"] = true }
         object["failure_code"] = failureCode?.rawValue
+        object["delivery_state"] = deliveryState.rawValue
+        if !telemetry.isEmpty { object["telemetry"] = telemetry }
+        object["handoff_metrics"] = handoffMetrics
         if let batchReceipt {
             object["batch_steps"] = batchReceipt.steps.count
             object["batch_failed"] = isError

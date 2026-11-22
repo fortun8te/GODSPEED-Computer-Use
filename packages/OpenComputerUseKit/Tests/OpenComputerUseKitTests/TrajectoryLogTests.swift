@@ -81,6 +81,26 @@ final class TrajectoryLogTests: XCTestCase {
         XCTAssertNil(lines[1]["arguments"])
     }
 
+    func testMetadataKeepsTelemetryOnReturnedAndThrownCallsWithoutPrivateContent() throws {
+        let log = TrajectoryLog(environment: [:], directory: directory)
+        log.recordToolCall(name: "local_decision", arguments: ["state": "private app state"],
+                           result: .text("private recommendation", deliveryState: .notSent), startedAt: started(),
+                           telemetry: ["gsd1_read_requests": 1, "gsd1_read_suggested": 1, "gsd1_read_inference_ms": 3.5])
+        log.recordFailedToolCall(name: "handoff", arguments: ["goal": "private goal"],
+                                 error: ComputerUseError.notSent("private failure"), startedAt: started(),
+                                 telemetry: ["choose_requests": 1])
+        let lines = try records(log)
+        XCTAssertEqual(lines[0]["telemetry"] as? [String: Double],
+                       ["gsd1_read_requests": 1, "gsd1_read_suggested": 1, "gsd1_read_inference_ms": 3.5])
+        XCTAssertEqual(lines[1]["telemetry"] as? [String: Double], ["choose_requests": 1])
+        for line in lines {
+            XCTAssertEqual(line["delivery_state"] as? String, "not_sent")
+            XCTAssertNil(line["arguments"])
+            XCTAssertNil(line["result_text"])
+            XCTAssertNil(line["failure_detail"])
+        }
+    }
+
     func testDefaultLogOmitsPrivateContentButRecordsFailedBatch() throws {
         let log = TrajectoryLog(environment: [:], directory: directory)
         let receipt = TrajectoryLog.BatchReceipt(

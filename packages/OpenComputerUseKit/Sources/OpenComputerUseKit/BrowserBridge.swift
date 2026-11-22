@@ -485,8 +485,11 @@ final class BrowserBridge: @unchecked Sendable {
                 // a claimed user tab never does.
                 try startIfNeeded()
                 // A freshly started helper authenticates first, so allow the same time as any tab listing.
-                let listed = try? requestTool("tabs", arguments: [:], timeout: min(10, max(1, BrowserCallBudget.remaining() - 3)))
-                guard let listed, !listed.isError, BrowserReply.agentOriginTabIDs(in: listed.text).contains(id) else {
+                let listed = try requestTool("tabs", arguments: [:], timeout: min(10, max(1, BrowserCallBudget.remaining() - 3)))
+                guard !listed.isError, BrowserReply.sessionTabIDs(in: listed.text) != nil else {
+                    throw ComputerUseError.notSent("browser close_tab could not verify ownership of tab \(id). List this session’s tabs before retrying.")
+                }
+                guard BrowserReply.agentOriginTabIDs(in: listed.text).contains(id) else {
                     throw ComputerUseError.invalidArguments("browser close_tab requires a tab opened by this browser connection")
                 }
                 openedTabs.insert(id)
@@ -560,7 +563,8 @@ final class BrowserBridge: @unchecked Sendable {
             .compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
             .joined(separator: "\n")
         let isError = (result["isError"] as? Bool) ?? false
-        if isError, ["socket", "no active", "not connected", "native host", "extension"].contains(where: { text.lowercased().contains($0) }) {
+        if isError, !BrowserReply.isExtensionPanelBlock(text),
+           ["socket", "no active", "not connected", "native host", "extension"].contains(where: { text.lowercased().contains($0) }) {
             text += "\nChrome is not connected to GODSPEED's browser helper yet: run obu setup once and add the Open Browser Use Chrome extension."
         }
         return (text, isError)
@@ -1274,15 +1278,29 @@ extension ComputerUseToolDispatcher {
 
         case "open", "new_tab", "open_tab":
             let url = try Self.navigationURL(arguments["url"])
-            let opened = try bridge.callTool("open_tab", arguments: url.map { ["initial_url": $0] } ?? [:], timeout: 20)
-            guard !opened.isError else { return finish([opened]) }
+            let opened: (text: String, isError: Bool)
+            do {
+                opened = try bridge.callTool("open_tab", arguments: url.map { ["initial_url": $0] } ?? [:], timeout: 20)
+            } catch let error as ComputerUseError where error.deliveryState == .outcomeUnknown {
+                let reason = error.localizedDescription
+                throw ComputerUseError.stateUnavailable("browser: open could not confirm tab creation. List this session’s tabs before opening another. \(reason)")
+            }
+            guard !opened.isError else {
+                if BrowserReply.isExtensionPanelBlock(opened.text) {
+                    throw ComputerUseError.stateUnavailable("browser: open could not confirm tab creation. List this session’s tabs. " + BrowserReply.failureText(opened.text))
+                }
+                return finish([opened])
+            }
             guard let newID = BrowserReply.createdTabID(in: opened.text) else {
                 throw ComputerUseError.stateUnavailable("browser: open may have created a tab, but returned no tab ID. List tabs before retrying.")
             }
             BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: newID)
+            func openedTabReceipt(_ text: String) -> ToolCallResult {
+                ToolCallResult(content: [.text(text)], isError: false, browserContinuationTabID: newID)
+            }
             guard let url else {
                 bridge.currentTab = newID
-                return .text("opened a blank tab (id \(newID))")
+                return openedTabReceipt("opened a blank tab (id \(newID))")
             }
             if !BrowserReply.acceptedInitialNavigation(in: opened.text) {
                 // Keep the allocated tab ID even when attaching or navigating fails.
@@ -1306,18 +1324,23 @@ extension ComputerUseToolDispatcher {
                let tabs = try? bridge.callTool("tabs", arguments: [:], timeout: 2), !tabs.isError {
                 loaded = BrowserReply.completedTab(in: tabs.text, id: newID, expectedURL: url)
             }
-            guard loaded || fresh.waitLoad(changedFrom: nil, expect: url, timeout: 20) else {
+            let ready = loaded || fresh.waitLoad(changedFrom: nil, expect: url, timeout: 20)
+            do {
                 try verifyPage(fresh)
-                throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but the requested page did not become ready. Inspect that tab before retrying.")
+            } catch let error as ComputerUseError where error.deliveryState == .outcomeUnknown {
+                throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created; inspect or close that tab before opening another. \(error.localizedDescription)")
             }
-            try verifyPage(fresh)
+            guard ready else {
+                throw ComputerUseError.stateUnavailable("browser: tab \(newID) was created, but the requested page did not become ready. Inspect or close that tab before opening another.")
+            }
             bridge.currentTab = newID
-            if Self.defersBrowserNavigationObservation { return .text("opened tab \(newID)") }
+            let receipt = "opened tab \(newID)"
+            if Self.defersBrowserNavigationObservation { return openedTabReceipt(receipt) }
             fresh.settle()
             fresh.prime()
             // The page comes with the reply, so the model needs no separate read before acting.
-            if let read = try? fresh.read(find: nil, full: false) { return .text("opened. " + read) }
-            return .text("opened \(fresh.title(try? fresh.location()))")
+            if let read = try? fresh.read(find: nil, full: false) { return openedTabReceipt(receipt + ": " + read) }
+            return openedTabReceipt(receipt)
 
         case "go", "goto", "navigate", "visit":
             guard let url = try Self.navigationURL(arguments["url"]) else {
@@ -1360,9 +1383,23 @@ extension ComputerUseToolDispatcher {
             guard let id = Self.browserTabID(arguments["tab_id"]) else {
                 throw ComputerUseError.invalidArguments("browser use_tab needs a tab_id from browser tabs")
             }
-            let claimed = try call("claim_tab")
-            guard !claimed.isError else { return finish([claimed]) }
-            BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: id)
+            // Selecting an existing session tab must not claim it as a user tab. Chrome's
+            // claim operation changes origin to "user" and would make a newly opened tab uncloseable.
+            let alreadyInSession: Bool
+            if action == "use_tab" || action == "switch" {
+                let listed = try bridge.callTool("tabs", arguments: [:], timeout: 10)
+                guard !listed.isError, let ids = BrowserReply.sessionTabIDs(in: listed.text) else {
+                    throw ComputerUseError.notSent("browser use_tab could not verify the session’s tabs. List tabs before continuing.")
+                }
+                alreadyInSession = ids.contains(id)
+            } else {
+                alreadyInSession = false
+            }
+            if !alreadyInSession {
+                let claimed = try call("claim_tab")
+                guard !claimed.isError else { return finish([claimed]) }
+                BrowserPageMemory.shared.forgetTab(bridge: bridge, tab: id)
+            }
             try verifyPage(page)
             guard let place = try? page.location(), !place.href.isEmpty else {
                 throw ComputerUseError.stateUnavailable("browser: tab \(id) was claimed, but its connection could not be verified. The current tab selection was kept. Inspect the listed tabs before retrying.")

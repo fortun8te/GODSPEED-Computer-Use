@@ -15,12 +15,17 @@ FAILURE_CODES = (
 BATCH_STOPS = ("step_failure", "time_budget", "window_changed", "recipe_verification")
 STEP_OBSERVATIONS = ("not_sent", "no_effect_seen", "outcome_unknown")
 BATCH_OBSERVATIONS = ("returned", "failed", "unavailable")
+DELIVERY_STATES = ("not_sent", "outcome_unknown", "acknowledged", "verified")
 DONE_CHECKS = ("not_requested", "skipped", "verified", "unmet")
 
 
 def summarize(directory, run_id=None, driver_build=None):
     counts = Counter()
     failures = Counter()
+    tools = Counter()
+    delivery_states = Counter()
+    telemetry = Counter()
+    handoffs = Counter()
     batch_stops = Counter()
     step_observations = Counter()
     batch_observations = Counter()
@@ -45,6 +50,17 @@ def summarize(directory, run_id=None, driver_build=None):
                 if driver_build is not None and row.get("driver_build") != driver_build:
                     continue
                 counts["calls"] += 1
+                if isinstance(row.get("tool"), str):
+                    tools[row["tool"]] += 1
+                delivery = row.get("delivery_state")
+                if delivery in DELIVERY_STATES:
+                    delivery_states[delivery] += 1
+                for field, totals in (("telemetry", telemetry), ("handoff_metrics", handoffs)):
+                    metrics = row.get(field)
+                    if isinstance(metrics, dict):
+                        for key, value in metrics.items():
+                            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                                totals[key] += value
                 counts["tool_errors"] += row.get("is_error") is True
                 counts["screenshots_returned"] += row.get("screenshot_returned") is True
                 if row.get("schema_version") == 2:
@@ -93,6 +109,10 @@ def summarize(directory, run_id=None, driver_build=None):
         "decision_hints_v2", "vision_clicks_v2", "calls_v3", "batch_failures_v3",
         "decision_hints_v3", "vision_clicks_v3", "malformed_rows", "admission_timeouts",
     )}
+    out["tool_counts"] = dict(sorted(tools.items()))
+    out["delivery_states"] = dict(sorted(delivery_states.items()))
+    out["telemetry_totals"] = dict(sorted(telemetry.items()))
+    out["handoff_totals"] = dict(sorted(handoffs.items()))
     out["failure_codes"] = dict(sorted(failures.items()))
     out["batch_stops"] = dict(sorted(batch_stops.items()))
     out["step_observations"] = dict(sorted(step_observations.items()))

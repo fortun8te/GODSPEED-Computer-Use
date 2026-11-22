@@ -97,4 +97,12 @@ final class FocusTransitionTests: XCTestCase {
         XCTAssertNotNil(ComputerUseService.modalEditorRefusal(readWindowID: 4, observedWindowID: nil))
         XCTAssertNotNil(ComputerUseService.modalEditorRefusal(readWindowID: nil, observedWindowID: 4))
     }
+    func testNestedPickerFocusRequiresOneReadableSheet() {
+        let nested = ["open": ["path"], "path": [String]()]
+        XCTAssertEqual(ComputerUseService.deepestUniqueSheet("open") { nested[$0] }, "path")
+        XCTAssertNil(ComputerUseService.deepestUniqueSheet("open") { _ in ["path", "other"] })
+        XCTAssertNil(ComputerUseService.deepestUniqueSheet("open") { _ in ["open"] })
+        XCTAssertNil(ComputerUseService.deepestUniqueSheet("open") { _ in nil })
+    }
+
 }

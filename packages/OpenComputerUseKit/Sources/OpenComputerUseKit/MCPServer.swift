@@ -120,10 +120,12 @@ public final class StdioMCPServer {
                         try recordOperations ? withOperationJournal(call) : call()
                     }
                 } catch {
-                    trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt, admissionMs: admissionMs)
+                    trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt,
+                                                    admissionMs: admissionMs, telemetry: telemetry.snapshot())
                     return try encodeJSONRPCResult(id: id, result: telemetry.reply(ToolCallResult.failure(error), startedAt: startedAt))
                 }
-                trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt, admissionMs: admissionMs)
+                trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt,
+                                          admissionMs: admissionMs, telemetry: telemetry.snapshot())
                 // Keep the full baseline locally. Only shorten the transport reply,
                 // after the dispatcher has finished its readback and delivery checks.
                 var reply = result

@@ -36,6 +36,30 @@ final class LocalDecisionToolTests: XCTestCase {
         }
     }
 
+    func testTypedOutcomesDistinguishRecommendationFromAbstentionAndHelperFailure() throws {
+        let scenarios: [([String: Any]?, String)] = [
+            (["model": "gsd1-read", "probs": ["inspect": 0.91, "pause": 0.09]], "suggested"),
+            (["model": "gsd1-read", "probs": ["inspect": 0.51, "pause": 0.49]], "abstained"),
+            ([HelperHTTP.busyResponseKey: true], "busy"),
+            (["model": "gsd1-action"], "invalid_scores"),
+            (nil, "unavailable"),
+        ]
+        // Use a non-autostart loopback port so the unreachable scenario stays a unit test.
+        let url = URL(string: "http://127.0.0.1:18766")!
+        for (reply, outcome) in scenarios {
+            let telemetry = ToolTelemetry()
+            try ToolTelemetry.$current.withValue(telemetry) {
+                _ = try LocalDecisionTool.run(arguments: arguments(role: "read"), baseURL: url) { _, _, _ in reply }
+            }
+            let metrics = telemetry.snapshot()
+            XCTAssertEqual(metrics["gsd1_read_requests"], 1)
+            XCTAssertEqual(metrics["gsd1_read_" + outcome], 1)
+            for (_, alternative) in scenarios where alternative != outcome {
+                XCTAssertNil(metrics["gsd1_read_" + alternative])
+            }
+        }
+    }
+
     func testEvidenceIsRestrictedToLoopback() {
         XCTAssertNil(LocalDecisionTool.baseURL(environment: ["OPEN_COMPUTER_USE_GSD1_URL": "https://example.com"]))
         XCTAssertEqual(LocalDecisionTool.baseURL(environment: ["OPEN_COMPUTER_USE_GSD1_URL": loopback.absoluteString]), loopback)
