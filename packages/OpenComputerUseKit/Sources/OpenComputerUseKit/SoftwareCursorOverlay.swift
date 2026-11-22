@@ -543,7 +543,7 @@ func visualCursorRetargetGlide(
 /// left of the tip, and next to the bottom edge above it, so it is never cut off.
 func visualCursorNameTagFrame(width: CGFloat, height: CGFloat, available: CGRect,
                               tip: CGPoint = SoftwareCursorPanelMetrics.tipAnchor) -> CGRect {
-    var x = tip.x + 17
+    var x = tip.x + 21
     if x + width > available.maxX { x = tip.x - 9 - width }
     x = min(max(x, available.minX), max(available.minX, available.maxX - width))
     var y = tip.y - 22 - height / 2
