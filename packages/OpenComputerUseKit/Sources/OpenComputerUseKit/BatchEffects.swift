@@ -232,6 +232,12 @@ enum BatchEffects {
             DoneCheck.supportsAbsenceCheck(state) && !state.contains("the app hides its web content")
         }
 
+        static func resumeSignature(state: String, liveWindowID: UInt32?, quiet: Bool) -> WindowSig? {
+            guard quiet, isComplete(state), let liveWindowID,
+                  HandoffTool.observedWindowID(in: state) == liveWindowID else { return nil }
+            return BatchEffects.windowSig(state: state, id: liveWindowID)
+        }
+
         static func reusableSignature(before: String, after: String, id: UInt32) -> WindowSig? {
             let head = before.split(separator: "\n", maxSplits: 3).prefix(3)
             guard head.count == 3, head.last == "Window ID: \(id)",
@@ -393,12 +399,24 @@ enum BatchEffects {
             for (alias, key) in Self.keyAliases where arguments[key] == nil {
                 if let value = arguments[alias] { arguments[key] = value }
             }
-            // Seconds given as timeout_s / timeout_seconds / timeout (a small number is seconds).
-            if arguments["timeout_ms"] == nil {
-                let seconds = ["timeout_s", "timeout_seconds", "timeout"].lazy.compactMap { key -> Double? in
-                    (arguments[key] as? NSNumber)?.doubleValue ?? Double((arguments[key] as? String) ?? "")
-                }.first
-                if let seconds { arguments["timeout_ms"] = try Self.milliseconds(seconds, perUnit: seconds <= 60 ? 1000 : 1) }
+            // Explicit seconds keys always use seconds. The old unitless alias keeps its legacy heuristic.
+            let timeoutKey = ["timeout_ms", "timeout_s", "timeout_seconds", "timeout"]
+                .first { arguments[$0] != nil }
+            let given: Int?
+            if let timeoutKey {
+                let raw = arguments[timeoutKey]
+                let value: Double?
+                if let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+                    value = number.doubleValue
+                } else {
+                    value = (raw as? String).flatMap(Double.init)
+                }
+                guard let value else { throw ComputerUseError.invalidArguments("wait time must be a finite number") }
+                let seconds = timeoutKey == "timeout_s" || timeoutKey == "timeout_seconds"
+                    || (timeoutKey == "timeout" && value <= 60)
+                given = try Self.milliseconds(value, perUnit: seconds ? 1_000 : 1)
+            } else {
+                given = nil
             }
             func text(_ key: String) -> String? {
                 (arguments[key] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
@@ -420,7 +438,6 @@ enum BatchEffects {
                     "wait needs one of window, text, gone or settle: true, e.g. {\"tool\": \"wait\", \"window\": \"Export\", \"timeout_ms\": 8000}"
                 )
             }
-            let given = (arguments["timeout_ms"] as? NSNumber)?.intValue ?? Int((arguments["timeout_ms"] as? String) ?? "")
             timeoutMs = min(max(given ?? Self.defaultTimeoutMs, 100), Self.maxTimeoutMs)
         }
 
@@ -451,9 +468,9 @@ enum BatchEffects {
                 let sig = BatchEffects.windowSig(state: state, id: id)
                 return [sig.title, sig.dialog].compactMap { $0 }.contains { $0.localizedCaseInsensitiveContains(wanted) }
             case .text(let wanted):
-                return state.localizedCaseInsensitiveContains(wanted)
+                return DoneCheck.textMatches(state, wanted)
             case .gone(let wanted):
-                return DoneCheck.supportsAbsenceCheck(state) && !state.localizedCaseInsensitiveContains(wanted)
+                return DoneCheck.supportsAbsenceCheck(state) && !DoneCheck.textMatches(state, wanted)
             case .settle:
                 guard DoneCheck.supportsAbsenceCheck(state) else {
                     lastHash = nil

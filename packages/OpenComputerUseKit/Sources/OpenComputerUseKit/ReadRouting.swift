@@ -31,26 +31,63 @@ enum ReadRouting {
         service: ComputerUseService, app: String, text: String?, role: String?, exact: Bool,
         limit: Int, maxNodes: Int, windowID: CGWindowID?, learning: AdaptiveLearning = .shared
     ) throws -> [String: Any] {
-        guard windowID == nil else {
-            return try service.query(app: app, text: text, role: role, exact: exact, limit: limit, maxNodes: maxNodes, windowID: windowID)
+        let key = windowID == nil ? learningKey(for: app) : nil
+        let arm = key.map { queryArm(app: $0, risky: isRiskyLookup(text) || isRiskyLookup(role), learning: learning) }
+            ?? "targeted_query"
+        let clock = ProcessInfo.processInfo
+        let started = clock.systemUptime
+        func fullTree(_ window: CGWindowID?) throws -> [String: Any] {
+            try service.fullTreeQuery(app: app, text: text, role: role, exact: exact,
+                                      limit: limit, maxNodes: maxNodes, windowID: window)
         }
-        let key = learningKey(for: app)
-        let arm = queryArm(app: key, risky: isRiskyLookup(text) || isRiskyLookup(role), learning: learning)
-        let started = Date()
-        let matches: [String: Any]
-        if arm == "full_tree_read" {
-            matches = try service.fullTreeQuery(app: app, text: text, role: role, exact: exact, limit: limit, maxNodes: maxNodes)
-        } else {
-            matches = try service.query(app: app, text: text, role: role, exact: exact, limit: limit, maxNodes: maxNodes, windowID: nil)
+        func targeted(_ window: CGWindowID?) throws -> [String: Any] {
+            try service.query(app: app, text: text, role: role, exact: exact,
+                              limit: limit, maxNodes: maxNodes, windowID: window)
         }
-        let count = (matches["matches"] as? [Any])?.count ?? 0
-        recordQuery(app: key, arm: arm, matches: count, latencyMs: Date().timeIntervalSince(started) * 1000, learning: learning)
-        return matches
+        let useFullTree = arm == "full_tree_read"
+        let matches = try (useFullTree ? fullTree(windowID) : targeted(windowID))
+        let primaryEnded = clock.systemUptime
+        let recovered = fallbackAfterEmptyQuery(matches, source: useFullTree ? "targeted_fallback" : "full_tree_fallback",
+                                                alternate: useFullTree ? targeted : fullTree)
+        if let key {
+            let count = (matches["matches"] as? [Any])?.count ?? 0
+            let recoveredCount = (recovered["matches"] as? [Any])?.count ?? 0
+            let fallback = count == 0 && recoveredCount > 0
+                ? (arm: useFullTree ? "targeted_query" : "full_tree_read",
+                   latencyMs: (clock.systemUptime - primaryEnded) * 1_000)
+                : nil
+            recordQuery(app: key, arm: arm, matches: count, latencyMs: (primaryEnded - started) * 1_000,
+                        fallback: fallback, learning: learning)
+        }
+        return recovered
     }
 
-    /// One query outcome. A lookup that returned at least one match is verified; an empty one is not.
-    static func recordQuery(app: String, arm: String, matches: Int, latencyMs: Double, learning: AdaptiveLearning = .shared) {
+    static func fallbackAfterEmptyQuery(_ matches: [String: Any], source: String,
+                                        alternate: (CGWindowID) throws -> [String: Any]) -> [String: Any] {
+        guard let candidates = matches["matches"] as? [Any], candidates.isEmpty,
+              let observed = matches["window_id"] as? Int, observed > 0,
+              let window = CGWindowID(exactly: observed),
+              (BrowserCallBudget.activeRemaining ?? .infinity) > 0.3,
+              !RequestCancellation.requested,
+              var recovered = try? alternate(window),
+              recovered["window_id"] as? Int == observed,
+              let recoveredCandidates = recovered["matches"] as? [Any],
+              !recoveredCandidates.isEmpty || (
+                  matches["truncated"] as? Bool == true && recovered["truncated"] as? Bool == false
+              ) else { return matches }
+        recovered["source"] = source
+        return recovered
+    }
+
+    /// An empty result is only a miss when the other route found the control in the same window.
+    static func recordQuery(app: String, arm: String, matches: Int, latencyMs: Double,
+                            fallback: (arm: String, latencyMs: Double)? = nil, learning: AdaptiveLearning = .shared) {
+        guard matches > 0 || fallback != nil else { return }
         learning.routes.record(app: app, action: queryAction, arm: arm, verified: matches > 0, latencyMs: latencyMs)
+        if let fallback {
+            learning.routes.record(app: app, action: queryAction, arm: fallback.arm,
+                                   verified: true, latencyMs: fallback.latencyMs)
+        }
         learning.saveRoutes()
     }
 
@@ -86,18 +123,24 @@ enum ReadRouting {
 extension ComputerUseService {
     /// The full-tree lookup arm: the same filter as the targeted search, applied to the current read of the app's window.
     /// Read-only (no activation). Its numbers are the state's element numbers, usable by every element action.
-    func fullTreeQuery(app query: String, text: String?, role: String?, exact: Bool, limit: Int, maxNodes: Int) throws -> [String: Any] {
+    func fullTreeQuery(app query: String, text: String?, role: String?, exact: Bool, limit: Int, maxNodes: Int, windowID: CGWindowID?) throws -> [String: Any] {
         try requireUsableComputerUseSession()
-        let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+        let app = try AppDiscovery.resolveRunning(query)
+        let snapshot = try SnapshotBuilder.build(for: app,
+            treeLimits: AccessibilityTreeLimits.defaults.replacing(maxNodeCount: min(5000, max(1, maxNodes))),
+            recoveryPolicy: .readOnly, observation: .init(includeScreenshot: false), windowID: windowID)
+        if let windowID, snapshot.observedWindowID != windowID { throw ComputerUseError.windowChanged(windowID) }
+        rememberSnapshot(snapshot, for: query)
         let criteria = TargetedAX.Criteria(text: text, exact: exact, role: role,
                                           limit: min(100, max(1, limit)), maxNodes: min(5000, max(1, maxNodes)))
         let found = snapshot.elements.values.sorted { $0.index < $1.index }.filter {
-            targetedRecordMatches(criteria, role: $0.role, title: $0.title, description: nil, value: $0.value)
+            targetedRecordMatches(criteria, role: $0.role, title: $0.title,
+                                  description: $0.identity?.name, value: $0.value ?? $0.identity?.value, identifier: $0.identifier)
         }
         let matches: [[String: Any]] = found.prefix(criteria.limit).map { record in
             var dict: [String: Any] = ["index": record.index]
             if let role = record.role, !role.isEmpty { dict["role"] = role }
-            if let title = record.title, !title.isEmpty { dict["title"] = title }
+            if let title = record.title ?? record.identity?.name, !title.isEmpty { dict["title"] = title }
             if let value = record.value, !value.isEmpty { dict["value"] = value }
             if let identifier = record.identifier, !identifier.isEmpty { dict["identifier"] = identifier }
             if let frame = record.localFrame {
@@ -106,8 +149,10 @@ extension ComputerUseService {
             if !record.prettyActions.isEmpty { dict["actions"] = record.prettyActions }
             return dict
         }
-        return ["matches": matches, "truncated": found.count > criteria.limit,
-                "stop_reason": "complete", "window_id": snapshot.targetWindowID.map { Int($0) } ?? 0,
+        let treeTruncated = !DoneCheck.supportsAbsenceCheck(snapshot.treeLines.joined(separator: "\n"))
+        let stopReason = treeTruncated ? "tree_limit" : (found.count > criteria.limit ? "limit" : "complete")
+        return ["matches": matches, "truncated": stopReason != "complete",
+                "stop_reason": stopReason, "window_id": snapshot.observedWindowID.map { Int($0) } ?? 0,
                 "max_nodes": criteria.maxNodes, "limit": criteria.limit]
     }
 }

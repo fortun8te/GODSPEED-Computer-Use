@@ -21,9 +21,13 @@ OPEN_COMPUTER_USE_APP_OUTPUT_DIR="$stage" \
 
 app="$stage/GODSPEED.app"
 test -x "$app/Contents/MacOS/OpenComputerUse"
-codesign --verify --strict "$app"
+codesign --verify --strict --deep "$app"
 name="Godspeed-macOS-$([[ "${GODSPEED_ARCH:-native}" == native ]] && uname -m || printf '%s' "$GODSPEED_ARCH").zip"
-ditto -c -k --sequesterRsrc --keepParent "$app" "$stage/$name"
+mkdir "$stage/payload"
+mv "$app" "$stage/payload/GODSPEED.app"
+install -m 755 "$repo_root/scripts/godspeed-mcp" "$stage/payload/godspeed-mcp"
+cp "$repo_root/LICENSE" "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/payload/"
+ditto -c -k --sequesterRsrc "$stage/payload" "$stage/$name"
 mv -f "$stage/$name" "$out/$name"
 (cd "$out" && shasum -a 256 "$name" > "$name.sha256")
 printf '%s\n' "$out/$name"

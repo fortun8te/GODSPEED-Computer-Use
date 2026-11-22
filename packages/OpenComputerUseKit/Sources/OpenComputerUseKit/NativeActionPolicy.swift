@@ -89,7 +89,7 @@ extension ComputerUseService {
             return policyElement(app: app, index: index)
         }
         return ActionPolicy.classificationRecord(index: index) { policy in
-            try currentSnapshot(for: app, needScreenshot: false, recoveryPolicy: policy)
+            try currentSnapshot(for: app, needScreenshot: false, recoveryPolicy: policy, requireStableBounds: false)
         }
     }
 }

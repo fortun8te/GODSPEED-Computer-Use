@@ -6,7 +6,8 @@ import UniformTypeIdentifiers
 enum LocalWindowImage {
     static let maxSide = 1_280
 
-    static func downscaled(_ image: CGImage) -> CGImage? {
+    static func downscaled(_ image: CGImage, maxSide: Int = LocalWindowImage.maxSide) -> CGImage? {
+        guard maxSide > 0 else { return nil }
         let side = max(image.width, image.height)
         guard side > maxSide else { return image }
         let scale = Double(maxSide) / Double(side)
@@ -41,13 +42,34 @@ enum LocalWindowImage {
     }
 }
 
+/// Caches the loopback helper's advertised picture support across steps in a workflow.
+final class RefereePictureCapabilityCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [URL: (supported: Bool, expires: TimeInterval)] = [:]
+
+    func supports(_ url: URL, now: TimeInterval, probe: () -> Bool?) -> Bool {
+        if let cached = lock.withLock({ entries[url] }), now < cached.expires {
+            return cached.supported
+        }
+        let reply = probe()
+        lock.withLock {
+            entries = entries.filter { $0.value.expires > now }
+            if entries.count >= 8, let oldest = entries.min(by: { $0.value.expires < $1.value.expires }) {
+                entries.removeValue(forKey: oldest.key)
+            }
+            entries[url] = (reply == true, now + (reply == nil ? 1 : 15))
+        }
+        return reply == true
+    }
+}
+
 /// Picture support is advertised by the helper. Older servers have a smaller text-only body limit.
 enum RefereePicture {
     static func attachment(url: URL?, visionEnabled: Bool, state: String, remaining: TimeInterval?,
-                           supportsPictures: (URL, TimeInterval) -> Bool,
+                           supportsPictures: (URL, TimeInterval) -> Bool, allowRichTree: Bool = false, thin: Bool? = nil,
                            capture: () -> Data?) -> String? {
         guard let url, HelperAutoStarter.isLoopback(url), visionEnabled, HandoffTool.observedWindowID(in: state) != nil,
-              (remaining ?? .infinity) >= 1.2, RefereeView.isThin(state),
+              (remaining ?? .infinity) >= 1.2, allowRichTree || (thin ?? RefereeView.isThin(state)),
               supportsPictures(url.appendingPathComponent("health"), 0.15),
               let image = capture() else { return nil }
         return image.base64EncodedString()

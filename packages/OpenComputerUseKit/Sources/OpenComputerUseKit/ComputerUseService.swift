@@ -821,7 +821,8 @@ public final class ComputerUseService {
                     ?? refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy, observation: options)
             }
             Self.actionObservation?.record(snapshot)
-            return snapshotResult(for: snapshot, style: .actionResult)
+            let result = snapshotResult(for: snapshot, style: .actionResult)
+            return LeanOutput.usesCompactReads ? LeanOutput.condensed(result, mode: .compact) : result
         } catch {
             throw ComputerUseError.acknowledged("Input was sent. Read the app to check its effect. \(SmartSteps.messageText(error))")
         }
@@ -982,7 +983,9 @@ public final class ComputerUseService {
             guard clock.systemUptime < deadline else { return .missing }
             return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
         }, locate: {
-            guard clock.systemUptime < deadline, let jpeg = LocalWindowImage.jpeg(crop) else { return nil }
+            guard clock.systemUptime < deadline,
+                  let overview = LocalWindowImage.downscaled(crop, maxSide: VisionFallback.overviewMaxSide),
+                  let jpeg = LocalWindowImage.jpeg(overview) else { return nil }
             return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
                                          remaining: deadline - clock.systemUptime)
         })
@@ -1112,6 +1115,19 @@ public final class ComputerUseService {
             mouseButton: mouseButton,
             clickCount: clickCount
         )
+
+        if Self.requiredWindowID != nil, clickMethod == .accessibility,
+           let elementIndex, x == nil, y == nil {
+            let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, requireStableBounds: false)
+            let record = try lookupElement(snapshot: snapshot, index: elementIndex)
+            try refuseDisabledControl(record, elementIndex: elementIndex)
+            let button = MouseButtonKind(rawValue: mouseButton.lowercased()) ?? .left
+            guard try performAXClickSequence(on: record, snapshot: snapshot, button: button, clickCount: clickCount,
+                                             includeNearbyHitTesting: false, allowActivationFallback: false) else {
+                throw ComputerUseError.notSent("The observed control could not be clicked through accessibility.")
+            }
+            return try actionResult(for: query, recoveryPolicy: .readOnly)
+        }
 
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
         let button = MouseButtonKind(rawValue: mouseButton.lowercased()) ?? .left
@@ -1430,14 +1446,18 @@ public final class ComputerUseService {
                               isError: state.isError)
     }
 
+    static func validateScrollPages(_ pages: Double) throws {
+        guard pages.isFinite, pages > 0, pages <= 100 else {
+            throw ComputerUseError.invalidArguments("pages must be greater than 0 and at most 100")
+        }
+    }
+
     public func scroll(app query: String, direction: String, elementIndex: String, pages: Double) throws -> ToolCallResult {
         let normalized = direction.lowercased()
         guard ["up", "down", "left", "right"].contains(normalized) else {
             throw ComputerUseError.message("Invalid scroll direction: \(direction)")
         }
-        guard pages.isFinite, pages > 0, pages <= 100 else {
-            throw ComputerUseError.invalidArguments("pages must be greater than 0 and at most 100")
-        }
+        try Self.validateScrollPages(pages)
 
         let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
@@ -1773,8 +1793,13 @@ public final class ComputerUseService {
         let flags = try dragModifierFlags(modifiers)
         let snapshot = try snapshotForAction(app: query,
             elementIndex: sourceIndex == nil || destinationIndex == nil ? nil : sourceIndex, recoveryPolicy: .readOnly)
+        if snapshot.mode == .fixture {
+            throw ComputerUseError.backgroundUnsupported(
+                "The fixture drag supports four screenshot coordinates only. Omit drag_steps, hold_ms, verify, modifiers and element targets."
+            )
+        }
         guard let id = snapshot.targetWindowID, let bounds = snapshot.windowBounds,
-              let window = snapshot.windowElement, snapshot.mode != .fixture else {
+              let window = snapshot.windowElement else {
             throw ComputerUseError.backgroundUnsupported("An element drag needs a readable native window.")
         }
         func endpoint(_ index: String?, _ x: Double?, _ y: Double?) throws -> (CGPoint, () throws -> Void) {
@@ -2275,7 +2300,11 @@ public final class ComputerUseService {
     ) throws -> ToolCallResult {
         if Self.requiredWindowID != nil { try requireBoundFocusedWindow(in: snapshot) }
         let clipboard = PrivateClipboard.current
-        if snapshot.app.bundleIdentifier == "com.apple.finder", Self.requiredWindowID == nil {
+        // Finder file copy/cut/paste is implemented through Finder scripting because
+        // background keyboard events cannot reliably target a non-key Finder window.
+        // A pinned window is still safe: requireBoundFocusedWindow above verified that
+        // the supplied window is the current Finder target before resolving its selection.
+        if snapshot.app.bundleIdentifier == "com.apple.finder" {
             let key: String?
             switch (action, clipboard.payload) {
             case (.copy, _): key = "cmd+c"
@@ -2445,6 +2474,78 @@ public final class ComputerUseService {
     /// The same press with the path already split into titles. Background-only safe: the
     /// lookup and AXPress never activate, raise or move the pointer, so no mode check is needed.
     /// The reply is one line, so a batch can show it without the whole app state.
+    func finderFileCommand(app query: String, titles: [String], path: String, newName: String?) throws -> ToolCallResult {
+        let menu = try menuPathTitles(titles).map { $0.lowercased() }
+        let renaming = menu == ["file", "rename"]
+        guard renaming || menu == ["file", "duplicate"], path.hasPrefix("/"), Self.requiredWindowID == nil,
+              renaming == (newName != nil) else {
+            throw ComputerUseError.invalidArguments("Use file_path for Finder File > Duplicate or File > Rename, without a window pin. Rename also needs new_name.")
+        }
+        try requireUsableComputerUseSession()
+        guard try AppDiscovery.resolveRunning(query).bundleIdentifier == "com.apple.finder" else {
+            throw ComputerUseError.invalidArguments("Only Finder File > Duplicate and File > Rename support file_path.")
+        }
+        let source = URL(fileURLWithPath: path).standardizedFileURL
+        let folder = source.deletingLastPathComponent()
+        guard let properties = try? source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileResourceIdentifierKey]),
+              properties.isRegularFile == true, properties.isSymbolicLink != true else {
+            throw ComputerUseError.notSent("The requested Finder source is not a regular file.")
+        }
+        let body: String
+        let action: String
+        if let newName {
+            guard !newName.isEmpty, newName != ".", newName != "..", newName.utf8.count <= 255,
+                  !newName.contains(where: { $0 == "/" || $0 == ":" || $0.isNewline || $0 == "\0" }) else {
+                throw ComputerUseError.invalidArguments("new_name must be a plain filename in the source folder.")
+            }
+            let destination = folder.appendingPathComponent(newName)
+            guard !FileManager.default.fileExists(atPath: destination.path) else {
+                throw ComputerUseError.notSent("The destination already exists. Nothing was renamed.")
+            }
+            body = """
+            if exists item \(FinderRename.quoted(newName)) of (container of sourceItem) then return "destination-exists"
+            set name of sourceItem to \(FinderRename.quoted(newName))
+            return POSIX path of (sourceItem as alias)
+            """
+            action = "Renamed"
+        } else {
+            body = """
+            set copiedItem to duplicate sourceItem
+            return POSIX path of (copiedItem as alias)
+            """
+            action = "Duplicated"
+        }
+        let script = """
+        tell application id "com.apple.finder"
+            set sourceItem to (POSIX file \(FinderRename.quoted(source.path))) as alias
+            \(body)
+        end tell
+        """
+        guard let reply = try AppleEventsGate.send(script, bundle: "com.apple.finder") else {
+            throw ComputerUseError.notSent("Finder automation permission is required for this path-based command.")
+        }
+        if reply.stringValue == "destination-exists" {
+            throw ComputerUseError.notSent("The destination already exists. Nothing was renamed.")
+        }
+        if let newName, let originalID = properties.fileResourceIdentifier as? NSObject {
+            let expected = folder.appendingPathComponent(newName)
+            if let result = try? expected.resourceValues(forKeys: [.fileResourceIdentifierKey]),
+               let copiedID = result.fileResourceIdentifier as? NSObject,
+               originalID.isEqual(copiedID), !FileManager.default.fileExists(atPath: source.path) {
+                return .text("Renamed in Finder: \(expected.path)", deliveryState: .verified)
+            }
+        }
+        if let returnedPath = reply.stringValue, returnedPath.hasPrefix("/") {
+            let result = URL(fileURLWithPath: returnedPath).standardizedFileURL
+            if result != source, result.deletingLastPathComponent() == folder,
+               FileManager.default.fileExists(atPath: result.path),
+               newName.map({ result.lastPathComponent == $0 && !FileManager.default.fileExists(atPath: source.path) }) ?? true {
+                return .text("\(action) in Finder: \(result.path)", deliveryState: .verified)
+            }
+        }
+        throw ComputerUseError.acknowledged("Finder accepted the command, but the result could not be verified. Check the source folder before retrying.")
+    }
+
     public func pressMenu(app query: String, titles: [String]) throws -> ToolCallResult {
         let titles = try menuPathTitles(titles)
         if let item = titles.last?.lowercased(), let key = [
@@ -2463,7 +2564,12 @@ public final class ComputerUseService {
                 "duplicate": "tell application id \"com.apple.finder\" to set made to duplicate (get selection)\nreturn count of made",
                 "move to trash": "tell application id \"com.apple.finder\" to set gone to delete (get selection)\nreturn count of gone",
             ][last]
-            if let script, try AppleEventsGate.send(script, bundle: "com.apple.finder") != nil {
+            if let script, let reply = try AppleEventsGate.send(script, bundle: "com.apple.finder") {
+                if last == "duplicate", reply.int32Value == 0 {
+                    throw ComputerUseError.acknowledged(
+                        "Finder reported no duplicates. Read the folder and confirm the intended file is selected before trying again."
+                    )
+                }
                 return .text("pressed \(titles.joined(separator: " > ")) (done through Finder on the selected items)")
             }
         }
@@ -2518,8 +2624,40 @@ public final class ComputerUseService {
         return SkyKeyboardTarget(windowID: windowID, pid: snapshot.app.pid)
     }
 
+    func handoffMatchesDocument(app: String, windowID: UInt32, path: String) -> Bool {
+        guard let snapshot = snapshotsByApp[app.lowercased()], snapshot.observedWindowID == windowID,
+              let window = snapshot.windowElement,
+              let actual = stringValue(of: window, attribute: kAXDocumentAttribute) else { return false }
+        let documentURL = actual.hasPrefix("/") ? URL(fileURLWithPath: actual) : URL(string: actual)
+        guard let documentURL, documentURL.isFileURL else { return false }
+        return documentURL.standardizedFileURL.path == URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
+    /// The display text can run a text area's name and contents together. Read
+    /// exact AX values only for explicitly guarded fields in the observed window.
+    func handoffTextControls(app: String, windowID: UInt32, labels: [String],
+                             parsed: [HandoffTool.Control]) -> [HandoffTool.Control] {
+        guard let snapshot = snapshotsByApp[app.lowercased()], snapshot.observedWindowID == windowID else {
+            return parsed
+        }
+        return parsed.map { control in
+            guard ["text field", "search text field", "text area", "text entry area"].contains(control.role),
+                  let record = snapshot.elements[control.index], let element = record.element,
+                  let name = [stringValue(of: element, attribute: kAXTitleAttribute),
+                              stringValue(of: element, attribute: kAXDescriptionAttribute), record.identifier]
+                    .compactMap({ $0 }).first(where: { candidate in labels.contains { HandoffTool.sameLabel($0, candidate) } }),
+                  !RecipeLocator.looksSecret(name),
+                  !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)),
+                  let value = stringValue(of: element, attribute: kAXValueAttribute) else { return control }
+            return HandoffTool.Control(index: control.index, role: control.role, label: name, value: value,
+                                       disabled: control.disabled, writableText: control.writableText)
+        }
+    }
+
+    @TaskLocal static var expectedSetValue: String?
+
     public func setValue(app query: String, elementIndex: String, value: String) throws -> ToolCallResult {
-        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex)
+        let snapshot = try snapshotForAction(app: query, elementIndex: elementIndex, requireStableBounds: false)
         let record = try lookupElement(snapshot: snapshot, index: elementIndex)
 
         if snapshot.mode == .fixture {
@@ -2543,21 +2681,29 @@ public final class ComputerUseService {
         // check with an error). A text field is then filled the way a person does it: focus, select all, type.
         let settable = (try? isSettableForSetValue(element: element, attribute: kAXValueAttribute)) ?? false
         guard settable else {
+            if Self.expectedSetValue != nil { throw ComputerUseError.notSent("The checked field does not support direct value writes.") }
             if StrictBackground.enabled() {
                 throw ComputerUseError.backgroundUnsupported("This field cannot be set without focusing it and sending keys.")
             }
+            if Self.requiredWindowID != nil { _ = try currentSnapshot(for: query, needScreenshot: false) }
             if let typed = try typeIntoUnsettableTextField(app: query, element: element, record: record, value: value, pid: snapshot.app.pid) {
                 return typed
             }
             throw ComputerUseError.message(nonSettableSetValueErrorMessage + setValueFallbackHint)
         }
 
-        let cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+        let cursorTarget = Self.requiredWindowID == nil ? visualCursorTarget(for: record, snapshot: snapshot) : nil
         moveVisualCursor(to: cursorTarget)
 
         var delivery: DeliveryState = .notSent
         do {
             try requireUsableComputerUseSession()
+            if let expected = Self.expectedSetValue {
+                guard !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)),
+                      stringValue(of: element, attribute: kAXValueAttribute) == expected else {
+                    throw ComputerUseError.notSent("The field no longer matches the expected current value. Nothing was sent.")
+                }
+            }
             delivery = .outcomeUnknown
             let result = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString)
             guard result == .success else {
@@ -2746,7 +2892,9 @@ public final class ComputerUseService {
     /// The snapshot an element action runs against. A queried index resolves to
     /// that control's own window context with no snapshot; any other index uses
     /// the normal current snapshot.
-    private func snapshotForAction(app query: String, elementIndex: String?, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
+    private func snapshotForAction(app query: String, elementIndex: String?,
+                                   recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+                                   requireStableBounds: Bool = true) throws -> AppSnapshot {
         if Self.requiredRefGeneration == nil,
            let elementIndex, let index = Int(elementIndex), index > TargetedElementRegistry<TargetedElement>.indexBase {
             try requireUsableComputerUseSession()
@@ -2767,7 +2915,8 @@ public final class ComputerUseService {
                 throw error
             }
         }
-        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil, recoveryPolicy: recoveryPolicy)
+        return try currentSnapshot(for: query, needScreenshot: elementIndex == nil, recoveryPolicy: recoveryPolicy,
+                                   requireStableBounds: requireStableBounds)
     }
 
     private func registerTargetedElement(record source: ElementRecord, context: TargetedAX.WindowContext,
@@ -2795,8 +2944,10 @@ public final class ComputerUseService {
         return dict
     }
 
-    private func windowBindingError(_ id: CGWindowID) -> ComputerUseError {
-        .windowChanged(id)
+    private func windowBindingError(_ id: CGWindowID, reason: String? = nil, line: UInt = #line) -> ComputerUseError {
+        let detail = inputFallbackDebugEnabled(environment: RequestConfiguration.environment)
+            ? "ComputerUseService.swift:\(line)" + (reason.map { " " + $0 } ?? "") : nil
+        return .windowChanged(id, detail: detail)
     }
 
     private func requireBoundFocusedWindow(in snapshot: AppSnapshot) throws {
@@ -2821,13 +2972,16 @@ public final class ComputerUseService {
         return focused
     }
 
-    func currentSnapshot(for query: String, needScreenshot: Bool = true, recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation) throws -> AppSnapshot {
+    func currentSnapshot(for query: String, needScreenshot: Bool = true,
+                         recoveryPolicy: SnapshotRecoveryPolicy = .allowActivation,
+                         requireStableBounds: Bool = true) throws -> AppSnapshot {
         if let windowID = Self.requiredWindowID {
             try requireUsableComputerUseSession()
             let app: RunningAppDescriptor
             do {
                 app = try AppDiscovery.resolveRunning(query)
             } catch ComputerUseError.appNotFound {
+                debugClickDecision("window pin: app no longer running")
                 throw windowBindingError(windowID)
             }
             guard let snapshot = snapshotsByApp[query.lowercased()],
@@ -2835,6 +2989,7 @@ public final class ComputerUseService {
                   binding.matches(windowID: windowID, app: TargetedAppIdentity(app: app)),
                   !snapshot.app.runningApplication.isTerminated,
                   let observedWindow = snapshot.windowElement else {
+                debugClickDecision("window pin: cached observation does not match requested window or process")
                 throw windowBindingError(windowID)
             }
             if let generation = Self.requiredRefGeneration {
@@ -2844,16 +2999,27 @@ public final class ComputerUseService {
                     throw ComputerUseError.staleRef
                 }
             }
-            let live: TargetedAX.WindowContext
-            do {
-                live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID, matchingRoot: observedWindow)
-            } catch ComputerUseError.stateUnavailable {
-                throw windowBindingError(windowID)
+            func observedWindowRejection() throws -> String? {
+                let live: TargetedAX.WindowContext
+                do {
+                    live = try SnapshotBuilder.resolveTargetWindow(for: app, windowID: windowID, matchingRoot: observedWindow)
+                } catch ComputerUseError.stateUnavailable(let reason) {
+                    return reason
+                }
+                guard live.windowID == windowID, SnapshotBuilder.isUsableWindowElement(live.windowElement) else {
+                    return "observed root is no longer usable"
+                }
+                guard !requireStableBounds || live.windowBounds == snapshot.windowBounds else {
+                    return "observed window bounds changed"
+                }
+                return nil
             }
-            guard live.windowID == windowID,
-                  SnapshotBuilder.isUsableWindowElement(live.windowElement),
-                  live.windowBounds == snapshot.windowBounds else {
-                throw windowBindingError(windowID)
+            if try observedWindowRejection() != nil {
+                // Retry the same root and bounds once without binding to a replacement.
+                try RequestCancellation.check(delivery: .notSent)
+                if let reason = try observedWindowRejection() {
+                    throw windowBindingError(windowID, reason: reason)
+                }
             }
             return snapshot
         }
@@ -3014,7 +3180,7 @@ public final class ComputerUseService {
 
         // The strict route preserves the current observation and never heals a missing target.
         if strict {
-            let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly)
+            let snapshot = try currentSnapshot(for: query, needScreenshot: false, recoveryPolicy: .readOnly, requireStableBounds: false)
             guard let hit = try find(in: snapshot) else {
                 throw ComputerUseError.stateUnavailable("No exact control matches '\(labels[0])'. Read the window again.")
             }
@@ -3024,7 +3190,7 @@ public final class ComputerUseService {
         // A cached state may list controls that are gone, so an ambiguity there is checked against a fresh read.
         let fresh: AppSnapshot
         if Self.requiredWindowID != nil {
-            fresh = try currentSnapshot(for: query, needScreenshot: false)
+            fresh = try currentSnapshot(for: query, needScreenshot: false, requireStableBounds: false)
             if let hit = try find(in: fresh) { return hit }
         } else {
             // The expensive fresh read is skipped when this same label already missed on the current snapshot
@@ -3165,6 +3331,7 @@ public final class ComputerUseService {
         if let windowID = Self.requiredWindowID {
             guard let element = record.element, let window = snapshot.windowElement,
                   SnapshotBuilder.belongsToWindow(element, window: window) else {
+                debugClickDecision("window pin: selected accessibility element is outside the observed root")
                 throw windowBindingError(windowID)
             }
         }
@@ -3247,11 +3414,11 @@ public final class ComputerUseService {
                 return true
             }
 
-            if !StrictBackground.enabled(), try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if !backgroundOnlyMode(), try performAction(named: "AXOpen", on: element, availableActions: record.rawActions, repeatCount: clickCount) {
                 return true
             }
         case .right:
-            if !StrictBackground.enabled(), try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
+            if !backgroundOnlyMode(), try performAction(named: kAXShowMenuAction as String, on: element, availableActions: record.rawActions, repeatCount: clickCount) {
                 return true
             }
         case .middle:

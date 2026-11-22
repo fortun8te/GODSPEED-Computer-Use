@@ -12,6 +12,24 @@ final class ReadRoutingWiringTests: XCTestCase {
         return AdaptiveLearning(directory: dir)
     }
 
+    func testEmptyLookupUsesTheOtherRouteOnlyInTheSameWindow() {
+        let primary: [String: Any] = ["matches": [], "window_id": 42, "truncated": false]
+        let alternate = ReadRouting.fallbackAfterEmptyQuery(primary, source: "targeted_fallback") { window in
+            XCTAssertEqual(window, 42)
+            return ["matches": ["Equals"], "window_id": Int(window), "truncated": false]
+        }
+        XCTAssertEqual(alternate["matches"] as? [String], ["Equals"])
+        XCTAssertEqual(alternate["source"] as? String, "targeted_fallback")
+        let changed = ReadRouting.fallbackAfterEmptyQuery(primary, source: "full_tree_fallback") { _ in
+            ["matches": ["Equals"], "window_id": 43]
+        }
+        XCTAssertNil(changed["source"])
+        let partial = ReadRouting.fallbackAfterEmptyQuery(primary, source: "full_tree_fallback") { _ in
+            ["matches": [], "window_id": 42, "truncated": true]
+        }
+        XCTAssertEqual(partial["truncated"] as? Bool, false)
+    }
+
     func testRiskyLookupsNeverExploreEvenWhenTheFullTreeArmIsMature() throws {
         let learning = try tempLearning()
         for _ in 0..<30 {
@@ -31,10 +49,11 @@ final class ReadRoutingWiringTests: XCTestCase {
         XCTAssertFalse(ReadRouting.isRiskyLookup(nil))
     }
 
-    func testArmWithThreeUnverifiedLookupsIsBenchedAndDropsOut() throws {
+    func testArmWithThreeConfirmedMissesIsBenchedAndDropsOut() throws {
         let learning = try tempLearning()
         for _ in 0..<3 {
-            ReadRouting.recordQuery(app: "notes", arm: "full_tree_read", matches: 0, latencyMs: 9, learning: learning)
+            ReadRouting.recordQuery(app: "notes", arm: "full_tree_read", matches: 0, latencyMs: 9,
+                                    fallback: ("targeted_query", 4), learning: learning)
         }
         XCTAssertTrue(learning.routes.isBenched(app: "notes", action: "query", arm: "full_tree_read"))
         for _ in 0..<100 {
@@ -42,16 +61,16 @@ final class ReadRoutingWiringTests: XCTestCase {
         }
     }
 
-    func testVerifiedLookupsAreRewardedAndUnverifiedOnesAreNot() throws {
+    func testEmptyLookupsWithoutAlternateEvidenceDoNotBenchTheRoute() throws {
         let learning = try tempLearning()
         for _ in 0..<5 {
             ReadRouting.recordQuery(app: "notes", arm: "targeted_query", matches: 2, latencyMs: 3, learning: learning)
         }
-        // An unverified (empty) lookup is a failure, so the streak of three benches the arm, while the verified ones stay.
+        // The control may be absent from both reads. Do not punish the route.
         for _ in 0..<3 {
             ReadRouting.recordQuery(app: "notes", arm: "targeted_query", matches: 0, latencyMs: 3, learning: learning)
         }
-        XCTAssertTrue(learning.routes.isBenched(app: "notes", action: "query", arm: "targeted_query"))
+        XCTAssertFalse(learning.routes.isBenched(app: "notes", action: "query", arm: "targeted_query"))
         XCTAssertFalse(learning.routes.isBenched(app: "notes", action: "query", arm: "full_tree_read"))
     }
 

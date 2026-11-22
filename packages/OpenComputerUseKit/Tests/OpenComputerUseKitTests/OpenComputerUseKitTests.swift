@@ -288,9 +288,10 @@ final class OpenComputerUseKitTests: XCTestCase {
     }
 
     func testToolDefinitionCount() {
-        XCTAssertEqual(ToolDefinitions.all.filter { $0.name != "browser" }.count, 22)
+        let definitions = ToolDefinitions.configured(virtualDisplayEnabled: false, browserAvailable: true)
+        XCTAssertEqual(definitions.filter { $0.name != "browser" }.count, 22)
         XCTAssertEqual(
-            ToolDefinitions.all.filter { $0.name != "browser" }.map(\.name).sorted(),
+            definitions.filter { $0.name != "browser" }.map(\.name).sorted(),
             [
                 "batch",
                 "click",
@@ -719,12 +720,34 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(try KeyPressParser.parse("F12").displayValue, "f12")
     }
 
+    func testFailedMCPToolCarriesNumericTelemetry() throws {
+        let server = StdioMCPServer(trajectoryEnvironment: ["OPEN_COMPUTER_USE_TRAJECTORY_LOG": "0"])
+        let response = try XCTUnwrap(server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"click","arguments":{"strict_background":"invalid"}}}"#))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
+        let result = try XCTUnwrap(json["result"] as? [String: Any])
+        let meta = try XCTUnwrap(result["_meta"] as? [String: Any])
+        let telemetry = try XCTUnwrap(meta["godspeed/telemetry"] as? [String: Double])
+        XCTAssertEqual(result["isError"] as? Bool, true)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(telemetry["wall_ms"]), 0)
+        XCTAssertNil(telemetry["click_operations"])
+    }
+
     func testInitializeResponseContainsToolsCapability() throws {
         let server = StdioMCPServer(service: ComputerUseService())
         let response = server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"1.1.4"},"capabilities":{}}}"#)
         XCTAssertNotNil(response)
         XCTAssertTrue(response!.contains(#""name":"godspeed""#))
         XCTAssertTrue(response!.contains(#""tools":{"listChanged":false}"#))
+    }
+
+    func testToolListingAndInitializeUseCanonicalKeyOrder() throws {
+        let server = StdioMCPServer(trajectoryEnvironment: ["OPEN_COMPUTER_USE_TRAJECTORY_LOG": "0"])
+        for method in ["initialize", "tools/list"] {
+            let response = try XCTUnwrap(server.handle(line: #"{"jsonrpc":"2.0","id":1,"method":"\#(method)","params":{}}"#))
+            let parsed = try JSONSerialization.jsonObject(with: Data(response.utf8))
+            let canonical = try JSONSerialization.data(withJSONObject: parsed, options: [.sortedKeys, .withoutEscapingSlashes])
+            XCTAssertEqual(Data(response.utf8), canonical)
+        }
     }
 
     func testInitializeResponseContainsComputerUseInstructions() throws {
@@ -738,9 +761,9 @@ final class OpenComputerUseKitTests: XCTestCase {
         let instructions = try XCTUnwrap(result["instructions"] as? String)
 
         XCTAssertEqual(instructions, computerUseServerInstructions)
-        XCTAssertTrue(instructions.contains("get_app_state, then batch"))
-        XCTAssertTrue(instructions.contains("After a partial failure, read fresh state"))
-        XCTAssertTrue(instructions.contains("observable done_when"))
+        XCTAssertTrue(instructions.contains("use one batch with done_when"))
+        XCTAssertTrue(instructions.contains("Check uncertain delivery before retrying"))
+        XCTAssertTrue(instructions.contains("use handoff with app, goal, done_when"))
     }
 
     func testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep() {
@@ -775,6 +798,31 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(windowRelativeFrame(elementFrame: textFieldGlobal, windowBounds: window), textField)
     }
 
+    func testLeanToolListingShortensSharedProseWithoutChangingArgumentShapes() throws {
+        let full = ToolDefinitions.configured(virtualDisplayEnabled: false, browserAvailable: true)
+        let lean = ToolDefinitions.configured(virtualDisplayEnabled: false, browserAvailable: true, leanListing: true)
+        let fullByName = Dictionary(uniqueKeysWithValues: full.map { ($0.name, $0) })
+        let sameTools = try lean.map { try XCTUnwrap(fullByName[$0.name]).asDictionary }
+        let leanBytes = try JSONSerialization.data(withJSONObject: lean.map(\.asDictionary)).count
+        let originalBytes = try JSONSerialization.data(withJSONObject: sameTools).count
+        XCTAssertLessThan(leanBytes, originalBytes)
+        if ProcessInfo.processInfo.environment["GODSPEED_MEASURE_PAYLOADS"] == "1" {
+            print("Godspeed matched tool catalog bytes: \(originalBytes) -> \(leanBytes)")
+        }
+        for tool in lean {
+            let original = try XCTUnwrap(fullByName[tool.name])
+            XCTAssertEqual(tool.inputSchema["required"] as? [String], original.inputSchema["required"] as? [String])
+            let a = try XCTUnwrap(tool.inputSchema["properties"] as? [String: [String: Any]])
+            let b = try XCTUnwrap(original.inputSchema["properties"] as? [String: [String: Any]])
+            XCTAssertEqual(Set(a.keys), Set(b.keys))
+            for key in a.keys {
+                let lhs = try JSONSerialization.data(withJSONObject: a[key]!.filter { $0.key != "description" }, options: .sortedKeys)
+                let rhs = try JSONSerialization.data(withJSONObject: b[key]!.filter { $0.key != "description" }, options: .sortedKeys)
+                XCTAssertEqual(lhs, rhs, "\(tool.name).\(key)")
+            }
+        }
+    }
+
     func testToolDescriptionsMatchOfficialComputerUseSurface() {
         let tools = Dictionary(uniqueKeysWithValues: ToolDefinitions.all.map { ($0.name, $0) })
 
@@ -805,10 +853,8 @@ final class OpenComputerUseKitTests: XCTestCase {
             ["auto", "accessibility", "app_post", "sky_click", "global"]
         )
         let dragDescription = tools["drag"]?.description ?? ""
-        XCTAssertTrue(dragDescription.contains("Global pointer use is off unless the user has enabled it."))
-        XCTAssertTrue(dragDescription.contains("window moves or Finder drag-and-drop"))
-        XCTAssertTrue(dragDescription.contains("Both points must be inside the app's window"))
-        XCTAssertTrue(dragDescription.contains("Delivery does not verify the UI result"))
+        XCTAssertTrue(dragDescription.contains("inside one window"))
+        XCTAssertTrue(dragDescription.contains("verify the drop"))
         XCTAssertFalse(dragDescription.contains("plugin"))
         let getAppStateSchema = tools["get_app_state"]?.inputSchema
         let getAppStateProperties = getAppStateSchema?["properties"] as? [String: [String: Any]]
@@ -827,17 +873,13 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(getAppStateProperties?["settle_ms"]?["minimum"] as? Int, 1)
         let scrollPages = (tools["scroll"]?.inputSchema["properties"] as? [String: [String: Any]])?["pages"]
         XCTAssertEqual(scrollPages?["type"] as? String, "number")
-        XCTAssertEqual(
-            scrollPages?["description"] as? String,
-            "Number of pages to scroll. Fractional values are supported. Defaults to 1"
-        )
-        XCTAssertEqual(
-            tools["select_text"]?.description,
-            "Use to select text inside a text element, or place the cursor before or after it; not to replace a field's value (use set_value). text must match the accessibility tree exactly. If not unique, add prefix or suffix. Give label (or element_index)."
-        )
+        XCTAssertTrue((scrollPages?["description"] as? String)?.contains("Defaults to 1") == true)
+        XCTAssertTrue(tools["select_text"]?.description.contains("UTF-16 range") == true)
         let selectTextSchema = tools["select_text"]?.inputSchema
         let selectTextProperties = selectTextSchema?["properties"] as? [String: [String: Any]]
-        XCTAssertEqual(selectTextSchema?["required"] as? [String], ["app", "text"])
+        XCTAssertEqual(selectTextSchema?["required"] as? [String], ["app"])
+        XCTAssertEqual(selectTextProperties?["start"]?["type"] as? String, "integer")
+        XCTAssertEqual(selectTextProperties?["length"]?["type"] as? String, "integer")
         XCTAssertEqual(selectTextSchema?["additionalProperties"] as? Bool, false)
         XCTAssertEqual(
             selectTextProperties?["selection"]?["enum"] as? [String],
@@ -921,15 +963,17 @@ final class OpenComputerUseKitTests: XCTestCase {
         XCTAssertEqual(result.primaryText, "Invalid scroll direction: sideways")
     }
 
-    func testScrollRejectsNonPositivePagesWithOfficialMessage() {
+    func testScrollRejectsNonPositivePagesBeforeDelivery() {
         let dispatcher = ComputerUseToolDispatcher()
-        let result = dispatcher.callToolAsResult(
-            name: "scroll",
-            arguments: ["app": "Sublime Text", "element_index": "14", "direction": "down", "pages": 0.0]
-        )
-
-        XCTAssertTrue(result.isError)
-        XCTAssertEqual(result.primaryText, "pages must be > 0")
+        for pages: Any in [0.0, 101.0, true, "invalid"] {
+            let result = dispatcher.callToolAsResult(
+                name: "scroll",
+                arguments: ["app": "Sublime Text", "element_index": "14", "direction": "down", "pages": pages]
+            )
+            XCTAssertTrue(result.isError)
+            XCTAssertEqual(result.deliveryState, .notSent)
+            XCTAssertTrue(result.primaryText?.contains("pages must be greater than 0") == true)
+        }
     }
 
     func testSecondaryActionInvalidMessageMatchesOfficialShape() {

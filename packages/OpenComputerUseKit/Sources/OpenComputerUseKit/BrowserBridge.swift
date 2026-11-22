@@ -1005,6 +1005,19 @@ extension ComputerUseToolDispatcher {
             case .paste:
                 let node = label != nil || index != nil ? try target() : nil
                 try authorizeBrowserEffect(policy, action: "paste", arguments: arguments, page: page, node: node)
+                if let (format, text) = try BrowserFormattedPaste.directPayload(arguments) {
+                    if format == "text" {
+                        let result = try page.type(text, replace: false, into: node, keyEvents: false)
+                        return .text(result.reply(verb: "Pasted into", target: node?.name ?? "the focused Chrome field"),
+                                     deliveryState: result.deliveryState)
+                    }
+                    guard let node else {
+                        throw ComputerUseError.invalidArguments("Formatted paste requires a named or indexed rich-text editor.")
+                    }
+                    let html = format == "markdown" ? try BrowserFormattedPaste.markdownHTML(text) : text
+                    return try page.pasteFormattedHTML(html, into: node)
+                }
+
                 if case .files(let paths, let move) = PrivateClipboard.current.payload {
                     guard !move, let node else {
                         throw ComputerUseError.invalidArguments("Paste copied files into a labelled Chrome file input. Cut files can only be moved in Finder.")

@@ -42,6 +42,23 @@ final class BatchResumeTests: XCTestCase {
         XCTAssertEqual(resumed.map { $0.arguments["label"] as? String }, ["Item 6", "Item 7", "Item 8", "Item 9", "Item 10"])
     }
 
+    func testRepeatedResumeKeepsOriginalStepNumbersAndSlots() throws {
+        let steps = clicks(4) + [.init(tool: "type_text", arguments: ["app": "Notes", "text": "draft"])]
+        let first = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([.acknowledged, .outcomeUnknown], stop: .stepFailure, total: 5),
+            goal: "Edit note", doneWhen: nil, app: "Notes", windowID: 9, processID: 7))
+        let work = try BatchResume.steps(of: first, values: ["step-5-text": "draft"])
+        let second = try XCTUnwrap(BatchResume.record(
+            steps: work, receipt: receipt([.acknowledged, .notSent], stop: .timeBudget, total: 3),
+            goal: first.goal, doneWhen: nil, app: first.app, windowID: first.windowID, processID: first.processID,
+            continuing: first))
+        XCTAssertEqual(second.total, 5)
+        XCTAssertEqual(second.sent.map(\.number), [1, 2, 3])
+        XCTAssertEqual(second.sent[1].state, .outcomeUnknown)
+        XCTAssertEqual(second.pending.map(\.number), [4, 5])
+        XCTAssertEqual(second.slotNames, ["step-5-text"])
+    }
+
     /// A step that may have been sent is never resumed, and the reply names it.
     func testUnknownStepIsExcludedAndNamed() throws {
         var states = Array(repeating: DeliveryState.acknowledged, count: 5)
@@ -84,6 +101,21 @@ final class BatchResumeTests: XCTestCase {
         XCTAssertEqual(resumed.last?.arguments["text"] as? String, "hunter2-secret")
     }
 
+    func testPerStepWindowSurvivesAnUnpinnedBatchResume() throws {
+        let steps = [BatchTool.Step(tool: "click", arguments: ["app": "Notes", "window_id": 42, "label": "Save"])]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([], stop: .timeBudget, total: 1),
+            goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7))
+        let resumed = try XCTUnwrap(BatchResume.steps(of: record, values: [:]).first)
+        XCTAssertEqual(try validatedQueryWindowID(resumed.arguments["window_id"]), 42)
+    }
+
+    func testBrowserStepsDoNotEmitANativeResumeToken() {
+        let steps = [BatchTool.Step(tool: "browser", arguments: ["action": "click", "tab_id": 42, "label": "Save"])]
+        XCTAssertNil(BatchResume.record(steps: steps, receipt: receipt([], stop: .timeBudget, total: 1),
+                                        goal: "", doneWhen: nil, app: nil, windowID: nil, processID: nil))
+    }
+
     func testWindowOrProcessChangeIsRefused() throws {
         let start = Date()
         let record = try XCTUnwrap(BatchResume.record(
@@ -91,10 +123,10 @@ final class BatchResumeTests: XCTestCase {
             goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7, now: start))
         try BatchResume.check(record, now: start, liveProcessID: 7, liveWindowID: 42)
         XCTAssertThrowsError(try BatchResume.check(record, now: start, liveProcessID: 7, liveWindowID: 43)) { error in
-            guard case ComputerUseError.windowChanged(42) = error else { return XCTFail("\(error)") }
+            guard case ComputerUseError.windowChanged(42, _) = error else { return XCTFail("\(error)") }
         }
         XCTAssertThrowsError(try BatchResume.check(record, now: start, liveProcessID: 8, liveWindowID: 42)) { error in
-            guard case ComputerUseError.windowChanged(42) = error else { return XCTFail("\(error)") }
+            guard case ComputerUseError.windowChanged(42, _) = error else { return XCTFail("\(error)") }
         }
     }
 

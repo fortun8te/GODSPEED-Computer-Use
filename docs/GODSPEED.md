@@ -33,6 +33,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 |---|---|
 | `batch` | Up to 40 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
+| `local_decision` | Optional GSD1 recommendation from typed Action, Read or Recover evidence. [Setup](../experiments/LocalHelper/README.md#optional-gsd1-on-apple-silicon). |
 | `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
 | `click`, `hover`, `type_text`, `press_key`, `set_value`, `select_text`, `scroll`, `perform_secondary_action` | Element actions by label or index. |
 | `drag` | Drag between controls or points in one window. Add `verify` for a drop check. |
@@ -180,7 +181,7 @@ Browser:
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPEN_COMPUTER_USE_BROWSER` | auto | `0` removes the `browser` tool. |
-| `OPEN_COMPUTER_USE_OBU_BIN` | bundled `obu` | Explicit `obu` path. |
+| `OPEN_COMPUTER_USE_OBU_BIN` | auto-detect | Absolute path to the Open Browser Use executable. Follow the [Chrome setup guide](INSTALL.md#chrome-setup). |
 | `OPEN_COMPUTER_USE_BROWSER_SESSION` | `godspeed-<pid>` | Base session ID. Each agent's interactive browser and each of its peek lanes have distinct IDs. |
 | `OPEN_COMPUTER_USE_BROWSER_PROFILE` | none | Passed to `obu --profile`. |
 | `OPEN_COMPUTER_USE_BROWSER_APP` | `Google Chrome` | The app read after a browser step. |

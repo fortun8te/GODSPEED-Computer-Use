@@ -47,37 +47,49 @@ enum BatchResume {
         let pending: [Stored]
         /// Mutating steps that ran. Never resumed automatically; the reply names them.
         let sent: [Sent]
+        var strictBackground: Bool? = nil
+        var backgroundOnly: Bool? = nil
 
         var slotNames: [String] { pending.flatMap { $0.slots.values }.sorted() }
     }
 
     /// The record for a stopped batch, or nil when every step ran or a step cannot be stored as JSON.
     static func record(steps: [BatchTool.Step], receipt: TrajectoryLog.BatchReceipt, goal: String, doneWhen: Any?,
-                       app: String?, windowID: UInt32?, processID: Int32?, now: Date = Date()) -> Record? {
+                       app: String?, windowID: UInt32?, processID: Int32?, now: Date = Date(),
+                       continuing prior: Record? = nil) -> Record? {
+        guard prior == nil || prior?.pending.count == steps.count else { return nil }
         var pending: [Stored] = []
-        var sent: [Sent] = []
+        var sent = prior?.sent ?? []
         for (index, step) in steps.enumerated() {
-            let number = index + 1
+            let number = prior?.pending[index].number ?? index + 1
             if index < receipt.steps.count, receipt.steps[index].deliveryState != .notSent {
                 let state = receipt.steps[index].deliveryState
                 if !step.isReadOnly { sent.append(Sent(number: number, tool: step.tool, state: state)) }
                 continue
             }
-            guard let stored = stored(step, number: number) else { return nil }
+            // Resume preflight is a native window read. Browser steps need their own tab/driver binding.
+            guard step.tool != "browser",
+                  let stored = stored(step, number: number, batchWindowID: windowID) else { return nil }
             pending.append(stored)
         }
         guard !pending.isEmpty else { return nil }
         let doneData = doneWhen.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]) }
         return Record(id: UUID().uuidString, createdAt: now, expiresAt: now.addingTimeInterval(lifetime),
                       app: app, goal: goal, doneWhen: doneData, windowID: windowID, processID: processID,
-                      total: steps.count, pending: pending, sent: sent)
+                      total: prior?.total ?? steps.count, pending: pending, sent: sent.sorted { $0.number < $1.number },
+                      strictBackground: StrictBackground.enabled(), backgroundOnly: backgroundOnlyMode())
     }
 
-    static func stored(_ step: BatchTool.Step, number: Int) -> Stored? {
+    static func stored(_ step: BatchTool.Step, number: Int, batchWindowID: UInt32?) -> Stored? {
         var arguments = step.arguments
-        arguments.removeValue(forKey: "window_id")
+        if step.tool != HandoffTool.name, let batchWindowID,
+           (try? validatedQueryWindowID(arguments["window_id"])) == batchWindowID {
+            arguments.removeValue(forKey: "window_id")
+        }
         var slots: [String: String] = [:]
-        for key in slotKeys where arguments[key] != nil {
+        let privateKeys = step.tool == HandoffTool.name
+            ? slotKeys + ["values", "expected_values", "done_when"] : slotKeys
+        for key in privateKeys where arguments[key] != nil {
             arguments.removeValue(forKey: key)
             slots[key] = "step-\(number)-\(key)"
         }
@@ -88,7 +100,18 @@ enum BatchResume {
 
     /// Steps ready to run again: arguments decoded, slot values filled from `values`. Throws when a slot is missing.
     static func steps(of record: Record, values: [String: Any]) throws -> [BatchTool.Step] {
-        let missing = record.slotNames.filter { !(values[$0] is String) }
+        let missing = record.pending.flatMap { step in
+            step.slots.compactMap { key, slot -> String? in
+                let value = values[slot]
+                let valid: Bool
+                switch key {
+                case "values", "done_when": valid = value is [String: Any] || value is [Any]
+                case "expected_values": valid = value is [String: String]
+                default: valid = value is String
+                }
+                return valid ? nil : slot
+            }
+        }.sorted()
         guard missing.isEmpty else {
             throw ComputerUseError.invalidArguments("Provide these values again to resume: \(missing.joined(separator: ", ")).")
         }
@@ -145,10 +168,22 @@ enum BatchResume {
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(id.uppercased() + ".json"))
     }
 
+    /// Claim after preflight. Only one process can remove the stored token and run its steps.
+    static func claim(_ id: String) throws {
+        guard let uuid = UUID(uuidString: id) else {
+            throw ComputerUseError.invalidArguments("RESUME_NOT_FOUND. The resume token is invalid.")
+        }
+        do {
+            try FileManager.default.removeItem(at: directory.appendingPathComponent(uuid.uuidString + ".json"))
+        } catch {
+            throw ComputerUseError.notSent("The resume token could not be claimed. It may already be running or expired. Read the app before continuing.")
+        }
+    }
+
     /// Reads and uses a token in one step.
     static func consume(_ id: String, now: Date = Date()) throws -> Record {
         let record = try load(id, now: now)
-        discard(id)
+        try claim(id)
         return record
     }
 

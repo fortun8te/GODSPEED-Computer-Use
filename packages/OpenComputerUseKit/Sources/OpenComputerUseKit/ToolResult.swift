@@ -34,6 +34,7 @@ public struct ToolCallResult: @unchecked Sendable {
     public let content: [ToolResultContentItem]
     public let isError: Bool
     public let deliveryState: DeliveryState
+    let handoffMetrics: [String: Int]?
     let batchReceipt: TrajectoryLog.BatchReceipt?
     let failureCode: TrajectoryLog.FailureCode?
     let browserObservationURL: String?
@@ -52,11 +53,12 @@ public struct ToolCallResult: @unchecked Sendable {
         browserObservationURL: String? = nil, browserContinuationTabID: Int? = nil,
         browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil,
         browserEvidenceScope: BrowserEvidenceScope? = nil,
-        deliveryState: DeliveryState? = nil
+        deliveryState: DeliveryState? = nil, handoffMetrics: [String: Int]? = nil
     ) {
         self.content = content
         self.isError = isError
         self.deliveryState = deliveryState ?? (isError ? .outcomeUnknown : .acknowledged)
+        self.handoffMetrics = handoffMetrics
         self.batchReceipt = batchReceipt
         self.failureCode = failureCode
         self.browserObservationURL = browserObservationURL
@@ -84,6 +86,7 @@ public struct ToolCallResult: @unchecked Sendable {
         ]
         var metadata: [String: Any] = [:]
         for (key, value) in deliveryState.metadata { metadata["godspeed/\(key)"] = value }
+        metadata["godspeed/handoff"] = handoffMetrics
         metadata["godspeed/preview_pages"] = browserPreviewPages
         let code = batchReceipt?.failureCode ?? failureCode
         if let code, code == .staleRef || code == .windowChanged || code.isActionRefusal {
@@ -92,11 +95,18 @@ public struct ToolCallResult: @unchecked Sendable {
         if let receipt = batchReceipt {
             var batch: [String: Any] = [
                 "total_steps": receipt.totalSteps,
-                "steps": receipt.steps.enumerated().map { $0.element.metadata(number: $0.offset + 1) },
                 "not_run": max(0, receipt.totalSteps - receipt.steps.count),
                 "observation": receipt.observation.rawValue,
                 "completion": receipt.doneCheck.rawValue,
             ]
+            if receipt.canSummarizeSteps, !isError {
+                batch["step_summary"] = [
+                    "completed": receipt.steps.count,
+                    "verified": receipt.steps.filter { $0.deliveryState == .verified }.count,
+                ]
+            } else {
+                batch["steps"] = receipt.steps.enumerated().map { $0.element.metadata(number: $0.offset + 1) }
+            }
             batch["stop"] = receipt.stop?.rawValue
             batch["recovery"] = receipt.recovery
             metadata["godspeed/batch"] = batch
@@ -110,7 +120,8 @@ public struct ToolCallResult: @unchecked Sendable {
             content: content, isError: isError, batchReceipt: batchReceipt, failureCode: failureCode,
             browserObservationURL: browserObservationURL, browserContinuationTabID: browserContinuationTabID,
             browserPreviewPages: browserPreviewPages, browserFullObservationText: browserFullObservationText,
-            browserEvidenceScope: browserEvidenceScope, deliveryState: deliveryState ?? self.deliveryState
+            browserEvidenceScope: browserEvidenceScope, deliveryState: deliveryState ?? self.deliveryState,
+            handoffMetrics: handoffMetrics
         )
     }
 

@@ -83,6 +83,23 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(measured["full_pass_delta_percentage_points"], -7.5)
         self.assertIsNone(measured["paired_metric_deltas"]["input_tokens"]["median_candidate_minus_baseline"])
 
+    def test_cached_tokens_are_reported_with_paired_coverage(self):
+        for row in self.baseline:
+            row["metrics"].update(input_tokens=100, cached_input_tokens=80, reasoning_output_tokens=5)
+        for row in self.candidate:
+            row["metrics"].update(input_tokens=90, cached_input_tokens=85, reasoning_output_tokens=3)
+        result = self.run_comparison()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metrics = json.loads(result.stdout)["conditions"]["background"]["paired_metric_deltas"]
+        self.assertEqual(metrics["uncached_input_tokens"]["median_candidate_minus_baseline"], -15)
+        self.assertEqual(metrics["cached_input_tokens"]["median_candidate_minus_baseline"], 5)
+        self.assertEqual(metrics["reasoning_output_tokens"]["median_candidate_minus_baseline"], -2)
+        self.assertEqual(metrics["cache_write_input_tokens"]["matched_observations"], 0)
+
+    def test_cached_tokens_cannot_exceed_input(self):
+        self.candidate[0]["metrics"].update(input_tokens=100, cached_input_tokens=101)
+        self.assert_blocked("cached input exceeds total input")
+
     def test_missing_both_arms_is_not_valid(self):
         self.baseline.pop()
         self.candidate.pop()

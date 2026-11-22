@@ -24,7 +24,7 @@ jobs:
       - name: Verify compact replies, cursor identity and idle exit
         run: swift test --filter 'CompactVerifiedReplyTests|CursorRequestEnvironmentTests|CursorGlideShapeTests|CursorWindowAnchorTests|CursorDeliveryTests/testGestureBoundariesRetainMovesForTheirOwnClient|HandoffToolTests|LifecycleTests|LockedUseDispatchTests|testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep'
       - name: Verify safety, delivery, durability and browser policy
-        run: swift test --filter 'ActionHardeningTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests|RelayGrant|BrowserBridgeRelayGrant|GroundingCascadeTests|BatchResumeTests|TeachRecorderTests|TeachModeTests|TeachToolTests|TeachSourcesTests|TeachKeystrokePrivacyTests'
+        run: swift test --filter 'ActionHardeningTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|LocalDecisionToolTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests|RelayGrant|BrowserBridgeRelayGrant|GroundingCascadeTests|BatchResumeTests|TeachRecorderTests|TeachModeTests|TeachToolTests|TeachSourcesTests|TeachKeystrokePrivacyTests'
       - name: Verify the local training tools
         run: python3 -I -m unittest discover -s scripts/flywheel -p 'test_*.py' && python3 -I -m unittest discover -s scripts/flywheel/synth -p 'test_*.py'
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -33,12 +33,17 @@ jobs:
       - name: Verify the JavaScript API
         run: node --test scripts/node-repl/open-computer-use-repl.test.mjs scripts/node-repl/page-api.test.mjs scripts/node-repl/page-precise.test.mjs scripts/node-repl/native-precise.test.mjs scripts/node-repl/precise-actions.test.mjs
       - name: Verify matched benchmark scoring
-        run: python3 scripts/tests/test_godspeed_benchmark_compare.py
+        run: python3 -I -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Reject stale packages after a failed build
         run: ./scripts/tests/godspeed-package-guard.sh
       - name: Package a development build
         if: github.event_name == 'workflow_dispatch'
-        run: ./scripts/package-godspeed.sh
+        run: |
+          GODSPEED_ARCH=arm64 ./scripts/package-godspeed.sh
+          ./scripts/install-godspeed.sh --archive dist/godspeed/Godspeed-macOS-arm64.zip --verify-only
+          root="$(mktemp -d)"
+          ./scripts/install-godspeed.sh --archive dist/godspeed/Godspeed-macOS-arm64.zip --app-dir "$root/apps" --launcher-dir "$root/bin"
+          GODSPEED_APP="$root/apps/GODSPEED.app" python3 scripts/tests/godspeed-mcp-smoke.py --launcher "$root/bin/godspeed-mcp" --direct
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: github.event_name == 'workflow_dispatch'
         with:

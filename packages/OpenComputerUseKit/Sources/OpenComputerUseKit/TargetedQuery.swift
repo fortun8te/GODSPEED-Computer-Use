@@ -50,7 +50,7 @@ final class TargetedElementRegistry<Value> {
 
     func resolve(_ index: Int, app: TargetedAppIdentity) throws -> Value {
         guard let entry = entries[index], now() < entry.expires else {
-            entries.removeValue(forKey: index)
+            remove(index)
             throw ComputerUseError.stateUnavailable("Query index \(index) has expired or is no longer available; run query again in this session")
         }
         guard entry.app == app else {
@@ -59,7 +59,11 @@ final class TargetedElementRegistry<Value> {
         return entry.value
     }
 
-    func remove(_ index: Int) { entries.removeValue(forKey: index) }
+    func remove(_ index: Int) {
+        if entries.removeValue(forKey: index) != nil {
+            order.removeAll { $0 == index }
+        }
+    }
     func removeAll(forPIDs pids: Set<Int32>) {
         entries = entries.filter { !pids.contains($0.value.app.pid) }
         order.removeAll { entries[$0] == nil }
@@ -93,7 +97,7 @@ func boundedTargetedWalk<Node: Hashable>(
         head += 1
         result.visitedNodes += 1
         let scan: (matches: Bool, descend: Bool)
-        do { scan = try inspect(node) } catch { result.stopReason = "ax_error"; break }
+        do { scan = try inspect(node) } catch { result.stopReason = "ax_error"; continue }
         if expired() { result.stopReason = "timeout"; break }
         if scan.matches {
             result.matches.append(node)
@@ -102,7 +106,7 @@ func boundedTargetedWalk<Node: Hashable>(
         if scan.descend {
             let remaining = max(0, maxNodes - seen.count)
             let page: (nodes: [Node], truncated: Bool)
-            do { page = try children(node, remaining) } catch { result.stopReason = "ax_error"; break }
+            do { page = try children(node, remaining) } catch { result.stopReason = "ax_error"; continue }
             if expired() { result.stopReason = "timeout"; break }
             if page.truncated || page.nodes.count > remaining { result.stopReason = "max_nodes" }
             for child in page.nodes.prefix(remaining) where seen.insert(child).inserted { queue.append(child) }

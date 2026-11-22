@@ -3,13 +3,17 @@ import Foundation
 let computerUseServerInstructions = """
 Use Godspeed for Mac apps and Chrome.
 
-- Mac: compact get_app_state, then batch known actions with an observable done_when. For one step, use its tool. Use unique labels or fresh indexes.
-- Web: browser in its own tab. Use interactive or find to narrow a read. Request screenshots for visual targets that need them.
-- Verify against the result. Model hints are advisory. After a partial failure, read fresh state before retrying uncertain steps.
-- Use handoff for bounded subtasks and remember only verified reusable batches. Use the private clipboard across apps. Ask before sending, deleting, or purchasing.
+- Start with the outcome. For a familiar workflow, use batch with app, the exact saved goal and current values to replay a verified recipe. For known steps, use one batch with done_when and compact:true. A verified receipt is enough to finish.
+- For a bounded Mac task with a concrete final check but unknown steps, use handoff with app, goal, done_when and any text values. It reads and acts locally. If it stops, use its receipt and continue only the remaining work.
+- For a single action, use its tool. Use query or compact get_app_state to identify controls and browser find for web controls. Request screenshots when needed.
+- Keep work in the background. Check uncertain delivery before retrying. Ask before sending, deleting or purchasing.
 """
 
 public final class StdioMCPServer {
+    private static let diffableNativeActions: Set<String> = [
+        "click", "set_value", "type_text", "press_key", "press_menu", "scroll"
+    ]
+
     private let service: ComputerUseService
     private let dispatcher: ComputerUseToolDispatcher
     private let backgroundStateReset: () -> Void
@@ -85,7 +89,8 @@ public final class StdioMCPServer {
                             ],
                         ],
                         "instructions": computerUseServerInstructions,
-                    ]
+                    ],
+                    stableOrder: true
                 )
             case "notifications/initialized", "notifications/cancelled":
                 return nil
@@ -100,29 +105,38 @@ public final class StdioMCPServer {
                     id: id,
                     result: [
                         "tools": definitions.map(\.asDictionary),
-                    ]
+                    ],
+                    stableOrder: true
                 )
             case "tools/call":
                 let name = params["name"] as? String ?? ""
                 let arguments = params["arguments"] as? [String: Any] ?? [:]
                 let startedAt = Date()
+                let telemetry = ToolTelemetry()
                 let result: ToolCallResult
                 do {
                     let call = { try self.dispatcher.callTool(name: name, arguments: arguments) }
-                    result = try recordOperations ? withOperationJournal(call) : call()
+                    result = try ToolTelemetry.$current.withValue(telemetry) {
+                        try recordOperations ? withOperationJournal(call) : call()
+                    }
                 } catch {
                     trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt, admissionMs: admissionMs)
-                    throw error
+                    return try encodeJSONRPCResult(id: id, result: telemetry.reply(ToolCallResult.failure(error), startedAt: startedAt))
                 }
                 trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt, admissionMs: admissionMs)
-                // Remember the state the model was shown, so the next batch can reply with only the changes.
-                if name != BatchTool.name, let app = arguments["app"] as? String, let state = LeanOutput.stateText(of: result) {
-                    BatchObservationMemory.shared.recordShown(app: app, text: state)
+                // Keep the full baseline locally. Only shorten the transport reply,
+                // after the dispatcher has finished its readback and delivery checks.
+                var reply = result
+                if name != BatchTool.name, !result.isError,
+                   let app = arguments["app"] as? String, let state = LeanOutput.stateText(of: result) {
+                    let memory = BatchObservationMemory.shared
+                    if LeanOutput.usesCompactReads, Self.diffableNativeActions.contains(name),
+                       !result.content.contains(where: { $0.dictionary["type"] as? String == "image" }) {
+                        reply = LeanOutput.diffed(result, previous: memory.shownText(app: app))
+                    }
+                    memory.recordShown(app: app, text: state)
                 }
-                return try encodeJSONRPCResult(
-                    id: id,
-                    result: result.asDictionary
-                )
+                return try encodeJSONRPCResult(id: id, result: telemetry.reply(reply, startedAt: startedAt))
             default:
                 // A notification (no id) gets no reply. A request without a usable method must still get one,
                 // or the client waits forever for a response that never comes.
@@ -162,12 +176,12 @@ public final class StdioMCPServer {
         if !ClientScope.othersActive() { backgroundStateReset() }
     }
 
-    private func encodeJSONRPCResult(id: Any?, result: [String: Any]) throws -> String {
+    private func encodeJSONRPCResult(id: Any?, result: [String: Any], stableOrder: Bool = false) throws -> String {
         try encode([
             "jsonrpc": "2.0",
             "id": id ?? NSNull(),
             "result": result,
-        ])
+        ], stableOrder: stableOrder)
     }
 
     private func encodeJSONRPCError(id: Any?, code: Int, message: String) throws -> String {
@@ -181,8 +195,10 @@ public final class StdioMCPServer {
         ])
     }
 
-    private func encode(_ object: [String: Any]) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
+    private func encode(_ object: [String: Any], stableOrder: Bool = false) throws -> String {
+        let options: JSONSerialization.WritingOptions = stableOrder
+            ? [.withoutEscapingSlashes, .sortedKeys] : [.withoutEscapingSlashes]
+        let data = try JSONSerialization.data(withJSONObject: object, options: options)
         guard let text = String(data: data, encoding: .utf8) else {
             throw ComputerUseError.message("Failed to encode JSON-RPC response.")
         }

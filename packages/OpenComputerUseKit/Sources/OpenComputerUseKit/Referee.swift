@@ -95,6 +95,7 @@ enum Referee {
         if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
         let started = ProcessInfo.processInfo.systemUptime
         let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("decide"), body: body, timeout: wait)
+        ToolTelemetry.current?.recordHelper("decide", startedAt: started, image: body["image_base64"] != nil, reply: reply)
         // Learning row (see LearningLog): the view sent and the answer, or a timeout. Never changes the verdict.
         recordDecision(kind: "decide", view: body["view"] as? String ?? "", options: [], reply: reply,
                        latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: LearningLog.shared)
@@ -138,11 +139,15 @@ enum Referee {
         localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"))
     }
 
-    static func picture(url: URL?, state: String, remaining: TimeInterval?, capture: () -> Data?) -> String? {
+    private static let pictureCapabilities = RefereePictureCapabilityCache()
+
+    static func picture(url: URL?, state: String, remaining: TimeInterval?, allowRichTree: Bool = false, thin: Bool? = nil, capture: () -> Data?) -> String? {
         RefereePicture.attachment(url: url, visionEnabled: VisionFallback.isEnabled, state: state, remaining: remaining,
             supportsPictures: { url, timeout in
-                HelperHTTP.getJSON(url, timeout: timeout)?["decision_image"] as? String == "v1"
-            }, capture: capture)
+                pictureCapabilities.supports(url, now: ProcessInfo.processInfo.systemUptime) {
+                    HelperHTTP.getJSON(url, timeout: timeout).map { $0["decision_image"] as? String == "v1" }
+                }
+            }, allowRichTree: allowRichTree, thin: thin, capture: capture)
     }
 
     static func choose(goal: String, doneWhen: String, history: String, screen: String, options: [(id: String, text: String)],
@@ -161,9 +166,15 @@ enum Referee {
         if HelperAutoStarter.isLoopback(baseURL) { body["image_base64"] = imageBase64 }
         let started = ProcessInfo.processInfo.systemUptime
         let reply = HelperHTTP.postJSON(baseURL.appendingPathComponent("choose"), body: body, timeout: wait)
-        // Learning row (see LearningLog): the screen sent, the options and the scores, or a timeout.
-        recordDecision(kind: "choose", view: body["screen"] as? String ?? "", options: options, reply: reply,
-                       latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: LearningLog.shared)
+        ToolTelemetry.current?.recordHelper("choose", startedAt: started, image: body["image_base64"] != nil, reply: reply)
+        let learning = LearningLog.shared
+        if learning.isEnabled {
+            let context = chooserCaptureContext(goal: goal, doneWhen: doneWhen, history: history,
+                                                imageSupplied: body["image_base64"] != nil)
+            recordDecision(kind: "choose", view: body["screen"] as? String ?? "", options: options, reply: reply,
+                           latencyMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, log: learning,
+                           chooserContext: context)
+        }
         guard let object = reply else {
             if wait == chooseTimeout { HelperAutoStarter.shared.helperUnreachable(baseURL) }
             return nil
@@ -171,27 +182,40 @@ enum Referee {
         return chooseProbabilities(object, options: options)
     }
 
+    static func chooserCaptureContext(goal: String, doneWhen: String, history: String,
+                                      imageSupplied: Bool) -> LearningChooserContext {
+        func scrubbedPrefix(_ text: String, _ limit: Int) -> String {
+            String(LearningScrubber.scrubText(text).unicodeScalars.prefix(limit))
+        }
+        return LearningChooserContext(goal: scrubbedPrefix(goal, 500),
+                                      done_when: scrubbedPrefix(doneWhen, 300),
+                                      history: scrubbedPrefix(history, 500),
+                                      image_supplied: imageSupplied)
+    }
+
     /// The usable scores of a choose reply: "none" and every option id must be present.
     static func chooseProbabilities(_ object: [String: Any], options: [(id: String, text: String)]) -> [String: Double]? {
-        guard let probabilities = parseChoose(object), probabilities["none"] != nil,
-              options.allSatisfy({ probabilities[$0.id] != nil }) else { return nil }
-        return probabilities
+        guard let probabilities = parseChoose(object) else { return nil }
+        let expected = Set(options.map(\.id)).union(["none"])
+        guard expected.isSubset(of: probabilities.keys) else { return nil }
+        return probabilities.filter { expected.contains($0.key) }
     }
 
     /// Writes one decide or choose row. The outcome comes from the helper's answer only: decide gives act, hint
     /// (a line would be shown) or abstain; choose gives act, or abstain when "none" scores highest. No reply is
     /// timeout and an unusable reply is invalid. Nothing is written unless LearningLog is enabled.
     static func recordDecision(kind: String, view: String, options: [(id: String, text: String)], reply: [String: Any]?,
-                               latencyMs: Double, log: LearningLog) {
+                               latencyMs: Double, log: LearningLog, chooserContext: LearningChooserContext? = nil) {
         guard log.isEnabled else { return }
         var row = LearningDecisionRow(
             kind: kind, view: view, options: options.map { LearningOption(id: $0.id, text: $0.text) },
-            latency_ms: latencyMs, model: reply?["model"] as? String
+            latency_ms: latencyMs, model: reply?["model"] as? String, chooser_context: chooserContext
         )
         if let reply, kind == "choose" {
             if let probabilities = chooseProbabilities(reply, options: options) {
                 row.probabilities = probabilities
-                row.outcome = probabilities.max { $0.value < $1.value }?.key == "none" ? "abstain" : "act"
+                let bestAction = options.compactMap { probabilities[$0.id] }.max() ?? 0
+                row.outcome = (probabilities["none"] ?? 0) >= bestAction ? "abstain" : "act"
             } else {
                 row.outcome = "invalid"
             }
@@ -202,6 +226,7 @@ enum Referee {
         } else {
             row.outcome = reply == nil ? "timeout" : "invalid"
         }
+        if reply?[HelperHTTP.busyResponseKey] as? Bool == true { row.outcome = "busy" }
         log.append(row)
     }
 
@@ -258,27 +283,29 @@ enum Referee {
 /// Every failure (connection refused, a non-200 status, a bad body, a timeout) is nil, so callers just
 /// leave their answer out.
 enum HelperHTTP {
-    /// POST a JSON body and return the JSON object of a 200 reply.
-    static func postJSON(_ url: URL, body: [String: Any], timeout: TimeInterval) -> [String: Any]? {
+    static let busyResponseKey = "_godspeed_helper_busy"
+
+    /// POST JSON. A busy helper returns a busy marker so callers abstain without scheduling a health probe.
+    static func postJSON(_ url: URL, body: [String: Any], timeout: TimeInterval, followRedirects: Bool = true) -> [String: Any]? {
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
-        let containsImage = body["image_base64"] != nil
+        let useProtectedSession = !followRedirects || body["image_base64"] != nil
         let reply: Data?
         if let withoutExclusive = RequestInferenceAdmission.withoutExclusive {
             // Never release an active focus borrow or a protected desktop lease.
             guard !FocusBorrow.shared.isBorrowing, !LockedUseActionScope.requiresScreenCaptureKit else { return nil }
             do {
-                reply = try withoutExclusive { send(request, timeout: timeout, containsImage: containsImage) }
+                reply = try withoutExclusive { send(request, timeout: timeout, containsImage: useProtectedSession, acceptBusy: true) }
             } catch {
                 // The desktop gate was lost. Stop the request so no later step runs on stale observations.
                 RequestCancellation.current?.cancel()
                 return nil
             }
         } else {
-            reply = send(request, timeout: timeout, containsImage: containsImage)
+            reply = send(request, timeout: timeout, containsImage: useProtectedSession, acceptBusy: true)
         }
         guard let reply else { return nil }
         return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
@@ -305,15 +332,20 @@ enum HelperHTTP {
         }
     }
 
-    private static func send(_ request: URLRequest, timeout: TimeInterval, containsImage: Bool = false) -> Data? {
+    private static func send(_ request: URLRequest, timeout: TimeInterval, containsImage: Bool = false,
+                             acceptBusy: Bool = false) -> Data? {
         guard !RequestCancellation.requested else { return nil }
         let box = ReplyBox()
         let done = DispatchSemaphore(value: 0)
         let session = containsImage ? imageSession : URLSession.shared
         let task = session.dataTask(with: request) { data, response, _ in
             defer { done.signal() }
-            guard (response as? HTTPURLResponse)?.statusCode == 200, let data else { return }
-            box.set(data)
+            let status = (response as? HTTPURLResponse)?.statusCode
+            if acceptBusy && status == 503 {
+                box.set(Data("{\"\(busyResponseKey)\":true}".utf8))
+            } else if status == 200, let data {
+                box.set(data)
+            }
         }
         task.resume()
         let deadline = DispatchTime.now() + timeout + 0.05
@@ -348,19 +380,21 @@ final class HelperAutoStarter: @unchecked Sendable {
     private let lock = NSLock()
     private var lastCheck: TimeInterval?
     private var launched = false
+    private let restartLocalScorer: Bool
 
-    init(launcher: URL, log: URL) {
+    init(launcher: URL, log: URL, restartLocalScorer: Bool = false) {
         self.launcher = launcher
         self.log = log
+        self.restartLocalScorer = restartLocalScorer
     }
 
     /// Called after a helper call got no answer. Checks health off the calling thread and starts the
     /// launcher detached when the helper is really down.
     func helperUnreachable(_ baseURL: URL, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard RequestInferenceAdmission.withoutExclusive == nil, !RequestCancellation.requested,
+        guard restartLocalScorer || RequestInferenceAdmission.withoutExclusive == nil, !RequestCancellation.requested,
               Self.isLoopback(baseURL) else { return }
         lock.lock()
-        let check = !launched && Self.shouldCheck(lastCheck: lastCheck, now: now, cooldown: Self.checkCooldown)
+        let check = !launched && Self.shouldCheck(lastCheck: lastCheck, now: now, cooldown: restartLocalScorer ? 2 : Self.checkCooldown)
         if check { lastCheck = now }
         lock.unlock()
         guard check else { return }
@@ -386,12 +420,22 @@ final class HelperAutoStarter: @unchecked Sendable {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
         process.standardError = output
+        if restartLocalScorer {
+            process.terminationHandler = { [weak self] _ in
+                self?.resetLaunch()
+            }
+        }
         do {
             // Not waited for: the helper keeps running after this call, and after this agent exits.
             try process.run()
         } catch {
+            if restartLocalScorer { resetLaunch() }
             try? output.write(contentsOf: Data("helper auto-start failed: \(error)\n".utf8))
         }
+    }
+
+    private func resetLaunch() {
+        lock.withLock { launched = false }
     }
 
     private static func logHandle(_ url: URL) -> FileHandle? {

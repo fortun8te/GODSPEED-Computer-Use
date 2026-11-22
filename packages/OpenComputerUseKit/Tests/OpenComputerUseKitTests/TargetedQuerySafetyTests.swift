@@ -78,6 +78,17 @@ final class TargetedQuerySafetyTests: XCTestCase {
         XCTAssertThrowsError(try registry.resolve(third, app: app))
     }
 
+    func testRemovingAHandleDoesNotEvictAnUnrelatedLiveHandle() throws {
+        let app = TargetedAppIdentity(pid: 1, bundleIdentifier: nil, launchedAt: nil)
+        let registry = TargetedElementRegistry<Int>(capacity: 2)
+        let first = registry.insert(app: app) { $0 }
+        let second = registry.insert(app: app) { $0 }
+        registry.remove(second)
+        let third = registry.insert(app: app) { $0 }
+        XCTAssertEqual(try registry.resolve(first, app: app), first)
+        XCTAssertEqual(try registry.resolve(third, app: app), third)
+    }
+
     func testReadOnlyResolutionNeverLaunchesAbsentApp() {
         XCTAssertThrowsError(try AppDiscovery.resolveRunning("NoSuchReviewApp", applications: []))
         XCTAssertThrowsError(try AppDiscovery.resolveRunning("com.1password.1password", applications: []))
@@ -134,6 +145,16 @@ final class TargetedQuerySafetyTests: XCTestCase {
         }, children: { _, _ in ([1], false) })
         XCTAssertEqual(failed.matches, [0])
         XCTAssertEqual(failed.stopReason, "ax_error")
+    }
+
+    func testUnreadableNodeDoesNotHideALaterSibling() throws {
+        let result = try boundedTargetedWalk(root: 0, maxNodes: 5, limit: 5, expired: { false }, inspect: { node in
+            if node == 1 { throw ComputerUseError.stateUnavailable("unreadable sibling") }
+            return (node == 2, node == 0)
+        }, children: { _, _ in ([1, 2], false) })
+        XCTAssertEqual(result.matches, [2])
+        XCTAssertEqual(result.stopReason, "ax_error")
+        XCTAssertTrue(result.truncated)
     }
 
     func testSettleMsRejectsAnythingButAPositiveInteger() {

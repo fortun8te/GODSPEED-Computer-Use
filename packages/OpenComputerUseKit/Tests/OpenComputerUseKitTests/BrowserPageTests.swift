@@ -934,6 +934,15 @@ final class BrowserPageTests: XCTestCase {
 
     // MARK: - Change line, new marks, typing, fingerprint
 
+    func testUnloadWithoutObservedDestinationDoesNotClaimNavigation() {
+        let before = "https://a.test/start"
+        let observation: [String: Any] = ["href": before, "seenHref": before, "mut": 3, "seen": 2]
+        XCTAssertEqual(BrowserRules.changeAfterUnload(observation, loadedAddress: nil), .navigationUnconfirmed)
+        XCTAssertEqual(BrowserRules.changeAfterUnload(observation, loadedAddress: before), .navigationUnconfirmed)
+        XCTAssertEqual(BrowserRules.changeAfterUnload(observation, loadedAddress: "https://a.test/end"),
+                       .navigated("https://a.test/end"))
+    }
+
     func testChangeLineSaysNavigatedChangedOrNoChange() {
         XCTAssertEqual(BrowserRules.change(["href": "https://b.test/x", "seenHref": "https://a.test", "mut": 5, "seen": 5]), .navigated("https://b.test/x"))
         XCTAssertEqual(BrowserRules.change(["href": "https://a.test", "seenHref": "https://a.test", "mut": 7, "seen": 5]), .changed)
@@ -1087,8 +1096,10 @@ extension BrowserPageTests {
         defer { bridge.shutdown() }
         // The tab is listed, not opened by the agent: it belongs to the user.
         _ = try bridge.callTool("tabs", arguments: [:], timeout: 3)
+        _ = try bridge.callTool("claim_tab", arguments: ["tab_id": 12], timeout: 3)
         BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
         let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertFalse(sent.contains("Emulation.setFocusEmulationEnabled"), "a claimed user tab must keep its real page focus state")
         XCTAssertFalse(sent.contains("Page.addScriptToEvaluateOnNewDocument"), "a user tab must not get page hooks")
         XCTAssertFalse(sent.contains("__gs"), "a user tab must not get window.__gs")
     }
@@ -1105,7 +1116,24 @@ extension BrowserPageTests {
         _ = try bridge.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 5)
         BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
         let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertTrue(sent.contains("Emulation.setFocusEmulationEnabled"), "agent tabs need background focus emulation")
         XCTAssertTrue(sent.contains("Page.addScriptToEvaluateOnNewDocument"))
+    }
+
+    func testClaimingAnAgentTabStopsPageFocusEmulation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (helper, log) = try RecordingBrowserHelper.make(directory: directory, openTabID: 12)
+        let bridge = BrowserBridge(sessionID: "claimed-focus-\(UUID().uuidString)", launchEnvironment: [
+            "OPEN_COMPUTER_USE_BROWSER": "1", "OPEN_COMPUTER_USE_OBU_BIN": helper.path,
+        ])
+        defer { bridge.shutdown() }
+        _ = try bridge.callTool("open_tab", arguments: ["url": "about:blank"], timeout: 3)
+        _ = try bridge.callTool("claim_tab", arguments: ["tab_id": 12], timeout: 3)
+        BrowserPage(bridge: bridge, tab: ["tab_id": 12]).prime()
+        let sent = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        XCTAssertFalse(sent.contains("Emulation.setFocusEmulationEnabled"), "claiming transfers the tab to user ownership")
     }
 
     func testUrlContainsMatchesTheHostAndPathNotTheQuery() {

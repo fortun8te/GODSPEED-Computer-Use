@@ -91,11 +91,27 @@ public final class ComputerUseToolDispatcher {
             throw ComputerUseError.notSent(problem)
         }
         try StrictBackground.validate(name, arguments: arguments)
+        if name == "scroll", try ScrollChunks(arguments) == nil, let raw = arguments["pages"] {
+            guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+                throw ComputerUseError.invalidArguments("pages must be greater than 0 and at most 100")
+            }
+            try ComputerUseService.validateScrollPages(number.doubleValue)
+        }
         // Journal logical steps here so standalone actions, batches and handoffs share the same boundary.
-        return try OperationJournal.recordStep(tool: name, arguments: arguments) {
+        let telemetry = ToolTelemetry.current
+        telemetry?.add("dispatches")
+        let browserAction = (arguments["action"] as? String).map { Self.canonicalBrowserAction($0.lowercased()) }
+        let clicks = name == "click" || (name == "browser" && ["click", "press", "tap"].contains(browserAction ?? ""))
+        let result = try OperationJournal.recordStep(tool: name, arguments: arguments) {
             try callNormalizedTool(name: name, arguments: arguments, ref: ref, log: log,
                                    notesInResult: notesInResult, beforeNativeDispatch: beforeNativeDispatch)
         }
+        if clicks {
+            telemetry?.add("click_operations")
+            if result.deliveryState == .notSent { telemetry?.add("click_operations_not_sent") }
+        }
+        if result.isError { telemetry?.add("dispatch_errors") }
+        return result
     }
 
     private func callNormalizedTool(
@@ -135,7 +151,7 @@ public final class ComputerUseToolDispatcher {
         }
         // Focus and legacy shortcuts run only after authorization.
         try authorizeNativeAction(name: name, arguments: arguments)
-        if !StrictBackground.enabled(), name != "browser" { beforeNativeDispatch?() }
+        if !backgroundOnlyMode(), name != "browser" { beforeNativeDispatch?() }
         if let app = arguments["app"] as? String, !app.isEmpty {
             RecentAppMemory.shared.remember(app)
         }
@@ -152,7 +168,7 @@ public final class ComputerUseToolDispatcher {
         }
 
         // System Settings: a pane's name opens the pane by its link (its sidebar is often unreadable).
-        if !StrictBackground.enabled(), ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
+        if !backgroundOnlyMode(), ["click", "query", "open", "press_menu", "type_text", "set_value"].contains(name),
            let app = arguments["app"] as? String, SettingsPanes.isSettings(app),
            let label = SettingsPanes.paneName(in: arguments), try SettingsPanes.open(label: label) {
             // A failed readback cannot justify running the original action too.
@@ -284,7 +300,8 @@ public final class ComputerUseToolDispatcher {
             return result
         }
 
-        let before: [String]? = (SmartSteps.retryTools.contains(name) && !wasFrontmost)
+        let before: [String]? = (FocusBorrow.isEnabled && !backgroundOnlyMode()
+                                  && SmartSteps.retryTools.contains(name) && !wasFrontmost)
             ? (try? service.currentSnapshot(for: app, needScreenshot: false))?.treeLines
             : nil
 
@@ -314,14 +331,15 @@ public final class ComputerUseToolDispatcher {
                 before: before,
                 after: after?.treeLines,
                 appIsFrontmost: frontmost(),
-                borrowingAllowed: FocusBorrow.isEnabled,
+                borrowingAllowed: FocusBorrow.isEnabled && !backgroundOnlyMode(),
                 alreadyBorrowed: FocusBorrow.isBorrowed(pid: pid)
             )
             // "Reported ok, tree unchanged" does not prove the step was lost: a Send, Buy or Like click, a
             // toggle, or a shortcut can work without changing the window. Only steps that are harmless twice
             // are repeated; for the rest the model is told and decides.
             // An uncertain or independently verified action is never repeated.
-            if shouldRetry, result.deliveryState == .acknowledged, isSafeToRepeat(name: name, arguments: arguments, app: app, snapshot: after) {
+            if shouldRetry, !backgroundOnlyMode(), result.deliveryState == .acknowledged,
+               isSafeToRepeat(name: name, arguments: arguments, app: app, snapshot: after) {
                 result = try FocusBorrow.withBorrow(pid: pid) {
                     try dispatchAction()
                 }
@@ -456,6 +474,8 @@ public final class ComputerUseToolDispatcher {
             return try OperationJournal.withBatchGoal(arguments["goal"] as? String ?? "") { try runBatch(arguments: arguments) }
         case HandoffTool.name:
             return try runHandoff(arguments: arguments)
+        case LocalDecisionTool.name:
+            return try LocalDecisionTool.run(arguments: arguments, baseURL: LocalDecisionTool.baseURL())
         case "browser":
             return try runBrowser(arguments: arguments)
         case SmartSteps.saveAsName:
@@ -528,7 +548,10 @@ public final class ComputerUseToolDispatcher {
                     includeMenuBar: try strictObservationBool("include_menu_bar", in: arguments, default: false)
                 ),
                 settleMs: settle.wait,
-                compact: try strictObservationBool("compact", in: arguments, default: false),
+                compact: try strictObservationBool(
+                    "compact", in: arguments,
+                    default: LeanOutput.usesCompactReads
+                ),
                 windowID: stateWindow
             )
             ReadRouting.recordSettle(settle.tuned, result: state, startedAt: settleStarted, app: stateApp)
@@ -704,6 +727,14 @@ public final class ComputerUseToolDispatcher {
                 keyMethod: try parseKeyMethod(optionalString("key_method", in: arguments))
             )
         case "press_menu":
+            if arguments["file_path"] != nil || arguments["new_name"] != nil {
+                return try service.finderFileCommand(
+                    app: requireString("app", in: arguments),
+                    titles: try menuPathArgument(arguments["path"]),
+                    path: requireString("file_path", in: arguments),
+                    newName: try arguments["new_name"].map { _ in try requireString("new_name", in: arguments) }
+                )
+            }
             return try service.pressMenu(
                 app: requireString("app", in: arguments),
                 titles: try menuPathArgument(arguments["path"])

@@ -13,6 +13,15 @@ final class BackgroundSafetyTests: XCTestCase {
 
     // MARK: - Key equivalents
 
+    func testFinderBackgroundOpenNavigatesFoldersWithoutOpeningFiles() {
+        let background = FinderOpen.openScript(target: "item 1 of (get selection)", allowFileOpen: false)
+        XCTAssertTrue(background.contains("set target of Finder window 1 to t"))
+        XCTAssertTrue(background.contains("__godspeed_background_file_refused__"))
+        XCTAssertFalse(background.contains("open t"))
+        let foreground = FinderOpen.openScript(target: "item 1 of (get selection)", allowFileOpen: true)
+        XCTAssertTrue(foreground.contains("open t"))
+    }
+
     func testCommandLetterMapsToMenuEquivalent() throws {
         XCTAssertEqual(try equivalent("cmd+s"), SkyMenuKeyEquivalent(character: "S", modifiers: 0))
         XCTAssertEqual(try equivalent("command+S"), SkyMenuKeyEquivalent(character: "S", modifiers: 0))

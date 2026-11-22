@@ -53,7 +53,9 @@ final class CursorHideTimerTests: XCTestCase {
         XCTAssertTrue(panel!.isVisible, "the new action's cursor must not be ordered out by a stale fade")
     }
 
-    func testCursorFadesOutWhenItsTargetWindowCloses() {
+    func testCursorFadesOutWhenItsTargetWindowCloses() throws {
+        try XCTSkipUnless(LockedUseSession.current().state == .unlocked,
+                          "Requires an unlocked desktop for WindowServer visibility transitions.")
         SoftwareCursorOverlay.reset()
         defer { SoftwareCursorOverlay.reset() }
         // A real window the cursor points at; closing it must not leave the cursor over the desktop.
@@ -84,7 +86,9 @@ final class CursorHideTimerTests: XCTestCase {
         XCTAssertEqual(panel?.alphaValue, 1, "a hidden cursor must leave the panel fully opaque for the next action")
     }
 
-    func testCursorDoesNotPresentForTargetThatAlreadyLeftTheScreen() {
+    func testCursorDoesNotPresentForTargetThatAlreadyLeftTheScreen() throws {
+        try XCTSkipUnless(LockedUseSession.current().state == .unlocked,
+                          "Requires an unlocked desktop for WindowServer visibility transitions.")
         SoftwareCursorOverlay.reset()
         defer { SoftwareCursorOverlay.reset() }
         let target = NSWindow(

@@ -116,24 +116,32 @@ final class FocusBorrowSession {
     private let controller: FocusBorrowController
     private var leases: [FocusBorrowController.Lease] = []
     private let enabled: Bool
+    private let backgroundOnly: () -> Bool
+    private let secondsSinceUserInput: () -> TimeInterval
+    private var fellBackToBackground = false
     /// When the first borrow of this session started. The user's own keys go to the borrowed app while it is
     /// in front, so a session gives focus back after `maxAge` and later steps run in the background.
     private var startedAt: Date?
     static let maxAge: TimeInterval = 6
 
-    init(controller: FocusBorrowController = FocusBorrow.shared, enabled: Bool = FocusBorrow.isEnabled) {
+    init(controller: FocusBorrowController = FocusBorrow.shared, enabled: Bool = FocusBorrow.isEnabled,
+         backgroundOnly: @escaping () -> Bool = { backgroundOnlyMode() },
+         secondsSinceUserInput: @escaping () -> TimeInterval = FocusBorrowController.secondsSinceUserInput) {
         self.controller = controller
         self.enabled = enabled
+        self.backgroundOnly = backgroundOnly
+        self.secondsSinceUserInput = secondsSinceUserInput
     }
 
     /// Brings `pid` forward and keeps it there until `close()`. Returns false when the app could not be
     /// brought forward (the steps then run as they would in the background).
     @discardableResult
     func ensure(pid: pid_t) -> Bool {
-        guard enabled, !backgroundOnlyMode() else { return false }
+        guard enabled, !backgroundOnly(), !fellBackToBackground else { return false }
         if let startedAt, Date().timeIntervalSince(startedAt) > Self.maxAge
-            || (isActive && FocusBorrowController.secondsSinceUserInput() < Date().timeIntervalSince(startedAt)) {
+            || (isActive && secondsSinceUserInput() < Date().timeIntervalSince(startedAt)) {
             // Too long, or the user came back mid-borrow: hand focus back now and run the rest in the background.
+            fellBackToBackground = true
             close()
             return false
         }
@@ -146,7 +154,7 @@ final class FocusBorrowSession {
         return lease.activated
     }
 
-    var isActive: Bool { !leases.isEmpty }
+    var isActive: Bool { leases.contains(where: \.activated) }
 
     /// Gives focus back: releases the borrows in reverse order.
     func close() {
@@ -204,7 +212,9 @@ final class FocusBorrowController: @unchecked Sendable {
         if needsActivation {
             activated = activator.waitForTypingPause() && activator.activate(pid: pid)
         }
-        return Lease(pid: pid, activated: activated)
+        let lease = Lease(pid: pid, activated: activated)
+        if !activated { release(lease) }
+        return lease
     }
 
     /// Closes a borrow. When it was the last open one, gives focus back to the app that had it before,

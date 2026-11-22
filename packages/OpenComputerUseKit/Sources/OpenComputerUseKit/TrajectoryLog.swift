@@ -18,7 +18,7 @@ final class TrajectoryLog: @unchecked Sendable {
     static let redactedValue = "[redacted]"
 
     /// Words that mark a password or secure field, matched case-insensitively.
-    static let secureFieldMarkers = ["password", "passcode", "secure"]
+    static let secureFieldMarkers = LearningScrubber.secureMarkers
     /// Argument keys that name the target element. A secure marker in one of these marks the whole call.
     static let targetKeys: Set<String> = [
         "label", "labels", "role", "element_role", "subrole", "name", "title", "placeholder", "description", "identifier",
@@ -97,7 +97,7 @@ final class TrajectoryLog: @unchecked Sendable {
         let safeArguments = name == "clipboard" ? [:] : (capturesContent && Self.focusesSecureField(output)
             ? Self.redactTypedValues(arguments) : arguments)
         let receipts = capturesContent && name == BatchTool.name
-            ? result.primaryText.flatMap { Self.parseReceipts(Self.redactSecureLines($0)) } : nil
+            ? (result.batchReceipt?.fullStepReport ?? result.primaryText).flatMap { Self.parseReceipts(Self.redactSecureLines($0)) } : nil
         submitCall(
             name: name,
             arguments: safeArguments,
@@ -567,6 +567,17 @@ final class TrajectoryLog: @unchecked Sendable {
         var observation: Observation = .unavailable
         var decisionHint = false
         var doneCheck: DoneCheck = .notRequested
+        /// Full click details remain available to the opt-in content log after the reply is compacted.
+        var fullStepReport: String?
+        var wantsCompactMetadata = false
+
+        var canSummarizeSteps: Bool {
+            wantsCompactMetadata && doneCheck == .verified && stop == nil && observation != .failed
+                && steps.count == totalSteps && !steps.isEmpty
+                && steps.allSatisfy {
+                    $0.failureCode == nil && $0.deliveryState != .outcomeUnknown && $0.observation != .outcomeUnknown
+                }
+        }
 
         var deliveryState: DeliveryState {
             // A strong done_when check on fresh evidence reconciles an unacknowledged step (see BatchTool).

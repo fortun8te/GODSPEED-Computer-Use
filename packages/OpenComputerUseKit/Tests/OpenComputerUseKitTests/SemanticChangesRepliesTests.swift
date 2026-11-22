@@ -4,7 +4,7 @@ import XCTest
 /// Change-only batch replies with a `Changes:` summary (`OPEN_COMPUTER_USE_SEMANTIC_REPLIES`).
 /// Before/after fixtures: each test reads the reply with the setting on and off.
 final class SemanticChangesRepliesTests: XCTestCase {
-    private let header = "App=com.apple.Notes (pid 4242)\nWindow: \"Notes\", App: Notes.\n[w=settable]"
+    private let header = "App=com.apple.Notes (pid 4242)\nWindow: \"Notes\", App: Notes.\nWindow ID: 9\n[w=settable]"
     private var savedMinimum = 0
 
     // The fixtures are small; production skips the summary on diffs under 400 bytes (see the last test).

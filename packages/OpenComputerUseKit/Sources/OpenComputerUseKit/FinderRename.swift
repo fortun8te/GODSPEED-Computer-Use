@@ -35,13 +35,15 @@ enum FinderRename {
         let source = """
         tell application id "com.apple.finder"
             set theItem to \(target)
-            set oldName to name of theItem
             set name of theItem to \(quoted(newName))
-            return oldName
+            return name of theItem
         end tell
         """
-        guard let old = try AppleEventsGate.send(source, bundle: "com.apple.finder")?.stringValue else { return nil }
-        return .text("Renamed \"\(old)\" to \"\(newName)\" (through Finder, in the background). No Return needed.")
+        guard let reply = try AppleEventsGate.send(source, bundle: "com.apple.finder") else { return nil }
+        guard let actual = reply.stringValue, actual == newName else {
+            throw ComputerUseError.acknowledged("Finder accepted the rename request, but the resulting name could not be confirmed. Read the folder before retrying.")
+        }
+        return .text("Renamed the item to \"\(actual)\" in Finder. No Return needed.", deliveryState: .verified)
     }
 
     /// A plain file name: no path separators, not empty, not a key name.
@@ -183,7 +185,10 @@ enum FinderOpen {
         try run(target: "item 1 of (get selection)")
     }
 
-    private static func run(target: String) throws -> String? {
+    static func openScript(target: String, allowFileOpen: Bool) -> String {
+        let fileAction = allowFileOpen
+            ? "open t\n                return \"Opened \" & (name of t) & \".\""
+            : "return \"__godspeed_background_file_refused__\""
         let source = """
         tell application id "com.apple.finder"
             if not (exists \(target)) then return ""
@@ -192,14 +197,21 @@ enum FinderOpen {
                 set target of Finder window 1 to t
                 return "Opened folder " & (name of t) & " in the Finder window."
             else
-                open t
-                return "Opened " & (name of t) & "."
+                \(fileAction)
             end if
         end tell
         """
+        return source
+    }
+
+    private static func run(target: String) throws -> String? {
+        let source = openScript(target: target, allowFileOpen: !backgroundOnlyMode())
         guard let reply = try AppleEventsGate.send(source, bundle: "com.apple.finder") else { return nil }
         guard let message = reply.stringValue else {
             throw ComputerUseError.acknowledged("Finder acknowledged the open. Read its state before trying again.")
+        }
+        if message == "__godspeed_background_file_refused__" {
+            throw ComputerUseError.backgroundUnsupported("Opening the selected file could bring its app forward. Nothing was opened.")
         }
         return message.isEmpty ? nil : message
     }

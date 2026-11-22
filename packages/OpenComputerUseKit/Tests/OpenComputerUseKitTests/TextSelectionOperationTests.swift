@@ -57,7 +57,9 @@ final class TextSelectionOperationTests: XCTestCase {
             readRange: { CFRange(location: target.location, length: target.length) }))
     }
 
-    func testQueryIndexesValidateSessionBeforeLookingUpTheApp() {
+    func testQueryIndexesValidateSessionBeforeLookingUpTheApp() throws {
+        try XCTSkipUnless(LockedUseSession.current().state == .unlocked,
+                          "The validator is reached after the unlocked-session check.")
         let service = ComputerUseService()
         XCTAssertThrowsError(try LockedUseActionScope.withValidator({ throw ComputerUseError.message("revoked") }) {
             try service.selectText(app: "nonexistent-selection-test-app", elementIndex: "1000001", text: "x",
@@ -79,6 +81,8 @@ final class TextSelectionOperationTests: XCTestCase {
 
     @MainActor
     func testRealAXTextViewSupportsUTF16SelectionAndBothCaretModes() throws {
+        try XCTSkipUnless(LockedUseSession.current().state == .unlocked,
+                          "Real AX selection needs an unlocked desktop.")
         guard AXIsProcessTrusted(), NSScreen.main != nil else { throw XCTSkip("Real AX selection requires Accessibility and a display") }
         NSApplication.shared.finishLaunching()
         let window = NSWindow(contentRect: NSRect(x: 120, y: 120, width: 350, height: 150),

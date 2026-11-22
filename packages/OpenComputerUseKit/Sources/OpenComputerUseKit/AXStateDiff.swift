@@ -21,6 +21,18 @@ public enum AXStateDiff {
     /// Removed lines are shown up to this many per run; the rest collapse into one summary line.
     public static let maxRemovedRunLength = 8
 
+    /// Compare observations without building an edit script when no diff will be shown.
+    static func sameContent(previous: String, current: String) -> Bool {
+        guard !previous.isEmpty else { return false }
+        if previous == current { return true }
+        let oldLines = previous.split(separator: "\n", omittingEmptySubsequences: false)
+        let newLines = current.split(separator: "\n", omittingEmptySubsequences: false)
+        guard oldLines.count == newLines.count else { return false }
+        return zip(oldLines, newLines).allSatisfy { pair in
+            strippedContent(of: String(pair.0)) == strippedContent(of: String(pair.1))
+        }
+    }
+
     /// Summarises how `current` differs from `previous`.
     ///
     /// - Returns: `nil` when the caller should send the full state instead, which is the case when

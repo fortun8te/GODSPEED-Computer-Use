@@ -5,6 +5,10 @@ import Foundation
 /// reach disk. Nothing is sent anywhere. Clipboard content is never read, so it is never stored.
 /// OPEN_COMPUTER_USE_LEARNING_LOG=0 turns the log off. OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES=0 skips PNG saves.
 final class LearningLog: @unchecked Sendable {
+    @TaskLocal static var episodeID: String?
+    @TaskLocal static var decisionID: String?
+    @TaskLocal static var suppliedValues: [String] = []
+
     static let enabledVariable = "OPEN_COMPUTER_USE_LEARNING_LOG"
     static let imagesVariable = "OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES"
     static let runIDVariable = "OPEN_COMPUTER_USE_RUN_ID"
@@ -68,6 +72,8 @@ final class LearningLog: @unchecked Sendable {
         var scrubbed = LearningScrubber.scrub(object)
         if scrubbed["ts"] == nil { scrubbed["ts"] = Self.timestamp(now) }
         if scrubbed["run_id"] == nil { scrubbed["run_id"] = runID }
+        if let episodeID = Self.episodeID { scrubbed["episode_id"] = episodeID }
+        if let decisionID = Self.decisionID { scrubbed["decision_id"] = decisionID }
         guard let line = try? JSONSerialization.data(
             withJSONObject: scrubbed, options: [.sortedKeys, .withoutEscapingSlashes]
         ) else { return false }
@@ -89,8 +95,16 @@ final class LearningLog: @unchecked Sendable {
         let name = "learning-\(Self.format(now, "yyyy-MM-dd-HHmmss-SSS"))-\(UUID().uuidString.lowercased().prefix(8)).png"
         return locked { () -> String? in
             do {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                try png.write(to: directory.appendingPathComponent(name), options: .atomic)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                let url = directory.appendingPathComponent(name)
+                try png.write(to: url, options: .atomic)
+                do {
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                } catch {
+                    try? FileManager.default.removeItem(at: url)
+                    throw error
+                }
             } catch {
                 return nil
             }
@@ -103,7 +117,8 @@ final class LearningLog: @unchecked Sendable {
     /// and a stdio MCP process) then never interleave a row write with a cap eviction. If the lock file cannot be
     /// opened, `body` still runs: O_APPEND keeps each row whole, and a log must never block an action.
     private func locked<T>(_ body: () -> T) -> T {
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
         let descriptor = open(directory.appendingPathComponent(".learning.lock").path, O_RDWR | O_CREAT, 0o600)
         guard descriptor >= 0 else { return body() }
         defer { close(descriptor) }
@@ -115,7 +130,8 @@ final class LearningLog: @unchecked Sendable {
     /// Appends the whole line with one O_APPEND write loop, so the bytes land at the current end of the file.
     private func write(_ data: Data, to url: URL) -> Bool {
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
         } catch {
             return false
         }
@@ -140,8 +156,12 @@ final class LearningLog: @unchecked Sendable {
         let files = learningFiles()
         var total = files.reduce(UInt64(0)) { $0 + $1.size }
         for file in files where total > maxBytes && file.name != name {
-            try? FileManager.default.removeItem(at: file.url)
-            total -= file.size
+            do {
+                try FileManager.default.removeItem(at: file.url)
+                total -= file.size
+            } catch {
+                continue
+            }
         }
     }
 
@@ -180,6 +200,14 @@ struct LearningOption: Codable {
     var text: String
 }
 
+/// Text inputs for replaying a chooser request from a scrubbed local capture.
+struct LearningChooserContext: Codable {
+    let goal: String
+    let done_when: String
+    let history: String
+    let image_supplied: Bool
+}
+
 /// A decide or choose call. The outcome is what the model returned, not a label.
 struct LearningDecisionRow: Codable {
     var kind = "decide"
@@ -195,6 +223,16 @@ struct LearningDecisionRow: Codable {
     /// The model's own answer for decide (act, look_again, done, stuck) and its confidence.
     var label: String?
     var confidence: Double?
+    var chooser_context: LearningChooserContext?
+}
+
+/// The disposition of one chooser invocation, kept separate from the model's scores.
+struct LearningChoiceOutcomeRow: Codable {
+    var kind = "choice_outcome"
+    let disposition: String
+    var selected_option_id: String?
+    var delivery_state: String?
+    var readback: String?
 }
 
 /// A grounding call: where the model pointed in a crop.
@@ -296,7 +334,7 @@ enum LearningDoneWhen {
 enum LearningScrubber {
     static let redacted = "[redacted]"
     static let textLimit = 6_000
-    static let secureMarkers = ["password", "passcode", "secure"]
+    static let secureMarkers = ["password", "passcode", "wachtwoord", "secure"]
     static let codeMarkers = ["code", "otp", "2fa", "verification"]
     static let labelKeys: Set<String> = ["role", "subrole", "label", "target_role", "target_label"]
     /// Keys we write ourselves or that hold file names and ids. They are never scrubbed.
@@ -322,6 +360,8 @@ enum LearningScrubber {
                 continue
             } else if codeLabel && ["value", "before", "after"].contains(key) && value is String {
                 output[key] = redacted
+            } else if ["view", "before", "after"].contains(key), let state = value as? String {
+                output[key] = scrubText(TrajectoryLog.redactSecureLines(state))
             } else {
                 output[key] = scrubValue(value)
             }
@@ -330,10 +370,18 @@ enum LearningScrubber {
     }
 
     private static func scrubValue(_ value: Any) -> Any {
-        if let text = value as? String { return clean(text) }
+        if let text = value as? String { return scrubText(text) }
         if let object = value as? [String: Any] { return scrub(object) }
         if let list = value as? [Any] { return list.map(scrubValue) }
         return value
+    }
+
+    static func scrubText(_ text: String) -> String {
+        let scrubbed = LearningLog.suppliedValues.sorted { $0.utf16.count > $1.utf16.count }
+            .reduce(text) { result, supplied in
+                result.replacingOccurrences(of: supplied, with: redacted)
+            }
+        return clean(scrubbed)
     }
 
     /// Redacts API keys, card numbers that pass Luhn and long mixed tokens, then clips to the limit.
@@ -351,7 +399,7 @@ enum LearningScrubber {
 
     /// Words that name a password or secure field in English and Dutch. Matching is loose on purpose: a false
     /// match only costs one crop image.
-    static let secureImageMarkers = ["password", "passcode", "wachtwoord", "secure"]
+    static let secureImageMarkers = secureMarkers
 
     /// True when any of these texts (window text, a label, a subrole) names a secure field. Such views keep their
     /// rows but never their crop images.

@@ -55,6 +55,7 @@ final class DragReleaseTests: XCTestCase {
     }
 
     private func startReading() throws {
+        try XCTSkipUnless(LockedUseSession.current().state == .unlocked, "Posting events requires an unlocked desktop.")
         guard AXIsProcessTrusted() else { throw XCTSkip("Posting events needs the Accessibility permission") }
         NSApplication.shared.setActivationPolicy(.accessory)
         NSApplication.shared.finishLaunching()
