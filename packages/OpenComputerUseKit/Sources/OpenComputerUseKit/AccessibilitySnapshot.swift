@@ -17,6 +17,7 @@ final class ElementRecord {
     let isSyntheticText: Bool
     /// What the snapshot showed at this index, checked before any action on it; nil where no check applies.
     let identity: ElementIdentity?
+    let completionField: DoneCheck.Field?
 
     init(
         index: Int,
@@ -29,7 +30,8 @@ final class ElementRecord {
         rawActions: [String],
         prettyActions: [String],
         isSyntheticText: Bool = false,
-        identity: ElementIdentity? = nil
+        identity: ElementIdentity? = nil,
+        completionField: DoneCheck.Field? = nil
     ) {
         self.index = index
         self.identifier = identifier
@@ -42,6 +44,7 @@ final class ElementRecord {
         self.prettyActions = prettyActions
         self.isSyntheticText = isSyntheticText
         self.identity = identity
+        self.completionField = completionField
     }
 }
 
@@ -172,6 +175,11 @@ public struct AppSnapshot {
 
     var nativeWindow: NativeWindowObservation? = nil
     var elementRefs: NativeSnapshotRefs? = nil
+
+    var completionFields: [DoneCheck.Field] {
+        guard observation.includeAX, DoneCheck.supportsAbsenceCheck(treeLines.joined(separator: "\n")) else { return [] }
+        return elements.values.compactMap(\.completionField)
+    }
 
     /// The capture and AX tree shared an exact window ID at observation time.
     public var observedWindowID: CGWindowID? { nativeWindow?.id }
@@ -622,7 +630,9 @@ enum SnapshotBuilder {
                 title: element.title,
                 value: element.value,
                 rawActions: element.actions,
-                prettyActions: element.actions
+                prettyActions: element.actions,
+                completionField: HandoffTool.fieldRoles.contains(element.role)
+                    ? element.title.map { DoneCheck.Field(label: $0, value: element.value) } : nil
             )
             records[element.index] = record
 
@@ -1123,7 +1133,8 @@ private struct TreeRenderer {
         }
         let nextAncestors = ancestors + [root]
 
-        let role = stringValue(of: root, attribute: kAXRoleAttribute) ?? "AXUnknown"
+        let rawRole = stringValue(of: root, attribute: kAXRoleAttribute)
+        let role = rawRole ?? "AXUnknown"
         if role == axWebAreaRole {
             hasWebArea = true
         }
@@ -1275,6 +1286,21 @@ private struct TreeRenderer {
         let lineBody = "\(linePrefix)\(traitsSegment)\(titleSegment)\(rowSummarySegment)\(labelSegment)\(helpSegment)\(urlSegment)\(identifierSegment)\(valueSegment)\(placeholderSegment)\(frameSegment)"
         lines.append("\(AXTreeTextFormatting.indentation(depth, compact: context.compactText, style: context.indentationStyle))\(lineBody)\(actionsSegment)")
 
+        let identity = ElementIdentity(
+            role: rawRole, subrole: subrole,
+            title: stringValue(of: root, attribute: kAXTitleAttribute),
+            description: stringValue(of: root, attribute: kAXDescriptionAttribute),
+            identifier: stringValue(of: root, attribute: kAXIdentifierAttribute),
+            value: ElementIdentity.valueIsName.contains(role) ? stringValue(of: root, attribute: kAXValueAttribute) : nil
+        )
+        let completionField: DoneCheck.Field?
+        if ComputerUseService.typingRoles.contains(SmartSteps.roleKey(role)), let name = identity.name {
+            completionField = DoneCheck.Field(label: name, value: isSecureTextField(subrole: subrole)
+                ? nil : attributeValue(of: root, attribute: kAXValueAttribute) as? String)
+        } else {
+            completionField = nil
+        }
+
         let record = ElementRecord(
             index: index,
             identifier: axIdentifier,
@@ -1283,13 +1309,8 @@ private struct TreeRenderer {
             role: role,
             rawActions: actions,
             prettyActions: prettyActions,
-            identity: ElementIdentity(
-                role: stringValue(of: root, attribute: kAXRoleAttribute), subrole: subrole,
-                title: stringValue(of: root, attribute: kAXTitleAttribute),
-                description: stringValue(of: root, attribute: kAXDescriptionAttribute),
-                identifier: stringValue(of: root, attribute: kAXIdentifierAttribute),
-                value: ElementIdentity.valueIsName.contains(role) ? stringValue(of: root, attribute: kAXValueAttribute) : nil
-            )
+            identity: identity,
+            completionField: completionField
         )
         records[index] = record
 
@@ -2690,10 +2711,11 @@ extension SnapshotBuilder {
     }
 
     static func directFieldValue(_ label: String, in context: TargetedAX.WindowContext) -> String? {
-        let criteria = TargetedAX.Criteria(text: label, exact: true, role: nil, limit: 2, maxNodes: 120)
-        guard let scan = try? targetedSearch(criteria, in: context, timeout: 0.15), !scan.truncated,
+        let name = DoneCheck.normalizedFieldLabel(label)
+        guard !name.isEmpty else { return nil }
+        let criteria = TargetedAX.Criteria(text: nil, exact: true, role: nil, limit: 2, maxNodes: 120)
+        guard let scan = try? targetedSearch(criteria, in: context, timeout: 0.15, completionFieldName: name), !scan.truncated,
               scan.records.count == 1, let field = scan.records.first,
-              field.title?.caseInsensitiveCompare(label) == .orderedSame,
               ComputerUseService.typingRoles.contains(SmartSteps.roleKey(field.role)),
               let element = field.element, belongsToWindow(element, window: context.windowElement),
               let value = field.value else { return nil }
@@ -2802,13 +2824,15 @@ extension SnapshotBuilder {
 
     /// Use one bounded traversal so every app has the same visibility and match rules.
     static func targetedSearch(
-        _ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext, timeout: TimeInterval = 2
+        _ criteria: TargetedAX.Criteria, in context: TargetedAX.WindowContext, timeout: TimeInterval = 2,
+        completionFieldName: String? = nil
     ) throws -> TargetedAX.SearchResult {
         let deadline = TimingLog.now() + min(timeout, BrowserCallBudget.activeRemaining ?? timeout)
         let expired = { ProcessInfo.processInfo.systemUptime >= deadline }
         var scans: [AXSearchNode: NodeScan] = [:]
         var records: [AXSearchNode: ElementRecord] = [:]
         var textTruncated = false
+        var hiddenCompletionMatch = false
         var clip: CGRect?
         let root = AXSearchNode(element: context.windowElement)
         let result = try boundedTargetedWalk(root: root, maxNodes: criteria.maxNodes, limit: criteria.limit,
@@ -2820,13 +2844,31 @@ extension SnapshotBuilder {
             if node == root { clip = scan.globalFrame }
             let visible = scan.globalFrame.map { frame in frame.isEmpty || clip.map { frame.intersects($0) } ?? true } ?? true
             if visible, criteria.text != nil, [scan.title, scan.description, scan.value].contains(where: { ($0?.count ?? 0) > 1000 }) { textTruncated = true }
-            let matches = visible && targetedRecordMatches(criteria, role: scan.role, title: scan.title, description: scan.description, value: scan.value, identifier: scan.identifier)
-            if matches { records[node] = makeRecord(node.element, scan: scan, windowBounds: context.windowBounds) }
-            return (matches, visible)
+            let matches: Bool
+            if let completionFieldName {
+                let title = DoneCheck.normalizedFieldLabel(scan.title ?? "")
+                let name = title.isEmpty ? DoneCheck.normalizedFieldLabel(scan.description ?? "") : title
+                matches = ComputerUseService.typingRoles.contains(SmartSteps.roleKey(scan.role))
+                    && name == completionFieldName
+                if matches, [scan.title, scan.description, scan.value].contains(where: { ($0?.count ?? 0) > 1000 }) {
+                    textTruncated = true
+                }
+            } else {
+                matches = visible && targetedRecordMatches(criteria, role: scan.role, title: scan.title, description: scan.description, value: scan.value, identifier: scan.identifier)
+            }
+            if matches {
+                if completionFieldName != nil, !visible {
+                    // An offscreen duplicate can disqualify a claim, not supply evidence.
+                    hiddenCompletionMatch = true
+                } else {
+                    records[node] = makeRecord(node.element, scan: scan, windowBounds: context.windowBounds)
+                }
+            }
+            return (matches, completionFieldName != nil || visible)
         }, children: { node, remaining in
             guard !expired() else { return ([], true) }
             let role = scans[node]?.role
-            let attributes = role.map { largeContainerRoles.contains($0) } == true
+            let attributes = completionFieldName == nil && role.map { largeContainerRoles.contains($0) } == true
                 ? [axVisibleChildrenAttribute, kAXChildrenAttribute as String]
                 : [kAXChildrenAttribute as String, "AXContents"]
             for attribute in attributes {
@@ -2844,7 +2886,7 @@ extension SnapshotBuilder {
             }
             return ([], false)
         })
-        let reason = result.stopReason ?? (textTruncated ? "text_limit" : nil)
+        let reason = result.stopReason ?? (hiddenCompletionMatch ? "offscreen_match" : (textTruncated ? "text_limit" : nil))
         return .init(records: result.matches.compactMap { records[$0] }, truncated: reason != nil, stopReason: reason, visitedNodes: result.visitedNodes)
     }
 

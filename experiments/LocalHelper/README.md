@@ -6,6 +6,8 @@ Run the offline comparison from the repo with:
 python3 experiments/LocalHelper/eval.py --output /tmp/godspeed-local-eval.json
 ```
 
+Use `--skip-grounding` to evaluate d1 decisions without exporting screenshots or calling LFM. Point at a staged local helper with `--base-url http://127.0.0.1:8766` or `GODSPEED_LOCAL_EVAL_URL`; the runner never starts or configures a helper.
+
 The runner only connects to the existing helper at `127.0.0.1:8765`. It skips when the helper is unavailable. It makes sequential requests and records the checkpoint reported by `/health`. It never starts a helper. The Swift fixture test exports requests made with the same view builders Godspeed uses. Use `--skip-build` after building those tests.
 
 The tree fixtures are synthetic. The calculator and form lines follow the headless scenario bank. Mail, Finder, Settings and the web page use scrubbed, hand-authored trees. Each app family belongs to one split. The PNGs are drawn fixtures. No screen capture or live app is needed.
@@ -36,3 +38,7 @@ From a Godspeed v1.1.12 source checkout, run `./scripts/setup-gsd1.sh` with nati
 The setup adds a loopback helper on port 18765. In a fresh MCP session, `local_decision` can score typed Action, Read and Recover questions. Only one tuned checkpoint stays loaded at a time and idle checkpoints unload. The helper binds locally, and the tool yields recommendations for existing Godspeed actions and verification. First use may return no recommendation while the helper starts. If needed, check `curl -fsS http://127.0.0.1:18765/health`.
 
 The adapter and base artifacts carry Liquid AI's LFM Open License terms. See the model release's LICENSE and NOTICE.
+
+## Candidate routing
+
+The routine completion checker and vision still use their stock service contracts. Keep stock for autonomous choice and generic completion until alternatives pass their matching live input and outcome checks. For the typed tool, Action needs observed controls, Read needs scoped read evidence, and Recover needs delivery plus independent readback. An uncertain score yields no recommendation; a recommendation carries no input dispatch or completion claim.

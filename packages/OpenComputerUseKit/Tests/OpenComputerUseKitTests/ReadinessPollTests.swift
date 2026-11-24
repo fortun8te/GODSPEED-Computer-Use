@@ -31,6 +31,28 @@ final class ReadinessPollTests: XCTestCase {
         XCTAssertEqual(now, 0.23, accuracy: 0.0001)
     }
 
+    func testMatchReadAtOrAfterDeadlineIsRejected() {
+        for finishedAt in [1.0, 1.1] {
+            var now: TimeInterval = 0
+            let ready = ReadinessPoll.first(timeout: 1, now: { now }) {
+                now = finishedAt
+                return "Save"
+            }
+            XCTAssertNil(ready)
+        }
+    }
+
+    func testWakeAtDeadlineDoesNotStartAnotherRead() {
+        var now: TimeInterval = 0
+        var reads = 0
+        let ready = ReadinessPoll.first(timeout: 1, interval: 1, now: { now }, sleep: { now += $0 }) {
+            reads += 1
+            return reads == 1 ? nil : "Save"
+        }
+        XCTAssertNil(ready)
+        XCTAssertEqual(reads, 1)
+    }
+
     func testLazyWebAreaReadsFullTreeOnceAfterMultipleProbes() {
         var probes = 0
         var renders = 0

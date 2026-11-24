@@ -80,7 +80,8 @@ final class LearningLogTests: XCTestCase {
 
     func testEnvironmentSwitches() {
         XCTAssertTrue(LearningLog.isEnabled(environment: [:]))
-        XCTAssertTrue(LearningLog.imagesEnabled(environment: [:]))
+        XCTAssertFalse(LearningLog.imagesEnabled(environment: [:]))
+        XCTAssertTrue(LearningLog.imagesEnabled(environment: [LearningLog.imagesVariable: "1"]))
         for value in ["0", "false", "no", "off", " OFF "] {
             XCTAssertFalse(LearningLog.isEnabled(environment: [LearningLog.enabledVariable: value]), value)
             XCTAssertFalse(LearningLog.imagesEnabled(environment: [LearningLog.imagesVariable: value]), value)

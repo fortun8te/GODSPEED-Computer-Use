@@ -103,6 +103,7 @@ enum DoneCheck {
         var pageURL: () -> String?
         var fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
         var supportsAbsence = true
+        var observedFields: [Field]? = nil
         /// The exact predicates already checked against an independent source.
         var directlyVerified: [Condition] = []
     }
@@ -211,7 +212,14 @@ enum DoneCheck {
             case .text(let text):
                 ok = evidence.screenText.map { textMatches($0, text) } ?? false
             case .field(let label, let value):
-                ok = evidence.screenText.map { fieldEquals($0, label: label, value: value) } ?? false
+                if normalizedFieldLabel(label) == "edit field",
+                   let screen = evidence.screenText, BatchTool.calculatorDisplay(screen) != nil {
+                    ok = fieldEquals(screen, label: label, value: value)
+                } else if let fields = evidence.observedFields {
+                    ok = uniqueFieldValue(fields, label: label).map { fieldValuesEqual($0, value) } ?? false
+                } else {
+                    ok = evidence.screenText.map { fieldEquals($0, label: label, value: value) } ?? false
+                }
             case .urlContains(let part):
                 if !didFetchURL {
                     fetchedURL = evidence.pageURL()
@@ -304,41 +312,49 @@ enum DoneCheck {
         isPlainNumber(text) ? containsNumber(screen, text) : (contains(screen, text) || containsLabeledNumber(screen, text))
     }
 
-    /// The temporal form requires one readable exact field on each side.
-    static func exactFieldValue(_ screen: String, label: String) -> String? {
-        if HandoffTool.sameLabel(label, "Edit field"), let display = BatchTool.calculatorDisplay(screen) {
-            return display.input
-        }
-        let matches = HandoffTool.parseControls(screen).filter {
-            HandoffTool.fieldRoles.contains($0.role) && HandoffTool.sameLabel($0.label, label)
-        }
-        guard matches.count == 1 else { return nil }
-        return matches[0].value
+    static func normalizedFieldLabel(_ label: String) -> String {
+        label.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
     }
 
-    /// True when a state line for `label` ends in `= value`. A "(w:str)"-style type note after the value is ignored.
+    static func uniqueFieldValue(_ fields: [Field], label: String) -> String? {
+        let wanted = normalizedFieldLabel(label)
+        guard !wanted.isEmpty else { return nil }
+        let matches = fields.filter { normalizedFieldLabel($0.label) == wanted }
+        return matches.count == 1 ? matches[0].value : nil
+    }
+
+    struct Field: Sendable {
+        let label: String
+        let value: String?
+    }
+
+    static func exactFieldValue(_ screen: String, label: String) -> String? {
+        guard supportsAbsenceCheck(screen) else { return nil }
+        if normalizedFieldLabel(label) == "edit field", let display = BatchTool.calculatorDisplay(screen) {
+            return display.input
+        }
+        return uniqueFieldValue(HandoffTool.parseControls(screen).compactMap(nativeField), label: label)
+    }
+
+    static func nativeField(_ control: HandoffTool.Control) -> Field? {
+        guard HandoffTool.fieldRoles.contains(control.role) || control.role == "secure text field" else { return nil }
+        let value = control.value.flatMap { value in
+            value.count >= defaultTextLimit && value.hasSuffix("...") ? nil : value
+        }
+        return Field(label: control.label, value: control.role == "secure text field" ? nil : value)
+    }
+
     static func fieldEquals(_ text: String, label: String, value: String) -> Bool {
-        let needle = label.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !needle.isEmpty else { return false }
-        if needle == "edit field", let display = BatchTool.calculatorDisplay(text) {
-            return display.input == value.trimmingCharacters(in: .whitespaces)
+        guard let actual = exactFieldValue(text, label: label) else { return false }
+        if normalizedFieldLabel(label) == "edit field", BatchTool.calculatorDisplay(text) != nil {
+            return actual == value.trimmingCharacters(in: .whitespaces)
         }
-        let paddedNeedle = " " + needle + " "
-        let expected = value.trimmingCharacters(in: .whitespaces).lowercased()
-        for line in text.split(separator: "\n") {
-            guard let range = line.range(of: " = ") else { continue }
-            let field = line[..<range.lowerBound].trimmingCharacters(in: .whitespaces).lowercased()
-            guard !field.hasSuffix(clippedFieldNote) else { continue }
-            let paddedField = " " + field + " "
-            guard paddedField.contains(paddedNeedle) else { continue }
-            var actual = line[range.upperBound...].trimmingCharacters(in: .whitespaces).lowercased()
-            if actual.hasSuffix(")"),
-               let paren = actual.range(of: #" \(w:[a-z]+\)$"#, options: .regularExpression) {
-                actual = String(actual[..<paren.lowerBound])
-            }
-            if actual == expected { return true }
-        }
-        return false
+        return fieldValuesEqual(actual, value)
+    }
+
+    static func fieldValuesEqual(_ actual: String, _ expected: String) -> Bool {
+        actual.trimmingCharacters(in: .whitespaces).lowercased()
+            == expected.trimmingCharacters(in: .whitespaces).lowercased()
     }
 
     /// A plain number like "1641" or "0.25" also matches how the Mac's region writes it on screen:

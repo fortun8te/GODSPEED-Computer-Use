@@ -9,7 +9,7 @@ import json
 import math
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 import statistics
 import sys
@@ -508,9 +508,13 @@ def normalize_probs(probs):
         value = probs[label]
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError("Invalid probability")
-        clean[label] = max(float(value), 1e-12)
-    total = sum(clean.values())
-    return {label: value / total for label, value in clean.items()}
+        clean[label] = float(value)
+    maximum = max(clean.values(), default=0)
+    if maximum == 0:
+        raise ValueError("Probability scores need at least one positive value")
+    scaled = {label: max(value / maximum, 1e-12) for label, value in clean.items()}
+    total = math.fsum(scaled.values())
+    return {label: value / total for label, value in scaled.items()}
 
 
 def argmax(probs):
@@ -603,7 +607,8 @@ def fit_calibration(rows, isotonic):
 
     done = [(scaled[row["id"]]["done"], row["gold"] == "done") for row in rows]
     # Strict rule: predict done only when P(done) is above the highest P(done) any non-done row received.
-    threshold = max((p for p, is_done in done if not is_done), default=0.0)
+    negatives = [p for p, is_done in done if not is_done]
+    threshold = max(negatives, default=1.0)
     false_done = sum(1 for p, is_done in done if not is_done and p > threshold)
     done_total = sum(1 for _, is_done in done if is_done)
     recall = sum(1 for p, is_done in done if is_done and p > threshold) / done_total if done_total else None
@@ -620,7 +625,8 @@ def fit_calibration(rows, isotonic):
         "ece": {"before": expected_calibration_error(before_table), "after": expected_calibration_error(after_table)},
         "reliability": {"before": before_table, "after": after_table},
         "temperatures": {question: group["temperature"] for question, group in groups.items()},
-        "done": {"validation_done_rows": done_total, "done_threshold": threshold, "false_done": false_done,
+        "done": {"validation_done_rows": done_total, "validation_non_done_rows": len(negatives),
+                 "done_threshold": threshold, "false_done": false_done,
                  "done_recall": None if recall is None else round(recall, 6),
                  "recall_cost": None if recall is None else round(1 - recall, 6)},
     }
@@ -737,7 +743,7 @@ def export_learning(source, destination):
     if not folder.is_dir():
         raise ValueError("Learning folder not found")
     output_path = writable(destination)
-    rows, goals = [], {}
+    rows, goals = [], defaultdict(set)
     for file in sorted(folder.glob("learning-*.jsonl")):
         for index, line in enumerate(file.read_text(encoding="utf-8").splitlines()):
             if not line.strip():
@@ -750,7 +756,8 @@ def export_learning(source, destination):
                 raise ValueError("Invalid learning row")
             rows.append((f"{file.name}/{index}", row))
             if row.get("kind") == "episode" and row.get("goal"):
-                goals[row.get("run_id")] = row["goal"]
+                if row.get("run_id"):
+                    goals[(row["run_id"], row.get("episode_id"))].add(row["goal"])
     counts, skipped, out = Counter(), 0, []
     for ident, row in rows:
         label = learning_label(row)
@@ -758,8 +765,12 @@ def export_learning(source, destination):
             skipped += 1
             continue
         last_step = " ".join(str(row.get(key) or "") for key in ("tool", "target_role", "target_label")).strip()
+        episode_goals = goals.get((row.get("run_id"), row.get("episode_id")), set())
+        if len(episode_goals) > 1:
+            skipped += 1
+            continue
         state = {
-            "goal": goals.get(row.get("run_id")) or row.get("tool") or "unknown",
+            "goal": next(iter(episode_goals), None) or row.get("tool") or "unknown",
             "last_step": last_step or "unknown",
             "result": (f"delivery {row.get('delivery_state') or 'unknown'}; "
                        f"verification {row.get('verification') or 'none'}; "
@@ -801,8 +812,9 @@ def learning_episodes(folder):
     if not folder.is_dir():
         raise ValueError("Learning folder not found")
     episodes, dropped = [], Counter()
+    tagged_steps = {}
     for file in sorted(folder.glob("learning-*.jsonl")):
-        pending = []
+        pending = {}
         for line in file.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -812,19 +824,28 @@ def learning_episodes(folder):
                 raise ValueError("Invalid learning row")
             if not isinstance(row, dict):
                 raise ValueError("Invalid learning row")
-            if row.get("kind") == "step":
-                if pending and (row.get("n") == 1 or pending[-1].get("run_id") != row.get("run_id")):
+            kind = row.get("kind")
+            if kind not in ("step", "episode"):
+                continue
+            run_id, episode_id = row.get("run_id"), row.get("episode_id")
+            if episode_id:
+                key, groups = (run_id, episode_id), tagged_steps
+            else:
+                key, groups = run_id, pending
+            if kind == "step":
+                if row.get("n") == 1 and groups.get(key):
                     dropped["incomplete"] += 1
-                    pending = []
-                pending.append(row)
-            elif row.get("kind") == "episode":
-                episodes.append({"file": file.name, "run_id": row.get("run_id"), "ts": row.get("ts"),
-                                 "goal": row.get("goal") or "", "app": row.get("app") or "", "steps": pending,
-                                 "done_when": row.get("done_when"), "done": row.get("done"),
-                                 "window": row.get("window")})
-                pending = []
+                    groups.pop(key)
+                groups.setdefault(key, []).append(row)
+            else:
+                episodes.append({"file": file.name, "run_id": run_id, "ts": row.get("ts"),
+                                 "goal": row.get("goal") or "", "app": row.get("app") or "",
+                                 "steps": groups.pop(key, []), "done_when": row.get("done_when"),
+                                 "done": row.get("done"), "window": row.get("window")})
         if pending:
-            dropped["incomplete"] += 1
+            dropped["incomplete"] += len(pending)
+    if tagged_steps:
+        dropped["incomplete"] += len(tagged_steps)
     return episodes, dropped
 
 CONFIRM_WORDS = {"send", "pay", "payment", "purchase", "buy", "checkout", "delete", "remove", "trash", "erase", "transfer"}

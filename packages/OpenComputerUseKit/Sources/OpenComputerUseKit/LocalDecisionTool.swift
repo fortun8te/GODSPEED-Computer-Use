@@ -21,6 +21,14 @@ enum LocalDecisionTool {
                     score: (URL, [String: Any], TimeInterval) -> [String: Any]? = {
                         HelperHTTP.postJSON($0, body: $1, timeout: $2, followRedirects: false)
                     }) throws -> ToolCallResult {
+        try run(arguments: arguments, baseURL: baseURL, now: { ProcessInfo.processInfo.systemUptime },
+                recoverHelper: { starter.helperUnreachable($0) }, score: score)
+    }
+
+    static func run(arguments: [String: Any], baseURL: URL?, now: () -> TimeInterval,
+                    recoverHelper: (URL) -> Void,
+                    score: (URL, [String: Any], TimeInterval) -> [String: Any]?) throws -> ToolCallResult {
+        try RequestCancellation.check(delivery: .notSent)
         guard let baseURL, HelperAutoStarter.isLoopback(baseURL) else {
             throw ComputerUseError.invalidArguments("Configure the loopback GSD1 helper first.")
         }
@@ -46,10 +54,18 @@ enum LocalDecisionTool {
             telemetry?.add("\(metricPrefix)_skipped_deadline")
             return .text("No local recommendation. The request deadline is too close.", deliveryState: .notSent)
         }
-        let start = ProcessInfo.processInfo.systemUptime
-        let reply = score(baseURL.appendingPathComponent("gsd1").appendingPathComponent("score"), body, min(deadline, 8))
+        let timeout = min(deadline, 8)
+        try RequestCancellation.check(delivery: .notSent)
+        let start = now()
+        let reply = score(baseURL.appendingPathComponent("gsd1").appendingPathComponent("score"), body, timeout)
         telemetry?.recordHelper(metricPrefix, startedAt: start, image: false, reply: reply)
-        if reply == nil, baseURL.port == 18765 { starter.helperUnreachable(baseURL) }
+        // A cancelled transport can look unavailable; it must not restart the helper or publish advice.
+        try RequestCancellation.check(delivery: .notSent)
+        guard now() - start < timeout, (BrowserCallBudget.activeRemaining ?? .infinity) > 0 else {
+            telemetry?.add("\(metricPrefix)_discarded_deadline")
+            return .text("No local recommendation. The request deadline elapsed.", deliveryState: .notSent)
+        }
+        if reply == nil, baseURL.port == 18765 { recoverHelper(baseURL) }
         guard let reply, reply["model"] as? String == "gsd1-" + role,
               let probabilities = Referee.parseChoose(reply),
               Set(probabilities.keys) == Set(options.keys) else {

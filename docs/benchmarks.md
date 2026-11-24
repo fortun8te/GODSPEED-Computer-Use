@@ -55,6 +55,17 @@ The deterministic handoff fixture fills two known empty fields in two actions an
 
 The configured local scorer selected the intended field on a separate two-option synthetic input. The first request took 2.48 seconds with the model unloaded. A repeat took 86 ms. Use matched held-out inputs before changing the model or its confidence threshold.
 
+### Payload and cache accounting
+
+| Offline comparison | Earlier | Current |
+| --- | ---: | ---: |
+| Structured metadata for a verified 40-step receipt | 3,923 B | 128 B |
+| Tool catalog with the same tools and shorter shared descriptions | 30,364 B | 29,927 B |
+
+Reproduce these byte counts with `GODSPEED_MEASURE_PAYLOADS=1 swift test --filter 'CompactVerifiedReplyTests|testLeanToolListingShortens'`. The receipt comparison uses explicit `compact: true`. Failed, incomplete, or uncertain steps still provide their individual receipts, and local logs retain the full details.
+
+Use host usage receipts for input, cache reads, cache writes, output, and reasoning. Fresh input equals total input minus cache reads when both are reported. Reasoning is part of output. Missing counts remain unreported. Compare payload bytes separately because hosts may handle structured metadata differently.
+
 ## Earlier runs
 
 These recorded runs used GPT-6 Luna at low reasoning. A task checker scored the final result.
@@ -94,4 +105,10 @@ Godspeed                                 unmeasured
 
 The public catalog also reports other model configurations. Keep each configuration separate when comparing tools. Godspeed’s four-task AppKit measurements above use a different fixture and measure driver output and timing. An equivalent Godspeed Scale score requires the full trial schedule and the same model, task states, GUI-only rules, and background disturbance checks.
 
-Use `python3 scripts/godspeed-benchmark-compare.py --suite scale-bench-v2 baseline.jsonl candidate.jsonl` to compare normalized trial receipts offline. The script checks matching configurations and all 90 trial slots before scoring. The separate `aside-internal` profile requires a predeclared schedule.
+Use `python3 scripts/godspeed-benchmark-compare.py --suite scale-bench-v2 baseline.jsonl candidate.jsonl` to compare normalized trial receipts offline. The script checks matching configurations and all 90 trial slots before scoring. It does not execute the benchmark. The separate `aside-internal` profile requires a predeclared schedule.
+
+## Isolation options checked on 21 Nov 2026
+
+Godspeed's hidden virtual display can separate target windows for a focused same-session smoke test. It does not isolate the login, files, Keychain, or other apps, so it is not a substitute for the Scale background-disturbance benchmark. The opt-in live check is [AgentDisplayLiveTests.swift](../packages/OpenComputerUseKit/Tests/OpenComputerUseKitTests/AgentDisplayLiveTests.swift); it must run in a dedicated or idle session because it creates and removes a system display.
+
+The repeatable full-suite option is a macOS guest under Apple's Virtualization framework. CUA's Lume runner uses a 150 GB sparse disk; its simpler setup guide asks for at least 50 GB free plus restore-image space ([runner](https://github.com/trycua/cua/blob/main/libs/cua-driver/tests/runners/macos-lume/README.md), [VM setup](https://github.com/trycua/cua/blob/main/docs/content/docs/how-to-guides/driver/run-in-macos-lume-vm.mdx)). This Mac had 22 GiB free and no `lume` binary, so no VM or live desktop benchmark was started.

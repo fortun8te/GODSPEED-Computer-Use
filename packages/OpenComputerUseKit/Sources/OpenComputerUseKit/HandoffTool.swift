@@ -399,7 +399,7 @@ enum HandoffTool {
     }
 
     static func check(_ conditions: [DoneCheck.Condition], screen: String,
-                      parsedControls: [Control]? = nil) -> DoneCheck.Result {
+                      parsedControls: [Control]? = nil, observedFields: [DoneCheck.Field]? = nil) -> DoneCheck.Result {
         let evidence = DoneCheck.Evidence(screenText: screen, pageURL: { nil })
         var controls = parsedControls
         var unmet: [String] = []
@@ -409,9 +409,11 @@ enum HandoffTool {
                     if display.input != expected { unmet.append(condition.summary) }
                     continue
                 }
-                if controls == nil { controls = parseControls(screen) }
-                let fields = (controls ?? []).filter { fieldRoles.contains($0.role) && sameLabel($0.label, label) }
-                if fields.count != 1 || fields.first?.value != expected { unmet.append(condition.summary) }
+                if observedFields == nil, controls == nil { controls = parseControls(screen) }
+                let fields = observedFields ?? (controls ?? []).compactMap(DoneCheck.nativeField)
+                if !DoneCheck.supportsAbsenceCheck(screen) || DoneCheck.uniqueFieldValue(fields, label: label) != expected {
+                    unmet.append(condition.summary)
+                }
             } else if case .missing(let reasons) = DoneCheck.check([condition], evidence: evidence) {
                 unmet.append(contentsOf: reasons)
             }
@@ -690,6 +692,10 @@ enum HandoffTool {
         var noChange = 0
         var failures = 0
         let doneSummary = request.doneWhen.map(\.summary).joined(separator: "; ")
+        let needsFreshFields = request.doneWhen.contains { condition in
+            if case .field = condition { return true }
+            return false
+        }
         var lastUnmet: [String] = []
         var deliveryState: DeliveryState = .notSent
         // A weak match (present in the state, no proof it changed) never completes the handoff by itself.
@@ -908,7 +914,12 @@ enum HandoffTool {
                 }
                 if choice.kind == .setValue { typedAny = true }
                 if choice.kind == .scroll { scrolls += 1 }
-                if !hasTime(), result.observedState == nil {
+                // A piggyback text snapshot cannot bind typed field observations. Require
+                // scoped readback before comparing fields, even when its text is identical.
+                let actionState = needsFreshFields ? nil : result.observedState.flatMap {
+                    matchesWindow($0, windowID: request.windowID) ? $0 : nil
+                }
+                if !hasTime(), needsFreshFields || result.observedState == nil {
                     steps.append(result.ok ? choice.text : "\(choice.text) failed")
                     return finish(.budget, "the last action may have run. Inspect its result before continuing.", initial: initial, latest: nil)
                 }
@@ -934,7 +945,6 @@ enum HandoffTool {
                 }
                 failures = 0
                 steps.append(choice.text)
-                let actionState = result.observedState.flatMap { matchesWindow($0, windowID: request.windowID) ? $0 : nil }
                 guard let next = actionState ?? readState() else {
                     if RequestCancellation.requested { return cancelled() }
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
@@ -1006,6 +1016,7 @@ extension ComputerUseToolDispatcher {
                                                labels: Array(request.expectedValues.keys), parsed: parsed)
         }
 
+        var fieldObservation: (state: String, fields: [DoneCheck.Field])?
         let deps = HandoffTool.Dependencies(
             readState: { [self] in
                 if let readFixtureState { return readFixtureState() }
@@ -1019,7 +1030,9 @@ extension ComputerUseToolDispatcher {
                 guard !captureRefusal(read), !read.isError else { return nil }
                 guard let state = LeanOutput.stateText(of: read),
                       let id = HandoffTool.observedWindowID(in: state), matchesDocument(id) else { return nil }
-                return BatchTool.stateText(ofText: state)
+                let text = BatchTool.stateText(ofText: state)
+                fieldObservation = (text, read.observedFields ?? [])
+                return text
             },
             act: { [self] candidate, state in
                 guard let window = request.windowID ?? HandoffTool.observedWindowID(in: state) else {
@@ -1080,7 +1093,10 @@ extension ComputerUseToolDispatcher {
                 return verdict.label == "stuck" && verdict.confidence >= Referee.minimumConfidence
             },
             check: { state in
-                HandoffTool.check(request.doneWhen, screen: state, parsedControls: controlsFor(state))
+                let fields = fieldObservation.flatMap { $0.state == state ? $0.fields : nil }
+                return HandoffTool.check(request.doneWhen, screen: state,
+                                         parsedControls: fields == nil ? controlsFor(state) : nil,
+                                         observedFields: fields)
             },
             replay: { [self] state in
                 // Recipe variables are named after field labels ("Name" -> "name"); the handoff's value keys map to them.

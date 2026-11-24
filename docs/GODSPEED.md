@@ -24,14 +24,14 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
       others   -> ComputerUseService   accessibility tree, actions, cursor
         VisionFallback            only when a label matches nothing
   LeanOutput.condensed            shrink the state text, keep element numbers
-  ◄── reply: step lines + one state (change-only when possible)
+  ◄── reply: action receipt + requested or useful state
 ```
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `batch` | Up to 40 steps in one call. Stops at the first failure, one line per step, then one state. The main tool. |
+| `batch` | Up to 40 steps in one call. Stops at the first failure. Click sequences group routine successes and include final state. Verified workflows can omit the implicit tree. Set `compact: false` for full step detail. |
 | `browser` | Web pages in the agent's own background Chrome tab (Open Browser Use). Listed only when `obu` is found. |
 | `local_decision` | Optional GSD1 recommendation from typed Action, Read or Recover evidence. [Setup](../experiments/LocalHelper/README.md#optional-gsd1-on-apple-silicon). |
 | `get_app_state` | The app's numbered element tree. Set `compact: true` for a control-focused view that keeps focus and actionable indexes. Request a screenshot separately when needed. |
@@ -49,7 +49,7 @@ GODSPEED agent (the app, started by macOS so grants stick to it)
 - **Labels**: use visible text first. Current element indexes also work.
 - **Fill**: `{"tool": "fill", "fields": {"To": "sam@x.com"}, "submit": "Send"}` becomes one `set_value` per field and a click. Add `"web": true` for a page.
 - **Goal**: `goal` is one sentence. The reply may add a `Check:` line (done, stuck, or still loading) from the referee. Treat it as a hint.
-- **Final reads**. `return_state: false` can skip the final tree when a direct file, exact native field, or URL check supplies the requested evidence. Missing evidence triggers a recovery read. Presence-only matches still report weak evidence.
+- **Final reads**. `return_state: false` can skip the final tree when a direct file, exact native field, or URL check supplies the requested evidence. Missing evidence triggers a recovery read. A presence check that was already true before the batch remains weak evidence.
 - **Wait steps**. Godspeed can check for a window, matching text, or busy indicator before taking a full read. The full read still confirms the wait. Busy checks make up to four accessibility reads at a time.
 - **Action readback**. The dialog check reuses the action's window read when available. A verified field write can use the next scheduled read. Batch effect checks can reuse a complete read of the same window when it shows a change. A delayed result or a change of window can require another read.
 - **Change-only replies**: the final read is compared with what the model last saw for that app. Only changed lines are sent. If an element's number moved, the full state is sent instead. If nothing changed, the reply says so.
@@ -234,9 +234,14 @@ Screenshots are available for controls that the accessibility tree misses. The o
 
 Handoff fills a unique, empty field directly when its value matches the completion check. It can also act on an explicit `Click <label>` goal with one enabled, low-risk target. These matches use zero model calls for that action. If a choice remains, handoff ranks the most relevant 12 options before asking the local Referee chooser. The local helper uses d1-2B 8-bit by default. It hands control back if confidence or the lead over the next option is too low. A pinned handoff verifies against that window. If input may already have landed, it stops for inspection.
 
+For an existing field value, pass `expected_values` alongside `values` and use an exact field check in `done_when`. For example, `expected_values: {"Name":"Before"}` and `values: {"Name":"After"}` pair with `done_when: {"field":"Name","equals":"After"}`. Godspeed checks the current value again just before writing.
+
+For a longer workflow, put several `handoff` steps inside a `batch`. Give each handoff its own completion check and give the outer batch the final workflow check. The batch shares its deadline with each handoff and stops before dependent steps if any handoff cannot verify its result. Use the returned recovery details to resolve that step. Resume tokens are single-use and may ask for structured inputs again. Inspect any action with uncertain delivery before resuming.
+
+
 ### Completion checks
 
-A batch takes a baseline before step 1 for checks that require a change. Use one check or a list.
+A batch takes a private baseline before step 1 for text, field, URL, and file checks that can distinguish a new result from a preexisting one. Use one check or a list.
 
 | Check | Evidence |
 | --- | --- |
@@ -246,7 +251,7 @@ A batch takes a baseline before step 1 for checks that require a change. Use one
 | `{"url_changed":"https://example.com/thanks"}` | An existing tab changed to the exact URL. |
 | `{"file_changed":"~/Desktop/out.pdf"}` | A regular file appeared at the path or its size, fresh modification time, or contents changed. Files up to 16 MiB are hashed. |
 
-A check that only matches final text, a field, a missing label, part of a URL, or an existing file reports `weak_evidence`. Those checks can match a preexisting state. An unavailable baseline leaves a change check unconfirmed. A UI change proves what Godspeed observed during the batch. Check the app's own receipt when you need to confirm that a send, payment, or save persisted.
+A check that was already true in the baseline reports `weak_evidence`. A text, field, missing-label, URL, or new-file check that changes from false to true on the same target can be verified. Use `file_changed` for an existing file you expect to update. An unavailable baseline leaves a change unconfirmed. A UI change proves what Godspeed observed during the batch. Check the app's own receipt when you need to confirm that a send, payment, or save persisted.
 
 Action readback looks for 120 ms of stable frames and checks for a busy Accessibility root. An explicit `settle_ms` read looks for 120 ms without an AX busy sign. It returns the current state with a status note if the budget runs out. A batch settle step requires repeated complete reads of the same state and stops on timeout.
 
@@ -318,6 +323,8 @@ Use `browser read` with `interactive: true` to find controls with fewer tokens. 
 
 Browser reads include reported focus, disabled, selected, checked and expanded states. Use these to confirm the control before asking for an image. If Chrome times out after `fill_field`, Godspeed can read back the exact value on the same control and document. A lookup timeout uses a full-tree fallback when the tab connection is still valid.
 
+Godspeed enables simulated page focus and page hooks only in tabs it opened. A claimed user tab keeps its actual focus state.
+
 Set `if_changed: true` on `browser screenshot` to avoid returning an identical capture. The comparison is exact and scoped to the client, tab, address, and browser helper generation. Godspeed keeps a digest in memory, not a saved image. In the REPL, `cua.browser("read", { tab_id: 12 })` uses the same persistent connection as native app bindings. `cua.batch(steps, options)` can alternate browser steps with native steps that each name their app. Keep dependent actions ordered and check the batch receipt before resuming. The REPL discards queued input from ended evaluations. Saved-recipe handoffs and final browser observations share the time left in the original operation.
 
 Use `browser outline` for visible headings in the main document, `browser frames` for the tab's document tree, and `browser scroll_into_view` with a label or current reference to reveal one control. Frame listings are for inspection. Actions still need a control reference or label. A browser click can use the left, middle or right button. Left clicks accept a count of up to three. Clicks and drags accept Alt, Control, Command, or Shift modifiers. The click checks its hit point before sending input.
@@ -370,7 +377,7 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 
 - macOS only. The app is built for the native arch. `obu` is built for arm64.
 - Keep steps that share input or depend on each other's output in one ordered batch.
-- Set `OPEN_COMPUTER_USE_CURSOR_COLOR=auto` for stable per-client cursor colors. The active cursor shows which client is driving the shared Mac input.
+- The default cursor stays grey when agents overlap. Set a hex colour for a fixed custom tint, or set `OPEN_COMPUTER_USE_CURSOR_COLOR=auto` to opt into stable per-client colours.
 - Background delivery depends on the app. Some dialogs, sheets and key chords require foreground input.
 - A batch is at most 40 steps.
 - The referee and vision are hints and fallbacks, off by default. Vision has been checked on one synthetic image, not on real apps.

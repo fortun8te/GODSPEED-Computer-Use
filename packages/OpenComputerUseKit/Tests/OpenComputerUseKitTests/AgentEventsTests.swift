@@ -198,6 +198,21 @@ final class AgentEventsTests: XCTestCase {
         }
     }
 
+    func testPopupAttributionRequiresTheMatchingOpener() {
+        withBrowserRequestEnvironment(["OPEN_COMPUTER_USE_AGENT_EVENTS": "1"]) {
+            AgentEvents.receive(["agentEvents": [
+                ["kind": "popup", "tabId": 12, "openerTabId": 7],
+                ["kind": "popup", "tabId": 13, "openerTabId": 8],
+                ["kind": "popup", "tabId": 14],
+            ]])
+            XCTAssertEqual(AgentEvents.rememberedPopupTabs(openedBy: 7), [12])
+            XCTAssertEqual(AgentEvents.rememberedPopupTabs(openedBy: 8), [13])
+            XCTAssertTrue(AgentEvents.rememberedPopupTabs(openedBy: 9).isEmpty)
+            AgentEvents.receive(["agentEvents": [["kind": "tabClosed", "tabId": 12]]])
+            XCTAssertTrue(AgentEvents.rememberedPopupTabs(openedBy: 7).isEmpty)
+        }
+    }
+
     func testPendingQueueKeepsTheNewestEvents() {
         withBrowserRequestEnvironment(["OPEN_COMPUTER_USE_AGENT_EVENTS": "1"]) {
             let many = (1...60).map { ["kind": "tabClosed", "tabId": $0] as [String: Any] }

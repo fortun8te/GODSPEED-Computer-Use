@@ -89,8 +89,8 @@ final class CursorTimingTests: XCTestCase {
         XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: -1), alone)
         XCTAssertLessThan(behind, alone * 0.65)
         XCTAssertLessThan(visualCursorClickPulseDuration(speed: 1, queuedBehind: 4), 0.1)
-        // A long backlog speeds up but still glides (floored at 60%) instead of turning every step into a jump.
-        XCTAssertEqual(visualCursorTravelDuration(distance: 400, speed: 1, queuedBehind: 100), alone * 0.6, accuracy: 1e-9)
+        // Backlogged travel stays brief even at deliberately slow playback, without skipping the path.
+        XCTAssertEqual(visualCursorTravelDuration(distance: 3_000, speed: 0.5, queuedBehind: 4), 0.16, accuracy: 1e-9)
         XCTAssertGreaterThan(visualCursorTravelDuration(distance: 40, speed: 1, queuedBehind: 100), 0)
     }
 
@@ -189,6 +189,31 @@ final class CursorTimingTests: XCTestCase {
             XCTAssertEqual(numbers.count, 2)
             XCTAssertEqual(numbers[0], Double(first.x), accuracy: 4)
             XCTAssertEqual(numbers[1], Double(first.y), accuracy: 4)
+        }
+    }
+
+    func testHiddenClickApproachesAndShortSettleContinuesAfterTurnFade() throws {
+        try XCTSkipIf(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        try withTrace { file, center in
+            SoftwareCursorOverlay.pulseClick(at: center, clickCount: 1, mouseButton: .left, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            XCTAssertEqual(try moves(in: file).count, 1)
+            SoftwareCursorOverlay.resetWhenIdle()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            XCTAssertFalse(SoftwareCursorOverlay.overlayPanelForTesting?.isVisible ?? true)
+
+            let next = CGPoint(x: center.x + 8, y: center.y)
+            SoftwareCursorOverlay.settle(at: next, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            let lines = try moves(in: file)
+            XCTAssertEqual(lines.count, 2)
+            XCTAssertTrue(try XCTUnwrap(lines.last).contains("from=(\(Int(center.x)),\(Int(center.y)))"))
+            let panel = try XCTUnwrap(SoftwareCursorOverlay.overlayPanelForTesting)
+            XCTAssertEqual(panel.frame.minX + SoftwareCursorPanelMetrics.tipAnchor.x, next.x, accuracy: 1)
+
+            SoftwareCursorOverlay.settle(at: center, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            XCTAssertEqual(try moves(in: file).count, 3)
         }
     }
 
