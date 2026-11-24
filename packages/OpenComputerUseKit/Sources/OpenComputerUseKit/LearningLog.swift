@@ -3,7 +3,7 @@ import Foundation
 
 /// Local training-data log. Rows are appended as JSONL, one file per UTC day, and scrubbed before they
 /// reach disk. Nothing is sent anywhere. Clipboard content is never read, so it is never stored.
-/// OPEN_COMPUTER_USE_LEARNING_LOG=0 turns the log off. OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES=0 skips PNG saves.
+/// OPEN_COMPUTER_USE_LEARNING_LOG=0 turns the log off. OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES=1 explicitly enables PNG saves.
 final class LearningLog: @unchecked Sendable {
     @TaskLocal static var episodeID: String?
     @TaskLocal static var decisionID: String?
@@ -29,7 +29,7 @@ final class LearningLog: @unchecked Sendable {
     }
 
     static func imagesEnabled(environment: [String: String]) -> Bool {
-        !disabledValues.contains(flag(environment[imagesVariable]))
+        ["1", "true", "yes", "on"].contains(flag(environment[imagesVariable]))
     }
 
     private static func flag(_ value: String?) -> String {

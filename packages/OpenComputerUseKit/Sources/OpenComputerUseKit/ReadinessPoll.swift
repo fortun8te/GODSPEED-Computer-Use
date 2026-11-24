@@ -14,12 +14,14 @@ enum ReadinessPoll {
         read: () -> Value?
     ) -> Value? {
         let deadline = now() + timeout
-        repeat {
-            guard !RequestCancellation.requested else { return nil }
+        while !RequestCancellation.requested, now() < deadline {
             // Note the generation before the read, so a change during the read ends the next sleep at once.
             let watch = pid.map { (monitor ?? AXChangeMonitor.shared, $0) }
             let token = watch.map { $0.0.track($0.1) }
-            if let value = read(), !RequestCancellation.requested { return value }
+            guard now() < deadline else { return nil }
+            let value = read()
+            guard !RequestCancellation.requested, now() < deadline else { return nil }
+            if let value { return value }
             let remaining = deadline - now()
             guard remaining > 0 else { return nil }
             if let watch, let token {
@@ -27,7 +29,7 @@ enum ReadinessPoll {
             } else {
                 sleep(min(interval, remaining))
             }
-        } while now() <= deadline
+        }
         return nil
     }
 }

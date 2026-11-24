@@ -387,6 +387,50 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(app.chooseCalls, 0)
     }
 
+    func testGuardedFieldCompletionRejectsStaleSameTextPiggyback() {
+        let window = "App=x\nWindow: Draft\nWindow ID: 31"
+        let screen = window + "\n1 text field Name = Before (w:str)\n2 text field City = Before (w:str)"
+        let conditions: [DoneCheck.Condition] = [
+            .field(label: "Name", equals: "After"), .field(label: "City", equals: "After"),
+        ]
+        let request = HandoffTool.Request(
+            app: "x", goal: "Update draft fields", doneWhen: conditions,
+            values: [("Name", "After"), ("City", "After")], maxSteps: 2, timeBudget: 10,
+            expectedValues: ["Name": "Before", "City": "Before"]
+        )
+        var name = "Before", city = "Before"
+        var observed: [DoneCheck.Field] = []
+        var reads = 0
+        var acts = 0
+        let deps = HandoffTool.Dependencies(
+            readState: {
+                reads += 1
+                observed = [.init(label: "Name", value: name), .init(label: "City", value: city)]
+                return screen
+            },
+            act: { _, _ in
+                acts += 1
+                if acts == 1 {
+                    // Independent change before the retry read. The rendered state is identical.
+                    name = "After"
+                    city = "After"
+                    return .init(ok: false, message: "the first action never went out", delivery: .notSent)
+                }
+                name = "Before"
+                return .init(ok: true, message: "", delivery: .acknowledged, observedState: screen)
+            },
+            choose: { _, _, _, _, _ in XCTFail("guarded action called chooser"); return nil },
+            looksStuck: { _, _, _ in XCTFail("guarded action called referee"); return false },
+            check: { HandoffTool.check(conditions, screen: $0, observedFields: observed) },
+            replay: { _ in nil }, now: { 0 }
+        )
+        let result = HandoffTool.run(request, deps)
+        XCTAssertEqual(acts, 2)
+        XCTAssertEqual(reads, 3)
+        XCTAssertNotEqual(result.kind, .done)
+        XCTAssertNotEqual(result.deliveryState, .verified)
+    }
+
     func testGuardedEditsStopBeforeAnyWriteWhenOneFieldChanged() {
         let app = FakeApp()
         app.name = "Before"

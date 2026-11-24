@@ -52,12 +52,38 @@ def compile_fixture(root):
     return identifier, binary
 
 
+def stop_process(process, timeout):
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout)
+
+
+def verified_background(run):
+    return (run["fixture_activations"] == 0
+            and not run["fixture_active_before_or_after"]
+            and run["foreground_same_before_and_after"])
+
+
 class MCP:
-    def __init__(self, binary, stderr):
+    def __init__(self, binary, stderr, helper=None):
         environment = {**os.environ, "OPEN_COMPUTER_USE_BACKGROUND_ONLY": "1",
                        "OPEN_COMPUTER_USE_FOCUS_BORROW": "0",
                        "OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS": "0",
-                       "OPEN_COMPUTER_USE_VISUAL_CURSOR": "0", "OPEN_COMPUTER_USE_TRAJECTORY_LOG": "0"}
+                       "OPEN_COMPUTER_USE_VISUAL_CURSOR": "0", "OPEN_COMPUTER_USE_TRAJECTORY_LOG": "0",
+                       "OPEN_COMPUTER_USE_DEBUG_INPUT_FALLBACKS": "1"}
+        if helper is not None:
+            environment.update({
+                "OPEN_COMPUTER_USE_HANDOFF_HELPER": "1" if helper else "0",
+                "OPEN_COMPUTER_USE_REFEREE_URL": "http://127.0.0.1:8765" if helper else "0",
+                "OPEN_COMPUTER_USE_VISION_URL": "0",
+                "OPEN_COMPUTER_USE_RECIPES": "0",
+            })
         environment.pop("OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY", None)
         self.process = subprocess.Popen([str(binary), "mcp"], env=environment, stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=stderr)
@@ -67,15 +93,17 @@ class MCP:
         self.pending = b""
 
     def close(self):
-        self.process.stdin.close()
         try:
-            self.process.wait(timeout=4)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            self.process.wait(timeout=4)
-        self.selector.close()
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass
+        try:
+            stop_process(self.process, timeout=4)
+        finally:
+            self.selector.close()
+            self.process.stdout.close()
 
-    def request(self, method, params, notify=False):
+    def request(self, method, params, notify=False, timeout=28):
         packet = {"jsonrpc": "2.0", "method": method, "params": params}
         if not notify:
             packet["id"] = self.next_id
@@ -84,7 +112,7 @@ class MCP:
         self.process.stdin.flush()
         if notify:
             return None
-        deadline = monotonic() + 28
+        deadline = monotonic() + timeout
         while monotonic() < deadline:
             if b"\n" in self.pending:
                 line, self.pending = self.pending.split(b"\n", 1)
@@ -108,12 +136,16 @@ class MCP:
 
     def call(self, name, arguments):
         started = monotonic()
-        payload, raw_bytes = self.request("tools/call", {"name": name, "arguments": arguments})
+        # Batch can spend up to 75 seconds on the app plus cleanup and readback.
+        timeout = 90 if name == "batch" else 28
+        payload, raw_bytes = self.request("tools/call", {"name": name, "arguments": arguments}, timeout=timeout)
         result = payload.get("result", {})
         reply = "\n".join(item["text"] for item in result.get("content", []) if item.get("type") == "text")
+        if not reply and isinstance(payload.get("error"), dict):
+            reply = str(payload["error"].get("message") or "MCP request failed")
         return {"tool": name, "seconds": round(monotonic() - started, 4), "response_text_bytes": len(reply.encode()),
                 "response_json_bytes": raw_bytes, "error": bool(payload.get("error") or result.get("isError")),
-                "reply": reply}
+                "reply": reply, "handoff": (result.get("_meta") or {}).get("godspeed/handoff")}
 
 
 def read_receipt(root, check):
@@ -160,7 +192,50 @@ def trial(client, app, root, task, batch_per_task):
             "independent_pass": verified, "calls": calls}
 
 
-def run_once(binary, fixture, identifier, directory, tasks, batch_per_task):
+def choice_trial(client, app, root):
+    call = client.call("handoff", {
+        "app": app, "goal": "Select target-file.txt in the fixture file list.",
+        "done_when": {"text": "Selected: target-file.txt"}, "max_steps": 1, "time_budget_s": 8,
+    })
+    state, verified = read_receipt(root, lambda _, data: data.get("selected") == "target-file.txt")
+    return {"task": "Local file selection", "independent_pass": verified, "selected": state.get("selected"),
+            "mcp_calls": 1, "calls": [call]}
+
+
+def resume_trial(client, app, root, pinned=False):
+    snapshot = client.call("get_app_state", {"app": app, "compact": True})
+    window = re.search(r"^Window ID: (\d+)", snapshot["reply"], re.MULTILINE)
+    if not window:
+        return {"task": "Resume a stopped local workflow", "independent_pass": False, "calls": [snapshot]}
+    binding = {"window_id": int(window[1])} if pinned else {}
+    initial = client.call("batch", {
+        **binding, "app": app, "goal": "Finish the multiplication after the folder is created",
+        "steps": [
+            {"tool": "click", "label": "Digit 3"},
+            {"tool": "set_value", "label": "Folder name", "value": "Benchmark folder"},
+            {"tool": "wait", "text": "Folder created", "timeout_ms": 250},
+            *({"tool": "click", "label": key} for key in ("Digit 7", "Multiply", "Digit 2", "Digit 4", "Equals")),
+        ],
+        "done_when": {"appeared": "Result: 888"}, "compact": True,
+    })
+    calls = [snapshot, initial]
+    token = re.search(r"Resume ([0-9A-Fa-f-]{36})", initial["reply"])
+    if not initial["error"] or not token or "3. wait" not in initial["reply"]:
+        return {"task": "Resume a stopped local workflow", "independent_pass": False, "calls": calls}
+    calls.append(client.call("click", {"app": app, "label": "Create folder"}))
+    resume_args = {"resume": token[1], "values": {"step-3-text": "Folder created"}}
+    resumed = client.call("batch", resume_args)
+    duplicate = client.call("batch", resume_args)
+    calls.extend((resumed, duplicate))
+    state, verified = read_receipt(root, lambda folder, data: data.get("answer") == 888
+                                   and (folder / "Benchmark folder").is_dir())
+    return {"task": "Resume a stopped local workflow", "answer": state.get("answer"),
+            "independent_pass": (verified and not resumed["error"] and duplicate["error"]
+                                 and "RESUME_NOT_FOUND" in duplicate["reply"]),
+            "mcp_calls": len(calls), "calls": calls}
+
+
+def run_once(binary, fixture, identifier, directory, tasks, batch_per_task, helper=None, resume_chain=False, pinned_resume=False):
     for name in ("other-file.txt", "target-file.txt"):
         (directory / name).write_text("Owned benchmark fixture.\n")
     environment = {**os.environ, "GODSPEED_BENCH_FIXTURE_ROOT": str(directory)}
@@ -170,20 +245,41 @@ def run_once(binary, fixture, identifier, directory, tasks, batch_per_task):
         if not ready:
             raise RuntimeError("The background fixture failed to start")
         with (directory / "driver.err").open("wb") as stderr:
-            client = MCP(binary, stderr)
+            client = MCP(binary, stderr, helper=helper)
             try:
                 handshake = client.handshake()
-                trials = [trial(client, identifier, directory, task, batch_per_task) for task in tasks]
+                if resume_chain:
+                    trials = [resume_trial(client, identifier, directory, pinned=pinned_resume)]
+                elif helper is None:
+                    trials = [trial(client, identifier, directory, task, batch_per_task) for task in tasks]
+                else:
+                    trials = [choice_trial(client, identifier, directory)]
             finally:
                 client.close()
         final, _ = read_receipt(directory, lambda *_: True)
-        return {"mcp": handshake, "tasks": trials, "fixture_activations": final["activations"],
+        diagnostics = (directory / "driver.err").read_text(errors="replace").splitlines()
+        return {"helper": helper, "mcp": handshake, "tasks": trials,
+                "window_pin_diagnostics": [line for line in diagnostics if "window pin:" in line], "fixture_activations": final["activations"],
                 "fixture_active_before_or_after": initial["active"] or final["active"],
                 "foreground_same_before_and_after": initial["frontPID"] == final["frontPID"]}
     finally:
         if app.poll() is None:
             app.terminate()
-            app.wait(timeout=5)
+            stop_process(app, timeout=5)
+
+
+def write_report(report, output):
+    serialized = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    if output is None:
+        print(serialized, end="")
+        return
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output.parent, delete=False) as stream:
+        path = Path(stream.name)
+        stream.write(serialized)
+    try:
+        path.replace(output)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def main():
@@ -191,30 +287,56 @@ def main():
     parser.add_argument("--driver", type=Path, default=Path("/Applications/GODSPEED.app/Contents/MacOS/OpenComputerUse"))
     parser.add_argument("--repeat", type=int, default=1, choices=range(1, 11))
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--resume-chain", action="store_true", help="Interrupt and resume a multi-step local workflow.")
+    mode.add_argument("--local-choice", action="store_true", help="Compare a live handoff with the local chooser off and on.")
     mode.add_argument("--single-window-batch", action="store_true", help="Group the four known operations in one verified batch.")
     mode.add_argument("--batch-per-task", action="store_true", help="Put each initial observation inside its own verified batch.")
+    parser.add_argument("--pin-resume-window", action="store_true", help="Pin the resume fixture batch to its observed window.")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="godspeed-four-task-") as temporary:
-        root = Path(temporary)
-        identifier, fixture = compile_fixture(root)
-        runs = []
-        for number in range(args.repeat):
-            directory = root / f"trial-{number + 1}"
-            directory.mkdir()
+    if args.pin_resume_window and not args.resume_chain:
+        parser.error("--pin-resume-window requires --resume-chain")
+    runs = []
+    report = {"protocol": "Scripted MCP calls against an isolated native AppKit fixture; no cloud model",
+              "local_choice": args.local_choice, "resume_chain": args.resume_chain,
+              "grouped": args.single_window_batch, "batch_per_task": args.batch_per_task,
+              "timing_scope": "Steady MCP session from app observation through the last action response. Setup and independent check excluded.",
+              "status": "running", "expected_runs": args.repeat * (2 if args.local_choice else 1), "runs": runs}
+    try:
+        with tempfile.TemporaryDirectory(prefix="godspeed-four-task-") as temporary:
+            root = Path(temporary)
+            identifier, fixture = compile_fixture(root)
+            helper_modes = (False, True) if args.local_choice else (None,)
             tasks = grouped_tasks() if args.single_window_batch else TASKS
-            runs.append(run_once(args.driver, fixture, identifier, directory, tasks, args.batch_per_task))
-        report = {"protocol": "Scripted MCP calls against an isolated native AppKit fixture, no language model",
-                  "grouped": args.single_window_batch,
-                  "batch_per_task": args.batch_per_task,
-                  "timing_scope": "Steady MCP session from app observation through the last action response. Setup and independent check excluded.",
-                  "runs": runs}
-        output = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
-        if args.output:
-            args.output.write_text(output)
-        else:
-            print(output, end="")
-        return 0 if all(task["independent_pass"] for run in runs for task in run["tasks"]) else 1
+            for number in range(args.repeat):
+                for helper in helper_modes:
+                    directory = root / f"trial-{number + 1}-{helper}"
+                    directory.mkdir()
+                    runs.append(run_once(args.driver, fixture, identifier, directory, tasks, args.batch_per_task,
+                                         helper, args.resume_chain, args.pin_resume_window))
+                    if args.output:
+                        write_report(report, args.output)
+    except KeyboardInterrupt:
+        report["status"] = "interrupted"
+        write_report(report, args.output)
+        return 130
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        report.update(status="failed", error=f"{type(error).__name__}: {error}")
+        write_report(report, args.output)
+        return 1
+    report["status"] = "completed"
+    write_report(report, args.output)
+    if args.local_choice:
+        def passes_choice(run):
+            task = run["tasks"][0]
+            metrics = task["calls"][0]["handoff"] or {}
+            return (verified_background(run)
+                    and task["independent_pass"] == run["helper"]
+                    and metrics.get("model", 0) == int(run["helper"])
+                    and metrics.get("verified", 0) == int(run["helper"]))
+        return 0 if all(passes_choice(run) for run in runs) else 1
+    return 0 if all(verified_background(run) and all(task["independent_pass"] for task in run["tasks"])
+                    for run in runs) else 1
 
 
 if __name__ == "__main__":

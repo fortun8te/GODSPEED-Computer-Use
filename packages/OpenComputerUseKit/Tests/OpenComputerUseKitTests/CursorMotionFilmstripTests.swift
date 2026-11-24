@@ -322,12 +322,9 @@ final class CursorMotionFilmstripTests: XCTestCase {
                 let press = min(attack * attack * (3 - 2 * attack), release * release * (3 - 2 * release))
                 emit(stop, .zero, 0, press: press, ripple: CursorClickRipple(progress: raw, strength: 1, reducesMotion: false))
             }
-            // Rest with the idle breathing.
             let restStart = time
             while time - restStart < 0.45 {
-                let t = CGFloat(time - restStart)
-                let fade = min(1, t / 0.6)
-                emit(stop, .zero, sin(t * visualCursorIdleRotationRate()) * visualCursorIdleRotationAmplitude() * fade * fade)
+                emit(stop, .zero, 0)
             }
         }
         return frames

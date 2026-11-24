@@ -32,7 +32,7 @@ enum AgentEvents {
     private final class Inbox: @unchecked Sendable {
         let lock = NSLock()
         var pending: [AgentEvent] = []
-        /// Popup tab ids with the tab that opened them. Used only so a later `tabClosed` forgets a popup.
+        /// Popup tab ids with the tab that opened them. Removed when a later `tabClosed` arrives.
         var popups: [(tabID: Int, openerTabID: Int?)] = []
     }
     private static let inbox = Inbox()
@@ -86,6 +86,12 @@ enum AgentEvents {
         inbox.lock.lock()
         defer { inbox.lock.unlock() }
         return inbox.popups.map(\.tabID)
+    }
+
+    static func rememberedPopupTabs(openedBy openerTabID: Int) -> Set<Int> {
+        inbox.lock.lock()
+        defer { inbox.lock.unlock() }
+        return Set(inbox.popups.filter { $0.openerTabID == openerTabID }.map(\.tabID))
     }
 
     static func resetForTesting() {
@@ -208,6 +214,7 @@ extension ToolCallResult {
             browserPreviewPages: browserPreviewPages,
             browserFullObservationText: browserFullObservationText,
             browserEvidenceScope: browserEvidenceScope,
+            observedFields: observedFields,
             deliveryState: deliveryState
         )
     }

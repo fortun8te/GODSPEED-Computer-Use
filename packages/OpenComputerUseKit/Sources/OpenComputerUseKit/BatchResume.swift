@@ -1,8 +1,7 @@
 import Foundation
 
-/// Resumable batches. A batch that stops keeps the steps it did not send for 24 hours, so `batch` with
-/// `resume` can run them after a fresh read. Only step structure is stored: typed text is replaced by a slot
-/// name, and the caller supplies its value again through `values`. Steps that ran are listed, never replayed.
+/// A stopped batch keeps pending step structure and delivery receipts for 24 hours.
+/// Typed values are replaced with slots that the caller fills on resume.
 enum BatchResume {
     static let lifetime: TimeInterval = 24 * 60 * 60
 
@@ -30,6 +29,11 @@ enum BatchResume {
         let number: Int
         let tool: String
         let state: DeliveryState
+        var observation: String? = nil
+        var verification: String? = nil
+        var tabID: String? = nil
+        var failureCode: String? = nil
+        var durationMs: Double? = nil
     }
 
     struct Record: Codable, Sendable {
@@ -45,43 +49,59 @@ enum BatchResume {
         let total: Int
         /// Steps that did not run: never attempted, or refused before any input was sent.
         let pending: [Stored]
-        /// Mutating steps that ran. Never resumed automatically; the reply names them.
+        /// Steps that ran or may have run, including completed reads and waits.
         let sent: [Sent]
+        /// The initial concrete window, including for batches without an explicit pin.
+        var originalWindowID: UInt32? = nil
+        var requiresFreshSteps: Bool? = nil
         var strictBackground: Bool? = nil
         var backgroundOnly: Bool? = nil
 
         var slotNames: [String] { pending.flatMap { $0.slots.values }.sorted() }
     }
 
-    /// The record for a stopped batch, or nil when every step ran or a step cannot be stored as JSON.
+    /// Builds a checkpoint using the original target and step numbers.
     static func record(steps: [BatchTool.Step], receipt: TrajectoryLog.BatchReceipt, goal: String, doneWhen: Any?,
                        app: String?, windowID: UInt32?, processID: Int32?, now: Date = Date(),
-                       continuing prior: Record? = nil) -> Record? {
+                       originalWindowID: UInt32? = nil, browserTabs: [Int: Int] = [:],
+                       requiresFreshSteps: Bool = false, continuing prior: Record? = nil) -> Record? {
         guard prior == nil || prior?.pending.count == steps.count else { return nil }
         var pending: [Stored] = []
         var sent = prior?.sent ?? []
         for (index, step) in steps.enumerated() {
             let number = prior?.pending[index].number ?? index + 1
             if index < receipt.steps.count, receipt.steps[index].deliveryState != .notSent {
-                let state = receipt.steps[index].deliveryState
-                if !step.isReadOnly { sent.append(Sent(number: number, tool: step.tool, state: state)) }
+                let result = receipt.steps[index]
+                let state: DeliveryState = result.observation == .outcomeUnknown ? .outcomeUnknown : result.deliveryState
+                let tab = step.tool == "browser"
+                    ? browserTabs[index].map { String($0) } ?? step.arguments["tab_id"].map { String(describing: $0) }
+                    : nil
+                sent.append(Sent(number: number, tool: step.tool, state: state,
+                                 observation: result.observation?.rawValue,
+                                 verification: result.verification?.rawValue,
+                                 tabID: tab, failureCode: result.failureCode?.rawValue, durationMs: result.durationMs))
                 continue
             }
-            // Resume preflight is a native window read. Browser steps need their own tab/driver binding.
-            guard step.tool != "browser",
-                  let stored = stored(step, number: number, batchWindowID: windowID) else { return nil }
+            guard let stored = stored(step, number: number, batchWindowID: windowID) else { return nil }
             pending.append(stored)
         }
-        guard !pending.isEmpty else { return nil }
+        guard !pending.isEmpty || (receipt.stop != nil && !sent.isEmpty) else { return nil }
         let doneData = doneWhen.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]) }
         return Record(id: UUID().uuidString, createdAt: now, expiresAt: now.addingTimeInterval(lifetime),
-                      app: app, goal: goal, doneWhen: doneData, windowID: windowID, processID: processID,
+                      app: prior == nil ? app : prior?.app, goal: prior?.goal ?? goal, doneWhen: prior?.doneWhen ?? doneData,
+                      windowID: prior == nil ? windowID : prior?.windowID,
+                      processID: prior == nil ? processID : prior?.processID,
                       total: prior?.total ?? steps.count, pending: pending, sent: sent.sorted { $0.number < $1.number },
+                      originalWindowID: prior == nil ? originalWindowID : prior?.originalWindowID,
+                      requiresFreshSteps: prior?.requiresFreshSteps ?? requiresFreshSteps,
                       strictBackground: StrictBackground.enabled(), backgroundOnly: backgroundOnlyMode())
     }
 
     static func stored(_ step: BatchTool.Step, number: Int, batchWindowID: UInt32?) -> Stored? {
-        var arguments = step.arguments
+        // Browser continuations require a fresh driver/tab inspection. Keep only
+        // the operation number and explicit tab, never URLs or browser payloads.
+        var arguments = step.tool == "browser"
+            ? step.arguments.filter { $0.key == "tab_id" } : step.arguments
         if step.tool != HandoffTool.name, let batchWindowID,
            (try? validatedQueryWindowID(arguments["window_id"])) == batchWindowID {
             arguments.removeValue(forKey: "window_id")
@@ -100,6 +120,12 @@ enum BatchResume {
 
     /// Steps ready to run again: arguments decoded, slot values filled from `values`. Throws when a slot is missing.
     static func steps(of record: Record, values: [String: Any]) throws -> [BatchTool.Step] {
+        guard !record.pending.contains(where: { $0.tool == "browser" }) else {
+            throw ComputerUseError.notSent("Inspect the browser tab and send the remaining steps explicitly.")
+        }
+        if record.requiresFreshSteps == true {
+            throw ComputerUseError.notSent("Read the recipe target and send the remaining steps explicitly.")
+        }
         let missing = record.pending.flatMap { step in
             step.slots.compactMap { key, slot -> String? in
                 let value = values[slot]
@@ -119,6 +145,11 @@ enum BatchResume {
             guard let object = try JSONSerialization.jsonObject(with: stored.arguments) as? [String: Any] else {
                 throw ComputerUseError.invalidArguments("The saved resume step \(stored.number) is unreadable. Send the steps again.")
             }
+            let normalized = ArgumentNormalizer.normalize(tool: stored.tool, arguments: object, lastApp: record.app)
+            if BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: object)])
+                || BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: normalized)]) {
+                throw ComputerUseError.notSent("Resume step \(stored.number) uses a target tied to an old snapshot. Read the target and send the remaining steps with fresh targets.")
+            }
             var arguments = object
             for (key, slot) in stored.slots { arguments[key] = values[slot] }
             return BatchTool.Step(tool: stored.tool, arguments: arguments)
@@ -130,8 +161,10 @@ enum BatchResume {
         guard now < record.expiresAt else {
             throw ComputerUseError.invalidArguments("RESUME_EXPIRED. The resume token is older than 24 hours. Read the app and send the remaining steps again.")
         }
-        guard record.processID == liveProcessID, record.windowID == nil || record.windowID == liveWindowID else {
-            if let windowID = record.windowID { throw ComputerUseError.windowChanged(windowID) }
+        let window = record.windowID ?? record.originalWindowID
+        guard let processID = record.processID, processID == liveProcessID,
+              let window, window == liveWindowID else {
+            if let windowID = window { throw ComputerUseError.windowChanged(windowID) }
             throw ComputerUseError.invalidArguments("WINDOW_CHANGED. The app changed since the batch stopped. Read it again and send the remaining steps.")
         }
     }
@@ -168,13 +201,15 @@ enum BatchResume {
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(id.uppercased() + ".json"))
     }
 
-    /// Claim after preflight. Only one process can remove the stored token and run its steps.
+    /// Claim after preflight. Moving the token keeps its receipts while preventing another run.
     static func claim(_ id: String) throws {
         guard let uuid = UUID(uuidString: id) else {
             throw ComputerUseError.invalidArguments("RESUME_NOT_FOUND. The resume token is invalid.")
         }
         do {
-            try FileManager.default.removeItem(at: directory.appendingPathComponent(uuid.uuidString + ".json"))
+            let source = directory.appendingPathComponent(uuid.uuidString + ".json")
+            let claimed = directory.appendingPathComponent(uuid.uuidString + ".claimed.json")
+            try FileManager.default.moveItem(at: source, to: claimed)
         } catch {
             throw ComputerUseError.notSent("The resume token could not be claimed. It may already be running or expired. Read the app before continuing.")
         }
@@ -187,13 +222,11 @@ enum BatchResume {
         return record
     }
 
-    /// The live process and pinned window for an app, to compare with a stored record.
+    /// Resolves the process and requested or current window from the same app descriptor.
     static func liveState(app: String?, windowID: UInt32?) -> (processID: Int32?, windowID: UInt32?) {
         guard let app, let descriptor = try? AppDiscovery.resolveRunning(app) else { return (nil, nil) }
-        let window = windowID.flatMap { id in
-            (try? SnapshotBuilder.resolveTargetWindow(for: descriptor, windowID: id))?.windowID
-        }
-        return (descriptor.pid, window.map { UInt32($0) })
+        let window = (try? SnapshotBuilder.resolveTargetWindow(for: descriptor, windowID: windowID))?.windowID
+        return (descriptor.pid, window)
     }
 
     private static func prune(_ folder: URL, now: Date) {
@@ -207,14 +240,28 @@ enum BatchResume {
 
     /// Reply lines: the token, the steps it will run, the steps not repeated, and any values to supply.
     static func replyLines(for record: Record) -> [String] {
-        var lines = ["Resume \(record.id): steps \(ranges(record.pending.map(\.number))) of \(record.total) did not run. "
-            + "Send batch with resume \"\(record.id)\" to run them (valid 24 hours)."]
+        let pending = ranges(record.pending.map(\.number))
+        var lines = [record.pending.isEmpty
+            ? "Batch checkpoint \(record.id)."
+            : "Resume \(record.id): steps \(pending) of \(record.total) did not run."]
+        if record.sent.contains(where: { $0.state == .outcomeUnknown }) {
+            lines.append("Inspect the uncertain step before sending any remaining actions.")
+        } else if record.pending.contains(where: { $0.tool == "browser" }) || record.sent.contains(where: { $0.tool == "browser" }) {
+            lines.append("Inspect the browser tab and send the remaining steps explicitly.")
+        } else if !record.pending.isEmpty, record.requiresFreshSteps == true || record.app == nil || record.processID == nil
+                    || (record.windowID ?? record.originalWindowID) == nil {
+            lines.append("Read the target and send the remaining steps explicitly.")
+        } else if !record.pending.isEmpty {
+            lines.append("Send batch with resume \"\(record.id)\" to continue if the original target still matches (valid 24 hours).")
+        }
         if !record.sent.isEmpty {
             let named = record.sent.prefix(5).map { sent in
-                "step \(sent.number) \(sent.tool)" + (sent.state == .outcomeUnknown ? " (outcome unknown)" : "")
+                let detail = sent.state == .outcomeUnknown ? "outcome unknown" : sent.verification ?? sent.observation ?? sent.state.rawValue
+                let tab = sent.tabID.map { " on tab \($0)" } ?? ""
+                return "step \(sent.number) \(sent.tool) (\(detail))\(tab)"
             }
             let more = record.sent.count > 5 ? " and \(record.sent.count - 5) more" : ""
-            lines.append("Not repeated, already sent: \(named.joined(separator: ", "))\(more). Send them again only if still needed.")
+            lines.append("Saved receipts: \(named.joined(separator: ", "))\(more). Inspect the current state before deciding what to do next.")
         }
         if !record.slotNames.isEmpty {
             lines.append("Provide values for \(record.slotNames.joined(separator: ", ")) when resuming.")

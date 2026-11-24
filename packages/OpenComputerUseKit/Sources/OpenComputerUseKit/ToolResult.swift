@@ -40,6 +40,7 @@ public struct ToolCallResult: @unchecked Sendable {
     let browserObservationURL: String?
     let browserEvidenceScope: BrowserEvidenceScope?
     let browserFullObservationText: String?
+    let observedFields: [DoneCheck.Field]?
     let browserContinuationTabID: Int?
     let browserPreviewPages: [[String: Any]]?
 
@@ -52,7 +53,7 @@ public struct ToolCallResult: @unchecked Sendable {
         batchReceipt: TrajectoryLog.BatchReceipt? = nil, failureCode: TrajectoryLog.FailureCode? = nil,
         browserObservationURL: String? = nil, browserContinuationTabID: Int? = nil,
         browserPreviewPages: [[String: Any]]? = nil, browserFullObservationText: String? = nil,
-        browserEvidenceScope: BrowserEvidenceScope? = nil,
+        browserEvidenceScope: BrowserEvidenceScope? = nil, observedFields: [DoneCheck.Field]? = nil,
         deliveryState: DeliveryState? = nil, handoffMetrics: [String: Int]? = nil
     ) {
         self.content = content
@@ -63,6 +64,7 @@ public struct ToolCallResult: @unchecked Sendable {
         self.failureCode = failureCode
         self.browserObservationURL = browserObservationURL
         self.browserEvidenceScope = browserEvidenceScope
+        self.observedFields = observedFields
         self.browserFullObservationText = browserFullObservationText
         self.browserContinuationTabID = browserContinuationTabID
         self.browserPreviewPages = browserPreviewPages
@@ -120,7 +122,7 @@ public struct ToolCallResult: @unchecked Sendable {
             content: content, isError: isError, batchReceipt: batchReceipt, failureCode: failureCode,
             browserObservationURL: browserObservationURL, browserContinuationTabID: browserContinuationTabID,
             browserPreviewPages: browserPreviewPages, browserFullObservationText: browserFullObservationText,
-            browserEvidenceScope: browserEvidenceScope, deliveryState: deliveryState ?? self.deliveryState,
+            browserEvidenceScope: browserEvidenceScope, observedFields: observedFields, deliveryState: deliveryState ?? self.deliveryState,
             handoffMetrics: handoffMetrics
         )
     }

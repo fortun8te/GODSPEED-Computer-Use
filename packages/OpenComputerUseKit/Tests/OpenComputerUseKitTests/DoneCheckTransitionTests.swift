@@ -35,6 +35,26 @@ final class DoneCheckTransitionTests: XCTestCase {
         }
     }
 
+    func testBrowserFieldTransitionRequiresStructuredUniqueFieldsInTheSameDocument() throws {
+        let document = try XCTUnwrap(BrowserDocumentIdentity(tree: ["frame": ["id": "main", "loaderId": "loader"]]))
+        let condition = DoneCheck.Condition.fieldChanged(label: "Name", equals: "Ada")
+        let before = BatchCompletion.Observation(
+            target: .browser(tab: 1, generation: 1), screen: "1 textbox Name = Bob", canProveAbsence: true,
+            observedFields: [.init(label: "Name", value: "Bob")], browserDocument: document
+        )
+        let baseline = BatchCompletion(conditions: [condition], startedAt: Date(), before: before)
+        var after = before
+        after.screen = "1 textbox Name = Ada"
+        after.observedFields = nil
+        XCTAssertFalse(baseline.meets(condition, after: after))
+        after.observedFields = [.init(label: "Name", value: "Ada"), .init(label: "name", value: nil)]
+        XCTAssertFalse(baseline.meets(condition, after: after))
+        after.observedFields = [.init(label: "Name", value: "Ada")]
+        XCTAssertTrue(baseline.meets(condition, after: after))
+        after.browserDocument = nil
+        XCTAssertFalse(baseline.meets(condition, after: after))
+    }
+
     func testWithoutABaselineAPresenceMatchIsWeak() {
         guard case .weak = DoneCheck.check([.text("Message sent")], evidence: .init(screenText: "1 text Message sent", pageURL: { nil })) else {
             return XCTFail("no baseline means no proof of change")

@@ -1,4 +1,5 @@
 import Foundation
+import JavaScriptCore
 import XCTest
 @testable import OpenComputerUseKit
 
@@ -6,6 +7,62 @@ import XCTest
 /// rendering from synthetic accessibility JSON, and label matching. The peek fixture uses a shell helper
 /// in place of Chrome and OBU.
 final class BrowserPageTests: XCTestCase {
+    func testObservedFocusRequiresTheExactControlAndAFocusedDocument() throws {
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript("""
+        var pageFocused = false;
+        var document = { hasFocus: () => pageFocused };
+        var host = { getRootNode: () => document };
+        var shadow = { host };
+        var field = { isConnected: true, ownerDocument: document, getRootNode: () => shadow };
+        document.activeElement = host;
+        shadow.activeElement = field;
+        """)
+        let probe = "(\(BrowserPage.observedFocusJS)).call(field)"
+        XCTAssertFalse(context.evaluateScript(probe).toBool())
+        context.evaluateScript("pageFocused = true")
+        XCTAssertTrue(context.evaluateScript(probe).toBool())
+        context.evaluateScript("shadow.activeElement = {};")
+        XCTAssertFalse(context.evaluateScript(probe).toBool())
+        context.evaluateScript("shadow.activeElement = field; field.isConnected = false;")
+        XCTAssertFalse(context.evaluateScript(probe).toBool())
+    }
+
+    func testExactRoleTargetKeepsTextboxWithSharedSearchLabel() throws {
+        let button: [String: Any] = ["role": ["value": "button"], "name": ["value": "Search"], "backendDOMNodeId": 11]
+        let textbox: [String: Any] = ["role": ["value": "textbox"], "name": ["value": "Search"], "backendDOMNodeId": 22]
+        let matches = try BrowserPage.exactControls(named: "Search", role: "textbox",
+                                                    query: { [button, textbox] }, fallback: { [] })
+        XCTAssertEqual(matches.map(\.backendNodeID), [22])
+    }
+
+    func testHorizontalScrollEvidenceUsesMovementOnBothPageAndElement() throws {
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript("""
+        const window = {
+            innerWidth: 200, innerHeight: 100, scrollX: 0, scrollY: 0,
+            scrollBy({left}) { this.scrollX = Math.max(0, this.scrollX + left); }
+        };
+        const document = {scrollingElement:{scrollWidth:400, scrollHeight:100}};
+        const getComputedStyle = () => ({overflowX:'auto', overflowY:'hidden'});
+        const panel = {
+            nodeType:1, clientWidth:200, scrollWidth:400, clientHeight:100, scrollHeight:100,
+            scrollLeft:0, scrollTop:0,
+            scrollBy({left}) { this.scrollLeft = Math.max(0, this.scrollLeft + left); }
+        };
+        """)
+        let page = "(\(BrowserPage.scrollPageJS))"
+        let panel = "(\(BrowserPage.scrollElementJS)).bind(panel)"
+        for scroll in [page, panel] {
+            let right = context.evaluateScript("\(scroll)('right', 50)")?.toArray()
+            XCTAssertEqual(BrowserRules.scrollEvidence(direction: "right", raw: right), "scrolled right")
+            let left = context.evaluateScript("\(scroll)('left', 50)")?.toArray()
+            XCTAssertEqual(BrowserRules.scrollEvidence(direction: "left", raw: left), "scrolled left")
+            let atEdge = context.evaluateScript("\(scroll)('left', 50)")?.toArray()
+            XCTAssertEqual(BrowserRules.scrollEvidence(direction: "left", raw: atEdge), "no horizontal scroll detected")
+        }
+    }
+
     func testClippedBrowserTextAndControlsCannotBeCompletionEvidence() {
         let heading: [String: Any] = ["role": ["value": "heading"], "name": ["value": "Ready"]]
         let clipped: [String: Any] = ["role": ["value": "heading"], "name": ["value": String(repeating: "x", count: 200)]]
@@ -235,19 +292,26 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(lines, ["1 checkbox Include files [focused, mixed]", "2 button More [collapsed, disabled]"])
         var field = ax("textbox", "Name", backend: 14, value: "Ada")
         field["properties"] = [property("focused", true)]
-        let line = BrowserPage.parseAX([field], textBudget: 0).controls.first?.line ?? ""
-        XCTAssertTrue(DoneCheck.fieldEquals(line, label: "Name", value: "Ada"))
+        let fields = BrowserPage.completionFields([field])
+        XCTAssertEqual(DoneCheck.uniqueFieldValue(fields, label: "Name"), "Ada")
     }
 
-    func testClippedBrowserFieldCannotVerifyItsPrefix() throws {
+    func testBrowserCompletionUsesExactUniqueAXFieldsAndFullValues() {
         let prefix = String(repeating: "a", count: 80)
-        func line(_ value: String) throws -> String {
-            try XCTUnwrap(BrowserPage.parseAX([
-                ax("textbox", "Name", backend: 14, value: value),
-            ]).controls.first).line
+        let condition = DoneCheck.Condition.field(label: "  nAME ", equals: prefix)
+        let exact = ax("textbox", "Name", backend: 14, value: prefix)
+        let suffix = ax("textbox", "Display Name", backend: 15, value: prefix)
+        let duplicate = ax("textbox", "NAME", backend: 16)
+        let longer = ax("textbox", "Name", backend: 17, value: prefix + "b")
+        func check(_ raw: [[String: Any]]) -> DoneCheck.Result {
+            DoneCheck.check([condition], evidence: .init(
+                screenText: "Name = " + prefix, pageURL: { nil }, observedFields: BrowserPage.completionFields(raw)
+            ))
         }
-        XCTAssertTrue(DoneCheck.fieldEquals(try line(prefix), label: "Name", value: prefix))
-        XCTAssertFalse(DoneCheck.fieldEquals(try line(prefix + "b"), label: "Name", value: prefix))
+        XCTAssertEqual(check([exact, suffix]), .weak(met: [condition.summary]))
+        for raw in [[suffix], [exact, duplicate], [longer], []] {
+            XCTAssertEqual(check(raw), .missing(unmet: [condition.summary]))
+        }
     }
 
     func testRenderPutsControlsBeforeTextAndAddsAddress() {
@@ -732,6 +796,15 @@ final class BrowserPageTests: XCTestCase {
         XCTAssertEqual(cleanup.cleanupUnconfirmed, 2)
         XCTAssertEqual(cleanup.retryURLs, [], "read pages are not retried; unconfirmed tabs are inspected first")
 
+        let failedWithUnconfirmedCleanup = [
+            BrowserPreviewPage(status: "failed", text: "a", cleanupConfirmed: false),
+            BrowserPreviewPage(status: "not_started", text: "b", cleanupConfirmed: nil),
+        ]
+        let retry = ComputerUseToolDispatcher.peekReceipt(urls, pages: failedWithUnconfirmedCleanup)
+        XCTAssertEqual(retry.retryURLs, ["https://b.test"])
+        XCTAssertTrue(retry.line.contains("inspect those tabs"))
+        XCTAssertFalse(retry.line.contains("https://a.test"))
+
         let complete = [
             BrowserPreviewPage(status: "read", text: "a", cleanupConfirmed: true),
             BrowserPreviewPage(status: "read", text: "b", cleanupConfirmed: true),
@@ -991,6 +1064,9 @@ final class BrowserPageTests: XCTestCase {
         let before = "https://a.test/start"
         let observation: [String: Any] = ["href": before, "seenHref": before, "mut": 3, "seen": 2]
         XCTAssertEqual(BrowserRules.changeAfterUnload(observation, loadedAddress: nil), .navigationUnconfirmed)
+        var intermediate = observation
+        intermediate["href"] = "https://a.test/loading"
+        XCTAssertEqual(BrowserRules.changeAfterUnload(intermediate, loadedAddress: nil), .navigationUnconfirmed)
         XCTAssertEqual(BrowserRules.changeAfterUnload(observation, loadedAddress: before), .navigationUnconfirmed)
         XCTAssertEqual(BrowserRules.changeAfterUnload(observation, loadedAddress: "https://a.test/end"),
                        .navigated("https://a.test/end"))
@@ -1206,9 +1282,11 @@ extension BrowserPageTests {
                                                   readyState: "loading"))
         XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/",
                                                   readyState: "complete"))
-        // Still on the requested origin but not yet at the requested page: keep waiting.
+        // A same-origin redirect is confirmed once the destination completes.
         XCTAssertNil(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/cart",
-                                                  readyState: "complete"))
+                                                  readyState: "interactive"))
+        XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://a.test/cart",
+                                                    readyState: "complete"), .redirected)
         XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "https://login.b.test/sso",
                                                     readyState: "complete"), .redirected)
         XCTAssertEqual(BrowserRules.navigationStage(expected: expected, from: "https://a.test/", href: "chrome-error://chromewebdata/",

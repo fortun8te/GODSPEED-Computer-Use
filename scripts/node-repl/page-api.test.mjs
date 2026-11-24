@@ -309,3 +309,16 @@ test("cua.browser.page works in the REPL through the native peer", async () => {
   ]);
   assert.equal(sent[1].arguments.label, "Save");
 });
+
+test("click keeps the textbox role when a button shares its Search label", async () => {
+  const browser = fakeBrowser(({ action, args }) => {
+    if (action === "read") return readWith("button Search", "textbox Search");
+    return ok(args.target_role === "textbox" ? "clicked textbox" : "clicked button");
+  });
+  const search = createBrowserPage(browser, 8).getByRole("textbox", { name: "Search" });
+  assert.equal(await search.click(), "clicked textbox");
+  assert.deepEqual(browser.calls.at(-1).args, {
+    tab_id: 8, label: "Search", target_role: "textbox", target_exact: true,
+  });
+  assert.equal(await createBrowserPage(browser, 8).getByRole("textbox", { name: "Search", exact: false }).click(), "clicked textbox");
+});
