@@ -63,6 +63,20 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(values, sorted(values))
         self.assertLess(report["ece"]["after"], report["ece"]["before"])
 
+    def test_normalization_rejects_empty_scores_and_handles_large_weights(self):
+        with self.assertRaises(ValueError):
+            f.normalize_probs({label: 0 for label in LABELS})
+        self.assertEqual(f.normalize_probs({label: 1e308 for label in LABELS}),
+                         {label: 0.25 for label in LABELS})
+
+    def test_done_threshold_without_negative_evidence_abstains(self):
+        rows = [{"id": "a", "gold": "done", "question": "decision",
+                 "probs": f.normalize_probs({label: 1 for label in LABELS})}]
+        params, report = f.fit_calibration(rows, isotonic=False)
+        self.assertEqual(params["done_threshold"], 1.0)
+        self.assertEqual(report["done"]["validation_non_done_rows"], 0)
+        self.assertEqual(report["done"]["done_recall"], 0.0)
+
     def test_done_threshold_keeps_zero_false_done_and_reports_recall(self):
         rng = random.Random(3)
         rows = []

@@ -4,35 +4,71 @@ import XCTest
 
 final class CursorWindowFollowTests: XCTestCase {
     @MainActor
-    func testTypingFeedbackKeepsTheCursorPoseThenSettlesAndStopsOnReset() throws {
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            throw XCTSkip("This test measures the animated path with Reduce Motion off")
+    func testFirstFrameAfterWindowChangeIsInsideDestinationWindow() throws {
+        try withOverlay { _, _ in
+            let screen = try XCTUnwrap(NSScreen.screens.first).visibleFrame
+            let mapping = try XCTUnwrap(currentVisualCursorScreenMappings().first { $0.appKitFrame.contains(CGPoint(x: screen.midX, y: screen.midY)) })
+            let sourceFrame = CGRect(x: screen.midX - 300, y: screen.midY, width: 120, height: 90)
+            let destinationFrame = CGRect(x: screen.midX + 110, y: screen.midY, width: 120, height: 90)
+            let source = NSPanel(contentRect: sourceFrame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            let destination = NSPanel(contentRect: destinationFrame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            destination.level = .floating
+            source.orderFrontRegardless()
+            destination.orderFrontRegardless()
+            defer {
+                SoftwareCursorOverlay.frameObserverForTesting = nil
+                source.orderOut(nil)
+                destination.orderOut(nil)
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            let sourceWindow = CursorTargetWindow(windowID: CGWindowID(source.windowNumber), layer: source.level.rawValue)
+            let destinationWindow = CursorTargetWindow(windowID: CGWindowID(destination.windowNumber), layer: destination.level.rawValue)
+            let nativeBounds = CGRect(x: destinationFrame.minX - mapping.appKitFrame.minX + mapping.screenStateFrame.minX,
+                                      y: mapping.appKitFrame.maxY - destinationFrame.maxY + mapping.screenStateFrame.minY,
+                                      width: destinationFrame.width, height: destinationFrame.height)
+            let anchor = CursorRestingAnchor(windowID: destinationWindow.windowID, layer: destinationWindow.layer,
+                                            windowLocalPoint: CGPoint(x: nativeBounds.width / 2, y: nativeBounds.height / 2),
+                                            windowBounds: nativeBounds)
+            SoftwareCursorOverlay.settle(at: CGPoint(x: sourceFrame.midX, y: sourceFrame.midY), in: sourceWindow)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            var points: [CGPoint] = []
+            SoftwareCursorOverlay.frameObserverForTesting = { _, frame, _ in points.append(frame.tipPosition) }
+            SoftwareCursorOverlay.moveCursor(to: CGPoint(x: destinationFrame.midX, y: destinationFrame.midY), in: destinationWindow, anchor: anchor)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            XCTAssertTrue(destinationFrame.contains(try XCTUnwrap(points.first)))
+            XCTAssertTrue(points.allSatisfy { destinationFrame.contains($0) })
+            XCTAssertEqual(SoftwareCursorOverlay.overlayPanelForTesting?.level, destination.level)
         }
+    }
+
+    @MainActor
+    func testRestingCursorStaysStillBeforeAndAfterTyping() throws {
         try withOverlay { file, frame in
             let target = point(frame)
             func observation() throws -> VisualCursorObservationSnapshot {
-                try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
+                SoftwareCursorOverlay.flushObservationsForTesting()
+                return try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             }
             SoftwareCursorOverlay.settle(at: target, in: nil)
-            let deadline = Date().addingTimeInterval(1.5)
-            while abs(try observation().rotation ?? 0) < 0.03, Date() < deadline {
-                RunLoop.main.run(until: Date().addingTimeInterval(0.02))
-            }
-            let before = try XCTUnwrap(observation().rotation)
-            XCTAssertGreaterThan(abs(before), 0.025)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+            let before = try observation()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+            let resting = try observation()
+            XCTAssertEqual(resting.timestamp, before.timestamp, "resting must not repaint")
+            XCTAssertEqual(try XCTUnwrap(resting.rotation), 0, accuracy: 0.001)
 
             SoftwareCursorOverlay.beginFeedback(.typing)
-            let first = try observation()
-            XCTAssertEqual(first.phase, "typing")
-            XCTAssertGreaterThan(abs(try XCTUnwrap(first.rotation)), 0.01)
-            RunLoop.main.run(until: Date().addingTimeInterval(0.47))
+            XCTAssertEqual(try observation().phase, "typing")
+            SoftwareCursorOverlay.endFeedback(.typing)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.6))
             let settled = try observation()
-            XCTAssertEqual(try XCTUnwrap(settled.rotation), 0, accuracy: 0.01)
+            XCTAssertEqual(settled.phase, "idle")
+            XCTAssertEqual(try XCTUnwrap(settled.rotation), 0, accuracy: 0.001)
             XCTAssertEqual(try XCTUnwrap(settled.tipPosition).x, target.x, accuracy: 0.5)
             XCTAssertEqual(try XCTUnwrap(settled.tipPosition).y, target.y, accuracy: 0.5)
 
             SoftwareCursorOverlay.reset()
-            RunLoop.main.run(until: Date().addingTimeInterval(0.08))
             XCTAssertEqual(try observation().phase, "hidden")
         }
     }
@@ -44,6 +80,7 @@ final class CursorWindowFollowTests: XCTestCase {
             let target = CGPoint(x: frame.minX + 2, y: frame.minY + 2)
             let start = CGPoint(x: target.x + 280, y: target.y + 22)
             SoftwareCursorOverlay.settle(at: start, in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             var samples: [CGPoint] = []
             let timer = Timer(timeInterval: 0.012, repeats: true) { _ in
                 MainActor.assumeIsolated {
@@ -58,6 +95,7 @@ final class CursorWindowFollowTests: XCTestCase {
             defer { timer.invalidate() }
             SoftwareCursorOverlay.moveCursor(to: target, in: nil)
             SoftwareCursorOverlay.waitUntilIdleForTesting()
+            SoftwareCursorOverlay.flushObservationsForTesting()
             let final = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             let actual = try XCTUnwrap(final.tipPosition)
             XCTAssertEqual(actual.x, target.x, accuracy: 0.5)
@@ -72,19 +110,20 @@ final class CursorWindowFollowTests: XCTestCase {
     }
 
     @MainActor
-    func testReschedulingHidePreservesSwayStopAndLongHide() throws {
-        // A hide delay longer than the sway timeout (the default is shorter): the sway
-        // stops at six seconds and the hide still fires afterwards.
-        let longHide: TimeInterval = 7.2
+    func testReschedulingHideKeepsTheCursorStillUntilTheDeadline() throws {
         try withOverlay { file, frame in
             SoftwareCursorOverlay.settle(at: point(frame), in: nil)
-            SoftwareCursorOverlay.scheduleHide(after: longHide)
-            RunLoop.main.run(until: Date().addingTimeInterval(6.4))
-            let stopped = try Data(contentsOf: file)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            SoftwareCursorOverlay.scheduleHide(after: 1.2)
             RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-            XCTAssertEqual(try Data(contentsOf: file), stopped, "Sway should stop after six seconds")
-            let remaining = longHide - 6.4 - 0.3 + 0.4
-            RunLoop.main.run(until: Date().addingTimeInterval(remaining))
+            SoftwareCursorOverlay.flushObservationsForTesting()
+            let resting = try Data(contentsOf: file)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            SoftwareCursorOverlay.flushObservationsForTesting()
+            XCTAssertEqual(try Data(contentsOf: file), resting)
+            XCTAssertTrue(SoftwareCursorOverlay.overlayPanelForTesting?.isVisible ?? false)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+            SoftwareCursorOverlay.flushObservationsForTesting()
             let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             XCTAssertEqual(state.phase, "hidden")
         }
@@ -94,14 +133,18 @@ final class CursorWindowFollowTests: XCTestCase {
     func testResetAbortsInFlightHideFade() throws {
         try withOverlay { file, frame in
             SoftwareCursorOverlay.settle(at: point(frame), in: nil)
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             SoftwareCursorOverlay.scheduleHide(after: 0.02)
             RunLoop.main.run(until: Date().addingTimeInterval(0.06))
             SoftwareCursorOverlay.reset()
+            SoftwareCursorOverlay.flushObservationsForTesting()
             let resetState = try Data(contentsOf: file)
             RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+            SoftwareCursorOverlay.flushObservationsForTesting()
             XCTAssertEqual(try Data(contentsOf: file), resetState, "The old fade must not finish after reset")
             SoftwareCursorOverlay.settle(at: point(frame), in: nil)
-            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
+            SoftwareCursorOverlay.flushObservationsForTesting()
             let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             XCTAssertEqual(state.phase, "idle")
             XCTAssertNotNil(state.tipPosition)
@@ -145,6 +188,7 @@ final class CursorWindowFollowTests: XCTestCase {
             for key in ["OPEN_COMPUTER_USE_VISUAL_CURSOR", "OPEN_COMPUTER_USE_VISUAL_CURSOR_OBSERVATION_FILE", "OPEN_COMPUTER_USE_ACTION_READ_BACK", "OPEN_COMPUTER_USE_CURSOR_SPEED"] {
                 if let value = previous[key] { setenv(key, value, 1) } else { unsetenv(key) }
             }
+            SoftwareCursorOverlay.flushObservationsForTesting()
             try? FileManager.default.removeItem(at: file)
         }
         try body(file, CGRect(x: screen.minX + 100, y: screen.minY + 100, width: 200, height: 160))
@@ -161,6 +205,7 @@ final class CursorWindowFollowTests: XCTestCase {
 
     @MainActor
     private func assertPosition(_ file: URL, frame: CGRect, file testFile: StaticString = #filePath, line: UInt = #line) throws {
+        SoftwareCursorOverlay.flushObservationsForTesting()
         let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
         let expected = point(frame)
         XCTAssertEqual(try XCTUnwrap(state.restingTipPosition).x, expected.x, accuracy: 1, file: testFile, line: line)
@@ -175,6 +220,7 @@ final class CursorWindowFollowTests: XCTestCase {
             let live = Frame(original)
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in live.value }
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             for frame in [original.offsetBy(dx: 240, dy: 80), original.offsetBy(dx: 80, dy: 160), original] {
                 live.value = frame
                 RunLoop.main.run(until: Date().addingTimeInterval(0.08))
@@ -189,6 +235,7 @@ final class CursorWindowFollowTests: XCTestCase {
             let live = Frame(original)
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in live.value }
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             let first = Timer(timeInterval: 0.04, repeats: false) { _ in live.value = original.offsetBy(dx: 180, dy: 40) }
             let second = Timer(timeInterval: 0.24, repeats: false) { _ in live.value = original.offsetBy(dx: 260, dy: 100) }
             RunLoop.main.add(first, forMode: .common)
@@ -213,6 +260,7 @@ final class CursorWindowFollowTests: XCTestCase {
             try assertPosition(file, frame: live.value)
             // The next pipeline stage must not restore the snapshot's old point.
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             try assertPosition(file, frame: live.value)
         }
     }
@@ -223,6 +271,7 @@ final class CursorWindowFollowTests: XCTestCase {
             let live = Frame(original)
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in live.value }
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             SoftwareCursorOverlay.settle(at: point(original), in: nil)
             live.value = original.offsetBy(dx: 240, dy: 100)
             RunLoop.main.run(until: Date().addingTimeInterval(0.08))
@@ -235,10 +284,12 @@ final class CursorWindowFollowTests: XCTestCase {
         try withOverlay { file, original in
             CursorWindowFrameTracker.installFrameOverrideForTesting { _ in original }
             SoftwareCursorOverlay.settle(at: point(original), in: nil, anchor: anchor(original))
+            SoftwareCursorOverlay.waitUntilIdleForTesting()
             SoftwareCursorOverlay.pulseClick(at: point(original), clickCount: 1, mouseButton: .left, in: nil, anchor: anchor(original))
             SoftwareCursorOverlay.waitUntilIdleForTesting()
             SoftwareCursorOverlay.reset()
             RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+            SoftwareCursorOverlay.flushObservationsForTesting()
             let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             XCTAssertEqual(state.phase, "hidden")
             XCTAssertNil(state.tipPosition)
@@ -301,6 +352,7 @@ final class CursorWindowFollowTests: XCTestCase {
             }
             SoftwareCursorOverlay.waitUntilIdleForTesting(timeout: 6)
             XCTAssertEqual(window.frame.minX, original.minX + 240, accuracy: 1, "The fixture must move the live window")
+            SoftwareCursorOverlay.flushObservationsForTesting()
             let state = try JSONDecoder().decode(VisualCursorObservationSnapshot.self, from: Data(contentsOf: file))
             let expected = window.convertPoint(toScreen: CGPoint(x: button.frame.midX, y: button.frame.midY))
             XCTAssertEqual(try XCTUnwrap(state.tipPosition).x, expected.x, accuracy: 1)
@@ -371,13 +423,15 @@ final class CursorWindowFollowTests: XCTestCase {
             for offset in [CGPoint(x: 220, y: 60), CGPoint(x: 100, y: 140), .zero] {
                 window.setFrameOrigin(CGPoint(x: original.minX + offset.x, y: original.minY + offset.y))
                 let moved = try awaitFrame { abs($0.minX - (initial.minX + offset.x)) < 1 }
-                RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+                RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+                SoftwareCursorOverlay.waitUntilIdleForTesting()
                 try assertPosition(file, frame: moved)
             }
             for mapping in currentVisualCursorScreenMappings() {
                 window.setFrameOrigin(CGPoint(x: mapping.appKitFrame.minX + 120, y: mapping.appKitFrame.minY + 120))
                 let moved = try awaitFrame { abs($0.minX - (mapping.screenStateFrame.minX + 120)) < 1 }
-                RunLoop.main.run(until: Date().addingTimeInterval(0.04))
+                RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+                SoftwareCursorOverlay.waitUntilIdleForTesting()
                 try assertPosition(file, frame: moved)
             }
             print("Live AX cursor following verified on \(currentVisualCursorScreenMappings().count) display(s).")

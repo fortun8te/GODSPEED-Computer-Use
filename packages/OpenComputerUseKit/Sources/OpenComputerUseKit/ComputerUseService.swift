@@ -1126,6 +1126,9 @@ public final class ComputerUseService {
                                              includeNearbyHitTesting: false, allowActivationFallback: false) else {
                 throw ComputerUseError.notSent("The observed control could not be clicked through accessibility.")
             }
+            let target = visualCursorTarget(for: record, snapshot: snapshot)
+            moveVisualCursor(to: target)
+            pulseVisualCursor(at: target, clickCount: clickCount, mouseButton: button)
             return try actionResult(for: query, recoveryPolicy: .readOnly)
         }
 
@@ -2714,7 +2717,7 @@ public final class ComputerUseService {
             throw ComputerUseError.message(nonSettableSetValueErrorMessage + setValueFallbackHint)
         }
 
-        let cursorTarget = Self.requiredWindowID == nil ? visualCursorTarget(for: record, snapshot: snapshot) : nil
+        var cursorTarget = Self.requiredWindowID == nil ? visualCursorTarget(for: record, snapshot: snapshot) : nil
         moveVisualCursor(to: cursorTarget)
 
         var delivery: DeliveryState = .notSent
@@ -2734,6 +2737,10 @@ public final class ComputerUseService {
 
             delivery = .acknowledged
             try requireUsableComputerUseSession()
+            if Self.requiredWindowID != nil {
+                cursorTarget = visualCursorTarget(for: record, snapshot: snapshot)
+                moveVisualCursor(to: cursorTarget)
+            }
             // A password field's value is never read back: AppKit answers "" whatever it holds, so the check failed a
             // write that had worked and invited sending it again.
             if !isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) {
@@ -2745,7 +2752,7 @@ public final class ComputerUseService {
                 delivery = .verified
             }
         } catch {
-            settleVisualCursor(at: cursorTarget)
+            if Self.requiredWindowID == nil || delivery == .acknowledged { settleVisualCursor(at: cursorTarget) }
             if delivery == .acknowledged { throw ComputerUseError.acknowledged(SmartSteps.messageText(error)) }
             throw error
         }
@@ -4725,7 +4732,7 @@ public final class ComputerUseService {
         if let screenshotData = snapshot.screenshotData {
             content.append(TimingLog.measure("snapshot.base64_encode") { .screenshotImage(screenshotData) })
         }
-        return ToolCallResult(content: content)
+        return ToolCallResult(content: content, isError: false, observedFields: snapshot.completionFields)
     }
 }
 

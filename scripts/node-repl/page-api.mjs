@@ -163,6 +163,19 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
     return desc.name;
   }
 
+  async function resolveTargetArgs(desc, options, prefix = "") {
+    return targetArgs(desc, await labelFor(desc, options), prefix);
+  }
+
+  function targetArgs(desc, label, prefix = "") {
+    const args = { [prefix + "label"]: label };
+    if (desc.role) {
+      args[prefix + "target_role"] = desc.role;
+      args[prefix + "target_exact"] = desc.exact;
+    }
+    return args;
+  }
+
   function describeTarget(target, method, exact = true) {
     const located = typeof target === "object" && target !== null ? locatorDescriptions.get(target) : undefined;
     if (located) return located;
@@ -179,11 +192,11 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
   // Arguments are checked before the preflight read, so an invalid action reads nothing and sends nothing.
   async function clickOf(desc, options) {
     const args = browserClickArgs(options);
-    return run("click", { label: await labelFor(desc, options), ...args }, options);
+    return run("click", { ...await resolveTargetArgs(desc, options), ...args }, options);
   }
 
   async function fillOf(desc, value, options) {
-    return run("fill_field", { label: await labelFor(desc, options), text: value }, options);
+    return run("fill_field", { ...await resolveTargetArgs(desc, options), text: value }, options);
   }
 
   // Waits surface a driver state_unavailable (the condition was not seen before the wait ended) as TIMEOUT.
@@ -215,20 +228,20 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
           if (count === 0) return false;
           if (count > 1) throw ambiguous(desc, count);
         }
-        const text = await run("control_state", { label: desc.name }, opts);
+        const text = await run("control_state", targetArgs(desc, desc.name), opts);
         const match = /^Visible: (true|false)$/mu.exec(text);
         if (!match) throw new BrowserPageError("could not read control visibility", "PARSE_FAILED", { action: "control_state" });
         return match[1] === "true";
       },
       async textContent(options) {
         const opts = checkOptions("locator.textContent", options, LOCATOR_OPTIONS);
-        const text = await run("read_text", { label: await labelFor(desc, opts) }, opts);
+        const text = await run("read_text", await resolveTargetArgs(desc, opts), opts);
         return text === "Text: (empty)" ? "" : text;
       },
       async hover(options) {
         const opts = checkOptions("locator.hover", options, LOCATOR_HOVER_OPTIONS);
         const args = opts.dwellMs === undefined ? {} : { dwell_ms: dwellMs(opts.dwellMs) };
-        return run("hover", { label: await labelFor(desc, opts), ...args }, opts);
+        return run("hover", { ...await resolveTargetArgs(desc, opts), ...args }, opts);
       },
       // Drags this control onto `target`, another locator in the same tab. `verify` is checked after the drop.
       async dragTo(target, options) {
@@ -239,19 +252,19 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
         if (opts.steps !== undefined) args.drag_steps = dragSteps(opts.steps);
         if (opts.holdMs !== undefined) args.hold_ms = holdMs(opts.holdMs);
         if (opts.verify !== undefined) args.verify = verifyArgs(opts.verify);
-        const from = await labelFor(desc, opts);
-        const to = await labelFor(destination, opts);
-        return run("drag", { label: from, to_label: to, ...args }, opts);
+        const from = await resolveTargetArgs(desc, opts);
+        const to = await resolveTargetArgs(destination, opts, "to_");
+        return run("drag", { ...from, ...to, ...args }, opts);
       },
       async scrollIntoViewIfNeeded(options) {
         const opts = checkOptions("locator.scrollIntoViewIfNeeded", options, LOCATOR_OPTIONS);
-        return run("scroll_into_view", { label: await labelFor(desc, opts) }, opts);
+        return run("scroll_into_view", await resolveTargetArgs(desc, opts), opts);
       },
       // selectText("exact text") or selectText({ start, length }) in UTF-16 units, or { text, prefix, suffix }.
       async selectText(selection, options) {
         const opts = checkOptions("locator.selectText", options, SELECT_TEXT_OPTIONS);
         const args = selectionArgs(selection);
-        return run("select_text", { label: await labelFor(desc, opts), ...args }, opts);
+        return run("select_text", { ...await resolveTargetArgs(desc, opts), ...args }, opts);
       },
     });
     locatorDescriptions.set(locator, desc);
@@ -340,25 +353,25 @@ export function createBrowserPage(browser, tabId, pageOptions = {}) {
       const opts = checkOptions("hover", options, HOVER_OPTIONS);
       const desc = describeTarget(target, "hover", opts.exact ?? true);
       const args = opts.dwellMs === undefined ? {} : { dwell_ms: dwellMs(opts.dwellMs) };
-      return run("hover", { label: await labelFor(desc, opts), ...args }, opts);
+      return run("hover", { ...await resolveTargetArgs(desc, opts), ...args }, opts);
     },
 
     async selectOption(target, value, options) {
       const opts = checkOptions("selectOption", options, LABEL_OPTIONS);
       const desc = describeTarget(target, "selectOption", opts.exact ?? true);
-      return run("select", { label: await labelFor(desc, opts), option: nonEmptyString(value, "option") }, opts);
+      return run("select", { ...await resolveTargetArgs(desc, opts), option: nonEmptyString(value, "option") }, opts);
     },
 
     async check(target, options) {
       const opts = checkOptions("check", options, LABEL_OPTIONS);
       const desc = describeTarget(target, "check", opts.exact ?? true);
-      return run("check", { label: await labelFor(desc, opts) }, opts);
+      return run("check", await resolveTargetArgs(desc, opts), opts);
     },
 
     async uncheck(target, options) {
       const opts = checkOptions("uncheck", options, LABEL_OPTIONS);
       const desc = describeTarget(target, "uncheck", opts.exact ?? true);
-      return run("uncheck", { label: await labelFor(desc, opts) }, opts);
+      return run("uncheck", await resolveTargetArgs(desc, opts), opts);
     },
 
     async waitForText(text, options) {

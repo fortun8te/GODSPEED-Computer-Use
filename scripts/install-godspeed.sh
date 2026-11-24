@@ -9,17 +9,24 @@ launcher_dir="$HOME/.local/bin"
 release_url="https://github.com/fortun8te/godspeed/releases/download/$version"
 verify_only=false
 local_archive=""
+expected_version=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --verify-only) verify_only=true; shift ;;
     --archive) [[ $# -ge 2 ]] || exit 2; local_archive="$2"; shift 2 ;;
+    --expected-version) [[ $# -ge 2 && -n "$2" ]] || exit 2; expected_version="$2"; shift 2 ;;
     --app-dir) [[ $# -ge 2 ]] || exit 2; app_dir="$2"; shift 2 ;;
     --launcher-dir) [[ $# -ge 2 ]] || exit 2; launcher_dir="$2"; shift 2 ;;
-    *) printf 'Usage: %s [--archive ZIP] [--verify-only] [--app-dir DIR] [--launcher-dir DIR]\n' "$0" >&2; exit 2 ;;
+    *) printf 'Usage: %s [--archive ZIP [--expected-version X.Y.Z]] [--verify-only] [--app-dir DIR] [--launcher-dir DIR]\n' "$0" >&2; exit 2 ;;
   esac
 done
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
+if [[ -n "$expected_version" ]]; then
+  [[ -n "$local_archive" ]] || fail "--expected-version requires --archive."
+  [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Expected version must be X.Y.Z."
+fi
+verify_version="${expected_version:-${version#v}}"
 [[ "$(uname -s)" == Darwin && "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" == 1 ]]   || fail "This download requires an Apple Silicon Mac."
 os_major="$(sw_vers -productVersion | cut -d. -f1)"
 [[ "$os_major" -ge 14 ]] || fail "Godspeed requires macOS 14 or later."
@@ -56,10 +63,10 @@ binary="$app/Contents/MacOS/OpenComputerUse"
 [[ -x "$binary" && -x "$staging/godspeed-mcp" ]] || fail "The package is missing the app or MCP launcher."
 [[ "$(lipo -archs "$binary")" == arm64 ]] || fail "The package is not an arm64 build."
 codesign --verify --strict --deep "$app"
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" == "${version#v}" ]]   || fail "The package version does not match the release."
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" == "$verify_version" ]]   || fail "The package version does not match the release."
 
 if $verify_only; then
-  printf 'Verified Godspeed %s, arm64, and MCP launcher.\n' "$version"
+  printf 'Verified Godspeed v%s, arm64, and MCP launcher.\n' "$verify_version"
   exit 0
 fi
 
