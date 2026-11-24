@@ -4,17 +4,12 @@ import XCTest
 
 @MainActor
 final class CursorHideTimerTests: XCTestCase {
-    // Regression guards for the 2026-11-04 hide/sway/fade fixes.
-
-    func testSettleSchedulesSwayStopAndHideTogether() {
+    func testSettleSchedulesAnIdleHide() {
         SoftwareCursorOverlay.reset()
         defer { SoftwareCursorOverlay.reset() }
         SoftwareCursorOverlay.settle(at: CGPoint(x: 220, y: 320), in: nil)
-        // Scheduling the hide must not cancel the sway-stop that was just armed
-        // (the old ordering killed the sway timer immediately).
-        XCTAssertNotNil(SoftwareCursorOverlay.swayStopTimer, "hide scheduling must not cancel the sway-stop timer")
-        XCTAssertNotNil(SoftwareCursorOverlay.hideTimer, "the hide timer must still own disappearance")
-        XCTAssertEqual(visualCursorIdleSwayTimeout(), 6)
+        XCTAssertNotNil(SoftwareCursorOverlay.hideTimer)
+        XCTAssertEqual(visualCursorPostInteractionIdleTimeout(environment: [:]), 6)
     }
 
     func testMoveAloneReturnsToTheConfiguredIdleDelay() throws {
@@ -77,7 +72,7 @@ final class CursorHideTimerTests: XCTestCase {
         target.orderOut(nil)
         target.close()
         // WindowServer can report the closed window briefly. Wait for the
-        // actual fade before the normal three-second idle timeout could hide it.
+        // actual fade before the normal idle timeout could hide it.
         let deadline = Date().addingTimeInterval(1.5)
         while panel?.isVisible == true, Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.01))
@@ -119,5 +114,43 @@ final class CursorHideTimerTests: XCTestCase {
         SoftwareCursorOverlay.moveCursor(to: CGPoint(x: 390, y: 390), in: nil)
         SoftwareCursorOverlay.waitUntilIdleForTesting()
         XCTAssertTrue(SoftwareCursorOverlay.overlayPanelForTesting?.isVisible ?? false)
+    }
+
+    func testClosingWindowDoesNotDiscardTheNextClick() throws {
+        try XCTSkipUnless(LockedUseSession.current().state == .unlocked,
+                          "Requires an unlocked desktop for WindowServer visibility transitions.")
+        try XCTSkipIf(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                      "This test closes the old window while its glide is in progress.")
+        let visible = try XCTUnwrap(NSScreen.main).visibleFrame
+        let key = "OPEN_COMPUTER_USE_CURSOR_SPEED"
+        let original = getenv(key).map { String(cString: $0) }
+        setenv(key, "2", 1)
+        SoftwareCursorOverlay.reset()
+        defer {
+            SoftwareCursorOverlay.reset()
+            if let original { setenv(key, original, 1) } else { unsetenv(key) }
+        }
+
+        let first = NSPanel(contentRect: CGRect(x: visible.midX - 300, y: visible.midY, width: 200, height: 160),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let second = NSPanel(contentRect: CGRect(x: visible.midX + 100, y: visible.midY, width: 160, height: 120),
+                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        first.orderFrontRegardless()
+        second.orderFrontRegardless()
+        defer { first.orderOut(nil); second.orderOut(nil) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.08))
+        let from = CursorTargetWindow(windowID: CGWindowID(first.windowNumber), layer: first.level.rawValue)
+        let to = CursorTargetWindow(windowID: CGWindowID(second.windowNumber), layer: second.level.rawValue)
+        let destination = CGPoint(x: second.frame.midX, y: second.frame.midY)
+        SoftwareCursorOverlay.settle(at: CGPoint(x: first.frame.minX + 10, y: first.frame.midY), in: from)
+        SoftwareCursorOverlay.moveCursor(to: CGPoint(x: first.frame.maxX - 10, y: first.frame.midY), in: from)
+        SoftwareCursorOverlay.pulseClick(at: destination, clickCount: 1, mouseButton: .left, in: to)
+        first.orderOut(nil)
+
+        SoftwareCursorOverlay.waitUntilIdleForTesting()
+        let panel = try XCTUnwrap(SoftwareCursorOverlay.overlayPanelForTesting)
+        XCTAssertTrue(panel.isVisible)
+        XCTAssertEqual(panel.frame.minX + SoftwareCursorPanelMetrics.tipAnchor.x, destination.x, accuracy: 1)
+        XCTAssertEqual(panel.frame.minY + SoftwareCursorPanelMetrics.tipAnchor.y, destination.y, accuracy: 1)
     }
 }

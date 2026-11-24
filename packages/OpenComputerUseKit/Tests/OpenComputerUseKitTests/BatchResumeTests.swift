@@ -73,6 +73,24 @@ final class BatchResumeTests: XCTestCase {
         XCTAssertTrue(reply.contains("Resume \(record.id)"), reply)
     }
 
+    func testUncertainEffectRequiresInspectionAndKeepsCheckpoint() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            var stopped = receipt([.acknowledged], stop: .stepFailure, total: 2)
+            stopped.steps[0].observation = .outcomeUnknown
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: clicks(2), receipt: stopped, goal: "", doneWhen: nil,
+                app: "Notes", windowID: 42, processID: 7))
+            try BatchResume.save(record)
+            XCTAssertEqual(record.sent.first?.state, .outcomeUnknown)
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": record.id])) { error in
+                XCTAssertTrue(error.localizedDescription.contains("Inspect the saved step"))
+            }
+            XCTAssertNoThrow(try BatchResume.load(record.id))
+        }
+    }
+
     /// A step refused before any input was sent is pending again, so the batch can carry on from it.
     func testStepRefusedBeforeSendingIsPending() throws {
         var states = Array(repeating: DeliveryState.acknowledged, count: 4)
@@ -110,10 +128,62 @@ final class BatchResumeTests: XCTestCase {
         XCTAssertEqual(try validatedQueryWindowID(resumed.arguments["window_id"]), 42)
     }
 
-    func testBrowserStepsDoNotEmitANativeResumeToken() {
-        let steps = [BatchTool.Step(tool: "browser", arguments: ["action": "click", "tab_id": 42, "label": "Save"])]
-        XCTAssertNil(BatchResume.record(steps: steps, receipt: receipt([], stop: .timeBudget, total: 1),
-                                        goal: "", doneWhen: nil, app: nil, windowID: nil, processID: nil))
+    func testBrowserCheckpointKeepsTabProofAndRequiresInspection() throws {
+        let steps = [
+            BatchTool.Step(tool: "browser", arguments: ["action": "open"]),
+            BatchTool.Step(tool: "browser", arguments: ["action": "type", "tab_id": 42, "text": "private"]),
+        ]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([.verified], stop: .timeBudget, total: 2),
+            goal: "", doneWhen: nil, app: nil, windowID: nil, processID: nil, browserTabs: [0: 42]))
+        XCTAssertEqual(record.sent.first?.tabID, "42")
+        XCTAssertEqual(record.sent.first?.state, .verified)
+        XCTAssertFalse(String(decoding: record.pending[0].arguments, as: UTF8.self).contains("private"))
+        XCTAssertThrowsError(try BatchResume.steps(of: record, values: [:]))
+    }
+
+    func testStaleRawIndexIsRefusedEvenWhenWindowMatches() throws {
+        let steps = [
+            BatchTool.Step(tool: "click", arguments: ["app": "Notes", "element_index": 3]),
+            BatchTool.Step(tool: "click", arguments: ["app": "Notes", "elementId": 4]),
+        ]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([], stop: .windowChanged, total: 2),
+            goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42))
+        XCTAssertNoThrow(try BatchResume.check(record, now: Date(), liveProcessID: 7, liveWindowID: 42))
+        XCTAssertThrowsError(try BatchResume.check(record, now: Date(), liveProcessID: 7, liveWindowID: 43))
+        XCTAssertThrowsError(try BatchResume.steps(of: record, values: [:])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("old snapshot"))
+        }
+        let alias = try XCTUnwrap(BatchResume.record(
+            steps: Array(steps.suffix(1)), receipt: receipt([], stop: .windowChanged, total: 1),
+            goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42))
+        XCTAssertThrowsError(try BatchResume.steps(of: alias, values: [:]))
+    }
+
+    func testVerifiedMilestoneSurvivesStorageAndReplacementProcess() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            var stopped = receipt([.verified], stop: .timeBudget, total: 3)
+            stopped.steps[0].verification = .effectSeen
+            let first = try XCTUnwrap(BatchResume.record(
+                steps: clicks(3), receipt: stopped,
+                goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42))
+            try BatchResume.save(first)
+            let loaded = try BatchResume.load(first.id)
+            let next = try XCTUnwrap(BatchResume.record(
+                steps: try BatchResume.steps(of: loaded, values: [:]),
+                receipt: receipt([], stop: .windowChanged, total: 2),
+                goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 8,
+                originalWindowID: 43, continuing: loaded))
+            XCTAssertEqual(next.sent.map(\.number), [1])
+            XCTAssertEqual(next.sent.map(\.state), [.verified])
+            XCTAssertEqual(next.sent.first?.verification, "effect_seen")
+            XCTAssertEqual(next.processID, 7)
+            XCTAssertEqual(next.originalWindowID, 42)
+            XCTAssertThrowsError(try BatchResume.check(next, now: Date(), liveProcessID: 8, liveWindowID: 43))
+        }
     }
 
     func testWindowOrProcessChangeIsRefused() throws {
@@ -144,6 +214,9 @@ final class BatchResumeTests: XCTestCase {
             }
             try BatchResume.save(record, now: start)
             XCTAssertEqual(try BatchResume.consume(record.id, now: start.addingTimeInterval(60)).id, record.id)
+            let archived = folder.appendingPathComponent(record.id + ".claimed.json")
+            let claimed = try JSONDecoder().decode(BatchResume.Record.self, from: Data(contentsOf: archived))
+            XCTAssertEqual(claimed.sent.map(\.number), [1])
             XCTAssertThrowsError(try BatchResume.consume(record.id, now: start)) { error in
                 XCTAssertTrue(error.localizedDescription.contains("RESUME_NOT_FOUND"), "\(error)")
             }
@@ -194,10 +267,12 @@ final class BatchResumeTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }
         try BatchResume.$directoryOverride.withValue(folder) {
-            let reply = try dispatcher().runBatch(arguments: [
-                "app": "OpenComputerUseNoSuchApp", "goal": "Send the report",
-                "steps": [["tool": "click", "label": "A"], ["tool": "click", "label": "B"], ["tool": "click", "label": "C"]],
-            ])
+            let reply = try StrictBackground.$requested.withValue(true) {
+                try dispatcher().runBatch(arguments: [
+                    "app": "OpenComputerUseNoSuchApp", "goal": "Send the report",
+                    "steps": [["tool": "click", "label": "A"], ["tool": "click", "label": "B"], ["tool": "click", "label": "C"]],
+                ])
+            }
             XCTAssertTrue(reply.isError, reply.textContent)
             let regex = try NSRegularExpression(pattern: "Resume ([0-9A-F-]{36})")
             let text = reply.textContent

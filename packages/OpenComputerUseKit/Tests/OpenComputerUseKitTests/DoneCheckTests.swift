@@ -370,26 +370,36 @@ final class DoneCheckTests: XCTestCase {
         )
     }
 
-    func testFieldComparesValueAfterEqualsIgnoringTypeNote() {
-        let screen = """
-            Settings window
-            \t3 static text checkbox Blue kite = 1
-            \t4 selected song Blue kite = Quiet river (w:str)
-            """
-        XCTAssertTrue(DoneCheck.fieldEquals(screen, label: "checkbox Blue kite", value: "1"))
-        XCTAssertTrue(DoneCheck.fieldEquals(screen, label: "selected song", value: "Quiet river"))
-        XCTAssertFalse(DoneCheck.fieldEquals(screen, label: "checkbox Blue kite", value: "0"))
-        XCTAssertFalse(DoneCheck.fieldEquals(screen, label: "Volume", value: "1"), "no such label")
-        // Not a prefix match: "1" must not match "10".
-        XCTAssertFalse(DoneCheck.fieldEquals("Volume = 10", label: "Volume", value: "1"))
+    func testFieldRequiresUniqueExactNormalizedLabel() {
+        let condition = DoneCheck.Condition.field(label: "  nAME  ", equals: "Ada")
+        let suffix = "1 text field Display Name = Ada"
+        let exact = "2 text field Name = Ada (w:str)"
+        for screen in [suffix, exact + "\n3 text field name = Bob", exact + "\n3 text field NAME",
+                       exact + "\n3 text field Name = Ada"] {
+            XCTAssertEqual(DoneCheck.check([condition], evidence: evidence(screen: screen)),
+                           .missing(unmet: [condition.summary]))
+        }
+        XCTAssertEqual(DoneCheck.check([condition], evidence: evidence(screen: suffix + "\n" + exact)),
+                       .weak(met: [condition.summary]))
     }
 
-    func testFieldChecksLabelAndPreservesLiteralValue() {
-        XCTAssertFalse(DoneCheck.fieldEquals("Notes = Result = 42", label: "Result", value: "42"))
-        XCTAssertFalse(DoneCheck.fieldEquals("Username = Ada", label: "Name", value: "Ada"))
-        XCTAssertFalse(DoneCheck.fieldEquals("Result = Ready (pending)", label: "Result", value: "Ready"))
-        XCTAssertTrue(DoneCheck.fieldEquals("Result = Ready (pending)", label: "Result", value: "Ready (pending)"))
-        XCTAssertTrue(DoneCheck.fieldEquals("Name [focused] = a = b", label: "Name", value: "a = b"))
+    func testRenderedFieldHintsCannotHideAnAmbiguousAccessibleName() {
+        let condition = DoneCheck.Condition.field(label: "Name", equals: "Ada")
+        let screen = "1 text field Name = Ada\n2 text field Name Help: Account owner = Bob"
+        let evidence = DoneCheck.Evidence(screenText: screen, pageURL: { nil }, observedFields: [
+            .init(label: "Name", value: "Ada"), .init(label: "Name", value: "Bob"),
+        ])
+        XCTAssertEqual(DoneCheck.check([condition], evidence: evidence), .missing(unmet: [condition.summary]))
+    }
+
+    func testFieldKeepsFullValueAndPlainTextRemainsVerifiable() {
+        XCTAssertFalse(DoneCheck.fieldEquals("1 text field Notes = Result = 42", label: "Result", value: "42"))
+        XCTAssertFalse(DoneCheck.fieldEquals("1 text field Volume = 10", label: "Volume", value: "1"))
+        XCTAssertFalse(DoneCheck.fieldEquals("1 text field Result = Ready (pending)", label: "Result", value: "Ready"))
+        XCTAssertTrue(DoneCheck.fieldEquals("1 text field Result = Ready (pending)", label: "Result", value: "Ready (pending)"))
+        XCTAssertTrue(DoneCheck.fieldEquals("1 text field Name = a = b", label: "Name", value: "a = b"))
+        XCTAssertEqual(DoneCheck.check([.text("Result = 42")], evidence: evidence(screen: "Result = 42")),
+                       .weak(met: ["\"Result = 42\" is on screen"]))
     }
 
     func testGoneMeansNoStateLineMentionsTheLabel() {

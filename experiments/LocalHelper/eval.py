@@ -13,10 +13,10 @@ from urllib import error, request
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-HOST = "http://127.0.0.1:8765"
+DEFAULT_HOST = "http://127.0.0.1:8765"
 VARIANTS = ("legacy", "focused")
 CALL_LIMIT = 300
-DEFAULT_CHOOSE = (0.6, 0.2)
+DEFAULT_CHOOSE = (0.70, 0.35)
 DEFAULT_HINT = {"done": 0.86, "stuck": 0.6, "look_again": 0.6}
 
 
@@ -28,9 +28,9 @@ class NoRedirects(request.HTTPRedirectHandler):
 HTTP = request.build_opener(request.ProxyHandler({}), NoRedirects())
 
 
-def call(route, body=None, timeout=8):
+def call(route, body=None, timeout=8, host=DEFAULT_HOST):
     payload = json.dumps(body).encode() if body is not None else None
-    req = request.Request(HOST + "/" + route, data=payload, headers={"Content-Type": "application/json"})
+    req = request.Request(host.rstrip("/") + "/" + route, data=payload, headers={"Content-Type": "application/json"})
     started = time.perf_counter()
     try:
         with HTTP.open(req, timeout=timeout) as stream:
@@ -42,7 +42,7 @@ def call(route, body=None, timeout=8):
         return None, (time.perf_counter() - started) * 1000, str(exc)
 
 
-def export_fixtures(skip_build):
+def export_fixtures(skip_build, include_screenshots=True):
     with tempfile.TemporaryDirectory(prefix="godspeed-helper-eval-") as tmp:
         file = Path(tmp) / "requests.json"
         command = ["swift", "test", "-j", "3"]
@@ -50,7 +50,11 @@ def export_fixtures(skip_build):
             command += ["--skip-build"]
         command += ["--filter", "LocalHelperEvalFixturesTests/testExportLocalHelperEval"]
         subprocess.run(
-            command, cwd=ROOT, env={**os.environ, "GODSPEED_LOCAL_EVAL_OUTPUT": str(file)}, check=True,
+            command, cwd=ROOT, env={
+                **os.environ,
+                "GODSPEED_LOCAL_EVAL_OUTPUT": str(file),
+                "GODSPEED_LOCAL_EVAL_INCLUDE_SCREENSHOTS": "1" if include_screenshots else "0",
+            }, check=True,
         )
         return json.loads(file.read_text())
 
@@ -163,7 +167,7 @@ def summarize(rows, calibration):
     return summary
 
 
-def ground(row, variant):
+def ground(row, variant, host=DEFAULT_HOST):
     point = row.get("ocr_point") if variant == "focused" else None
     elapsed = row["ocr_ms"] if variant == "focused" else 0
     source = "ocr" if point is not None else "abstain"
@@ -171,7 +175,7 @@ def ground(row, variant):
     lfm_called = point is None and not (variant == "focused" and row["ambiguous"])
     if lfm_called:
         image = row["crop"] if variant == "focused" else row["legacy"]
-        reply, wall, failure = call("locate", {"query": row["query"], "image_base64": image}, timeout=15)
+        reply, wall, failure = call("locate", {"query": row["query"], "image_base64": image}, timeout=15, host=host)
         elapsed += wall
         if reply and reply.get("found") is True and all(type(reply.get(c)) in (float, int) for c in ("x", "y")):
             point = [reply["x"], reply["y"]]
@@ -187,14 +191,17 @@ def ground(row, variant):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-build", action="store_true", help="reuse an existing Swift test build")
+    parser.add_argument("--skip-grounding", action="store_true", help="evaluate d1 decisions only; skip screenshot export and LFM calls")
+    parser.add_argument("--base-url", default=os.environ.get("GODSPEED_LOCAL_EVAL_URL", DEFAULT_HOST),
+                        help="existing helper URL (default: GODSPEED_LOCAL_EVAL_URL or %(default)s)")
     parser.add_argument("--output", type=Path, help="write the report and keep incremental samples next to it")
     args = parser.parse_args()
-    health, _, failure = call("health", timeout=2)
+    health, _, failure = call("health", timeout=2, host=args.base_url)
     if not health or health.get("ok") is not True:
         print("SKIP: the existing local helper is unavailable.", failure or "")
         return
     print("Helper:", json.dumps(health), flush=True)
-    fixtures = export_fixtures(args.skip_build)
+    fixtures = export_fixtures(args.skip_build, include_screenshots=not args.skip_grounding)
     decisions = fixtures["decisions"]
     screenshots = fixtures["screenshots"]
     if 2 * (len(decisions) + len(screenshots)) + 1 > CALL_LIMIT:
@@ -216,7 +223,7 @@ def main():
             for index, row in enumerate(r for r in decisions if r["split"] == split):
                 order = VARIANTS if index % 2 == 0 else VARIANTS[::-1]
                 for variant in order:
-                    reply, wall_ms, err = call(row["route"], row[variant])
+                    reply, wall_ms, err = call(row["route"], row[variant], host=args.base_url)
                     result = {k: row[k] for k in ("id", "split", "route", "expected")}
                     result.update(variant=variant, reply=reply, wall_ms=wall_ms, error=err)
                     rows.append(result)
@@ -227,14 +234,14 @@ def main():
         for index, row in enumerate(screenshots):
             order = VARIANTS if index % 2 == 0 else VARIANTS[::-1]
             for variant in order:
-                result = ground(row, variant)
+                result = ground(row, variant, host=args.base_url)
                 visual.append(result)
                 save_sample(result)
     finally:
         if samples:
             samples.close()
     report = {
-        "helper": health, "calibration_from_dev_only": calibration,
+        "helper_url": args.base_url, "helper": health, "calibration_from_dev_only": calibration,
         "decisions": summarize(rows, calibration),
         "grounding": {
             variant: {

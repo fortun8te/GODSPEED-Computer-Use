@@ -15,6 +15,20 @@ struct BatchCompletion {
         var screen: String?
         var url: String?
         var canProveAbsence: Bool
+        var observedFields: [DoneCheck.Field]? = nil
+        var browserDocument: BrowserDocumentIdentity? = nil
+
+        func fieldValue(_ label: String) -> String? {
+            if case .browser = target {
+                return observedFields.flatMap { DoneCheck.uniqueFieldValue($0, label: label) }
+            }
+            if let screen, DoneCheck.normalizedFieldLabel(label) == "edit field",
+               let display = BatchTool.calculatorDisplay(screen) {
+                return display.input
+            }
+            if let observedFields { return DoneCheck.uniqueFieldValue(observedFields, label: label) }
+            return screen.flatMap { DoneCheck.exactFieldValue($0, label: label) }
+        }
     }
 
     struct Artifact: Equatable {
@@ -131,9 +145,12 @@ struct BatchCompletion {
             guard before.canProveAbsence, let previous = before.screen, let current = after.screen else { return false }
             return !DoneCheck.textMatches(previous, text) && DoneCheck.textMatches(current, text)
         case .fieldChanged(let label, let value):
-            guard before.canProveAbsence, after.canProveAbsence,
-                  let prior = before.screen.flatMap({ DoneCheck.exactFieldValue($0, label: label) }),
-                  let current = after.screen.flatMap({ DoneCheck.exactFieldValue($0, label: label) }) else { return false }
+            if case .browser = before.target {
+                guard let document = before.browserDocument, document == after.browserDocument else { return false }
+            } else {
+                guard before.canProveAbsence, after.canProveAbsence else { return false }
+            }
+            guard let prior = before.fieldValue(label), let current = after.fieldValue(label) else { return false }
             return current == value && prior != current
         case .urlChanged(let url):
             guard let previous = before.url, let current = after.url else { return false }
@@ -186,19 +203,20 @@ struct BatchCompletion {
                 ? "App=com.apple.calculator (pid \(running.pid))\n" : ""
             return Observation(
                 target: .native(pid: running.pid, launch: launch, window: id),
-                screen: appHeader + screen.joined(separator: "\n"), canProveAbsence: complete
+                screen: appHeader + screen.joined(separator: "\n"), canProveAbsence: complete,
+                observedFields: snapshot.completionFields
             )
         }
     }
 
-    static func browser(tabID: Int?, needsText: Bool, deadline: TimeInterval) -> Observation? {
+    static func browser(tabID: Int?, needsText: Bool, needsFields: Bool, deadline: TimeInterval) -> Observation? {
         guard BrowserBridge.isAvailable else { return nil }
         let bridge = BrowserBridge.shared
         return BrowserCallBudget.withDeadline(deadline) {
             guard deadline - ProcessInfo.processInfo.systemUptime > 0.6,
                   let tab = tabID ?? (try? bridge.resolveImplicitTab())?.id else { return nil }
             let page = BrowserPage(bridge: bridge, tab: ["tab_id": tab])
-            return page.completionObservation(tabID: tab, needsText: needsText)
+            return page.completionObservation(tabID: tab, needsText: needsText, needsFields: needsFields)
         }
     }
 }

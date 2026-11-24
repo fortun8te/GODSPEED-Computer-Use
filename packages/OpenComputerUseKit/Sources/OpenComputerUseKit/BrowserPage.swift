@@ -51,7 +51,7 @@ struct BrowserNode: Sendable {
 enum BrowserNavigationResult: Equatable, Sendable {
     /// The requested address loaded. `newDocument` is false when the same document was still in place.
     case arrived(finalURL: String, newDocument: Bool)
-    /// The page loaded on another origin than the one requested (a login or redirect target).
+    /// The page loaded at a different address than requested (a login or redirect target).
     case redirected(finalURL: String)
     /// Chrome's error page (chrome-error://, net::ERR_*) replaced the requested page.
     case errorPage(finalURL: String)
@@ -128,6 +128,7 @@ struct BrowserLocation: Sendable {
     let href: String
     let title: String
     let readyState: String
+    var isReady: Bool { readyState == "interactive" || readyState == "complete" }
 }
 
 final class BrowserPage {
@@ -205,7 +206,7 @@ final class BrowserPage {
     func readSnapshot(find: String?, full: Bool, interactive: Bool = false, diff: Bool = false,
                       includeLinkURLs: Bool = false, keepsDiffBaseline: Bool = true,
                       findExact: String? = nil) throws
-        -> (text: String, verifiedURL: String?, fullText: String?, evidenceScope: BrowserEvidenceScope?) {
+        -> (text: String, verifiedURL: String?, fullText: String?, evidenceScope: BrowserEvidenceScope?, fields: [DoneCheck.Field]?) {
         guardForeignFrames()
         let identity = remember && tabID != nil ? try? documentIdentity() : nil
         let generation = bridge.referenceGeneration
@@ -226,7 +227,7 @@ final class BrowserPage {
                                        readyState: place?.readyState ?? "complete", wholePage: false, numbered: false,
                                        includeLinkURLs: includeLinkURLs)
             return (text + "\n(exact-name search; read the page for numbered controls or to verify page content)",
-                    stable ? place?.href : nil, "", nil)
+                    stable ? place?.href : nil, "", nil, nil)
         }
         let raw = try fullTree()
         let query = find?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -291,6 +292,9 @@ final class BrowserPage {
         let scope = url.flatMap { url in
             identity.flatMap { evidenceScope(document: $0, generation: generation, url: url) }
         }
+        // CDP's full AX tree is scoped to one frame. A child frame could contain a duplicate.
+        let fields = scope != nil && identity?.hasChildFrames == false && query.isEmpty
+            ? Self.completionFields(raw) : nil
         if indicesAvailable, let tabID, let identity {
             let mode = keepsDiffBaseline && query.isEmpty && url != nil ? "\(full):\(interactive):\(includeLinkURLs)" : nil
             BrowserPageMemory.shared.store(parse.controls, bridge: bridge, tab: tabID, document: identity,
@@ -301,10 +305,10 @@ final class BrowserPage {
                let change = AXStateDiff.diff(previous: previous, current: text, matchIndexes: true),
                let header = text.split(separator: "\n").first {
                 let compact = "\(header)\nBrowser changes (read without diff for the full page):\n\(change)"
-                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text, scope) }
+                if compact.utf8.count < text.utf8.count { return (compact, url, evidence ?? text, scope, fields) }
             }
         }
-        return (text, url, evidence, scope)
+        return (text, url, evidence, scope, fields)
     }
 
     func evidenceScope(document: BrowserDocumentIdentity, generation: Int, url: String) -> BrowserEvidenceScope? {
@@ -420,8 +424,8 @@ final class BrowserPage {
         return data
     }
 
-    /// Checks only visible document text and the URL. No element resolution or saved read baseline.
-    func completionObservation(tabID: Int, needsText: Bool) -> BatchCompletion.Observation? {
+    /// Checks visible document text, URL and field identities without publishing element references.
+    func completionObservation(tabID: Int, needsText: Bool, needsFields: Bool) -> BatchCompletion.Observation? {
         let generation = bridge.referenceGeneration
         let script = """
         (() => {
@@ -433,9 +437,18 @@ final class BrowserPage {
         guard let value = (try? evaluate(script)) as? [Any], value.count == 3,
               let url = value[0] as? String, !url.isEmpty,
               generation == bridge.referenceGeneration else { return nil }
+        var fields: [DoneCheck.Field]?
+        var document: BrowserDocumentIdentity?
+        if needsFields, let identity = try? documentIdentity(), !identity.hasChildFrames,
+           let raw = try? fullTree(), !raw.isEmpty, (try? documentIdentity()) == identity,
+           generation == bridge.referenceGeneration {
+            fields = Self.completionFields(raw)
+            document = identity
+        }
         return BatchCompletion.Observation(
             target: .browser(tab: tabID, generation: generation), screen: value[1] as? String,
-            url: url, canProveAbsence: value[2] as? Bool == true
+            url: url, canProveAbsence: value[2] as? Bool == true,
+            observedFields: fields, browserDocument: document
         )
     }
 
@@ -553,6 +566,14 @@ final class BrowserPage {
             nodes = Self.nodes(of: try cdp("Accessibility.getFullAXTree"))
         }
         return nodes
+    }
+
+    static func completionFields(_ raw: [[String: Any]]) -> [DoneCheck.Field] {
+        raw.compactMap { node in
+            guard node["ignored"] as? Bool != true, let role = axValue(node["role"]),
+                  fieldRoles.contains(role), let label = axValue(node["name"]) else { return nil }
+            return DoneCheck.Field(label: label, value: axValue(node["value"]))
+        }
     }
 
     private static func nodes(of payload: [String: Any]) -> [[String: Any]] {
@@ -808,6 +829,24 @@ final class BrowserPage {
     """
 
     /// Chrome's own name search: fast, and it does not read the whole page.
+    func resolveRole(label: String?, role: String, exact: Bool) throws -> BrowserNode {
+        guardForeignFrames()
+        guard let label, !Self.normalize(label).isEmpty else {
+            throw ComputerUseError.invalidArguments("A role target needs a label.")
+        }
+        if exact {
+            let matches = try Self.exactControls(named: label, role: role,
+                                                 query: { try queryNamedRaw(label) }, fallback: fullTree)
+            if matches.count == 1, let node = matches.first { return node }
+            throw ComputerUseError.stateUnavailable("Expected one \(role) named '\(label)'. Found \(matches.count).")
+        }
+        let nodes = Self.parseAX(try fullTree(), controlBudget: Int.max, textBudget: 0, maxControls: .max).controls
+        if let node = try Self.pickFuzzy(nodes.filter { $0.role.lowercased() == role }, label: label) {
+            return node
+        }
+        throw ComputerUseError.stateUnavailable("No \(role) matches '\(label)'.")
+    }
+
     func resolveExact(label: String?, index: Int?, allowPassive: Bool = false) throws -> BrowserNode {
         if let index { return try resolve(label: nil, index: index) }
         guard let label, !Self.normalize(label).isEmpty else {
@@ -848,11 +887,16 @@ final class BrowserPage {
     }
 
     static func exactControls(
-        named name: String, query: () throws -> [[String: Any]], fallback: () throws -> [[String: Any]]
+        named name: String, role: String? = nil, query: () throws -> [[String: Any]], fallback: () throws -> [[String: Any]]
     ) throws -> [BrowserNode] {
-        let wanted = normalize(name)
+        let wanted = role == nil ? normalize(name) : collapse(name)
         func matches(_ raw: [[String: Any]]) -> [BrowserNode] {
-            namedCandidates(raw).filter { normalize($0.name) == wanted }
+            let nodes = namedCandidates(raw)
+            guard let role else { return nodes.filter { normalize($0.name) == wanted } }
+            var seen: Set<Int> = []
+            return nodes.filter {
+                $0.role.lowercased() == role && $0.name == wanted && seen.insert($0.backendNodeID).inserted
+            }
         }
         if let raw = try? query(), !raw.isEmpty {
             let found = matches(raw)
@@ -990,19 +1034,14 @@ final class BrowserPage {
                 guard BrowserCallBudget.remaining() > 2 else {
                     throw ComputerUseError.stateUnavailable("browser click ran out of time before the next press")
                 }
-                do {
-                    try BrowserCallBudget.withDeadline(releaseDeadline - 1.5) {
+                let generation = BrowserBridge.implicitTabGeneration ?? bridge.referenceGeneration
+                try BrowserBridge.$implicitTabGeneration.withValue(generation) {
+                    try Self.deliverInputPair(hold: 0, deadline: releaseDeadline, press: {
                         try mouse("mousePressed", point, buttons: button.mask, clickCount: beat, button: button, modifiers: modifiers)
-                    }
-                } catch {
-                    // A missing press reply may still have left the button held. Release once
-                    // within the reserved time. A release with an uncertain result is never replayed.
-                    try? BrowserCallBudget.withDeadline(releaseDeadline) {
+                    }, release: {
                         try mouse("mouseReleased", point, buttons: 0, clickCount: beat, button: button, modifiers: modifiers)
-                    }
-                    throw error
+                    })
                 }
-                try mouse("mouseReleased", point, buttons: 0, clickCount: beat, button: button, modifiers: modifiers)
             }
         } catch {
             throw ComputerUseError.stateUnavailable("browser: the click may have taken effect. Inspect the tab before retrying.")
@@ -1044,8 +1083,11 @@ final class BrowserPage {
         guard hypot(end.x - start.x, end.y - start.y) >= 4 else {
             throw ComputerUseError.invalidArguments("browser drag needs two distinct visible positions")
         }
-        try Self.deliverDrag(from: start, to: end, steps: steps, hold: hold) { type, point, buttons, count in
-            try self.mouse(type, point, buttons: buttons, clickCount: count, modifiers: modifiers)
+        let generation = BrowserBridge.implicitTabGeneration ?? bridge.referenceGeneration
+        try BrowserBridge.$implicitTabGeneration.withValue(generation) {
+            try Self.deliverDrag(from: start, to: end, steps: steps, hold: hold) { type, point, buttons, count in
+                try self.mouse(type, point, buttons: buttons, clickCount: count, modifiers: modifiers)
+            }
         }
     }
 
@@ -1063,28 +1105,43 @@ final class BrowserPage {
         let movementDeadline = releaseDeadline - 3
         try send("mouseMoved", start, 0, 0)
         var last = start
+        var pressMayHaveLanded = false
         do {
             try BrowserCallBudget.withDeadline(movementDeadline) {
-                try send("mousePressed", start, 1, 1)
+                try RequestCancellation.check(delivery: .notSent)
+                do {
+                    try send("mousePressed", start, 1, 1)
+                    pressMayHaveLanded = true
+                } catch {
+                    pressMayHaveLanded = Self.inputMayHaveLanded(error)
+                    throw error
+                }
+                try RequestCancellation.check()
                 if hold > 0 { pause(hold) }
                 for step in 1...steps {
+                    try RequestCancellation.check()
                     let progress = Double(step) / Double(steps)
-                    last = CGPoint(x: start.x + (end.x - start.x) * progress, y: start.y + (end.y - start.y) * progress)
-                    try send("mouseMoved", last, 1, 0)
+                    let point = CGPoint(x: start.x + (end.x - start.x) * progress, y: start.y + (end.y - start.y) * progress)
+                    do {
+                        try send("mouseMoved", point, 1, 0)
+                        last = point
+                    } catch {
+                        if Self.inputMayHaveLanded(error) { last = point }
+                        throw error
+                    }
                 }
             }
         } catch {
-            // A missing CDP reply doesn't prove the event was never sent.
-            try? BrowserCallBudget.withDeadline(releaseDeadline) {
-                try send("mouseReleased", last, 0, 1)
-            }
+            guard pressMayHaveLanded else { throw error }
+            try? Self.releaseInput(deadline: releaseDeadline) { try send("mouseReleased", last, 0, 1) }
             throw ComputerUseError.stateUnavailable("browser drag was interrupted after starting. Read the tab before retrying.")
         }
         do {
-            try send("mouseReleased", end, 0, 1)
+            try Self.releaseInput(deadline: releaseDeadline) { try send("mouseReleased", end, 0, 1) }
         } catch {
             throw ComputerUseError.stateUnavailable("The drop may have happened. Inspect the tab before repeating.")
         }
+        try RequestCancellation.check()
     }
 
     private func precisePoint(of node: BrowserNode, placement: ClickPlacement) throws -> CGPoint {
@@ -1432,12 +1489,10 @@ final class BrowserPage {
         if !combo.code.isEmpty { down["code"] = combo.code; up["code"] = combo.code }
         if let text = combo.text { down["text"] = text }
         if !combo.commands.isEmpty { down["commands"] = combo.commands }
-        if let hold {
-            try Self.deliverHeldKey(hold: hold, press: { _ = try cdp("Input.dispatchKeyEvent", down) },
+        let generation = BrowserBridge.implicitTabGeneration ?? bridge.referenceGeneration
+        try BrowserBridge.$implicitTabGeneration.withValue(generation) {
+            try Self.deliverHeldKey(hold: hold ?? 0, press: { _ = try cdp("Input.dispatchKeyEvent", down) },
                                    release: { _ = try cdp("Input.dispatchKeyEvent", up) })
-        } else {
-            _ = try cdp("Input.dispatchKeyEvent", down)
-            _ = try cdp("Input.dispatchKeyEvent", up)
         }
     }
 
@@ -1445,18 +1500,40 @@ final class BrowserPage {
                                press: () throws -> Void, release: () throws -> Void) throws {
         try ActionOptions.requireTime(for: hold + 3)
         let deadline = BrowserCallBudget.deadline(after: BrowserCallBudget.remaining())
+        try deliverInputPair(hold: hold, deadline: deadline, pause: pause, press: press, release: release)
+    }
+
+    private static func deliverInputPair(
+        hold: TimeInterval, deadline: TimeInterval, pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        press: () throws -> Void, release: () throws -> Void
+    ) throws {
+        try RequestCancellation.check(delivery: .notSent)
         do {
             try BrowserCallBudget.withDeadline(deadline - hold - 1.5, press)
         } catch {
-            try? BrowserCallBudget.withDeadline(deadline, release)
-            throw ComputerUseError.stateUnavailable("The held key may have reached the tab. Inspect it before repeating.")
+            guard inputMayHaveLanded(error) else { throw error }
+            try? releaseInput(deadline: deadline, release)
+            throw ComputerUseError.stateUnavailable("The press may have reached the tab. Inspect it before repeating.")
         }
-        if hold > 0 { pause(hold) }
+        if hold > 0, !RequestCancellation.requested { pause(hold) }
         do {
-            try BrowserCallBudget.withDeadline(deadline, release)
+            try releaseInput(deadline: deadline, release)
         } catch {
-            throw ComputerUseError.stateUnavailable("Chrome did not confirm key release. Inspect the tab before repeating.")
+            throw ComputerUseError.stateUnavailable("Chrome did not confirm input release. Inspect the tab before repeating.")
         }
+        try RequestCancellation.check()
+    }
+
+    private static func releaseInput(deadline: TimeInterval, _ release: () throws -> Void) throws {
+        try RequestCancellation.$current.withValue(nil) {
+            try BrowserCallBudget.withDeadline(deadline, release)
+        }
+    }
+
+    private static func inputMayHaveLanded(_ error: Error) -> Bool {
+        if let error = error as? RequestCancellation.Cancelled { return error.deliveryState != .notSent }
+        if let error = error as? ComputerUseError { return error.deliveryState != .notSent }
+        return true
     }
 
     /// Verify and select within the target's own document or shadow root.
@@ -1525,6 +1602,25 @@ final class BrowserPage {
         }
     }
 
+    func observesFocus(on node: BrowserNode, in document: BrowserDocumentIdentity) -> Bool {
+        guard (try? documentIdentity()) == document else { return false }
+        return (try? callOnNode(node, Self.observedFocusJS)) as? Bool == true
+    }
+
+    static let observedFocusJS = """
+    function() {
+        if (!this.isConnected || !this.ownerDocument.hasFocus()) return false;
+        let element = this;
+        let scope = element.getRootNode();
+        while (scope.activeElement === element) {
+            if (!scope.host) return scope === this.ownerDocument;
+            element = scope.host;
+            scope = element.getRootNode();
+        }
+        return false;
+    }
+    """
+
     private static let prepareFocusedFieldJS = """
     function(replace) {
         const root = this.getRootNode();
@@ -1565,9 +1661,11 @@ final class BrowserPage {
             + "if(el.isContentEditable)return el.innerText;return null;})()") as? String
     }
 
-    func readTargetText(label: String?, index: Int?) throws -> String {
+    func readTargetText(label: String?, index: Int?, resolved: BrowserNode? = nil) throws -> String {
         let node: BrowserNode
-        if let index {
+        if let resolved {
+            node = resolved
+        } else if let index {
             node = try resolve(label: nil, index: index)
         } else if let label, !label.isEmpty {
             let matches = try queryNamedRaw(label).compactMap { item -> BrowserNode? in
@@ -1683,6 +1781,8 @@ final class BrowserPage {
         let outcome = try callOnNode(node, """
         function(start,end,expected){
           if(!this.isConnected||this.type==='password'||this.disabled||this.value!==expected)return false;
+          this.focus({preventScroll:true});
+          if(!this.isConnected||this.value!==expected||this.getRootNode().activeElement!==this)return false;
           this.setSelectionRange(start,end);
           return this.selectionStart===start&&this.selectionEnd===end&&this.value===expected;
         }
@@ -1714,8 +1814,16 @@ final class BrowserPage {
             throw ComputerUseError.invalidArguments("browser: a radio button cannot be unchecked; choose another option instead")
         }
         try click(node)
-        guard let after = try? checkedState(node), after == expected else {
-            throw ComputerUseError.stateUnavailable("browser: the click may have taken effect, but the requested checked state was not confirmed. Read the control before retrying.")
+        let after = try? checkedState(node)
+        guard after == expected else {
+            let actual: String
+            switch after {
+            case "true": actual = " The control is checked."
+            case "false": actual = " The control is unchecked."
+            case "mixed": actual = " The control is mixed."
+            default: actual = ""
+            }
+            throw ComputerUseError.stateUnavailable("browser: the click may have taken effect, but the requested checked state was not confirmed.\(actual) Read the control before retrying.")
         }
         return "\(node.role) \"\(node.name)\" is now \(word)"
     }
@@ -1773,12 +1881,22 @@ final class BrowserPage {
         return (visible, enabled, state["checked"] as? String)
     }
 
+    static let checkedStateJS = """
+    function() {
+        if (!this.isConnected) return 'unknown';
+        if (this.tagName === 'INPUT' && (this.type === 'checkbox' || this.type === 'radio')) {
+            return this.indeterminate ? 'mixed' : String(this.checked);
+        }
+        const input = this.querySelector?.('input[type=checkbox],input[type=radio]');
+        if (input?.indeterminate) return 'mixed';
+        const aria = this.getAttribute('aria-checked');
+        if (['true', 'false', 'mixed'].includes(aria)) return aria;
+        return input ? String(input.checked) : 'unknown';
+    }
+    """
+
     private func checkedState(_ node: BrowserNode) throws -> String {
-        (try callOnNode(node, "function(){if(this.tagName==='INPUT'&&(this.type==='checkbox'||this.type==='radio'))"
-            + "return this.checked?'true':'false';"
-            + "const a=this.getAttribute('aria-checked');if(a==='true'||a==='false'||a==='mixed')return a;"
-            + "const c=this.querySelector&&this.querySelector('input[type=checkbox],input[type=radio]');"
-            + "if(c)return c.checked?'true':'false';return 'unknown';}") as? String) ?? "unknown"
+        (try callOnNode(node, Self.checkedStateJS) as? String) ?? "unknown"
     }
 
     /// Chooses an option by its text (or value). A native <select> is set directly with input and change events;
@@ -1788,12 +1906,15 @@ final class BrowserPage {
         let listing = try callOnNode(node, "function(){if(this.tagName!=='SELECT')return null;"
             + "return JSON.stringify(Array.from(this.options).map(o=>[o.text,o.value]));}")
         guard let json = listing as? String, let rows = BrowserRules.optionRows(json) else {
+            let openedControl = try nodeObjectID(node)
             try click(node)
             settle()
-            // The opened list's own entry first: a link elsewhere on the page with the same text is not it.
             let listRoles: Set<String> = ["option", "menuitem", "menuitemradio", "menuitemcheckbox", "treeitem", "radio"]
             let wanted = Self.normalize(option)
-            let entries = ((try? queryNamed(option)) ?? []).filter { listRoles.contains($0.role) && Self.normalize($0.name) == wanted }
+            let entries = try queryNamed(option).filter { candidate in
+                guard listRoles.contains(candidate.role), Self.normalize(candidate.name) == wanted else { return false }
+                return (try? callOnNode(candidate, Self.dropdownOwnsOptionJS, objectArguments: [openedControl])) as? Bool == true
+            }
             guard Set(entries.map(\.backendNodeID)).count == 1, let choice = entries.first else {
                 throw ComputerUseError.stateUnavailable("browser: the menu opened, but the option is missing or ambiguous. Read the menu before continuing.")
             }
@@ -1829,45 +1950,85 @@ final class BrowserPage {
         }
     }
 
+    static let dropdownOwnsOptionJS = """
+    function(control) {
+        if (!this.isConnected || !control.isConnected || this === control) return false;
+        if (control.contains(this)) return true;
+        const root = control.getRootNode();
+        const ids = ['aria-controls','aria-owns'].flatMap(name => (control.getAttribute(name) || '').split(/\\s+/)).filter(Boolean);
+        return ids.some(id => {
+            const menu = root.getElementById?.(id) ?? control.ownerDocument.getElementById(id);
+            return menu?.contains(this) === true;
+        });
+    }
+    """
+
     // MARK: Act: scroll and history
 
-    /// Scrolls the page: up, down, left, right, top or bottom, by `amount` pixels or most of a screen.
+    static let scrollPageJS = """
+    function(dir, amt) {
+        const horizontal = dir === 'left' || dir === 'right';
+        const e = document.scrollingElement || document.documentElement;
+        const before = horizontal ? window.scrollX : window.scrollY;
+        const d = amt > 0 ? amt : Math.round((horizontal ? window.innerWidth : window.innerHeight) * 0.8);
+        if (dir === 'top') window.scrollTo({top:0, behavior:'instant'});
+        else if (dir === 'bottom') window.scrollTo({top:e.scrollHeight, behavior:'instant'});
+        else window.scrollBy({
+            left: horizontal ? (dir === 'left' ? -d : d) : 0,
+            top: horizontal ? 0 : (dir === 'up' ? -d : d),
+            behavior:'instant'
+        });
+        return horizontal ? [before, window.scrollX] : [window.scrollY, Math.max(0, e.scrollHeight - window.innerHeight)];
+    }
+    """
+
+    static let scrollElementJS = """
+    function(dir, amt) {
+        const horizontal = dir === 'left' || dir === 'right';
+        const size = horizontal ? 'clientWidth' : 'clientHeight';
+        const extent = horizontal ? 'scrollWidth' : 'scrollHeight';
+        const position = horizontal ? 'scrollLeft' : 'scrollTop';
+        const can = (e) => e?.nodeType === 1 && /^(auto|scroll|overlay)$/.test(
+            getComputedStyle(e)[horizontal ? 'overflowX' : 'overflowY']
+        ) && e[extent] > e[size];
+        let el = this;
+        while (el && !can(el)) el = el.parentElement;
+        if (!el) {
+            for (const child of this.querySelectorAll('*')) {
+                if (can(child) && (!el || child[size] > el[size])) el = child;
+            }
+        }
+        if (!el) return null;
+        const before = el[position];
+        const d = amt > 0 ? amt : Math.round((horizontal ? window.innerWidth : window.innerHeight) * 0.8);
+        if (dir === 'top') el.scrollTo({top:0, behavior:'instant'});
+        else if (dir === 'bottom') el.scrollTo({top:el.scrollHeight, behavior:'instant'});
+        else el.scrollBy({
+            left: horizontal ? (dir === 'left' ? -d : d) : 0,
+            top: horizontal ? 0 : (dir === 'up' ? -d : d),
+            behavior:'instant'
+        });
+        return horizontal ? [before, el[position]] : [el[position], el[extent] - el[size]];
+    }
+    """
+
+    /// Scrolls the page by the given amount or most of a screen.
     func scrollPage(direction: String, amount: Int?) throws -> String {
         let pixels = Swift.max(0, amount ?? 0)
-        let raw = try evaluate("(function(dir,amt){const e=document.scrollingElement||document.documentElement;"
-            + "const d=amt>0?amt:Math.round(window.innerHeight*0.8);let x=0,y=0;"
-            + "if(dir==='down')y=d;else if(dir==='up')y=-d;else if(dir==='right')x=d;else if(dir==='left')x=-d;"
-            + "if(dir==='top')window.scrollTo({top:0,behavior:'instant'});"
-            + "else if(dir==='bottom')window.scrollTo({top:e.scrollHeight,behavior:'instant'});"
-            + "else window.scrollBy({left:x,top:y,behavior:'instant'});"
-            + "return [window.scrollY,Math.max(0,e.scrollHeight-window.innerHeight)];})('\(direction)',\(pixels))", feedback: "scroll")
-        guard let values = raw as? [Any], values.count == 2, let top = BrowserRules.number(values[0]),
-              let bottom = BrowserRules.number(values[1])
-        else {
+        let raw = try evaluate("(\(Self.scrollPageJS))(\(BrowserRules.jsLiteral(direction)),\(pixels))", feedback: "scroll")
+        guard let summary = BrowserRules.scrollEvidence(direction: direction, raw: raw) else {
             throw ComputerUseError.message("browser: the page did not scroll; browser read to check it has content")
         }
-        return BrowserRules.scrollSummary(direction: direction, top: top, bottom: bottom)
+        return summary
     }
 
     /// Scrolls the nearest scrollable box at or around the element (a list, a panel).
     func scrollElement(_ node: BrowserNode, direction: String, amount: Int?) throws -> String {
-        let raw = try callOnNode(node, "function(dir,amt){const d=amt>0?amt:Math.round(window.innerHeight*0.8);"
-            + "const can=(e)=>{if(!e||e.nodeType!==1)return false;const s=getComputedStyle(e);"
-            + "return /(auto|scroll|overlay)/.test(s.overflowY+' '+s.overflowX)&&"
-            + "(e.scrollHeight>e.clientHeight+1||e.scrollWidth>e.clientWidth+1);};"
-            + "let el=this;while(el&&!can(el))el=el.parentElement;"
-            + "if(!el){let best=null;for(const c of this.querySelectorAll('*')){if(can(c)&&(!best||c.clientHeight>best.clientHeight))best=c;}el=best;}"
-            + "if(!el)return null;"
-            + "if(dir==='top')el.scrollTo({top:0,behavior:'instant'});"
-            + "else if(dir==='bottom')el.scrollTo({top:el.scrollHeight,behavior:'instant'});"
-            + "else el.scrollBy({left:dir==='right'?d:(dir==='left'?-d:0),top:dir==='down'?d:(dir==='up'?-d:0),behavior:'instant'});"
-            + "return [el.scrollTop,el.scrollHeight-el.clientHeight];}", arguments: [direction, Swift.max(0, amount ?? 0)], feedback: "scroll")
-        guard let values = raw as? [Any], values.count == 2, let top = BrowserRules.number(values[0]),
-              let bottom = BrowserRules.number(values[1])
-        else {
+        let raw = try callOnNode(node, Self.scrollElementJS, arguments: [direction, Swift.max(0, amount ?? 0)], feedback: "scroll")
+        guard let summary = BrowserRules.scrollEvidence(direction: direction, raw: raw) else {
             throw ComputerUseError.invalidArguments("browser: \"\(node.name)\" does not scroll; leave out the label to scroll the page")
         }
-        return "\"\(node.name)\": " + BrowserRules.scrollSummary(direction: direction, top: top, bottom: bottom)
+        return "\"\(node.name)\": " + summary
     }
 
     func scroll(_ node: BrowserNode?, direction: String, chunks: ScrollChunks) throws -> String {
@@ -1969,11 +2130,11 @@ final class BrowserPage {
     """
 
     private func isInViewport(_ node: BrowserNode) throws -> Bool {
-        try callOnNode(node, """
+        let visibility = try callOnNode(node, """
         function(){
-          if(!this.isConnected||window!==window.top)return false;
+          if(!this.isConnected)return null;
           const text=this.nodeType===3, element=text?this.parentElement:this;
-          if(!element?.getBoundingClientRect)return false;
+          if(!element?.getBoundingClientRect)return null;
           let bounds;
           if(text){
             const range=document.createRange();
@@ -1982,16 +2143,21 @@ final class BrowserPage {
           }else bounds=element.getBoundingClientRect();
           const left=Math.max(0,bounds.left), right=Math.min(innerWidth,bounds.right);
           const top=Math.max(0,bounds.top), bottom=Math.min(innerHeight,bounds.bottom);
-          if(right<=left||bottom<=top)return false;
+          if(right<=left||bottom<=top)return null;
           for(const fraction of [0.5,0.25,0.75]){
             let hit=document.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2);
             for(let next;hit&&hit.shadowRoot&&(next=hit.shadowRoot.elementFromPoint(left+(right-left)*fraction,(top+bottom)/2))&&next!==hit;)hit=next;
             for(let current=hit;current;current=current.parentNode||current.host)
-              if(current===element)return true;
+              if(current===element)return window===window.top?'top':'frame';
           }
-          return false;
+          return null;
         }
-        """) as? Bool == true
+        """) as? String
+        if visibility == "top" { return true }
+        if visibility == "frame", let point = try? center(of: node) {
+            return frameHitIsIntended(node, at: point)
+        }
+        return false
     }
 
     /// Change the tab scale once and verify the reported scale in the same document.
@@ -2036,13 +2202,15 @@ final class BrowserPage {
     /// Back, forward or reload in this tab, waiting for the page to load again.
     func history(_ operation: String, authorizeDestination: (String) throws -> Void = { _ in }) throws -> String {
         if operation == "reload" {
-            guard let before = try evaluate("performance.timeOrigin") as? NSNumber else {
+            guard let before = topFrameLoaderID() else {
                 throw ComputerUseError.stateUnavailable("browser: could not identify the current document before reloading.")
             }
             _ = try cdp("Page.reload", ["ignoreCache": false])
             let place = try waitForHistoryResult {
-                guard let origin = try self.evaluate("performance.timeOrigin") as? NSNumber else { return false }
-                return origin != before
+                guard let loader = topFrameLoaderID(), loader != before,
+                      let place = try? location(), place.isReady,
+                      topFrameLoaderID() == loader else { return nil }
+                return place
             }
             settle()
             return "reloaded \(title(place))"
@@ -2066,21 +2234,21 @@ final class BrowserPage {
             let history = try self.cdp("Page.getNavigationHistory")
             guard let entries = history["entries"] as? [[String: Any]],
                   let index = (history["currentIndex"] as? NSNumber)?.intValue,
-                  entries.indices.contains(index) else { return false }
-            return (entries[index]["id"] as? NSNumber)?.intValue == entryID
+                  entries.indices.contains(index),
+                  (entries[index]["id"] as? NSNumber)?.intValue == entryID else { return nil }
+            return try location()
         }
         settle()
         return "went \(operation) to \(title(place))"
     }
 
-    private func waitForHistoryResult(_ reachedTarget: () throws -> Bool) throws -> BrowserLocation {
+    private func waitForHistoryResult(_ observe: () throws -> BrowserLocation?) throws -> BrowserLocation {
         let clock = ProcessInfo.processInfo
-        let deadline = clock.systemUptime + min(20, max(0, BrowserCallBudget.remaining()))
+        let deadline = BrowserCallBudget.observationDeadline(after: 20)
         let observed: BrowserLocation? = try BrowserCallBudget.withDeadline(deadline) {
             while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 try BrowserRequestContext.validateCurrent()
-                if (try? reachedTarget()) == true, let place = try? location(),
-                   place.readyState == "interactive" || place.readyState == "complete" {
+                if let place = try? observe(), place.isReady {
                     return place
                 }
                 let remaining = deadline - clock.systemUptime - 0.3
@@ -2114,7 +2282,7 @@ final class BrowserPage {
         }
         let clock = ProcessInfo.processInfo
         let start = clock.systemUptime
-        let deadline = start + min(timeout, max(0, BrowserCallBudget.remaining() - 1))
+        let deadline = BrowserCallBudget.observationDeadline(after: timeout, startingAt: start)
         return BrowserCallBudget.withDeadline(deadline) {
             while !RequestCancellation.requested && deadline - clock.systemUptime > 0.3 {
                 do { try BrowserRequestContext.validateCurrent() } catch { return false }
@@ -2164,14 +2332,21 @@ final class BrowserPage {
 
     /// After a click on a link that leads elsewhere: when the address moves on within 1.5 s, waits for that page
     /// to load and returns it.
-    func followNavigation(from old: String) -> BrowserLocation? {
+    func followNavigation(from old: String) throws -> BrowserLocation? {
         let deadline = Date().addingTimeInterval(1.5)
         while !RequestCancellation.requested && Date() < deadline {
             if let here = try? location(), here.href != old {
-                waitLoad(changedFrom: old, timeout: 20)
+                guard waitLoad(changedFrom: old, timeout: 20) else {
+                    throw ComputerUseError.stateUnavailable("browser: the click started navigation, but the destination did not become ready. Read the tab before retrying.")
+                }
                 settle()
+                guard let destination = try? location(), destination.href != old,
+                      BrowserRules.navigationStage(expected: destination.href, from: old, href: destination.href,
+                                                   readyState: destination.readyState) == .arrived else {
+                    throw ComputerUseError.stateUnavailable("browser: the click started navigation, but the destination could not be confirmed. Read the tab before retrying.")
+                }
                 prime()
-                return try? location()
+                return destination
             }
             Thread.sleep(forTimeInterval: 0.1)
         }
@@ -2262,21 +2437,28 @@ final class BrowserPage {
         if wait.condition == .valueChanged, startingDocument == nil {
             throw ComputerUseError.stateUnavailable("Could not bind the value wait to the current document.")
         }
+        let wanted = Self.normalize(wait.label)
         return try wait.run { () -> ControlWait.Sample<Int> in
             try BrowserRequestContext.validateCurrent()
             if let startingDocument, try documentIdentity() != startingDocument {
                 throw ComputerUseError.stateUnavailable("The document changed during the value wait.")
             }
-            let named = try queryNamedAny(wait.label).filter {
-                Self.normalize(Self.axValue($0["name"]) ?? "") == Self.normalize(wait.label)
+            let raw = try queryNamedRaw(wait.label)
+            let matchesLabel: ([String: Any]) -> Bool = { Self.namedWaitMatch($0, wanted: wanted) }
+            guard wait.condition == .valueChanged else {
+                return raw.contains(where: matchesLabel) ? .present : .absent
             }
+            let named = raw.filter(matchesLabel)
             guard !named.isEmpty else { return .absent }
-            guard wait.condition == .valueChanged else { return .present }
             let matches = Self.namedCandidates(named)
             guard Set(matches.map(\.backendNodeID)).count == 1, let node = matches.first,
                   let value = try observedControlValue(node) else { return .unreadable }
             return .value(node.backendNodeID, value)
         }
+    }
+
+    static func namedWaitMatch(_ node: [String: Any], wanted: String) -> Bool {
+        (node["ignored"] as? Bool) != true && normalize(axValue(node["name"]) ?? "") == wanted
     }
 
     private func observedControlValue(_ node: BrowserNode) throws -> String? {
@@ -2294,7 +2476,7 @@ final class BrowserPage {
 
     func waitFor(text: String?, label: String?, urlContains: String? = nil, controlCondition: ControlCondition? = nil, timeout: TimeInterval) -> Bool {
         let clock = ProcessInfo.processInfo
-        let deadline = clock.systemUptime + min(timeout, max(0, BrowserCallBudget.remaining()))
+        let deadline = BrowserCallBudget.observationDeadline(after: timeout)
         return BrowserCallBudget.withDeadline(deadline) {
             while !RequestCancellation.requested && clock.systemUptime < deadline {
                 do { try BrowserRequestContext.validateCurrent() } catch { return false }
@@ -2335,7 +2517,8 @@ final class BrowserPage {
         new Promise(resolve => {
             const needle = \(BrowserRules.jsLiteral(text));
             const matches = () => !!document.body && document.body.innerText.includes(needle);
-            if (matches() || \(milliseconds) <= 0) { resolve(matches()); return; }
+            const initialMatch = matches();
+            if (initialMatch || \(milliseconds) <= 0) { resolve(initialMatch); return; }
             let observer, timer, probe;
             const finish = result => {
                 observer.disconnect();
@@ -2664,8 +2847,8 @@ enum BrowserRules {
            let loadedAddress, !loadedAddress.isEmpty, loadedAddress != before {
             return .navigated(loadedAddress)
         }
-        let observed = change(observation)
-        if case .navigated = observed { return observed }
+        // The unloading document may expose an intermediate address before a destination loads.
+        // Only a verified loaded address confirms navigation; do not trust the settle probe's href.
         return .navigationUnconfirmed
     }
 
@@ -2774,6 +2957,15 @@ enum BrowserRules {
         }
     }
 
+    static func scrollEvidence(direction: String, raw: Any?) -> String? {
+        guard let values = raw as? [Any], values.count == 2,
+              let first = number(values[0]), let second = number(values[1]) else { return nil }
+        if direction == "left" || direction == "right" {
+            return first == second ? "no horizontal scroll detected" : "scrolled \(direction)"
+        }
+        return scrollSummary(direction: direction, top: first, bottom: second)
+    }
+
     /// What a scroll reports: the position in words, never a number a model has to decode.
     /// `bottom` is how far the page can scroll in total.
     static func scrollSummary(direction: String, top: Double, bottom: Double) -> String {
@@ -2830,7 +3022,7 @@ enum BrowserRules {
         guard old == nil || href != old else { return nil }
         guard readyState == "interactive" || readyState == "complete" else { return nil }
         if sameAddress(href, expected) { return .arrived }
-        if origin(href) != origin(expected) { return .redirected }
+        if origin(href) != origin(expected) || readyState == "complete" { return .redirected }
         return nil
     }
 
@@ -3152,6 +3344,7 @@ struct BrowserEvidenceScope: Equatable {
 
 struct BrowserDocumentIdentity: Equatable {
     private let loadersByFrame: [String: String]
+    var hasChildFrames: Bool { loadersByFrame.count > 1 }
 
     init?(tree: [String: Any]) {
         var loaders: [String: String] = [:]
@@ -3271,9 +3464,19 @@ enum BrowserCallBudget {
         return try body()
     }
 
+    static var activeDeadline: TimeInterval? {
+        Thread.current.threadDictionary[threadKey] as? TimeInterval
+    }
+
     static var activeRemaining: TimeInterval? {
-        guard let deadline = Thread.current.threadDictionary[threadKey] as? TimeInterval else { return nil }
-        return deadline - ProcessInfo.processInfo.systemUptime
+        activeDeadline.map { $0 - ProcessInfo.processInfo.systemUptime }
+    }
+
+    static func observationDeadline(
+        after timeout: TimeInterval, startingAt now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> TimeInterval {
+        // Leave time for the action's receipt and destination check.
+        min(now + timeout, (activeDeadline ?? now + limit) - 1)
     }
 
     static func remaining() -> TimeInterval {

@@ -40,7 +40,7 @@ test("locator.click maps anchor, offset, modifiers, button and click count", asy
   await save.click({ anchor: "right", offset: { x: -4, y: 2 }, modifiers: ["Meta", "Shift"], button: "left", clickCount: 2 });
   assert.deepEqual(browser.calls.at(-1), {
     action: "click",
-    args: { tab_id: 7, label: "Save", anchor: "right", offset_x: -4, offset_y: 2, modifiers: ["cmd", "shift"], mouse_button: "left", click_count: 2 },
+    args: { tab_id: 7, label: "Save", target_role: "button", target_exact: true, anchor: "right", offset_x: -4, offset_y: 2, modifiers: ["cmd", "shift"], mouse_button: "left", click_count: 2 },
     options: { emit: false },
   });
 });
@@ -60,7 +60,7 @@ test("locator.hover maps dwellMs within the 2000 ms limit", async () => {
   const browser = reading("button Tooltip");
   const tip = createBrowserPage(browser, 3).getByRole("button", { name: "Tooltip" });
   await tip.hover({ dwellMs: 800 });
-  assert.deepEqual(sent(browser), [["hover", { tab_id: 3, label: "Tooltip", dwell_ms: 800 }]]);
+  assert.deepEqual(sent(browser), [["hover", { tab_id: 3, label: "Tooltip", target_role: "button", target_exact: true, dwell_ms: 800 }]]);
   await rejects(tip.hover({ dwellMs: 2001 }), "INVALID_ARGUMENT");
   await rejects(tip.hover({ dwellMs: -5 }), "INVALID_ARGUMENT");
   assert.equal(sent(browser).length, 1);
@@ -75,7 +75,8 @@ test("locator.dragTo maps steps, hold and verify, and needs two locators", async
   assert.deepEqual(browser.calls.at(-1), {
     action: "drag",
     args: {
-      tab_id: 4, label: "Card A", to_label: "Drop zone", drag_steps: 6, hold_ms: 150,
+      tab_id: 4, label: "Card A", target_role: "button", target_exact: true,
+      to_label: "Drop zone", to_target_role: "button", to_target_exact: true, drag_steps: 6, hold_ms: 150,
       verify: { label: "Card A", condition: "appears", timeout: 3 },
     },
     options: { emit: false, strictBackground: true },
@@ -101,7 +102,7 @@ test("locator.dragTo stops on an ambiguous destination before dragging", async (
 test("locator.scrollIntoViewIfNeeded reveals the control by its label", async () => {
   const browser = reading("button Checkout");
   await createBrowserPage(browser, 2).getByRole("button", { name: "Checkout" }).scrollIntoViewIfNeeded();
-  assert.deepEqual(sent(browser), [["scroll_into_view", { tab_id: 2, label: "Checkout" }]]);
+  assert.deepEqual(sent(browser), [["scroll_into_view", { tab_id: 2, label: "Checkout", target_role: "button", target_exact: true }]]);
 });
 
 test("locator.selectText maps a text match, a UTF-16 range, and text with a prefix", async () => {
@@ -111,9 +112,9 @@ test("locator.selectText maps a text match, a UTF-16 range, and text with a pref
   await notes.selectText("cart");
   await notes.selectText({ text: "cart", prefix: "the " });
   assert.deepEqual(sent(browser), [
-    ["select_text", { tab_id: 6, label: "Notes", start: 2, length: 4 }],
-    ["select_text", { tab_id: 6, label: "Notes", text: "cart" }],
-    ["select_text", { tab_id: 6, label: "Notes", text: "cart", prefix: "the " }],
+    ["select_text", { tab_id: 6, label: "Notes", target_role: "textbox", target_exact: true, start: 2, length: 4 }],
+    ["select_text", { tab_id: 6, label: "Notes", target_role: "textbox", target_exact: true, text: "cart" }],
+    ["select_text", { tab_id: 6, label: "Notes", target_role: "textbox", target_exact: true, text: "cart", prefix: "the " }],
   ]);
   await rejects(notes.selectText({ start: 1 }), "INVALID_ARGUMENT");
   await rejects(notes.selectText({ start: 1, length: 2, text: "x" }), "INVALID_ARGUMENT");

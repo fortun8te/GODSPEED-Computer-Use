@@ -191,13 +191,18 @@ enum SoftwareCursorGlyphRenderer {
         state: SoftwareCursorGlyphRenderState,
         usesReferenceArtwork: Bool = true,
         ripple: CursorClickRipple? = nil,
-        indicator: CursorInteractionIndicator? = nil
+        indicator: CursorInteractionIndicator? = nil,
+        typingBlend: CGFloat? = nil
     ) {
         let drawingState = state.appKitDrawingState
+        let beam = typingBlend ?? (indicator?.feedback == .typing ? 1 : 0)
         if let ripple, ripple.opacity > 0 {
             drawClickRipple(ripple, in: bounds, context: context)
         }
 
+        context.saveGState()
+        context.setAlpha(1 - beam)
+        if beam > 0 { context.beginTransparencyLayer(auxiliaryInfo: nil) }
         if let referenceImage, usesReferenceArtwork, tint == nil, usesClassicArtwork {
             drawReferenceImage(
                 referenceImage,
@@ -215,7 +220,15 @@ enum SoftwareCursorGlyphRenderer {
             )
             drawSmoothPointer(in: bounds, context: context, state: drawingState)
         }
-        if let indicator {
+        if beam > 0 { context.endTransparencyLayer() }
+        context.restoreGState()
+        if beam > 0 {
+            context.saveGState()
+            context.setAlpha(beam)
+            drawInteractionIndicator(CursorInteractionIndicator(feedback: .typing), in: bounds, context: context)
+            context.restoreGState()
+        }
+        if let indicator, indicator.feedback != .typing {
             drawInteractionIndicator(indicator, in: bounds, context: context)
         }
     }
@@ -228,13 +241,12 @@ enum SoftwareCursorGlyphRenderer {
         case .drag:
             path.addEllipse(in: CGRect(x: -6, y: -6, width: 12, height: 12))
         case .typing:
-            // An I-beam beside the point leaves the target visible.
-            path.move(to: CGPoint(x: -12, y: 3))
-            path.addLine(to: CGPoint(x: -12, y: 13))
-            path.move(to: CGPoint(x: -15, y: 3))
-            path.addLine(to: CGPoint(x: -9, y: 3))
-            path.move(to: CGPoint(x: -15, y: 13))
-            path.addLine(to: CGPoint(x: -9, y: 13))
+            path.move(to: CGPoint(x: 0, y: -8))
+            path.addLine(to: CGPoint(x: 0, y: 8))
+            path.move(to: CGPoint(x: -3.5, y: -8))
+            path.addLine(to: CGPoint(x: 3.5, y: -8))
+            path.move(to: CGPoint(x: -3.5, y: 8))
+            path.addLine(to: CGPoint(x: 3.5, y: 8))
         case .scroll:
             guard let direction = indicator.feedback.scrollDirection else { return }
             // Place the chevron beside the pointer and aim it along the scroll delta.

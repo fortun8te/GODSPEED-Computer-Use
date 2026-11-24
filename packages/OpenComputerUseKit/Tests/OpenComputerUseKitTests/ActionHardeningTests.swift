@@ -110,6 +110,60 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertTrue(ActionOptions.usesStrictRoute("press_key", ["hold_ms": 200]))
     }
 
+    func testSentPressCanReadItsReplyAfterCancellation() {
+        XCTAssertTrue(BrowserBridge.needsInputRelease(method: "Input.dispatchMouseEvent", input: ["type": "mousePressed"]))
+        XCTAssertTrue(BrowserBridge.needsInputRelease(method: "Input.dispatchMouseEvent", input: ["type": "mouseMoved", "buttons": 1]))
+        XCTAssertFalse(BrowserBridge.needsInputRelease(method: "Input.dispatchMouseEvent", input: ["type": "mouseReleased"]))
+        let responses = BrowserBridgeResponses()
+        responses.append(Data("{\"id\":1}\n".utf8))
+        let token = RequestCancellation()
+        token.cancel()
+        RequestCancellation.$current.withValue(token) {
+            XCTAssertNotNil(responses.wait(for: 1, timeout: 0, observesCancellation: false))
+        }
+    }
+
+    func testBrowserKeyReleaseSurvivesCancellationDuringPressOrHold() throws {
+        for duringPress in [true, false] {
+            let token = RequestCancellation()
+            var events: [String] = []
+            try RequestCancellation.$current.withValue(token) {
+                XCTAssertThrowsError(try BrowserPage.deliverHeldKey(hold: 0.2, pause: { _ in
+                    token.cancel()
+                }, press: {
+                    events.append("down")
+                    if duringPress {
+                        token.cancel()
+                        try RequestCancellation.check()
+                    }
+                }, release: {
+                    try RequestCancellation.check()
+                    events.append("up")
+                }))
+            }
+            XCTAssertEqual(events, ["down", "up"])
+        }
+    }
+
+    func testBrowserKeySkipsReleaseWhenPressWasNotSent() {
+        XCTAssertThrowsError(try BrowserPage.deliverHeldKey(hold: 0, press: {
+            throw RequestCancellation.Cancelled(deliveryState: .notSent)
+        }, release: { XCTFail("Unexpected release") }))
+    }
+
+    func testBrowserDragReleasesAtLastSentPointAfterCancellation() throws {
+        let token = RequestCancellation()
+        var releases: [CGPoint] = []
+        try RequestCancellation.$current.withValue(token) {
+            XCTAssertThrowsError(try BrowserPage.deliverDrag(from: .zero, to: CGPoint(x: 20, y: 0), steps: 2) { type, point, buttons, _ in
+                try RequestCancellation.check()
+                if type == "mouseMoved", buttons == 1 { token.cancel() }
+                if type == "mouseReleased" { releases.append(point) }
+            })
+        }
+        XCTAssertEqual(releases, [CGPoint(x: 10, y: 0)])
+    }
+
     func testNativeHeldKeyReleasesItsModifiersWhenFocusChanges() throws {
         let chord = try KeyPressParser.parse("shift+Down", layout: { _ in nil })
         var events: [CGEvent] = []

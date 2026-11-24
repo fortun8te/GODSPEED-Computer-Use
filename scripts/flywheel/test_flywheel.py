@@ -165,6 +165,26 @@ class FlywheelTests(unittest.TestCase):
         self.assertEqual(state["goal"], "Save the note")
         self.assertEqual(state["last_step"], "click AXButton Save")
 
+    def test_export_learning_uses_the_correct_episode_goal(self):
+        rows = [
+            {"kind": "step", "tool": "click", "done_when": "verified", "run_id": "shared", "episode_id": "one"},
+            {"kind": "step", "tool": "click", "done_when": "verified", "run_id": "shared", "episode_id": "two"},
+            {"kind": "episode", "goal": "First goal", "run_id": "shared", "episode_id": "one"},
+            {"kind": "episode", "goal": "Second goal", "run_id": "shared", "episode_id": "two"},
+            {"kind": "step", "tool": "click", "done_when": "verified", "run_id": "legacy"},
+            {"kind": "episode", "goal": "First legacy goal", "run_id": "legacy"},
+            {"kind": "episode", "goal": "Second legacy goal", "run_id": "legacy"},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "learning-2026-11-20.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            output = source / "out.jsonl"
+            result = f.export_learning(source, output)
+            found = [json.loads(json.loads(line)["state"])["goal"] for line in output.read_text().splitlines()]
+        self.assertEqual(result["written"], 2)
+        self.assertEqual(found, ["First goal", "Second goal"])
+
     def test_export_learning_refuses_live_outputs_and_bad_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)

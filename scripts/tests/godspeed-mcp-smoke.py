@@ -10,9 +10,14 @@ import subprocess
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launcher", type=Path, default=Path.home() / ".local/bin/godspeed-mcp")
-    parser.add_argument("--version", default="1.1.12")
+    parser.add_argument("--version", help="Expected MCP version (default: this checkout's VERSION).")
     parser.add_argument("--direct", action="store_true", help="Use standalone stdio for an isolated checkout or CI.")
     args = parser.parse_args()
+    if args.version is None:
+        version_file = Path(__file__).resolve().parents[2] / "VERSION"
+        if not version_file.is_file():
+            parser.error("--version is required outside the Godspeed checkout")
+        args.version = version_file.read_text(encoding="utf-8").strip()
     environment = os.environ.copy()
     if args.direct:
         environment["OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY"] = "1"
