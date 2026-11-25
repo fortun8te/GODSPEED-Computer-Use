@@ -6,8 +6,13 @@ import ImageIO
 enum VisionFallback {
     // Keep OCR and the targeted second look at their original resolution.
     static let overviewMaxSide = 640
+    // Bound the accurate OCR pass while retaining Retina-size toolbar text.
+    static let accurateOCRMaxSide = 2560
     /// Read per request (L6): the settings file and each caller's options can change it.
-    static var baseURL: URL? { localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]) }
+    static var baseURL: URL? {
+        guard ModelHelperPolicy.isEnabled else { return nil }
+        return localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"])
+    }
 
     static func localURL(_ raw: String?) -> URL? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -51,6 +56,7 @@ enum VisionFallback {
             case .missing: continue
             }
         }
+        guard ModelHelperPolicy.isEnabled else { return nil }
         return locate().map { Candidate(fraction: $0, evidence: .model) }
     }
 
@@ -92,6 +98,31 @@ enum VisionFallback {
         guard (0..<1).contains(fraction.x), (0..<1).contains(fraction.y),
               WindowCaptureGeometry.isValid(bounds) else { return nil }
         return CGPoint(x: fraction.x * bounds.width, y: fraction.y * bounds.height)
+    }
+
+    /// Convert top-left window fractions to a bounded, integral pixel crop.
+    static func pixelCrop(_ rect: CGRect, width: Int, height: Int) -> CGRect? {
+        guard width > 0, height > 0, !rect.isNull, !rect.isInfinite,
+              rect.width > 0, rect.height > 0,
+              CGRect(x: 0, y: 0, width: 1, height: 1).contains(rect) else { return nil }
+        let w = CGFloat(width), h = CGFloat(height)
+        let pixels = CGRect(x: rect.minX * w, y: rect.minY * h,
+                            width: rect.width * w, height: rect.height * h).integral
+            .intersection(CGRect(x: 0, y: 0, width: w, height: h))
+        return pixels.isEmpty ? nil : pixels
+    }
+
+    /// Correct for the integral crop rounding before GroundingCascade maps back to window fractions.
+    static func remapCropPoint(_ point: CGPoint, pixels: CGRect, requested: CGRect,
+                               width: Int, height: Int) -> CGPoint? {
+        guard width > 0, height > 0, requested.width > 0, requested.height > 0,
+              (0..<1).contains(point.x), (0..<1).contains(point.y) else { return nil }
+        let x = (pixels.minX + point.x * pixels.width) / CGFloat(width)
+        let y = (pixels.minY + point.y * pixels.height) / CGFloat(height)
+        let mapped = CGPoint(x: (x - requested.minX) / requested.width,
+                             y: (y - requested.minY) / requested.height)
+        guard (0..<1).contains(mapped.x), (0..<1).contains(mapped.y) else { return nil }
+        return mapped
     }
 
     static func sameCapture(_ original: CGImage, _ fresh: CGImage) -> Bool {

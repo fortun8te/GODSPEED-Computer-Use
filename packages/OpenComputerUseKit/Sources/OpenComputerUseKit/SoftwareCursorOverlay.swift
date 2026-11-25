@@ -50,6 +50,7 @@ public enum VisualCursorSupport {
     private struct AnimationRequest: Sendable {
         let kind: AnimationKind
         let client: String
+        let generation: UInt64
         let body: @MainActor () -> Void
     }
 
@@ -57,6 +58,7 @@ public enum VisualCursorSupport {
         var pending: [AnimationRequest] = []
         var deliveriesRemaining = 0
         var drainScheduled = false
+        var generation: UInt64 = 0
     }
 
     private static let queueLock = NSLock()
@@ -70,9 +72,15 @@ public enum VisualCursorSupport {
         queueLock.withLock { animationQueue.pending.count + animationQueue.deliveriesRemaining }
     }
 
-    static func performCursorAnimation(kind: AnimationKind = .other, _ body: @escaping @MainActor () -> Void) {
-        let captured = settings
-        let client = ClientScope.current
+    /// Delivery-driven gestures capture this generation so reset cannot resurrect an old drag.
+    static var animationGeneration: UInt64 { queueLock.withLock { animationQueue.generation } }
+
+    static func performCursorAnimation(kind: AnimationKind = .other,
+                                       capturedSettings: VisualCursorSettings? = nil,
+                                       capturedClient: String? = nil,
+                                       _ body: @escaping @MainActor () -> Void) {
+        let captured = capturedSettings ?? settings
+        let client = capturedClient ?? ClientScope.current
         let perform: @MainActor () -> Void = {
             let dictionary = Thread.current.threadDictionary
             let previous = dictionary[settingsSnapshotKey]
@@ -92,12 +100,28 @@ public enum VisualCursorSupport {
             return
         }
         let shouldSchedule = queueLock.withLock {
-            animationQueue.pending.append(AnimationRequest(kind: kind, client: client, body: perform))
+            animationQueue.pending.append(AnimationRequest(
+                kind: kind, client: client, generation: animationQueue.generation, body: perform
+            ))
             guard !animationQueue.drainScheduled else { return false }
             animationQueue.drainScheduled = true
             return true
         }
         if shouldSchedule { DispatchQueue.main.async { drainAnimationSlice() } }
+    }
+
+    /// A reset also revokes deliveries that have not reached a stage yet. In particular, a
+    /// queued move must not reclaim the desktop after another process takes cursor ownership.
+    /// Keep the scheduled drain alive so new work can use it, but invalidate retained slices
+    /// as well as the pending array.
+    @MainActor
+    static func discardQueuedAnimations() {
+        queueLock.withLock {
+            animationQueue.generation &+= 1
+            animationQueue.pending.removeAll()
+            animationQueue.deliveriesRemaining = 0
+        }
+        deferredReset = false
     }
 
     @MainActor
@@ -123,7 +147,7 @@ public enum VisualCursorSupport {
         // A single expensive WindowServer operation can still exceed this budget.
         let deadline = CACurrentMediaTime() + 0.004
         while let next = deliveries.popFirst() {
-            next.body()
+            if queueLock.withLock({ next.generation == animationQueue.generation }) { next.body() }
             if CACurrentMediaTime() >= deadline { break }
         }
         let drained = queueLock.withLock {
@@ -213,6 +237,9 @@ struct VisualCursorSettings: Equatable, Sendable {
     var speed: CGFloat
     var floats: Bool
     var lensEnabled: Bool
+    var feedbackEnabled: Bool
+    var labelEnabled: Bool
+    var reducedMotion: Bool
     var idleHideDelay: TimeInterval
     var observationFilePath: String?
     var traceFilePath: String?
@@ -222,16 +249,26 @@ struct VisualCursorSettings: Equatable, Sendable {
     var agentName: String?
 
     init(environment: [String: String]) {
-        let rawColor = environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]
+        let rawColor = environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         color = CursorColor(hex: rawColor)
         automaticTint = rawColor == nil || rawColor?.lowercased() == "auto"
         agentName = cursorAgentName(environment["OPEN_COMPUTER_USE_CURSOR_NAME"])
+            ?? cursorAgentName(environment["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME"])
         enabled = visualCursorEnabled(environment: environment)
         speed = visualCursorSpeed(environment: environment)
         floats = visualCursorFloats(environment: environment)
         lensEnabled = ["1", "true", "on", "yes"].contains(
             environment["OPEN_COMPUTER_USE_CURSOR_LENS"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         )
+        feedbackEnabled = !["0", "false", "off", "no"].contains(
+            environment["OPEN_COMPUTER_USE_CURSOR_FEEDBACK"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
+        labelEnabled = !["0", "false", "off", "no"].contains(
+            environment["OPEN_COMPUTER_USE_CURSOR_LABEL"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
+        reducedMotion = environment["OPEN_COMPUTER_USE_CURSOR_MOTION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "reduced"
         idleHideDelay = visualCursorPostInteractionIdleTimeout(environment: environment)
         observationFilePath = visualCursorObservationFileURL(environment: environment)?.path
         let trace = environment["OPEN_COMPUTER_USE_CURSOR_TRACE_FILE"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -295,14 +332,16 @@ func visualCursorTravelDuration(distance: CGFloat, speed: CGFloat, queuedBehind:
     guard speed.isFinite, speed > 0, distance.isFinite, distance > 0 else { return 0 }
     let base = 0.15 + 0.30 * (1 - exp(-Double(distance) / 800))
     let duration = base / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind)
-    let bounded = queuedBehind >= 2 ? min(duration, 0.16) : duration
+    // An extremely small positive numeric setting can overflow division to infinity. A cosmetic
+    // move must still finish and release its frame clock, even with malformed external settings.
+    let bounded = min(duration, queuedBehind >= 2 ? 0.16 : 2)
     return bounded < visualCursorMinimumAnimatedDuration ? 0 : bounded
 }
 
 /// Seconds one click pulse takes at `speed` (150 ms at 1x). 0 means skip the pulse.
 func visualCursorClickPulseDuration(speed: CGFloat, queuedBehind: Int = 0) -> TimeInterval {
     guard speed.isFinite, speed > 0 else { return 0 }
-    let duration = 0.15 / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind)
+    let duration = min(0.4, 0.15 / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind))
     return duration < visualCursorMinimumAnimatedDuration ? 0 : duration
 }
 
@@ -327,10 +366,14 @@ func visualCursorFreshStartPoint(
 ) -> CGPoint {
     let plain = visualCursorFreshStartPoint(target: target, forward: forward, distance: distance)
     guard frame.contains(target) else { return plain }
-    return CGPoint(
+    let mirrored = CGPoint(
         x: plain.x < frame.minX || plain.x > frame.maxX ? target.x + (target.x - plain.x) : plain.x,
         y: plain.y < frame.minY || plain.y > frame.maxY ? target.y + (target.y - plain.y) : plain.y
     )
+    // A small window can be narrower than the approach on both sides. Mirroring alone then
+    // puts the arrival on the opposite edge, outside the target window.
+    return CGPoint(x: mirrored.x.clamped(to: frame.minX...frame.maxX.nextDown),
+                   y: mirrored.y.clamped(to: frame.minY...frame.maxY.nextDown))
 }
 
 func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
@@ -338,7 +381,7 @@ func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
 }
 
 func visualCursorFloats(environment: [String: String] = RequestConfiguration.environment) -> Bool {
-    let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.lowercased() ?? "0"
+    let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "0"
     return ["1", "true", "yes", "on"].contains(raw)
 }
 
@@ -979,6 +1022,9 @@ final class CursorStage {
     private let renderBaseHeading = visualCursorRenderBaseHeading()
     private var panel: CursorPanel?
     private var cursorView: SoftwareCursorView?
+    private let windowActivity = CursorWindowActivityOverlay()
+    private var activeWindowBounds: CGRect?
+    private var activityScreenMappings: [VisualCursorScreenMapping] = []
 
     /// Where the tip is drawn now; nil while the cursor is hidden.
     private var displayedTipPosition: CGPoint?
@@ -1001,6 +1047,9 @@ final class CursorStage {
     private var nextRetarget: CFTimeInterval = 0
     /// Feedback marks (typing, scroll, drag) hold the arrow upright under the mark.
     private var interactionIndicator: CursorInteractionIndicator?
+    private var deliveredDragGesture: UInt64 = 0
+    private var deliveredDragTimestamp: UInt64 = 0
+    private var deliveredDragPhase: NativeDragProgress.Phase?
     private var timeline: [Step] = []
     private var observationPhase = "hidden"
     private var activeSettings = VisualCursorSettings(environment: [:])
@@ -1086,16 +1135,27 @@ final class CursorStage {
         panel?.close()
         panel = nil
         cursorView = nil
+        windowActivity.close()
     }
 
     // MARK: Public entry points (all return immediately)
+
+    /// A disabled request must also dismiss this client's previous presentation. Merely skipping
+    /// the new animation leaves an older glide, feedback mark or idle cursor visible.
+    private func applyVisibilityPreference() -> Bool {
+        guard VisualCursorSupport.isEnabled else {
+            reset()
+            return false
+        }
+        return true
+    }
 
     func moveCursor(
         to targetPoint: CGPoint,
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay else { return }
+        guard applyVisibilityPreference(), canPresentOverlay else { return }
         deferredReset = false
         // Claim only when another process holds the cursor (or none is shown). Re-claiming on every
         // move reset another OCU process mid-glide each time, so two agents made the cursor flicker.
@@ -1112,7 +1172,7 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
         deferredReset = false
         enqueue(.pulse(
             target: targetPoint, clickCount: max(clickCount, 1), button: mouseButton,
@@ -1125,7 +1185,7 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
         deferredReset = false
         enqueue(.settle(target: targetPoint, window: targetWindow, anchor: anchor, settings: VisualCursorSupport.settings))
     }
@@ -1136,7 +1196,7 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow? = nil,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
         guard targetPoint != nil || displayedTipPosition != nil || isBusy else { return }
         deferredReset = false
         enqueue(.beginFeedback(feedback, target: targetPoint, window: targetWindow, anchor: anchor, settings: VisualCursorSupport.settings))
@@ -1148,17 +1208,70 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow? = nil,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), SoftwareCursorOverlay.ownsCursor() else { return }
         enqueue(.endFeedback(feedback, target: targetPoint, window: targetWindow, anchor: anchor, settings: VisualCursorSupport.settings))
     }
 
     func cancelFeedback(_ feedback: CursorInteractionFeedback) {
-        guard VisualCursorSupport.isEnabled, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), SoftwareCursorOverlay.ownsCursor() else { return }
         enqueue(.cancelFeedback(feedback))
+    }
+
+    /// Delivery is authoritative during a drag. Never replay a glide to a position that the
+    /// real input passed earlier, or keep an old click animation in front of live progress.
+    func presentDeliveredDrag(_ frame: CursorDeliveredDragFrame) {
+        // Requests can wait for the input lock in a different order from their creation.
+        // Compare the actual event time; an old gesture's late completion cannot replace a
+        // newer posted position, while a waiting gesture that really posts later still can.
+        guard frame.progress.timestamp >= deliveredDragTimestamp,
+              frame.progress.timestamp != deliveredDragTimestamp || deliveredDragGesture == 0 || frame.gesture == deliveredDragGesture,
+              applyVisibilityPreference(), canPresentOverlay else { return }
+        deliveredDragGesture = frame.gesture
+        deliveredDragTimestamp = frame.progress.timestamp
+        deferredReset = false
+        if SoftwareCursorOverlay.latestClaimPID != ProcessInfo.processInfo.processIdentifier || displayedTipPosition == nil {
+            SoftwareCursorOverlay.claimDesktopCursor()
+        }
+        timeline.removeAll()
+        glide = nil
+        pulse = nil
+        releaseTail = nil
+        clearFeedback()
+        cancelPendingHide()
+        stopWatch()
+        adopt(VisualCursorSupport.settings)
+        prepareWindowIfNeeded()
+        endFade()
+        // While the button is down the tip is the posted screen point. Only after delivery
+        // stops may a resting anchor follow a later move of the destination window.
+        let anchor = frame.completion == nil ? nil : frame.target.anchor
+        adoptAnchor(anchor)
+        lastAnchorFrame = anchor?.windowBounds
+        guard configureOrdering(relativeTo: frame.target.window) else { return }
+        panel?.alphaValue = 1
+        let point = clampTipPosition(frame.target.point)
+        restingTipPosition = point
+        interactionIndicator = CursorInteractionIndicator(feedback: .drag)
+        deliveredDragPhase = frame.progress.phase
+        observationPhase = frame.progress.phase == .moved || frame.progress.phase == .released ? "waiting" : "dragging"
+        let now = CACurrentMediaTime()
+        render(tip: point, velocity: .zero, at: now)
+        switch frame.completion {
+        case .delivered:
+            run(.endFeedback(.drag, target: nil, window: frame.target.window,
+                             anchor: anchor, settings: activeSettings), at: now)
+        case .cancelled:
+            clearFeedback()
+            resumeIdle(at: now)
+        case nil:
+            scheduleHide(after: max(activeSettings.idleHideDelay, 12))
+            startClock()
+        }
     }
 
     /// The overlay window, exposed for tests that must observe presentation state.
     var overlayPanelForTesting: NSWindow? { panel }
+    var activityPanelForTesting: NSWindow? { windowActivity.panelForTesting }
 
     /// Runs the main run loop until queued cursor work has played (tests and the smoke suite).
     func waitUntilIdleForTesting(timeout: TimeInterval = 3) {
@@ -1209,6 +1322,8 @@ final class CursorStage {
         displayedTipPosition = nil
         restingTipPosition = nil
         activeTargetWindow = nil
+        activeWindowBounds = nil
+        windowActivity.hide()
         adoptAnchor(nil)
         pose = CursorPoseDynamics()
         tipVelocity = CGVector(dx: 0, dy: 0)
@@ -1325,23 +1440,27 @@ final class CursorStage {
 
     private func adopt(_ settings: VisualCursorSettings) {
         let nameChanged = activeSettings.agentName != settings.agentName
+        let labelChanged = activeSettings.labelEnabled != settings.labelEnabled
         activeSettings = settings
         if nameChanged || currentAgentName == nil {
             currentAgentName = SoftwareCursorOverlay.nameForCursor(client: client, preferred: settings.agentName ?? fallbackName)
             updateNameTag()
         }
+        if labelChanged { updateNameTag() }
         if settings.automaticTint && assignedTint == nil {
             assignedTint = SoftwareCursorOverlay.tintForCursor(client: client)
         }
         cursorView?.tint = settings.color ?? (settings.automaticTint ? assignedTint : nil)
         cursorView?.lensEnabled = settings.lensEnabled
+        cursorView?.prefersReducedMotion = settings.reducedMotion
     }
 
     private var targetAppName: String?
 
     private func updateNameTag() {
-        guard let currentAgentName else { return }
-        let label = targetAppName.map { "\(currentAgentName) · \($0)" } ?? currentAgentName
+        let label = activeSettings.labelEnabled ? currentAgentName.map { name in
+            targetAppName.map { "\(name) · \($0)" } ?? name
+        } : nil
         if cursorView?.agentName != label {
             cursorView?.agentName = label
             cursorView?.needsDisplay = true
@@ -1349,7 +1468,7 @@ final class CursorStage {
     }
 
     private var reducesMotion: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        activeSettings.reducedMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
     private func beginGlide(
@@ -1508,7 +1627,8 @@ final class CursorStage {
             ), at: 0)
             return
         }
-        let duration = visualCursorClickPulseDuration(speed: activeSettings.speed, queuedBehind: timeline.count)
+        let duration = activeSettings.feedbackEnabled
+            ? visualCursorClickPulseDuration(speed: activeSettings.speed, queuedBehind: timeline.count) : 0
         guard panel?.isVisible == true, let point = restingTipPosition else { return }
         trace("pulse at=(\(Int(point.x)),\(Int(point.y))) count=\(clickCount) ms=\(Int(duration * 1000))")
         observationPhase = "pulse"
@@ -1649,6 +1769,11 @@ final class CursorStage {
         } else if let tail = releaseTail {
             if let sample = tail.sample(at: now) { (press, ripple) = sample } else { releaseTail = nil }
         }
+        if !activeSettings.feedbackEnabled {
+            press = 0
+            ripple = nil
+            releaseTail = nil
+        }
 
         let origin = artwork.geometry.origin(forTipPosition: state.tipPosition)
         // Whole-pixel steps on a 1x display and half-pixel on Retina keep the glyph crisp at rest
@@ -1662,6 +1787,9 @@ final class CursorStage {
             badgeFrame.intersection(screen.frame.insetBy(dx: 2, dy: 2).offsetBy(dx: -snapped.x, dy: -snapped.y))
         } ?? badgeFrame
 
+        // Keep the internal drag/typing lifecycle even when its visual badge is hidden: drag
+        // paths still need their straight-line motion and balanced begin/end boundaries.
+        let visibleIndicator = activeSettings.feedbackEnabled ? interactionIndicator : nil
         let changed = cursorView.rotation != state.rotation
             || cursorView.cursorBodyOffset != state.cursorBodyOffset
             || cursorView.fogOffset != state.fogOffset
@@ -1670,7 +1798,7 @@ final class CursorStage {
             || cursorView.clickProgress != press
             || (cursorView.ripple == nil) != (ripple == nil)
             || ripple != nil
-            || cursorView.indicator != interactionIndicator
+            || cursorView.indicator != visibleIndicator
             || cursorView.lensEnabled != activeSettings.lensEnabled
         let labelMoved = cursorView.labelViewport != labelViewport
         cursorView.rotation = state.rotation
@@ -1680,7 +1808,7 @@ final class CursorStage {
         cursorView.fogScale = state.fogScale
         cursorView.clickProgress = press
         cursorView.ripple = ripple
-        cursorView.indicator = interactionIndicator
+        cursorView.indicator = visibleIndicator
         cursorView.lensEnabled = activeSettings.lensEnabled
         cursorView.labelViewport = labelViewport
         // Per frame only the glyph square is redrawn; the wide window's name-tag room is redrawn only when the
@@ -1700,6 +1828,7 @@ final class CursorStage {
             writeObservationSnapshot(tipPosition: state.tipPosition, rotation: state.rotation)
         }
         SoftwareCursorOverlay.frameObserverForTesting?(now, state, press)
+        updateWindowActivity()
     }
 
     private func initialRenderState(at tipPosition: CGPoint) -> CursorVisualRenderState {
@@ -1752,6 +1881,7 @@ final class CursorStage {
         feedbackTimer?.invalidate()
         feedbackTimer = nil
         interactionIndicator = nil
+        deliveredDragPhase = nil
         cursorView?.indicator = nil
         cursorView?.needsDisplay = true
     }
@@ -1773,6 +1903,7 @@ final class CursorStage {
         releaseTail = nil
         cancelPendingHide()
         clearFeedback()
+        windowActivity.hide()
         stopWatch()
         clock.stop()
         trace("hide")
@@ -1806,6 +1937,8 @@ final class CursorStage {
         displayedTipPosition = nil
         restingTipPosition = nil
         activeTargetWindow = nil
+        activeWindowBounds = nil
+        windowActivity.hide()
         adoptAnchor(nil)
         pose = CursorPoseDynamics()
         tipVelocity = CGVector(dx: 0, dy: 0)
@@ -1889,12 +2022,16 @@ final class CursorStage {
             return false
         }
         missedVisibilityRead = false
+        activeWindowBounds = (info[kCGWindowBounds as String] as? NSDictionary)
+            .flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        activityScreenMappings = currentVisualCursorScreenMappings()
         if let panel, !activeSettings.floats {
             let level = NSWindow.Level(rawValue: layer)
             let layerChanged = panel.level != level
             if layerChanged { panel.level = level }
             if reorder || layerChanged { panel.order(.above, relativeTo: Int(activeTargetWindow.windowID)) }
         }
+        updateWindowActivity(reorder: reorder)
         return true
     }
 
@@ -1920,6 +2057,38 @@ final class CursorStage {
         !NSScreen.screens.isEmpty
     }
 
+    /// Status comes from the operation lifecycle. Resting cursors have no active-window
+    /// bloom; a pending press/release says Waiting and a completed submission says Delivered.
+    private func updateWindowActivity(reorder: Bool = false) {
+        guard activeSettings.feedbackEnabled, panel?.isVisible == true, fadeTimer == nil,
+              let target = activeTargetWindow,
+              let bounds = (restingAnchor?.windowID == target.windowID ? lastAnchorFrame : nil) ?? activeWindowBounds,
+              let frame = CursorWindowActivityGeometry.appKitFrame(for: bounds, mappings: activityScreenMappings) else {
+            windowActivity.hide()
+            return
+        }
+        let activity: CursorWindowActivity?
+        if interactionIndicator?.isCompleted == true {
+            activity = .delivered
+        } else if deliveredDragPhase == .moved || deliveredDragPhase == .released {
+            activity = .waiting
+        } else if let feedback = interactionIndicator?.feedback {
+            switch feedback {
+            case .drag: activity = .dragging
+            case .typing: activity = .typing
+            case .scroll: activity = .scrolling
+            }
+        } else if glide != nil || pulse != nil {
+            activity = .working
+        } else { activity = nil }
+        guard let activity else { windowActivity.hide(); return }
+        if let number = windowActivity.show(frame: frame, target: target, activity: activity,
+            tint: activeSettings.color ?? (activeSettings.automaticTint ? assignedTint : nil),
+            labelEnabled: activeSettings.labelEnabled, reorder: reorder), !activeSettings.floats {
+            panel?.order(.above, relativeTo: number)
+        }
+    }
+
     private func prepareWindowIfNeeded() {
         guard panel == nil else { return }
         let panel = CursorPanel(
@@ -1941,6 +2110,7 @@ final class CursorStage {
         cursorView = view
         updateNameTag()
         view.tint = activeSettings.color ?? (activeSettings.automaticTint ? assignedTint : nil)
+        view.prefersReducedMotion = activeSettings.reducedMotion
     }
 
     private func configureOrdering(relativeTo targetWindow: CursorTargetWindow?) -> Bool {
@@ -1959,6 +2129,9 @@ final class CursorStage {
             return false
         }
         missedVisibilityRead = false
+        activeWindowBounds = (info?[kCGWindowBounds as String] as? NSDictionary)
+            .flatMap { CGRect(dictionaryRepresentation: $0 as CFDictionary) }
+        activityScreenMappings = currentVisualCursorScreenMappings()
         targetAppName = (info?[kCGWindowOwnerName as String] as? String).map { String($0.prefix(15)) }
         updateNameTag()
 
@@ -2211,6 +2384,10 @@ enum SoftwareCursorOverlay {
         current.cancelFeedback(feedback)
     }
 
+    static func presentDeliveredDrag(_ frame: CursorDeliveredDragFrame) {
+        current.presentDeliveredDrag(frame)
+    }
+
     static func scheduleHide(after delay: TimeInterval) { current.scheduleHide(after: delay) }
 
     /// Called with every frame a cursor draws (time, pose, click press). Tests only: records real overlay motion.
@@ -2218,6 +2395,7 @@ enum SoftwareCursorOverlay {
 
     static var hideTimer: Timer? { current.hideTimer }
     static var overlayPanelForTesting: NSWindow? { current.overlayPanelForTesting }
+    static var activityPanelForTesting: NSWindow? { current.activityPanelForTesting }
     static var currentAgentNameForTesting: String? { current.currentAgentName }
 
     static func waitUntilIdleForTesting(timeout: TimeInterval = 3) {
@@ -2231,6 +2409,7 @@ enum SoftwareCursorOverlay {
 
     /// Every cursor, now.
     static func reset() {
+        VisualCursorSupport.discardQueuedAnimations()
         for stage in stages.values { stage.reset() }
     }
 
@@ -2349,12 +2528,15 @@ private final class SoftwareCursorView: NSView {
     }
     private var typingBlend: CGFloat = 0
     private var typingTimer: Timer?
+    var prefersReducedMotion = false {
+        didSet { if oldValue != prefersReducedMotion { updateTypingBlend() } }
+    }
 
     private func updateTypingBlend() {
         typingTimer?.invalidate()
         typingTimer = nil
         let target: CGFloat = indicator?.feedback == .typing ? 1 : 0
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+        guard !prefersReducedMotion, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             typingBlend = target
             needsDisplay = true
             return

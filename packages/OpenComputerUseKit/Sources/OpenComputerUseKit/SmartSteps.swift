@@ -407,16 +407,23 @@ enum SmartSteps {
         return nil
     }
 
-    /// Whether the sheet's "Where" folder choice shows `folder` (the popup shows only the folder's name).
+    /// A folder's basename is not destination evidence: two unrelated directories
+    /// can both be called "work". Only an observed absolute path can confirm it.
     static func whereMatches(popupValue: String?, folder: String) -> Bool {
-        let folderName = (folder as NSString).lastPathComponent
-        guard let popupValue, !folderName.isEmpty, folderName != "/" else { return false }
-        return popupValue.trimmingCharacters(in: .whitespacesAndNewlines) == folderName
+        func absolutePath(_ value: String) -> String? {
+            var path = value
+            guard path.hasPrefix("/") else { return nil }
+            while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+            return path
+        }
+        guard let popupValue, let observed = absolutePath(popupValue), let expected = absolutePath(folder) else { return false }
+        // Do not collapse "..": its meaning can depend on symbolic links.
+        return observed == expected
     }
 
     /// Fills the save sheet with accessibility only: the full path goes into the name field first, and is used when the
-    /// panel keeps it. Otherwise the name alone goes in, and the folder must already be the sheet's "Where" choice, or be
-    /// picked from that menu. When neither holds, this throws before Save, so nothing lands in the sheet's own folder.
+    /// panel keeps it. Otherwise the name alone goes in, and the sheet must expose
+    /// the exact absolute destination. A basename-only menu cannot prove it.
     private static func fillSavePanel(
         _ panel: (sheet: AXUIElement, nameField: AXUIElement),
         folder: String,
@@ -424,10 +431,10 @@ enum SmartSteps {
         full: String,
         app: String
     ) throws {
-        if setFieldValue(panel.nameField, full), axText(kAXValueAttribute, of: panel.nameField) == full {
+        if try setFieldValue(panel.nameField, full), axText(kAXValueAttribute, of: panel.nameField) == full {
             return
         }
-        guard setFieldValue(panel.nameField, name), axText(kAXValueAttribute, of: panel.nameField) == name else {
+        guard try setFieldValue(panel.nameField, name), axText(kAXValueAttribute, of: panel.nameField) == name else {
             throw ComputerUseError.message("Could not type the file name into the save sheet of \(app), so nothing was saved. Read the app's state and fill it in with set_value.")
         }
         guard let popup = ReadinessPoll.first(timeout: 0.2, read: {
@@ -435,20 +442,23 @@ enum SmartSteps {
                 axText(kAXValueAttribute, of: popup).map { _ in popup }
             }
         }) else {
+            try checkSaveInput()
             throw ComputerUseError.message("The save sheet of \(app) does not show its folder choice, so nothing was saved. Choose \(folder) in the sheet, then save again.")
         }
         if whereMatches(popupValue: axText(kAXValueAttribute, of: popup), folder: folder) { return }
-        if pickWhereFolder(popup, folderName: (folder as NSString).lastPathComponent),
-           ReadinessPoll.first(timeout: 0.3, read: {
-               whereMatches(popupValue: axText(kAXValueAttribute, of: popup), folder: folder) ? true : nil
-           }) == true {
-            return
-        }
-        throw ComputerUseError.message("The save sheet of \(app) is set to \"\(axText(kAXValueAttribute, of: popup) ?? "another folder")\", and cannot be pointed at \(folder) through accessibility, so nothing was saved. Choose that folder in the sheet, then save again.")
+        throw ComputerUseError.acknowledged("The save sheet of \(app) shows \"\(axText(kAXValueAttribute, of: popup) ?? "another folder")\", which does not confirm the full destination \(folder). The name field was filled, but Save was not pressed. Read the sheet and select the exact destination before saving.")
     }
 
-    private static func setFieldValue(_ field: AXUIElement, _ text: String) -> Bool {
-        AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, text as CFString) == .success
+    private static func checkSaveInput(delivery: DeliveryState = .outcomeUnknown) throws {
+        try RequestCancellation.check(delivery: delivery)
+        if let remaining = BrowserCallBudget.activeRemaining, !remaining.isFinite || remaining <= 0 {
+            throw ComputerUseError.timedOut("The save time budget ended. Inspect the document before repeating the save.", delivery: delivery)
+        }
+    }
+
+    private static func setFieldValue(_ field: AXUIElement, _ text: String) throws -> Bool {
+        try checkSaveInput()
+        return AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, text as CFString) == .success
     }
 
     /// The "Where:" folder popup of a save sheet, found by its label (not the file format popup).
@@ -471,23 +481,6 @@ enum SmartSteps {
         for child in axElements(kAXChildrenAttribute as String, of: node) {
             collectPopups(in: child, depth: depth - 1, into: &popups)
         }
-    }
-
-    /// Opens the "Where" popup and presses the item named `folderName`. A menu that lacks it is closed again.
-    private static func pickWhereFolder(_ popup: AXUIElement, folderName: String) -> Bool {
-        guard AXUIElementPerformAction(popup, kAXPressAction as CFString) == .success else { return false }
-        let item = ReadinessPoll.first(timeout: 0.3) {
-            axElements(kAXChildrenAttribute, of: popup).lazy
-                .flatMap { axElements(kAXChildrenAttribute, of: $0) }
-                .first { axText(kAXTitleAttribute, of: $0) == folderName }
-        }
-        if let item {
-            return AXUIElementPerformAction(item, kAXPressAction as CFString) == .success
-        }
-        for menu in axElements(kAXChildrenAttribute, of: popup) {
-            _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString)
-        }
-        return false
     }
 
     /// First button under `root` whose title `matches`, not descending into lists of files.
@@ -651,6 +644,7 @@ enum SmartSteps {
     }
 
     static func saveAs(app: String, path rawPath: String, service: ComputerUseService, home: String = NSHomeDirectory()) throws -> ToolCallResult {
+        try checkSaveInput(delivery: .notSent)
         let full = expandHome(rawPath.trimmingCharacters(in: .whitespacesAndNewlines), home: home)
         guard let parts = splitSavePath(full) else {
             throw ComputerUseError.invalidArguments("path must be a full path to the file, e.g. ~/Desktop/notes.txt")
@@ -700,12 +694,18 @@ enum SmartSteps {
         guard let panel = existingPanel ?? ReadinessPoll.first(timeout: 3, read: {
             savePanel(pid: descriptor.pid)
         }) else {
+            try checkSaveInput()
             throw ComputerUseError.acknowledged("The save sheet did not expose its name field. Check the app's state.")
         }
         try fillSavePanel(panel, folder: parts.folder, name: parts.name, full: full, app: app)
         guard let button = ReadinessPoll.first(timeout: 0.2, read: {
             findButton(in: panel.sheet, depth: 8, matches: { $0 == "Save" })
-        }), AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+        }) else {
+            try checkSaveInput()
+            throw ComputerUseError.acknowledged("The save sheet did not expose a Save button. The name field was filled; read the app before continuing.")
+        }
+        try checkSaveInput()
+        guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
             throw ComputerUseError.message("The Save button press could not be confirmed. Read the app's state before retrying.")
         }
 
@@ -727,6 +727,7 @@ enum SmartSteps {
                                 || (!extensionName.isEmpty && lowered.hasPrefix("use") && lowered.contains(".\(extensionName)"))
                         }
                         if let button, !answered.contains(where: { CFEqual($0, button) }) {
+                            guard (try? checkSaveInput()) != nil else { return nil }
                             answered.append(button)
                             _ = AXUIElementPerformAction(button, kAXPressAction as CFString)
                             break
@@ -736,6 +737,7 @@ enum SmartSteps {
                 return nil
             }
         }
+        try checkSaveInput()
         if saved == true { return .text("Saved \(full).", deliveryState: .verified) }
         var reply = "Save was sent, but a new write to \(full) could not be confirmed."
         reply += sheetIsOpen(pid: descriptor.pid)
@@ -801,8 +803,9 @@ enum SmartSteps {
                !NSRunningApplication.runningApplications(withBundleIdentifier: bundle).isEmpty {
                 if ["com.apple.TextEdit", "com.apple.iWork.Pages", "com.apple.iWork.Numbers", "com.apple.iWork.Keynote"].contains(bundle),
                    let count = AppleEventsGate.run("tell application id \"\(bundle)\" to count documents", bundle: bundle)?.int32Value, count == 0 {
-                    _ = AppleEventsGate.run("tell application id \"\(bundle)\" to make new document", bundle: bundle)
-                    return .text("\(name) is open; it had no document, so a new blank one was made.")
+                    if try AppleEventsGate.send("tell application id \"\(bundle)\" to make new document", bundle: bundle) != nil {
+                        return .text("\(name) is open; it had no document, so a new blank one was made.", deliveryState: .acknowledged)
+                    }
                 }
                 return .text("\(name) is open.")
             }
@@ -824,18 +827,16 @@ enum SmartSteps {
     /// Runs an NSWorkspace call and waits (up to 5 s) for its completion, turning its error into a message.
     static func openWorkspace(timeout: TimeInterval = 5,
                               _ start: @Sendable (@escaping @Sendable (Error?) -> Void) -> Void) throws {
-        let done = DispatchSemaphore(value: 0)
-        let outcome = OpenOutcome()
+        let operation = try LocalOperation<Void>(timeout: timeout, action: "open")
+        try operation.begin()
         start { error in
-            outcome.error = error
-            done.signal()
+            if let error {
+                operation.complete(.failure(ComputerUseError.stateUnavailable("macOS could not confirm the open request: \(error.localizedDescription)")))
+            } else {
+                operation.complete(.success(()))
+            }
         }
-        guard done.wait(timeout: .now() + timeout) == .success else {
-            throw ComputerUseError.timedOut("macOS did not answer the open request in time.", delivery: .outcomeUnknown)
-        }
-        if let failure = outcome.error {
-            throw ComputerUseError.message("macOS could not open it: \(failure.localizedDescription)")
-        }
+        try operation.wait()
     }
 
     /// The bundle of an installed app, by name or bundle identifier. nil when none is found.
@@ -876,11 +877,6 @@ enum SmartSteps {
         if case .staleTarget? = error as? ComputerUseError { return true }
         return false
     }
-}
-
-/// The error an NSWorkspace open reported, handed from its completion handler to the waiting caller.
-private final class OpenOutcome: @unchecked Sendable {
-    var error: Error?
 }
 
 /// Carries the exact snapshot built by a service action through the synchronous dispatcher.

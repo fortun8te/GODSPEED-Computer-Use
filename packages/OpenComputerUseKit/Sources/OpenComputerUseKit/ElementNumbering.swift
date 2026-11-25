@@ -192,6 +192,17 @@ enum StaleHealing {
         case refuse(String)
     }
 
+    /// A matching name proves nothing across documents or application lifetimes. Recovery is local to
+    /// the original observation; the caller keeps this same window pin through the eventual dispatch.
+    static func recover(index: String, role: String?, label: String?, observedWindow: NativeWindowObservation?,
+                        currentWindow: NativeWindowObservation?, nodes: [SmartSteps.Node]) -> Outcome {
+        guard let observedWindow, let currentWindow,
+              observedWindow.matches(windowID: currentWindow.id, app: currentWindow.app) else {
+            return .refuse("The observed window or application changed. Read the intended window again; nothing was sent.")
+        }
+        return resolve(index: index, role: role, label: label, nodes: nodes)
+    }
+
     static func resolve(index: String, role: String?, label: String?, nodes: [SmartSteps.Node]) -> Outcome {
         let wantedRole = role.map { SmartSteps.roleKey($0) }.flatMap { $0.isEmpty ? nil : $0 }
         guard let label = label?.trimmingCharacters(in: .whitespaces), !label.isEmpty else {

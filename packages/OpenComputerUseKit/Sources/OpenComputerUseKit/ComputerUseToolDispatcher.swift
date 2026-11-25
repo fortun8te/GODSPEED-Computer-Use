@@ -37,6 +37,7 @@ public final class ComputerUseToolDispatcher {
     let recipeStore: BatchRecipes
     /// The `teach` tool's session (watch-me recording).
     let teach: TeachMode
+    private let workspaceObservation: SharedWorkspace.Observation
 
     func localDecisionImage(app: String, state: String) -> Data? {
         service.localDecisionImage(app: app, state: state)
@@ -47,11 +48,12 @@ public final class ComputerUseToolDispatcher {
     }
 
     init(service: ComputerUseService = ComputerUseService(), actionPolicyURL: URL, recipeStore: BatchRecipes = .shared,
-         teach: TeachMode = .shared) {
+         teach: TeachMode = .shared, workspaceObservation: SharedWorkspace.Observation = .system) {
         self.service = service
         self.actionPolicyURL = actionPolicyURL
         self.recipeStore = recipeStore
         self.teach = teach
+        self.workspaceObservation = workspaceObservation
     }
 
     func currentActionPolicy() throws -> ActionPolicy { try ActionPolicy.load(from: actionPolicyURL) }
@@ -118,6 +120,7 @@ public final class ComputerUseToolDispatcher {
         name: String, arguments: [String: Any], ref: String?, log: SmartLog, notesInResult: Bool,
         beforeNativeDispatch: (() -> Void)?
     ) throws -> ToolCallResult {
+        let visualToken = try VisualSearch.actionToken(tool: name, arguments: arguments)
         let hasWindowPin = arguments["window_id"] != nil && name != "query" && name != "get_app_state"
             && name != BatchTool.name && name != HandoffTool.name
         if ref != nil || hasWindowPin {
@@ -140,6 +143,10 @@ public final class ComputerUseToolDispatcher {
             let result = try autoreleasepool {
                 try ComputerUseService.$requiredWindowID.withValue(windowID) {
                     try authorizeNativeAction(name: name, arguments: boundArguments)
+                    try requireSharedWorkspace(name: name, arguments: boundArguments)
+                    if let visualToken {
+                        try service.validateVisualSnapshot(app: app, token: visualToken, windowID: windowID)
+                    }
                     return try ComputerUseService.$requiredRefGeneration.withValue(target?.generation) {
                         try dispatchTool(name: name, arguments: boundArguments, log: log)
                     }
@@ -151,6 +158,7 @@ public final class ComputerUseToolDispatcher {
         }
         // Focus and legacy shortcuts run only after authorization.
         try authorizeNativeAction(name: name, arguments: arguments)
+        try requireSharedWorkspace(name: name, arguments: arguments)
         if !backgroundOnlyMode(), name != "browser" { beforeNativeDispatch?() }
         if let app = arguments["app"] as? String, !app.isEmpty {
             RecentAppMemory.shared.remember(app)
@@ -284,7 +292,7 @@ public final class ComputerUseToolDispatcher {
 
         let frontmostPID = (try? AppDiscovery.resolveRunning(app))?.pid
         let frontmost: () -> Bool = {
-            frontmostPID != nil && NSWorkspace.shared.frontmostApplication?.processIdentifier == frontmostPID
+            frontmostPID != nil && (try? ForegroundApplication.pid()) == frontmostPID
         }
         let wasFrontmost = frontmost()
         // Escape for a background app with a dialog open means "cancel the dialog": keys do not reach a
@@ -409,8 +417,10 @@ public final class ComputerUseToolDispatcher {
     private func dispatchHealingStaleIndex(name: String, arguments: [String: Any], app: String, log: SmartLog) throws -> ToolCallResult {
         let priorIndex = normalizedElementIndexArgument(arguments["element_index"])
         var prior: (role: String?, label: String?)?
+        var priorWindow: NativeWindowObservation?
         if let index = priorIndex {
             let snapshot = try? service.currentSnapshot(for: app, needScreenshot: false)
+            priorWindow = snapshot?.nativeWindow
             if let record = snapshot?.elements.values.first(where: { String($0.index) == index }) {
                 prior = (SmartSteps.roleKey(record.role), SmartSteps.name(of: record))
             } else if let snapshot, let number = Int(index),
@@ -424,17 +434,26 @@ public final class ComputerUseToolDispatcher {
         do {
             return try dispatchTool(name: name, arguments: arguments, log: log)
         } catch let error as ComputerUseError where SmartSteps.isStale(error) || ElementNumbering.isGone(error) {
-            guard let index = priorIndex, let prior, prior.label != nil else { throw error }
-            guard let fresh = SmartSteps.freshSnapshot(app: app, service: service) else { throw error }
-            switch StaleHealing.resolve(index: index, role: prior.role, label: prior.label, nodes: SmartSteps.nodes(of: fresh)) {
+            guard let index = priorIndex, let prior, prior.label != nil, let priorWindow else { throw error }
+            // A new front window can contain an identical control. Read the original window only;
+            // neither a user's window switch nor a process restart may redirect a healed action.
+            _ = try service.getAppState(app: app,
+                observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false), windowID: priorWindow.id)
+            let fresh = try service.currentSnapshot(for: app, needScreenshot: false, recoveryPolicy: .readOnly)
+            switch StaleHealing.recover(index: index, role: prior.role, label: prior.label,
+                                        observedWindow: priorWindow, currentWindow: fresh.nativeWindow,
+                                        nodes: SmartSteps.nodes(of: fresh)) {
             case .refuse(let message):
                 throw ComputerUseError.staleTarget(message)
             case .use(let now, let note):
                 log.note(note)
                 var retried = arguments
                 retried["element_index"] = String(now)
-                try authorizeNativeAction(name: name, arguments: retried)
-                return try dispatchTool(name: name, arguments: retried, log: log)
+                retried["window_id"] = priorWindow.id
+                return try ComputerUseService.$requiredWindowID.withValue(priorWindow.id) {
+                    try authorizeNativeAction(name: name, arguments: retried)
+                    return try dispatchTool(name: name, arguments: retried, log: log)
+                }
             }
         }
     }
@@ -468,6 +487,7 @@ public final class ComputerUseToolDispatcher {
     private func dispatchTool(name: String, arguments: [String: Any], log: SmartLog) throws -> ToolCallResult {
         // Smart fallbacks can reach the native dispatcher without another tool call.
         if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check() }
+        try requireSharedWorkspace(name: name, arguments: arguments)
         switch name {
         case BatchTool.name:
             // The goal and step number go into each journaled intent, so a restart notice can name them.
@@ -528,6 +548,18 @@ public final class ComputerUseToolDispatcher {
             // A settle wait the caller asked for is capped by the tuned wait when that is shorter (ReadRouting).
             let stateApp = try requireString("app", in: arguments)
             let stateWindow = try validatedQueryWindowID(arguments["window_id"])
+            let visualQueries = try VisualSearch.queries(arguments["visual_queries"])
+            let visualRegion = try VisualSearch.region(arguments["visual_region"])
+            if visualRegion != nil, visualQueries.isEmpty {
+                throw ComputerUseError.invalidArguments("visual_region requires visual_queries.")
+            }
+            if !visualQueries.isEmpty {
+                guard stateWindow != nil,
+                      try strictObservationBool("include_ax", in: arguments),
+                      try strictObservationBool("include_screenshot", in: arguments, default: false) else {
+                    throw ComputerUseError.invalidArguments("visual_queries requires window_id, include_ax and include_screenshot: true.")
+                }
+            }
             let settle = ReadRouting.settlePlan(requested: try optionalSettleMs(in: arguments), app: stateApp, windowID: stateWindow)
             let settleStarted = Date()
             let state = try service.getAppState(
@@ -548,13 +580,16 @@ public final class ComputerUseToolDispatcher {
                     includeMenuBar: try strictObservationBool("include_menu_bar", in: arguments, default: false)
                 ),
                 settleMs: settle.wait,
-                compact: try strictObservationBool(
+                compact: visualQueries.isEmpty ? try strictObservationBool(
                     "compact", in: arguments,
                     default: LeanOutput.usesCompactReads
-                ),
+                ) : false,
                 windowID: stateWindow
             )
             ReadRouting.recordSettle(settle.tuned, result: state, startedAt: settleStarted, app: stateApp)
+            if let stateWindow, !visualQueries.isEmpty {
+                return try VisualSearch.annotate(state, queries: visualQueries, region: visualRegion, windowID: stateWindow)
+            }
             return state
         case "click":
             // Precise clicks use one window-addressed route and never fall back to vision.
@@ -592,10 +627,9 @@ public final class ComputerUseToolDispatcher {
             } catch let error as ComputerUseError {
                 // Only a real, unambiguous label miss can use the local perception path (OCR, then the vision
                 // model), never in strict background mode or for a window-bound action.
-                if !StrictBackground.enabled(), ComputerUseService.requiredWindowID == nil,
-                   SmartSteps.isNotFound(error), !SmartSteps.isAmbiguous(error),
-                   VisionFallback.isEnabled, clickCount == 1,
-                   (optionalString("mouse_button", in: arguments) ?? "left").lowercased() == "left",
+                if ComputerUseService.allowsLocalPerceptionFallback(error: error, strict: StrictBackground.enabled(),
+                   windowBound: ComputerUseService.requiredWindowID != nil, clickCount: clickCount,
+                   mouseButton: optionalString("mouse_button", in: arguments) ?? "left"),
                    let label = labelArguments(in: arguments)?.first,
                    let result = try service.visionClick(app: requireString("app", in: arguments), label: label,
                                                        method: parseClickMethod(optionalString("click_method", in: arguments))) {
@@ -776,6 +810,12 @@ public final class ComputerUseToolDispatcher {
         default:
             throw ComputerUseError.unsupportedTool(name)
         }
+    }
+
+    private func requireSharedWorkspace(name: String, arguments: [String: Any]) throws {
+        try SharedWorkspace.requireAvailable(tool: name, arguments: arguments,
+            backgroundOnly: backgroundOnlyMode(), pinnedWindowID: ComputerUseService.requiredWindowID,
+            observation: workspaceObservation)
     }
 
     /// The batch can check its result in the ref's window without an app-wide read.

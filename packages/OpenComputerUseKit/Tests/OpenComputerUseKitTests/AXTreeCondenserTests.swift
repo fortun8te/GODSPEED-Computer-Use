@@ -290,9 +290,21 @@ final class AXTreeCondenserTests: XCTestCase {
         let input = spotifyLikeTree(minimumLines: 2000)
         XCTAssertGreaterThanOrEqual(input.components(separatedBy: "\n").count, 2000)
         let start = DispatchTime.now().uptimeNanoseconds
-        _ = AXTreeCondenser.condense(input)
+        let output = AXTreeCondenser.condense(input)
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        print("AX_CONDENSE_BENCHMARK elapsed_ms=\(elapsedMs) before_utf8_bytes=\(input.utf8.count) after_utf8_bytes=\(output.utf8.count)")
         XCTAssertLessThan(elapsedMs, 50, "condense took \(elapsedMs) ms")
+    }
+
+    func testFastHiddenScanStillRemovesBareDecorationWithTrailingWhitespace() {
+        let input = "0 window X\n\t1 image   \n\t2 separator\t\n\t3 button Save"
+        XCTAssertEqual(AXTreeCondenser.condense(input, options: options(hidden: true)), "0 window X\n\t3 button Save")
+    }
+
+    func testPlainSiblingBreaksRepeatedPropertyContext() {
+        let input = ["0 window X", "\t1 button Save Help: Same hint", "\t2 button Other",
+                     "\t3 button Export Help: Same hint"].joined(separator: "\n")
+        XCTAssertEqual(AXTreeCondenser.condense(input, options: options(repeated: true)), input)
     }
 
     // MARK: - Compaction rules (hidden, unwrap, descriptions, repeats, budget)

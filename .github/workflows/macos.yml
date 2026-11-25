@@ -20,11 +20,20 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Verify Godspeed behavior
-        run: swift test --filter 'AXTreeCondenserTests/testCompactObservation|DocsDriftTests|DoneCheckTransitionTests|AXChangeMonitorTests|GestureSafetyTests|NegativeLookupCacheTests|RegionFingerprintTests|SemanticChangesTests|AppTimingProfileTests|FocusTransitionTests|ShortcutCacheTests|FailureSignaturesTests|RouteBanditTests|LearningLogTests|CursorMotionQualityTests|BackgroundDragTests|AppAgentAdmissionTests|AppAgentProxyTests|TrajectoryLogTests|BatchEffectsTests|ClickVerifierTests|DoneCheckTests|CursorTimingTests/testClickRipple|CursorTimingTests/testCursorLens|CursorTimingTests/testInteractionIndicator|GodspeedLeanTests|BrowserPageTests|HeadlessScenarioBankTests|PrivateClipboardTests|RecipeSafetyTests|BatchReceiptsTests|LabelSpellingsTests|ClientScopeTests|ClientScopeSafetyTests|testInitializeResponseContainsComputerUseInstructions'
+        run: swift test --filter 'AXTreeCondenserTests|AXSemanticRenderingTests|AXLocalInterpretationTests|TargetedQuerySafetyTests|DocsDriftTests|DoneCheckTransitionTests|AXChangeMonitorTests|AXSnapshotReadCacheTests|GestureSafetyTests|NegativeLookupCacheTests|RegionFingerprintTests|SemanticChangesTests|AppTimingProfileTests|FocusTransitionTests|ShortcutCacheTests|FailureSignaturesTests|RouteBanditTests|LearningLogTests|CursorMotionQualityTests|BackgroundDragTests|AppAgentAdmissionTests|AppAgentProxyTests|TrajectoryLogTests|BatchEffectsTests|ClickVerifierTests|DoneCheckTests|CursorTimingTests/testClickRipple|CursorTimingTests/testCursorLens|CursorTimingTests/testInteractionIndicator|GodspeedLeanTests|BrowserPageTests|HeadlessScenarioBankTests|PrivateClipboardTests|RecipeSafetyTests|BatchReceiptsTests|LabelSpellingsTests|ClientScopeTests|ClientScopeSafetyTests|testInitializeResponseContainsComputerUseInstructions'
       - name: Verify compact replies, cursor identity and idle exit
-        run: swift test --filter 'CompactVerifiedReplyTests|CursorRequestEnvironmentTests|CursorGlideShapeTests|CursorWindowAnchorTests|CursorDeliveryTests/testGestureBoundariesRetainMovesForTheirOwnClient|HandoffToolTests|LifecycleTests|LockedUseDispatchTests|testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep'
+        env:
+          GODSPEED_WINDOW_ACTIVITY_PREVIEW: ${{ runner.temp }}/godspeed-window-activity.png
+        run: swift test --filter 'CompactVerifiedReplyTests|CursorRequestEnvironmentTests|CursorPreferencesTests|CursorDragPresentationTests|CursorWindowActivityTests|CursorGlideShapeTests|CursorWindowAnchorTests|CursorDeliveryTests/testGestureBoundariesRetainMovesForTheirOwnClient|CursorDeliveryTests/testReset|HandoffToolTests|LifecycleTests|LockedUseDispatchTests|testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep'
+      - name: Preserve native window activity preview
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: Godspeed-window-activity-preview
+          path: ${{ runner.temp }}/godspeed-window-activity.png
+          if-no-files-found: warn
       - name: Verify safety, delivery, durability and browser policy
-        run: swift test --filter 'ActionHardeningTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|LocalDecisionToolTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests|RelayGrant|BrowserBridgeRelayGrant|GroundingCascadeTests|BatchResumeTests|TeachRecorderTests|TeachModeTests|TeachToolTests|TeachSourcesTests|TeachKeystrokePrivacyTests'
+        run: swift test --filter 'ActionHardeningTests|NativeInputDeliveryTests|SharedWorkspaceTests|BackgroundSafetyTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalOperationTests|TypedNameReplacementTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|MCPLineWriterTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|LocalDecisionToolTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests|UserKeyWindowTests|RelayGrant|BrowserBridgeRelayGrant|GroundingCascadeTests|VisualSearchTests|StaleHealingContextTests|GodspeedTerminalSettingsTests|GodspeedSettingsTests|ModelHelperPolicyTests|HelperBudgetTests|LocalDecisionCancellationTests|BatchResumeTests|TeachRecorderTests|TeachModeTests|TeachToolTests|TeachSourcesTests|TeachKeystrokePrivacyTests'
       - name: Verify the local training tools
         run: python3 -I -m unittest discover -s scripts/flywheel -p 'test_*.py' && python3 -I -m unittest discover -s scripts/flywheel/synth -p 'test_*.py'
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -32,10 +41,25 @@ jobs:
           node-version: '24'
       - name: Verify the JavaScript API
         run: node --test scripts/node-repl/open-computer-use-repl.test.mjs scripts/node-repl/page-api.test.mjs scripts/node-repl/page-precise.test.mjs scripts/node-repl/native-precise.test.mjs scripts/node-repl/precise-actions.test.mjs
+      - name: Build and verify the pinned Chrome workspace
+        env:
+          GODSPEED_CHROME_WORKSPACE_DIR: ${{ runner.temp }}/godspeed-chrome-workspace
+        run: |
+          python3 scripts/package-godspeed-browser.py --fetch
+          python3 -m zipfile -e dist/chrome-workspace/Godspeed-Chrome-Workspace-1.1.0.1.zip "$GODSPEED_CHROME_WORKSPACE_DIR"
+          node --test integrations/chrome-workspace/test/*.test.mjs
       - name: Verify matched benchmark scoring
         run: python3 -I -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Reject stale packages after a failed build
         run: ./scripts/tests/godspeed-package-guard.sh
+      - name: Verify settings launcher and argument forwarding
+        run: ./scripts/tests/godspeed-launcher.sh
+      - name: Preserve the verified Chrome workspace package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Godspeed-Chrome-Workspace
+          path: dist/chrome-workspace/Godspeed-Chrome-Workspace-*.zip
+          if-no-files-found: error
       - name: Package a development build
         if: github.event_name == 'workflow_dispatch'
         run: |
@@ -45,6 +69,7 @@ jobs:
           root="$(mktemp -d)"
           ./scripts/install-godspeed.sh --archive dist/godspeed/Godspeed-macOS-arm64.zip --expected-version "$version" --app-dir "$root/apps" --launcher-dir "$root/bin"
           GODSPEED_APP="$root/apps/GODSPEED.app" python3 scripts/tests/godspeed-mcp-smoke.py --launcher "$root/bin/godspeed-mcp" --direct
+          GODSPEED_APP="$root/apps/GODSPEED.app" "$root/bin/godspeed" settings --show
           OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY=1 ./scripts/godspeed-doctor.sh --app "$root/apps/GODSPEED.app" --launcher "$root/bin/godspeed-mcp"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: github.event_name == 'workflow_dispatch'

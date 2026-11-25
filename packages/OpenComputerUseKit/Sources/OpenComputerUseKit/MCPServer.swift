@@ -5,8 +5,9 @@ Use Godspeed for Mac apps and Chrome.
 
 - Start with the outcome. For a familiar workflow, use batch with app, the exact saved goal and current values to replay a verified recipe. For known steps, use one batch with done_when and compact:true. A verified receipt is enough to finish.
 - For a bounded Mac task with a concrete final check but unknown steps, use handoff with app, goal, done_when and any text values. It reads and acts locally. If it stops, use its receipt and continue only the remaining work.
+- Keep a stopped batch's token across context resets. Use batch with inspect_resume to recover compact progress, then resume only eligible unsent steps with fresh values. Inspection does not execute or consume the checkpoint.
 - For a single action, use its tool. Use query or compact get_app_state to identify controls and browser find for web controls. Request screenshots when needed.
-- Keep work in the background. Check uncertain delivery before retrying. Ask before sending, deleting or purchasing.
+- Keep work in the background. Check uncertain delivery before retrying. Sending, deleting or purchasing needs user authorization; honor authorization already given for this task.
 """
 
 public final class StdioMCPServer {
@@ -33,21 +34,25 @@ public final class StdioMCPServer {
 
     init(dispatcher: ComputerUseToolDispatcher,
          backgroundStateReset: @escaping () -> Void = resetOpenComputerUseBackgroundWindowState,
-         trajectoryEnvironment: [String: String]? = nil, recordOperations: Bool = false) {
+         trajectoryEnvironment: [String: String]? = nil, recordOperations: Bool = false,
+         trajectoryLog: TrajectoryLog? = nil) {
         self.recordOperations = recordOperations
         self.service = dispatcher.service
         self.dispatcher = dispatcher
         self.backgroundStateReset = backgroundStateReset
-        self.trajectory = TrajectoryLog(environment: trajectoryEnvironment ?? GodspeedSettings.environment)
+        // App-agent callers supply a raw per-connection environment. Fill saved preferences
+        // underneath it too, so the terminal's telemetry switch applies to proxied sessions.
+        self.trajectory = trajectoryLog ?? TrajectoryLog(environment: GodspeedSettings.merged(trajectoryEnvironment ?? RequestConfiguration.environment))
     }
 
     public func run() throws {
         defer { endSession() }
         let requests = MCPRequestStream()
+        let output = MCPLineWriter()
         Thread.detachNewThread {
             while let line = readLine(strippingNewline: true) {
-                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
-                if !accepted { break }
+                let keepReading = autoreleasepool { requests.receiveRPCLine(line, reply: output.writeLine) }
+                if !keepReading { break }
             }
             requests.disconnect()
         }
@@ -55,7 +60,7 @@ public final class StdioMCPServer {
             autoreleasepool {
                 RequestCancellation.$current.withValue(request.cancellation) {
                     if let response = withOperationJournal({ handle(line: request.line) }) {
-                        FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                        output.writeLine(response)
                     }
                 }
             }
@@ -120,12 +125,11 @@ public final class StdioMCPServer {
                         try recordOperations ? withOperationJournal(call) : call()
                     }
                 } catch {
+                    let reply = telemetry.reply(ToolCallResult.failure(error))
                     trajectory.recordFailedToolCall(name: name, arguments: arguments, error: error, startedAt: startedAt,
                                                     admissionMs: admissionMs, telemetry: telemetry.snapshot())
-                    return try encodeJSONRPCResult(id: id, result: telemetry.reply(ToolCallResult.failure(error), startedAt: startedAt))
+                    return try encodeJSONRPCResult(id: id, result: reply)
                 }
-                trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt,
-                                          admissionMs: admissionMs, telemetry: telemetry.snapshot())
                 // Keep the full baseline locally. Only shorten the transport reply,
                 // after the dispatcher has finished its readback and delivery checks.
                 var reply = result
@@ -138,7 +142,10 @@ public final class StdioMCPServer {
                     }
                     memory.recordShown(app: app, text: state)
                 }
-                return try encodeJSONRPCResult(id: id, result: telemetry.reply(reply, startedAt: startedAt))
+                let response = telemetry.reply(reply)
+                trajectory.recordToolCall(name: name, arguments: arguments, result: result, startedAt: startedAt,
+                                          admissionMs: admissionMs, telemetry: telemetry.snapshot())
+                return try encodeJSONRPCResult(id: id, result: response)
             default:
                 // A notification (no id) gets no reply. A request without a usable method must still get one,
                 // or the client waits forever for a response that never comes.

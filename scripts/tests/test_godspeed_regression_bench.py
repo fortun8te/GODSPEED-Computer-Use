@@ -28,6 +28,33 @@ class RegressionBenchmarkTests(unittest.TestCase):
         self.assertEqual(bench.summarize(runs)["p95_wall_seconds"], 19)
         self.assertEqual(bench.summarize(runs)["fixture_pass_rate"], 0.95)
 
+    def test_final_observation_failure_does_not_count_as_completed_pass(self):
+        before = {"pid": 123, "tabCount": 2, "windows": ["Original", "Moved fixture tab"], "moved": True}
+        final = {"pid": 124, "generation": 2, "windows": ["Relaunched"], "events": bench.EXPECTED}
+        checked = bench.grade(before, final)
+        runs = [
+            {**checked, "wall_seconds": 1, "error": None},
+            {**checked, "wall_seconds": 20, "error": "Final get_app_state timed out"},
+            {**checked, "wall_seconds": 30, "error": None, "fixture_pass": False},
+        ]
+        result = bench.summarize(runs)
+        self.assertEqual(result["fixture_passes"], 2)
+        self.assertEqual(result["fixture_pass_rate"], 2 / 3)
+        self.assertEqual(result["completed_runs"], 2)
+        self.assertEqual(result["aborted_runs"], 1)
+        self.assertEqual(result["completed_passes"], 1)
+        self.assertEqual(result["completed_pass_rate"], 1 / 3)
+        self.assertEqual(result["p95_wall_seconds"], 30)
+
+    def test_empty_error_text_is_still_an_aborted_run(self):
+        result = bench.summarize([
+            {"wall_seconds": 2, "fixture_pass": True, "error": "",
+             "wrong_targets": 0, "duplicate_actions": 0},
+        ])
+        self.assertEqual(result["fixture_pass_rate"], 1)
+        self.assertEqual(result["aborted_runs"], 1)
+        self.assertEqual(result["completed_pass_rate"], 0)
+
     def test_workload_only_observes_after_dropped_reply(self):
         class Driver:
             phase = 0

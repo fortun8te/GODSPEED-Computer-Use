@@ -233,11 +233,14 @@ struct ControlWait {
     func run<ID: Equatable>(now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                             pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
                             read: () throws -> Sample<ID>) throws -> String {
+        try RequestCancellation.check(delivery: .notSent)
         let deadline = now() + min(timeout, max(0, BrowserCallBudget.activeRemaining ?? timeout))
         var baseline: (id: ID, value: String)?
         return try BrowserCallBudget.withDeadline(deadline) {
             while now() < deadline {
+                try RequestCancellation.check(delivery: .notSent)
                 let sample = try read()
+                try RequestCancellation.check(delivery: .notSent)
                 if now() >= deadline { break }
                 switch (condition, sample) {
                 case (.appears, .present), (.appears, .value):
@@ -257,6 +260,7 @@ struct ControlWait {
                 }
                 pause(min(0.15, max(0, deadline - now())))
             }
+            try RequestCancellation.check(delivery: .notSent)
             throw ComputerUseError.stateUnavailable("Timed out waiting for \(label) to satisfy \(condition.rawValue).")
         }
     }

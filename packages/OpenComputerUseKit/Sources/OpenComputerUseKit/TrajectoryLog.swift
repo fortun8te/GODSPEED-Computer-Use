@@ -199,7 +199,9 @@ final class TrajectoryLog: @unchecked Sendable {
         failureCode: FailureCode? = nil,
         visionUsed: Bool = false
     ) {
-        let duration = (Date().timeIntervalSince(startedAt) * 1000 * 10).rounded() / 10
+        let measuredDuration = telemetry["wall_ms"].flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        let elapsed = measuredDuration ?? max(0, Date().timeIntervalSince(startedAt) * 1_000)
+        let duration = (elapsed * 10).rounded() / 10
         var object: [String: Any] = [
             "event": "tool_call",
             "schema_version": 3,

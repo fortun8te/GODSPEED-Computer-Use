@@ -949,6 +949,29 @@ public final class ComputerUseService {
         return LocalWindowImage.jpeg(crop)
     }
 
+    /// Guard explicit semantic-search coordinates against both a replaced cached read and a changed live window.
+    /// Opt-in only: ordinary AX and pixel actions keep their existing latency.
+    func validateVisualSnapshot(app query: String, token: String, windowID: CGWindowID) throws {
+        let snapshot = try currentSnapshot(for: query, recoveryPolicy: .readOnly)
+        guard snapshot.observedWindowID == windowID, let bytes = snapshot.screenshotData,
+              VisualSearch.observationToken(windowID: windowID, bytes: bytes) == token,
+              let capture = WindowCapture.resolve(for: snapshot.app.pid, exactWindowID: windowID),
+              capture.bounds == snapshot.windowBounds,
+              let fresh = capture.screenshotResult().data,
+              VisualSearch.observationToken(windowID: windowID, bytes: fresh) == token else {
+            throw ComputerUseError.notSent("Visual snapshot changed or could not be verified. Read the window and inspect the target again.")
+        }
+        try RequestCancellation.check(delivery: .notSent)
+    }
+
+    /// Local OCR does not require a model helper. Only a real, unambiguous miss can enter this route;
+    /// strict or pinned requests retain their existing accessibility-only/direct delivery contract.
+    static func allowsLocalPerceptionFallback(error: ComputerUseError, strict: Bool, windowBound: Bool,
+                                              clickCount: Int, mouseButton: String) -> Bool {
+        !strict && !windowBound && SmartSteps.isNotFound(error) && !SmartSteps.isAmbiguous(error)
+            && clickCount == 1 && mouseButton.lowercased() == "left"
+    }
+
     /// Ground a label in the same observed window, then verify it immediately before delivery.
     func visionClick(app query: String, label: String, method: ClickMethod) throws -> ToolCallResult? {
         guard method == .auto || method == .skyClick, !VisionFallback.risky(label),
@@ -966,6 +989,9 @@ public final class ComputerUseService {
             return context
         }
 
+        // Do not capture or run OCR on a window already known to contain secure fields.
+        var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
+        guard !secure else { return nil }
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(VisionFallback.timeout, BrowserCallBudget.activeRemaining ?? .infinity)
         guard let context = liveWindow(), let original = SnapshotBuilder.localWindowImage(context),
@@ -974,16 +1000,17 @@ public final class ComputerUseService {
         var located: VisionFallback.Candidate?
         var verified = false
         // Password and secure fields keep their row but never their crop image.
-        var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
         defer {
             VisionFallback.recordLocate(query: label, crop: crop, candidate: located, verified: verified,
                                         secure: secure, log: LearningLog.shared)
         }
         let candidate = VisionFallback.candidate(scan: { accurate in
-            guard clock.systemUptime < deadline else { return .missing }
-            return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
+            guard !RequestCancellation.requested, clock.systemUptime < deadline else { return .missing }
+            // Preserve small toolbar labels and dense canvas text on the accurate pass.
+            let image = accurate ? (LocalWindowImage.downscaled(original, maxSide: VisionFallback.accurateOCRMaxSide) ?? crop) : crop
+            return LocalOCR.scan(image, label: label, level: accurate ? .accurate : .fast)
         }, locate: {
-            guard clock.systemUptime < deadline,
+            guard VisionFallback.isEnabled, !RequestCancellation.requested, clock.systemUptime < deadline,
                   let overview = LocalWindowImage.downscaled(crop, maxSide: VisionFallback.overviewMaxSide),
                   let jpeg = LocalWindowImage.jpeg(overview) else { return nil }
             return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
@@ -997,7 +1024,10 @@ public final class ComputerUseService {
         // A point is confirmed only when the control under it carries the label and no risky name.
         func confirms(_ point: CGPoint, _ candidate: VisionFallback.Candidate) -> Bool {
             guard let hit = try? hitTestElement(at: point, in: snapshot)?.element else { return false }
-            if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) { secure = true }
+            if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) {
+                secure = true
+                return false
+            }
             guard SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
                   let names = visualHitNames(hit, window: live.windowElement) else { return false }
             return VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names)
@@ -1009,13 +1039,15 @@ public final class ComputerUseService {
             chosen = (candidate, firstPoint)
         } else if candidate.evidence == .model, clock.systemUptime < deadline,
                   let zoomed = GroundingCascade.secondLook(at: candidate.fraction, locate: { rect in
-                      let width = CGFloat(crop.width), height = CGFloat(crop.height)
-                      let pixels = CGRect(x: rect.minX * width, y: rect.minY * height,
-                                          width: rect.width * width, height: rect.height * height).integral
-                      guard clock.systemUptime < deadline, let sub = crop.cropping(to: pixels),
-                            let jpeg = LocalWindowImage.jpeg(sub) else { return nil }
-                      return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
-                                                   remaining: deadline - clock.systemUptime)
+                      guard clock.systemUptime < deadline,
+                            let pixels = VisionFallback.pixelCrop(rect, width: original.width, height: original.height),
+                            let sub = original.cropping(to: pixels),
+                            let detail = LocalWindowImage.downscaled(sub),
+                            let jpeg = LocalWindowImage.jpeg(detail),
+                            let local = VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
+                                                              remaining: deadline - clock.systemUptime) else { return nil }
+                      return VisionFallback.remapCropPoint(local, pixels: pixels, requested: rect,
+                                                           width: original.width, height: original.height)
                   }, verify: { fraction in
                       guard let zoomPoint = VisionFallback.windowPoint(fraction, bounds: bounds) else { return false }
                       return confirms(zoomPoint, VisionFallback.Candidate(fraction: fraction, evidence: .zoom))
@@ -1027,13 +1059,27 @@ public final class ComputerUseService {
             return nil
         }
         let point = chosen.point
-        guard clock.systemUptime < deadline, liveWindow() != nil else { return nil }
+        // The helper can take seconds; reject any changed screen before delivering input.
+        guard clock.systemUptime < deadline, let finalWindow = liveWindow(),
+              let finalImage = SnapshotBuilder.localWindowImage(finalWindow),
+              VisionFallback.sameCapture(original, finalImage),
+              confirms(point, chosen.candidate), clock.systemUptime < deadline else { return nil }
         verified = true
 
         let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
         try RequestCancellation.check()  // L6: a cancelled request sends nothing
-        try InputSimulation.clickWithSkyLight(at: screenPoint, windowPoint: point, windowBounds: bounds,
-                                               windowID: id, clickCount: 1, pid: live.app.pid)
+        let cursorTarget = makeVisualCursorTarget(at: screenPoint, targetWindowID: id,
+            targetWindowLayer: snapshot.targetWindowLayer,
+            anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: point))
+        moveVisualCursor(to: cursorTarget)
+        do {
+            try InputSimulation.clickWithSkyLight(at: screenPoint, windowPoint: point, windowBounds: bounds,
+                                                   windowID: id, clickCount: 1, pid: finalWindow.app.pid)
+        } catch {
+            settleVisualCursor(at: cursorTarget)
+            throw error
+        }
+        pulseVisualCursor(at: cursorTarget, clickCount: 1, mouseButton: .left)
         // Read back the same window. Delivery has already happened if this read fails.
         let state = try? getAppState(app: query,
             observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false), windowID: id)
@@ -1060,7 +1106,8 @@ public final class ComputerUseService {
             if role == kAXStaticTextRole as String, let value = stringValue(of: element, attribute: kAXValueAttribute) {
                 current.append(value)
             }
-            if current.contains(where: VisionFallback.risky) { return nil }
+            if isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) ||
+               current.contains(where: VisionFallback.risky) { return nil }
             let actions = copyActions(for: element) ?? []
             if !sawAction, CFEqual(element, leaf) || actions.contains(kAXPressAction as String) {
                 names.append(contentsOf: current.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
@@ -1769,17 +1816,18 @@ public final class ComputerUseService {
 
         let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
         let end = try screenshotToGlobalPoint(snapshot: snapshot, x: toX, y: toY)
-        let startTarget = makeVisualCursorTarget(at: start, targetWindowID: snapshot.targetWindowID, targetWindowLayer: snapshot.targetWindowLayer)
-        let endTarget = makeVisualCursorTarget(at: end, targetWindowID: snapshot.targetWindowID, targetWindowLayer: snapshot.targetWindowLayer)
-        moveVisualCursor(to: startTarget)
-        let path = try withVisualFeedback(.drag, at: startTarget, completingAt: endTarget) {
+        let cursor = CursorDragPresentation(
+            window: snapshot.targetWindowID.map { CursorTargetWindow(windowID: $0, layer: snapshot.targetWindowLayer ?? 0) },
+            windowBounds: snapshot.windowBounds, frameSource: snapshot.windowElement.map(CursorFrameSource.init))
+        let path = try cursor.delivering { onProgress in
             try performDragEvent(
                 from: start,
                 to: end,
                 targetDescription: "from=(\(fromX), \(fromY)) to=(\(toX), \(toY))",
                 snapshot: snapshot,
                 path: deliveryPath,
-                flags: flags
+                flags: flags,
+                onProgress: onProgress
             )
         }
         return appendingDragDeliveryNote(
@@ -1832,10 +1880,11 @@ public final class ComputerUseService {
         guard start != end else { throw ComputerUseError.invalidArguments("Drag endpoints must be distinct.") }
         let target = BackgroundDragTarget(start: inputEventPoint(fromScreenStatePoint: start),
             end: inputEventPoint(fromScreenStatePoint: end), windowBounds: bounds, windowID: id, pid: snapshot.app.pid)
-        let visual = makeVisualCursorTarget(at: start, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
-        let finish = makeVisualCursorTarget(at: end, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
-        try withVisualFeedback(.drag, at: visual, completingAt: finish) {
+        let cursor = CursorDragPresentation(window: CursorTargetWindow(windowID: id, layer: snapshot.targetWindowLayer ?? 0),
+            windowBounds: bounds, frameSource: CursorFrameSource(window))
+        try cursor.delivering { onProgress in
             try BackgroundDragDispatcher.drag(target: target, flags: flags, steps: options.steps ?? 10, hold: options.hold,
+                onProgress: onProgress,
                 validateEndpoints: {
                     try checkStart()
                     try checkEnd()
@@ -2024,7 +2073,7 @@ public final class ComputerUseService {
         let pid = snapshot.app.pid
         return shouldRouteKeysThroughSkyLight(KeyRouteContext(
             backgroundOnly: backgroundOnlyMode(),
-            targetIsFrontmost: NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+            targetIsFrontmost: (try? ForegroundApplication.pid()) == pid,
             borrowed: FocusBorrow.isBorrowed(pid: pid),
             skyLightAvailable: SkyLightSPI.shared.capability.isAvailable,
             hasTargetWindow: snapshot.targetWindowID != nil || hasLiveTextFocus,
@@ -2430,7 +2479,7 @@ public final class ComputerUseService {
         }
         if let windowID = Self.requiredWindowID {
             try requireBoundFocusedWindow(in: snapshot)
-            if keyMethod == .auto, NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.app.pid {
+            if keyMethod == .auto, (try? ForegroundApplication.pid()) == snapshot.app.pid {
                 try InputSimulation.pressKey(key, pid: snapshot.app.pid)
             } else {
                 try SkyKeyboardDispatcher.pressKey(
@@ -3223,12 +3272,13 @@ public final class ComputerUseService {
             if let hit = try find(in: fresh) { return hit }
         } else {
             // The expensive fresh read is skipped when this same label already missed on the current snapshot
-            // generation (the generation changes on every stored read, so a new read always searches again).
+            // generation, provided AX has reported no change since then. A new read or notification searches again.
             let labelKey = given.joined(separator: "\n")
             let outcome = try negativeLookups.searchTwoStep(
                 keyFor: { NegativeLookupCache.Key(app: query.lowercased(), windowID: Int($0.targetWindowID ?? 0), label: labelKey, role: "") },
                 cached: try? currentSnapshot(for: query, needScreenshot: false),
                 generation: { self.snapshotStoreCount },
+                changeGeneration: { AXChangeMonitor.shared.track($0.app.pid) },
                 now: { TimingLog.now() },
                 find: { try find(in: $0) },
                 readFresh: { try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy,
@@ -3256,10 +3306,24 @@ public final class ComputerUseService {
         if LabelSpellings.menuBarTitles.contains(given[0]) {
             throw ComputerUseError.invalidArguments("'\(labels[0])' is a menu bar menu, not a window control. Use press_menu, e.g. {\"app\": \"\(query)\", \"path\": \"\(labels[0]) > Save\"}; press_menu with just \"\(labels[0])\" lists its items.")
         }
+        // A miss is a discovery opportunity, not permission to guess an action.
+        // Do not expose field values or document contents in the recovery shortlist.
+        let options = fresh.elements.values.sorted { $0.index < $1.index }.compactMap { record -> GroundingCascade.Option? in
+            guard clickable.contains(roleKey(record.role)) else { return nil }
+            let name = [record.title, record.identity?.name, record.identifier]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            guard let name else { return nil }
+            return GroundingCascade.Option(id: String(record.index), text: String(name.prefix(120)))
+        }
+        let suggestions = GroundingCascade.discoverySuggestions(label: labels[0], options: options)
         let shown = avail.isEmpty
             ? "none with a name; use element_index from the state, or query to find text"
             : avail.prefix(60).joined(separator: ", ")
-        throw ComputerUseError.targetNotFound("no element labelled '\(labels[0])'. Clickable labels now: \(shown)")
+        let recovery = suggestions.isEmpty ? "" :
+            " Possible controls (not verified matches): " + suggestions.map { "\($0.id) \($0.text)" }.joined(separator: "; ") +
+            ". Read the same window and inspect the intended control before acting."
+        throw ComputerUseError.targetNotFound("no element labelled '\(labels[0])'.\(recovery) Clickable labels now: \(shown)")
     }
 
     static func isToggleRole(_ role: String?) -> Bool {
@@ -4607,7 +4671,8 @@ public final class ComputerUseService {
         targetDescription: String,
         snapshot: AppSnapshot,
         path: DragDeliveryPath,
-        flags: CGEventFlags
+        flags: CGEventFlags,
+        onProgress: (NativeDragProgress) -> Void = { _ in }
     ) throws -> DragDeliveryPath {
         let eventStart = inputEventPoint(fromScreenStatePoint: start)
         let eventEnd = inputEventPoint(fromScreenStatePoint: end)
@@ -4620,12 +4685,12 @@ public final class ComputerUseService {
                 snapshot: snapshot
             )
             try raiseForGlobalPointerInput(snapshot.app)
-            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, flags: flags)
+            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, flags: flags, onProgress: onProgress)
         case .appPost:
             guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
                 throw ComputerUseError.stateUnavailable("drag requires an observed target window; run get_app_state again")
             }
-            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid, flags: flags)
+            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid, flags: flags, onProgress: onProgress)
         }
 
         return path

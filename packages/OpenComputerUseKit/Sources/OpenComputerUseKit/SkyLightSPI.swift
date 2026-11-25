@@ -1,4 +1,5 @@
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Darwin
 import Foundation
@@ -10,7 +11,28 @@ struct SkyLightActivationCommand: Equatable {
 }
 
 struct SkyLightSyntheticFocusContext {
+    let targetPID: pid_t
     let deactivateTarget: SkyLightActivationCommand
+}
+
+/// NSWorkspace's cached frontmost app can lag in a long-lived CLI process.
+/// Focus cleanup needs the current system owner, including a user switch that
+/// happened while the agent's target was processing its last input event.
+enum ForegroundApplication {
+    static func pid() throws -> pid_t {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.2)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedApplicationAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            throw ComputerUseError.stateUnavailable("Cannot determine the current foreground application.")
+        }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(value as! AXUIElement, &pid) == .success, pid > 0 else {
+            throw ComputerUseError.stateUnavailable("Cannot determine the current foreground PID.")
+        }
+        return pid
+    }
 }
 
 struct SkyLightSyntheticFocusPlan: Equatable {
@@ -77,6 +99,31 @@ func skyLightKeyWindowRecords(windowID: CGWindowID) -> [[UInt8]] {
 /// that lets NSMenu key equivalents fire.
 func keyEventUsesAuthentication(flags: CGEventFlags, authenticated: Bool) -> Bool {
     authenticated && !flags.contains(.maskCommand)
+}
+
+/// Decide once for a chord, including modifiers before Command is pressed and
+/// the final Command release whose flags correctly no longer contain Command.
+func keyChordUsesAuthentication(_ parsed: ParsedKeyPress, authenticated: Bool) -> Bool {
+    authenticated && !parsed.modifiers.contains { $0.flag.contains(.maskCommand) }
+}
+
+/// Modifier releases are flagsChanged events, not keyUp. Cleanup still owns
+/// the matching prior press; this guard refuses new modifier-down events.
+func keyEventIsRelease(_ event: CGEvent) -> Bool {
+    if event.type == .keyUp { return true }
+    guard event.type == .flagsChanged else { return false }
+    let flag: CGEventFlags
+    switch event.getIntegerValueField(.keyboardEventKeycode) {
+    case Int64(kVK_Command), Int64(kVK_RightCommand): flag = .maskCommand
+    case Int64(kVK_Shift), Int64(kVK_RightShift): flag = .maskShift
+    case Int64(kVK_Option), Int64(kVK_RightOption): flag = .maskAlternate
+    case Int64(kVK_Control), Int64(kVK_RightControl): flag = .maskControl
+    // The catalog's standalone Caps Lock release is also flagsChanged, with
+    // alpha-shift cleared. Do not treat an enabled status flag as cleanup.
+    case Int64(kVK_CapsLock): flag = .maskAlphaShift
+    default: return false
+    }
+    return !event.flags.contains(flag)
 }
 
 /// Probes the CGEvent's embedded SLSEventRecord pointer at the offsets Cua uses
@@ -325,13 +372,21 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
         return previous != 0
     }
 
-    func postToPid(_ event: CGEvent, pid: pid_t) throws {
+    func postToPid(_ event: CGEvent, pid: pid_t, delivery: NativeInputDelivery) throws {
         try requireUsableComputerUseSession()
         guard let postToPidFunction else {
             throw unavailableError()
         }
 
+        try delivery.check()
         postToPidFunction(pid, opaquePointer(for: event))
+    }
+
+    /// Release only a button already pressed through this transport. A revoked
+    /// lease stops new input, not the matching cleanup event.
+    func releaseMouseToPid(_ event: CGEvent, pid: pid_t) {
+        guard [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(event.type) else { return }
+        postToPidFunction?(pid, opaquePointer(for: event))
     }
 
     /// Posts a keyboard event with `SLEventPostToPid`. With `authenticated`, attaches an
@@ -340,8 +395,20 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
     /// `postToPid` when the SkyLight post symbol is missing. Returns true when an
     /// authentication message was attached. Needs a live check on Chromium/Electron.
     @discardableResult
-    func postKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) throws -> Bool {
+    func postKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool, delivery: NativeInputDelivery) throws -> Bool {
         try requireUsableComputerUseSession()
+        try delivery.check()
+        return postPreparedKeyToPid(event, pid: pid, authenticated: authenticated)
+    }
+
+    /// Balance a key-down already sent by this action, even if its lease ended.
+    /// Keep the same transport; only prepared key or modifier release is allowed.
+    func releaseKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) {
+        guard keyEventIsRelease(event) else { return }
+        _ = postPreparedKeyToPid(event, pid: pid, authenticated: authenticated)
+    }
+
+    private func postPreparedKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) -> Bool {
         guard let postToPidFunction else {
             event.postToPid(pid)
             return false
@@ -448,6 +515,7 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
         }
 
         return SkyLightSyntheticFocusContext(
+            targetPID: targetPID,
             deactivateTarget: plan.deactivateTarget
         )
     }
@@ -477,9 +545,12 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
     }
 
     func endSyntheticTargetFocus(_ context: SkyLightSyntheticFocusContext) throws {
-        try postActivationCommand(context.deactivateTarget)
-        if InputTiming.focusRecordSettle > 0 {
-            Thread.sleep(forTimeInterval: InputTiming.focusRecordSettle)
+        try SyntheticFocusTeardown.endIfStillBackground(targetPID: context.targetPID,
+            foregroundPID: ForegroundApplication.pid) {
+            try postActivationCommand(context.deactivateTarget)
+            if InputTiming.focusRecordSettle > 0 {
+                Thread.sleep(forTimeInterval: InputTiming.focusRecordSettle)
+            }
         }
     }
 

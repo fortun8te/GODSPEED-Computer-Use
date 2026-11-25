@@ -3,8 +3,8 @@ import Foundation
 /// Shrinks the rendered accessibility tree (GODSPEED's state text) before a model reads it.
 ///
 /// Input is the compact text: one tab per tree level and lines such as `\t\t12 button Play`.
-/// Every line the condenser keeps has its element index unchanged. It never removes a line
-/// that is selected, focused, settable, an action-capable control, or that carries secondary actions.
+/// Every line the condenser keeps has its element index unchanged. Semantic compaction protects
+/// controls and state; the optional hard output budget can omit them with an explicit cut notice.
 ///
 /// Rules, each switchable in `Options`:
 /// 1. `dropStructuralNoise`: an unlabeled container line (group, generic, section, scroll area,
@@ -57,36 +57,45 @@ enum AXTreeCondenser {
     }
 
     /// Compact native observation retains labelled context and all visible control evidence.
-    /// Only bare structural wrappers and decoration are omitted. Repeated rows, offscreen
-    /// controls and state lines survive regardless of their position or the output length.
+    /// Bare structural wrappers, decoration, and a plain leaf repeating its own control's
+    /// exact label are omitted. Distinct controls, repeated rows, offscreen controls and state
+    /// survive regardless of their position or output length. Explicitly preserved refs survive.
     static func compactObservation(_ text: String, preserving indexes: Set<String> = []) -> String {
-        let parts = text.components(separatedBy: "\n")
-        guard let firstTree = parts.firstIndex(where: { parseLine($0).isTree }) else { return text }
+        compactLines(text, preserving: indexes).map { $0.render() }.joined(separator: "\n")
+    }
 
-        let header = parts[..<firstTree]
-        let packedIndentation = header.contains("[tab=4 w=settable]")
-        let lines = parts[firstTree...].map(parseLine)
-        var output = Array(header)
+    private static func compactLines(_ text: String, preserving indexes: Set<String>) -> [Line] {
+        let lines = text.components(separatedBy: "\n").map(parseLine)
+        let packedIndentation = lines.contains { !$0.isTree && $0.raw == "[tab=4 w=settable]" }
+        let structure = TreeStructure(lines)
+        var output: [Line] = []
+        output.reserveCapacity(lines.count)
         var removedDepths: [Int] = []
         for (position, original) in lines.enumerated() {
             guard original.isTree else {
-                output.append(original.raw)
+                output.append(original)
                 continue
             }
 
-            let depth = packedIndentation ? original.width : original.indent.count
+            let depth = packedIndentation ? original.width : original.indent.utf8.count
             while let last = removedDepths.last, last >= depth {
                 removedDepths.removeLast()
             }
 
             let isBare = original.rest == original.role && !indexes.contains(original.index)
-            let isLeaf = position + 1 == lines.count || !lines[position + 1].isTree
-                || lines[position + 1].width <= original.width
+            let isLeaf = structure.ends[position] == position + 1
             if isBare && wrapperRoles.contains(original.role) {
                 removedDepths.append(depth)
                 continue
             }
             if isBare && isLeaf && decorationRoles.contains(original.role) {
+                continue
+            }
+            if isLeaf, !indexes.contains(original.index), original.role == "text",
+               !isProtectedLine(original), let parent = structure.parents[position],
+               (actionableRoles.contains(lines[parent].role) || lines[parent].role == "link"),
+               let payload = textParts(original.rest)?.payload, !payload.isEmpty,
+               let name = simpleName(lines[parent]), name[...] == payload {
                 continue
             }
 
@@ -95,27 +104,59 @@ enum AXTreeCondenser {
             line.indent = packedIndentation
                 ? String(repeating: "\t", count: adjustedDepth / 4) + String(repeating: " ", count: adjustedDepth % 4)
                 : String(original.indent.prefix(adjustedDepth))
-            output.append(line.render())
+            output.append(line)
         }
-        return output.joined(separator: "\n")
+        return output
     }
 
     /// A batch already checked the complete driver observation. Its compact reply can omit
     /// surplus plain text while keeping the controls and state available for recovery.
-    static func batchReply(_ text: String) -> String {
-        let lines = compactObservation(text).components(separatedBy: "\n").map(parseLine)
+    static func batchReply(_ text: String, preserving indexes: Set<String> = []) -> String {
+        let lines = compactLines(text, preserving: indexes)
+        let structure = TreeStructure(lines)
+        var controls = Array(repeating: 0, count: lines.count + 1)
+        for i in lines.indices {
+            controls[i + 1] = controls[i] + (isProtectedLine(lines[i]) || lines[i].role == "link" ? 1 : 0)
+        }
+        func holdsControl(_ i: Int) -> Bool { controls[structure.ends[i]] > controls[i] }
+        var essential = Set<Int>()
+        for i in lines.indices where lines[i].isTree {
+            if holdsControl(i) {
+                // Two adjacent plain labels can be a name plus a validation hint. Keep their
+                // original lines, without asserting an association the AX provider did not give.
+                for direction in [structure.previousSiblings, structure.nextSiblings] {
+                    var neighbor = direction[i]
+                    for _ in 0..<2 {
+                        guard let n = neighbor, lines[n].role == "text" else { break }
+                        essential.insert(n)
+                        neighbor = direction[n]
+                    }
+                }
+            }
+            if lines[i].role == "text" {
+                if holdsControl(i) || statusLikeText(lines[i]) { essential.insert(i) }
+                var parent = structure.parents[i]
+                while let p = parent {
+                    if actionableRoles.contains(lines[p].role) || ["dialog", "sheet", "alert", "status"].contains(lines[p].role) {
+                        essential.insert(i); break
+                    }
+                    parent = structure.parents[p]
+                }
+            }
+        }
         var contextLeft = 6
         var omitted = 0
         var kept: [String] = []
-        for line in lines {
-            if line.isTree, line.role == "text", !isProtectedLine(line), !holdsStateOrAction(line) {
+        for (i, line) in lines.enumerated() {
+            if line.isTree, line.role == "text", !essential.contains(i), !indexes.contains(line.index),
+               !isProtectedLine(line), !holdsStateOrAction(line) {
                 if contextLeft == 0 {
                     omitted += 1
                     continue
                 }
                 contextLeft -= 1
             }
-            kept.append(line.raw)
+            kept.append(line.render())
         }
         if omitted > 0 {
             kept.append("[Compact batch: \(omitted) text lines omitted. Read the app for all available text.]")
@@ -145,7 +186,10 @@ enum AXTreeCondenser {
         var lines = Array(parsed[firstTree...])
 
         if options.dropHidden { lines = dropHidden(lines) }
-        if options.dropStructuralNoise { lines = dropStructuralNoise(lines, unwrapSingleChild: options.unwrapSingleChild) }
+        if options.dropStructuralNoise {
+            lines = dropStructuralNoise(lines, unwrapSingleChild: options.unwrapSingleChild,
+                                        packedIndentation: header.contains("[tab=4 w=settable]"))
+        }
         if options.dedupeText { lines = dedupeText(lines) }
         if options.dropRepeatedProperties { lines = dropRepeatedProperties(lines) }
         if options.collapseRuns { lines = collapseRuns(lines, options: options) }
@@ -165,14 +209,17 @@ enum AXTreeCondenser {
     private struct Line {
         var raw: String = ""
         var isTree = false
-        var indent = ""
+        var indent = "" {
+            didSet { width = indent.utf8.reduce(0) { $0 + ($1 == 9 ? 4 : 1) } }
+        }
         var index = ""
         /// Everything after `<index> `, for example `button Play (selected)`.
         var rest = ""
         var role = ""
 
-        /// Tabs count four columns, spaces one. Only used for ordering lines by depth.
-        var width: Int { indent.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) } }
+        /// Cached ASCII indentation width. Hierarchy passes can compare depth without
+        /// rescanning the same String characters at every comparison.
+        var width = 0
 
         func render() -> String { isTree ? indent + index + " " + rest : raw }
     }
@@ -181,7 +228,11 @@ enum AXTreeCondenser {
         // Byte scan: indentation, then ASCII digits, then one space. Avoids counting the whole line.
         let bytes = line.utf8
         var cursor = bytes.startIndex
-        while cursor < bytes.endIndex, bytes[cursor] == 9 || bytes[cursor] == 32 { cursor = bytes.index(after: cursor) }
+        var width = 0
+        while cursor < bytes.endIndex, bytes[cursor] == 9 || bytes[cursor] == 32 {
+            width += bytes[cursor] == 9 ? 4 : 1
+            cursor = bytes.index(after: cursor)
+        }
         let digitStart = cursor
         while cursor < bytes.endIndex, (48...57).contains(bytes[cursor]) { cursor = bytes.index(after: cursor) }
         guard cursor > digitStart, cursor < bytes.endIndex, bytes[cursor] == 32 else { return Line(raw: line) }
@@ -189,9 +240,82 @@ enum AXTreeCondenser {
         let rest = String(line[restStart...])
         return Line(
             raw: line, isTree: true, indent: String(line[..<digitStart]), index: String(line[digitStart..<cursor]),
-            rest: rest, role: roleName(of: rest)
+            rest: rest, role: roleName(of: rest), width: width
         )
     }
+
+    /// One linear stack pass supplies ancestry, subtree bounds and sibling links. Repeated
+    /// scans from every wrapper used to make deeply nested provider trees quadratic.
+    private struct TreeStructure {
+        var parents: [Int?]
+        var ends: [Int]
+        var childCounts: [Int]
+        var previousSiblings: [Int?]
+        var nextSiblings: [Int?]
+
+        init(_ lines: [Line]) {
+            parents = Array(repeating: nil, count: lines.count)
+            ends = lines.indices.map { $0 + 1 }
+            childCounts = Array(repeating: 0, count: lines.count)
+            previousSiblings = Array(repeating: nil, count: lines.count)
+            nextSiblings = Array(repeating: nil, count: lines.count)
+            var stack: [Int] = []
+            var lastChild: [Int: Int] = [:]
+            for i in lines.indices {
+                guard lines[i].isTree else {
+                    for parent in stack { ends[parent] = i }
+                    stack.removeAll(keepingCapacity: true)
+                    lastChild.removeAll(keepingCapacity: true)
+                    continue
+                }
+                while let parent = stack.last, lines[parent].width >= lines[i].width {
+                    ends[parent] = i
+                    stack.removeLast()
+                }
+                parents[i] = stack.last
+                let family = stack.last ?? -1
+                if family >= 0 { childCounts[family] += 1 }
+                previousSiblings[i] = lastChild[family]
+                if let previous = lastChild[family] { nextSiblings[previous] = i }
+                lastChild[family] = i
+                stack.append(i)
+            }
+            for parent in stack { ends[parent] = lines.count }
+        }
+    }
+
+    /// Exact, deliberately conservative label equivalence. Properties and values do not
+    /// count as labels, and an arbitrary parenthesized name is never stripped as a trait.
+    private static func simpleName(_ line: Line) -> String? {
+        var name = String(line.rest.dropFirst(line.role.count)).trimmingCharacters(in: .whitespaces)
+        if name.hasPrefix("("), let end = name.firstIndex(of: ")") {
+            let raw = String(name[name.index(after: name.startIndex)..<end])
+            let tokens = raw.components(separatedBy: ", ")
+            if !tokens.isEmpty, tokens.allSatisfy({ knownTraitNames.contains($0) || $0.hasPrefix("w:") }) {
+                name = String(name[name.index(after: end)...]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        guard !name.isEmpty, !propertyTerminators.contains(where: { name.contains($0) }),
+              !name.contains("Description:"), !name.contains("Secondary Actions:") else { return nil }
+        return name
+    }
+
+    /// This only preserves evidence; it does not declare an action completed or infer a goal.
+    private static func statusLikeText(_ line: Line) -> Bool {
+        guard let payload = textParts(line.rest)?.payload else { return false }
+        let words = payload.prefix(240).lowercased().split { !$0.isLetter }
+        return words.prefix(6).contains { statusWords.contains(String($0)) }
+    }
+
+    private static let statusWords: Set<String> = [
+        "saved", "saving", "completed", "complete", "failed", "failure", "error", "success",
+        "successfully", "invalid", "required", "warning", "retry", "cancelled", "canceled",
+    ]
+
+    private static let knownTraitNames: Set<String> = [
+        "selected", "focused", "checked", "expanded", "collapsed", "disabled", "settable", "hidden",
+        "offscreen", "off-screen", "w", "string", "boolean", "float",
+    ]
 
     private static let multiWordRoles = [
         "secure text field", "scroll area", "layout area", "list item", "outline row", "pop up button",
@@ -199,29 +323,36 @@ enum AXTreeCondenser {
         "search field", "web area", "split group", "tab group", "color well", "disclosure triangle", "date field",
     ]
 
-    /// The multi-word roles with their trailing space, built once (they were rebuilt for every line).
-    private static let multiWordRolePrefixes = multiWordRoles.map { (role: $0, prefix: $0 + " ") }
+    /// A row, button or ordinary text line should not test every multi-word role.
+    private static let multiWordRolePrefixes: [String: [(role: String, prefix: String)]] = Dictionary(
+        grouping: multiWordRoles.map { (role: $0, prefix: $0 + " ") },
+        by: { String($0.role.prefix(while: { $0 != " " })) }
+    )
 
     private static func roleName(of rest: String) -> String {
-        for entry in multiWordRolePrefixes where rest == entry.role || rest.hasPrefix(entry.prefix) { return entry.role }
-        if textParts(rest) != nil { return "text" }
-        return String(rest.prefix(while: { $0 != " " }))
+        let firstWord = String(rest.prefix(while: { $0 != " " && $0 != "\t" }))
+        if let candidates = multiWordRolePrefixes[firstWord] {
+            for entry in candidates where rest == entry.role || rest.hasPrefix(entry.prefix) { return entry.role }
+        }
+        if firstWord == "static", rest == "static text" || rest.hasPrefix("static text ") { return "text" }
+        return firstWord
     }
 
     /// For text lines: the prefix kept as-is (`text ` or `static text `) and the text itself.
-    private static func textParts(_ rest: String) -> (head: String, payload: String)? {
+    private static func textParts(_ rest: String) -> (head: String, payload: Substring)? {
         // "text field ..." and "text area ..." are inputs, not text lines.
         if rest.hasPrefix("text field") || rest.hasPrefix("text area") || rest.hasPrefix("text entry area") { return nil }
         for head in ["static text ", "text "] where rest.hasPrefix(head) {
-            return (head, String(rest.dropFirst(head.count)))
+            return (head, rest.dropFirst(head.count))
         }
-        if rest == "static text" { return ("static text", "") }
-        if rest == "text" { return ("text", "") }
+        if rest == "static text" { return ("static text", rest[rest.endIndex...]) }
+        if rest == "text" { return ("text", rest[rest.endIndex...]) }
         return nil
     }
 
     /// Parenthesised trait groups, split on ", ". For example `(w:str, selected)` gives `w:str` and `selected`.
     private static func traitTokens(_ rest: String) -> [String] {
+        guard rest.utf8.contains(40) else { return [] }
         let pieces = rest.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "(" || $0 == ")" })
         var tokens: [String] = []
         for (offset, piece) in pieces.enumerated() where offset % 2 == 1 {
@@ -237,11 +368,18 @@ enum AXTreeCondenser {
 
     /// Removes containers that have no label, value, traits or actions, and re-indents what is under them.
     /// Re-indenting removes one tab per removed ancestor (or up to four spaces when a line has no tab).
-    private static func dropStructuralNoise(_ lines: [Line], unwrapSingleChild: Bool = false) -> [Line] {
+    private static func dropStructuralNoise(_ lines: [Line], unwrapSingleChild: Bool = false,
+                                            packedIndentation: Bool = false) -> [Line] {
         var result: [Line] = []
         result.reserveCapacity(lines.count)
         // Widths of removed containers that still enclose the current line.
         var removedWidths: [Int] = []
+        // Bare wrappers never need child-count metadata. Only named candidates can
+        // use the single-child rule; avoid building a whole graph when there are none.
+        let needsStructure = unwrapSingleChild && lines.contains {
+            $0.isTree && wrapperRoles.contains($0.role) && !isUnlabeledContainer($0)
+        }
+        let structure = needsStructure ? TreeStructure(lines) : nil
         for (position, original) in lines.enumerated() {
             var line = original
             guard line.isTree else {
@@ -251,9 +389,9 @@ enum AXTreeCondenser {
             let width = line.width
             while let last = removedWidths.last, last >= width { removedWidths.removeLast() }
             if !removedWidths.isEmpty {
-                line.indent = outdent(line.indent, levels: removedWidths.count)
+                line.indent = outdent(line.indent, levels: removedWidths.count, packed: packedIndentation)
             }
-            if isUnlabeledContainer(line) || (unwrapSingleChild && isSingleChildWrapper(lines, position)) {
+            if isUnlabeledContainer(line) || (unwrapSingleChild && isSingleChildWrapper(lines, position, structure: structure)) {
                 removedWidths.append(width)
             } else {
                 result.append(line)
@@ -269,20 +407,20 @@ enum AXTreeCondenser {
     private static let wrapperRoles: Set<String> = ["group", "generic", "section", "layout area"]
 
     /// A neutral group with exactly one child, no traits or actions, and no name or the child's own name.
-    private static func isSingleChildWrapper(_ lines: [Line], _ position: Int) -> Bool {
+    private static func isSingleChildWrapper(_ lines: [Line], _ position: Int, structure: TreeStructure?) -> Bool {
         let line = lines[position]
-        guard wrapperRoles.contains(line.role), !line.rest.contains("("), !line.rest.contains("Secondary Actions:"),
+        guard let structure, wrapperRoles.contains(line.role), !line.rest.contains("("), !line.rest.contains("Secondary Actions:"),
               position + 1 < lines.count, lines[position + 1].isTree, lines[position + 1].width > line.width else { return false }
-        let childWidth = lines[position + 1].width
-        let end = blockEnd(lines, from: position)
-        var children = 0
-        for k in (position + 1)..<end where lines[k].width <= childWidth { children += 1 }
-        guard children == 1 else { return false }
+        guard structure.childCounts[position] == 1 else { return false }
         let name = String(line.rest.dropFirst(line.role.count)).trimmingCharacters(in: .whitespaces)
-        return name.isEmpty || lines[position + 1].rest.contains(name)
+        return name.isEmpty || simpleName(lines[position + 1]) == name
     }
 
-    private static func outdent(_ indent: String, levels: Int) -> String {
+    private static func outdent(_ indent: String, levels: Int, packed: Bool) -> String {
+        if packed {
+            let width = max(0, indent.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) } - levels)
+            return String(repeating: "\t", count: width / 4) + String(repeating: " ", count: width % 4)
+        }
         var result = indent
         for _ in 0..<levels {
             if result.hasPrefix("\t") {
@@ -302,7 +440,7 @@ enum AXTreeCondenser {
         for line in lines {
             if line.isTree, let current = textParts(line.rest),
                let previous = result.last, previous.isTree, previous.indent == line.indent,
-               let before = textParts(previous.rest), before.payload == current.payload {
+               let before = textParts(previous.rest), before.payload == current.payload, !isProtectedLine(line) {
                 continue
             }
             result.append(line)
@@ -402,9 +540,11 @@ enum AXTreeCondenser {
     private static func isProtectedLine(_ line: Line) -> Bool {
         guard line.isTree else { return false }
         if actionableRoles.contains(line.role) { return true }
+        if line.role == "text", statusLikeText(line) { return true }
         if line.rest.contains("Secondary Actions:") { return true }
         if traitTokens(line.rest).contains(where: { token in
             token == "selected" || token == "focused" || token == "settable" || token == "checked" || token == "expanded"
+                || token == "collapsed" || token == "disabled"
                 || token == "w" || token.hasPrefix("w:")
         }) { return true }
         // A value (`= 40` or `Value: 40`) is state too, except in plain text.
@@ -420,7 +560,8 @@ enum AXTreeCondenser {
     private static func truncateText(_ lines: [Line], limit: Int) -> [Line] {
         let cap = max(0, limit)
         return lines.map { line in
-            guard line.isTree, let parts = textParts(line.rest), parts.payload.count > cap else { return line }
+            guard line.isTree, !isProtectedLine(line),
+                  let parts = textParts(line.rest), parts.payload.count > cap else { return line }
             var copy = line
             copy.rest = parts.head + String(parts.payload.prefix(cap)) + "…"
             return copy
@@ -439,12 +580,25 @@ enum AXTreeCondenser {
     private static func holdsStateOrAction(_ line: Line) -> Bool {
         guard line.isTree else { return false }
         if line.rest.contains("Secondary Actions:") { return true }
-        return traitTokens(line.rest).contains { $0 == "selected" || $0 == "focused" || $0 == "checked" || $0 == "settable" || $0 == "w" || $0.hasPrefix("w:") }
+        if line.role != "text", line.rest.contains(" = ") || line.rest.contains(" Value: ") { return true }
+        return traitTokens(line.rest).contains {
+            $0 == "selected" || $0 == "focused" || $0 == "checked" || $0 == "settable"
+                || $0 == "expanded" || $0 == "collapsed" || $0 == "disabled" || $0 == "w" || $0.hasPrefix("w:")
+        }
     }
 
     private static func dropHidden(_ lines: [Line]) -> [Line] {
+        // Most observations have neither hidden nodes nor bare decoration. Do not
+        // construct ancestry and scan every line's state just to return the same tree.
+        guard lines.contains(where: {
+            $0.isTree && (isHiddenMarked($0) || (decorationRoles.contains($0.role)
+                && $0.rest.trimmingCharacters(in: .whitespaces) == $0.role))
+        }) else { return lines }
         var result: [Line] = []
         result.reserveCapacity(lines.count)
+        let structure = TreeStructure(lines)
+        var stateCounts = Array(repeating: 0, count: lines.count + 1)
+        for i in lines.indices { stateCounts[i + 1] = stateCounts[i] + (holdsStateOrAction(lines[i]) ? 1 : 0) }
         var i = 0
         while i < lines.count {
             let line = lines[i]
@@ -453,8 +607,8 @@ enum AXTreeCondenser {
                 i += 1
                 continue
             }
-            let end = blockEnd(lines, from: i)
-            if isHiddenMarked(line), !lines[i..<end].contains(where: holdsStateOrAction) {
+            let end = structure.ends[i]
+            if isHiddenMarked(line), stateCounts[end] == stateCounts[i] {
                 i = end
                 continue
             }
@@ -492,7 +646,8 @@ enum AXTreeCondenser {
 
     private static func cutDescriptions(_ lines: [Line], limit: Int) -> [Line] {
         lines.map { line in
-            guard line.isTree, let range = descriptionPayload(line.rest), line.rest[range].count > limit else { return line }
+            guard line.isTree, line.rest.utf8.contains(58),
+                  let range = descriptionPayload(line.rest), line.rest[range].count > limit else { return line }
             var copy = line
             let cut = line.rest[range].prefix(limit)
             copy.rest = String(line.rest[..<range.lowerBound]) + cut + "…" + String(line.rest[range.upperBound...])
@@ -514,12 +669,19 @@ enum AXTreeCondenser {
 
     /// Removes a `Help:` or `Description:` that equals the previous sibling's of the same role, when the line keeps a name.
     private static func dropRepeatedProperties(_ lines: [Line]) -> [Line] {
-        var previous: [String: (role: String, help: String?, description: String?)] = [:]
+        guard lines.contains(where: {
+            $0.isTree && $0.rest.utf8.contains(58) && ($0.rest.contains("Help: ") || $0.rest.contains("Description: "))
+        }) else { return lines }
+        var previous: [Int: (role: String, help: String?, description: String?)] = [:]
         return lines.map { line in
             guard line.isTree else { return line }
-            let width = line.indent
+            let width = line.width
             // Forget deeper levels: a new row starts a new family.
-            for key in previous.keys where key.count > width.count { previous[key] = nil }
+            for key in previous.keys where key > width { previous[key] = nil }
+            guard line.rest.utf8.contains(58) else {
+                previous[width] = (line.role, nil, nil)
+                return line
+            }
             var copy = line
             var help: String?
             var description: String?
@@ -560,33 +722,33 @@ enum AXTreeCondenser {
     // MARK: - Rule 9: budget
 
     private static func applyBudget(_ lines: [Line], headerCount: Int, budget: Int) -> [Line] {
-        var total = headerCount
-        for line in lines { total += line.render().count + 1 }
+        let sizes = lines.map { $0.render().count + 1 }
+        let total = headerCount + sizes.reduce(0, +)
         guard total > budget else { return lines }
 
         let hardCap = budget + budget / 2
+        let structure = TreeStructure(lines)
         var used = headerCount
-        var kept: [Line] = []
-        var cut = 0
-        var lastIndent = ""
-        for line in lines {
-            let size = line.render().count + 1
-            let keep: Bool
-            if !line.isTree || used + size <= budget {
-                keep = true
-            } else {
-                keep = used + size <= hardCap && (isProtectedLine(line) || holdsStateOrAction(line))
+        var selected = Set<Int>()
+        for i in lines.indices {
+            var needed: [Int] = []
+            var cursor: Int? = i
+            while let candidate = cursor, !selected.contains(candidate) {
+                needed.append(candidate)
+                cursor = structure.parents[candidate]
             }
-            if keep {
-                used += size
-                kept.append(line)
-                lastIndent = line.indent
-            } else {
-                cut += 1
-            }
+            let size = needed.reduce(0) { $0 + sizes[$1] }
+            let protected = isProtectedLine(lines[i]) || holdsStateOrAction(lines[i])
+            guard !lines[i].isTree || used + size <= budget || (protected && used + size <= hardCap) else { continue }
+            used += size
+            selected.formUnion(needed)
         }
+        // Render in original order. A retained child always brings its real ancestry with it;
+        // it can never appear underneath the last unrelated group that happened to fit.
+        var kept = lines.indices.filter { selected.contains($0) }.map { lines[$0] }
+        let cut = lines.count - selected.count
         if cut > 0 {
-            kept.append(Line(raw: "\(lastIndent)…(\(cut) more lines cut to fit; use query to find a control)"))
+            kept.append(Line(raw: "…(\(cut) more lines cut to fit; use query to find a control)"))
         }
         return kept
     }

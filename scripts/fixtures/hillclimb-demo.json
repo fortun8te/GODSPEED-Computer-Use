@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "experiment": "synthetic-serialization-protocol-demo",
+  "identity": {
+    "suite_revision": "hillclimb-demo-v1",
+    "host": "local-python-fixture-only",
+    "model": "none",
+    "harness_revision": "sha256-recorded-by-runner"
+  },
+  "adapter": ["python3", "hillclimb-demo.py"],
+  "artifacts": ["hillclimb-demo.py"],
+  "baseline": {"encoding": "verbose"},
+  "parameters": {"encoding": ["verbose", "broken", "compact"]},
+  "train": [
+    {"id": "small", "input": {"nodes": 9, "label": "Save"}, "checks": ["target_retained", "states_retained"]},
+    {"id": "unicode", "input": {"nodes": 40, "label": "保存 🪄"}, "checks": ["target_retained", "states_retained"]}
+  ],
+  "holdout": [
+    {"id": "long", "input": {"nodes": 70, "label": "Later target"}, "checks": ["target_retained", "states_retained"]},
+    {"id": "other-label", "input": {"nodes": 23, "label": "Übernehmen"}, "checks": ["target_retained", "states_retained"]}
+  ],
+  "seeds": [17],
+  "repeats": 3,
+  "max_candidates": 3,
+  "max_rounds": 2,
+  "timeout_seconds": 5,
+  "max_total_seconds": 60,
+  "objective": {
+    "metric": "observation_bytes",
+    "minimum_improvement": 0.03,
+    "max_control_drift": 0,
+    "max_case_regression": 0,
+    "guardrails": {"agent_calls": 0, "helper_calls": 0}
+  }
+}

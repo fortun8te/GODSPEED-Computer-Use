@@ -27,14 +27,35 @@ public final class MCPRequestStream: @unchecked Sendable {
             return ["error": "The app agent is busy. Retry later."]
         }
         guard let rpcLine = envelope?["line"] as? String,
-              let rpc = try? JSONSerialization.jsonObject(with: Data(rpcLine.utf8)) as? [String: Any],
-              let id = rpc["id"]
-        else { return nil }
+              let response = busyReply(forRPCLine: rpcLine) else { return nil }
+        return ["response": response]
+    }
+
+    /// A correlated raw JSON-RPC refusal. Notifications do not receive replies.
+    public static func busyReply(forRPCLine line: String) -> String? {
+        guard let rpc = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let id = rpc["id"] else { return nil }
         let reply: [String: Any] = ["jsonrpc": "2.0", "id": id,
                                     "error": ["code": busyCode, "message": "Busy. Retry later."]]
         guard let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]),
               let text = String(data: data, encoding: .utf8) else { return nil }
-        return ["response": text]
+        return text
+    }
+
+    /// Intake for raw stdio readers. A full queue refuses only this line and
+    /// keeps the reader alive for subsequent requests and cancellation. `reply`
+    /// must share the worker's serialized output path.
+    @discardableResult
+    public func receiveRPCLine(_ line: String, reply: (String) -> Void) -> Bool {
+        switch intake(line, rpcLine: line) {
+        case .accepted:
+            return true
+        case .busy:
+            if let response = Self.busyReply(forRPCLine: line) { reply(response) }
+            return true
+        case .closed:
+            return false
+        }
     }
 
     /// JSON-RPC IDs are scoped to this connection. String and numeric IDs are distinct.

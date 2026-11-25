@@ -2,8 +2,9 @@ import Foundation
 
 /// Shrinks what GODSPEED sends back to the model:
 /// - every accessibility state text (items starting with "App=") goes through `AXTreeCondenser`
-///   (structural noise dropped, long runs of similar rows collapsed, long text cut), keeping every
-///   element index the model can act on. `OPEN_COMPUTER_USE_CONDENSE=0` turns it off.
+///   (structural noise dropped, long runs of similar rows collapsed, long text cut). Retained
+///   indexes stay unchanged; standard mode reports budget omissions. Compact native reads keep
+///   every distinct control. `OPEN_COMPUTER_USE_CONDENSE=0` turns standard condensation off.
 /// - a batch's final read can be replaced by `AXStateDiff` (only what changed since the previous read
 ///   of that app) when the change is small. `OPEN_COMPUTER_USE_BATCH_DIFF=0` turns it off.
 enum LeanOutput {
@@ -49,7 +50,7 @@ enum LeanOutput {
             switch mode {
             case .standard: return .text(AXTreeCondenser.condense(text))
             case .compact: return .text(AXTreeCondenser.compactObservation(text, preserving: indexes))
-            case .compactBatch: return .text(AXTreeCondenser.batchReply(text))
+            case .compactBatch: return .text(AXTreeCondenser.batchReply(text, preserving: indexes))
             }
         }
         return changed ? result.replacingContent(content) : result
@@ -89,11 +90,15 @@ enum LeanOutput {
     /// "more lines removed" count and the "Unchanged" footer. Secret values are redacted by SemanticChanges.
     static func semanticDiffReply(header: String, diff: String, before: String, after: String) -> String {
         // A short diff is already cheap to read; the summary line would only add tokens there.
-        guard diff.utf8.count > semanticSummaryMinDiffLength,
-              let summary = SemanticChanges.summary(before: before, after: after) else {
+        guard diff.utf8.count > semanticSummaryMinDiffLength else {
             return header + "\n" + diff
         }
-        let eventCount = SemanticChanges.events(before: before, after: after, limit: 4).count
+        // Parse and interpret each tree once. A fourth event is enough to decide whether
+        // every change fits the three-event summary; it need not trigger a second full pass.
+        let events = SemanticChanges.events(before: before, after: after, limit: 4)
+        guard !events.isEmpty else { return header + "\n" + diff }
+        let summary = events.prefix(3).joined(separator: "; ")
+        let eventCount = events.count
         let full = header + "\nChanges: " + summary + "\n" + diff
         guard (1...3).contains(eventCount), full.utf8.count > semanticTrimMinLength else { return full }
 

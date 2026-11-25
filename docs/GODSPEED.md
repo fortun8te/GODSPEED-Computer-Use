@@ -98,9 +98,21 @@ Chrome can follow its own redirects during navigation. Godspeed checks the resul
 
 ## Settings
 
-Two places, one rule: **an environment variable that is set always wins**. Otherwise the value from `~/.godspeed/settings.json` is used, and otherwise the default. The file is checked for changes as requests read settings. Each app-agent call uses its own options. Cursor and strict background settings apply on the next call. PURE's Settings > GODSPEED writes the file.
+Two places, one rule: **an environment variable that is set always wins**. Otherwise the value from `~/.godspeed/settings.json` is used, and otherwise the default. The file is checked for changes as requests read settings, at most once per half second. Each app-agent call uses its own options. Cursor, model-helper and background preferences apply to subsequent calls. The last valid settings stay active during a partial or malformed manual edit; removing the file restores defaults.
 
 The app agent snapshots its launch environment. Each request overlays the caller's `OPEN_COMPUTER_USE_*` options. Image, virtual display and browser options that the caller omits use their defaults or settings files. Socket selection, admission limits, the idle timer, package discovery and the cursor renderer style and namespace belong to the host process. The proxy keeps the client identity and trajectory settings for the connection.
+
+### Terminal settings
+
+Run `godspeed` or `godspeed settings` after installing a build with the new launcher. The home screen opens focused pages for **Cursor & appearance**, **Local compute**, **Background & observation**, **Privacy & diagnostics**, and **Presets**. Choose a number to open a page or edit a setting. Each setting explains its effect and supports resetting to the default. Changes remain a draft until saved; quitting with unsaved changes offers save, discard or return to editing.
+
+The accent picker offers Auto, Graphite, Blue, Violet, Pink, Coral, Amber, Mint, Teal and Sky, plus custom `#RRGGBB`. Colour swatches are optional; `NO_COLOR` and plain terminals remain usable. The cursor can have a nickname, a hidden label, reduced motion, shorter idle visibility, or quieter action feedback. It stays within the target window's stacking order unless floating is explicitly enabled.
+
+Presets show their exact changes before staging them. **Model-free** disables optional model helpers and enables compact local execution. **Quiet** keeps apps in the background and reduces cursor feedback. **Balanced** enables normal motion and compact observations. Quiet and Balanced preserve your model-helper and accent choices.
+
+Use `godspeed settings --show` for a read-only summary with no editing controls. If the launcher is not on PATH, use `~/.local/bin/godspeed`. For an app installed elsewhere, set `GODSPEED_APP=/path/to/GODSPEED.app`; the installer prints the matching command.
+
+The menu writes the existing settings file only on save, preserves unrelated keys, uses private atomic replacement, and refuses malformed or externally changed files. Environment overrides take precedence and are marked for the current process; another MCP client's environment can differ. Reconnect clients after changing connection-level trajectory logging or browser availability. The standard MCP launcher always enforces background-only delivery with focus borrowing and real-pointer fallbacks disabled. The menu does not grant permissions, install models or enable privileged Locked Use.
 
 ### `~/.godspeed/settings.json`
 
@@ -108,14 +120,36 @@ The app agent snapshots its launch environment. Each request overlays the caller
 |---|---|---|
 | `cursor_visible` | `OPEN_COMPUTER_USE_VISUAL_CURSOR` | `true` |
 | `cursor_lens` | `OPEN_COMPUTER_USE_CURSOR_LENS` | `false`. Optional local capture under the cursor window. |
-| `cursor_color` | `OPEN_COMPUTER_USE_CURSOR_COLOR` (`#RRGGBB`; `"default"` = original grey) | default grey |
+| `cursor_color` | `OPEN_COMPUTER_USE_CURSOR_COLOR` (`#RRGGBB`, `auto`, or `default` for Graphite) | automatic per-client tint |
 | `cursor_speed` | `OPEN_COMPUTER_USE_CURSOR_SPEED`: `calm` (2), `normal` (4), `fast` (8), `instant`, or a number | `normal` (4) |
+| `cursor_motion` | `OPEN_COMPUTER_USE_CURSOR_MOTION`: `system` or `reduced` | `system`, respects macOS Reduce Motion |
+| `cursor_feedback` | `OPEN_COMPUTER_USE_CURSOR_FEEDBACK` | `true`, click and action indicators |
+| `cursor_label` | `OPEN_COMPUTER_USE_CURSOR_LABEL` | `true` |
+| `cursor_name` | `OPEN_COMPUTER_USE_CURSOR_NAME` | automatic client name |
+| `cursor_idle_hide_seconds` | `OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS` | 6; menu accepts 0.2–60 seconds |
+| `cursor_float` | `OPEN_COMPUTER_USE_CURSOR_FLOAT` | `false` |
+| `model_helpers` | `OPEN_COMPUTER_USE_MODEL_HELPERS` | `true`; master permission for optional helpers, not a request to run them |
+| `handoff_helper` | `OPEN_COMPUTER_USE_HANDOFF_HELPER` | `true`; permits the local chooser after deterministic routes |
 | `screenshots_by_default` | `OPEN_COMPUTER_USE_DEFAULT_SCREENSHOT` | `false` |
 | `decision_hints` | `OPEN_COMPUTER_USE_REFEREE_URL` = `helper_url` | `false` |
 | `find_on_screen` | `OPEN_COMPUTER_USE_VISION_URL` = `helper_url` | `false` |
-| `helper_url` | the URL used by the two keys above | `http://127.0.0.1:8765` |
+| `helper_url` | shared loopback endpoint for enabled hints/vision and the handoff chooser | `http://127.0.0.1:8765` |
+| `gsd1_url` | `OPEN_COMPUTER_USE_GSD1_URL` | unset |
 | `recipes` | `OPEN_COMPUTER_USE_RECIPES` | `true` |
 | `browser` | `OPEN_COMPUTER_USE_BROWSER` | on if `obu` is found, else off |
+| `background_only` | `OPEN_COMPUTER_USE_BACKGROUND_ONLY` | `false` in the app; standard MCP launcher forces `true` |
+| `strict_background` | `OPEN_COMPUTER_USE_STRICT_BACKGROUND` | `false`; refuses native routes that need keyboard/focus fallback |
+| `compact_reads` | `OPEN_COMPUTER_USE_COMPACT_READS` | `false` |
+| `batch_diff` | `OPEN_COMPUTER_USE_BATCH_DIFF` | `true` |
+| `semantic_replies` | `OPEN_COMPUTER_USE_SEMANTIC_REPLIES` | `true` |
+| `learning_log` | `OPEN_COMPUTER_USE_LEARNING_LOG` | `true`; local scrubbed learning records |
+| `learning_log_images` | `OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES` | `false`; opt-in local model image records |
+| `trajectory_log` | `OPEN_COMPUTER_USE_TRAJECTORY_LOG` | `true`; reconnect clients after changing |
+| `debug_timing` | `OPEN_COMPUTER_USE_DEBUG_TIMING` | `false` |
+
+`model_helpers: false` prevents helper inference, model screenshots, warmups, health checks and auto-start, including the implicit localhost handoff chooser. Exact actions, local OCR, recipes and deterministic postcondition checks still work. It controls Godspeed's optional helpers; it does not change the model used by Claude Code, Codex or another host agent. A request that cannot be resolved deterministically returns evidence for the caller instead of silently enabling a helper.
+
+A custom `helper_url` also selects the handoff service when hints are off. An explicit client referee URL takes precedence over this saved endpoint unless the client supplies its own `OPEN_COMPUTER_USE_HANDOFF_URL`. Automatic helper startup is limited to the managed HTTP endpoints on `127.0.0.1` or `localhost` (8765 for decision/vision, 18765 for GSD1); custom endpoints must already be running.
 
 ### Environment variables
 
@@ -136,7 +170,7 @@ Behaviour switches (`0`/`off` turns off, unless noted):
 | `OPEN_COMPUTER_USE_FOCUS_BORROW` | off | Allow focus borrowing when background-only and strict modes are off. |
 | `OPEN_COMPUTER_USE_STRICT_BACKGROUND` | off | Require strict background delivery (settings key `strict_background`). |
 | `OPEN_COMPUTER_USE_LEARNING_LOG` | on | Local training data in `~/.godspeed/learning` (2 GB cap, oldest days deleted first). Secrets, password fields and the clipboard are never written. `0` turns it off. |
-| `OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES` | on | Keep the window crops already sent to the local vision model. Never saved while a password field is visible. |
+| `OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES` | off | Opt in to keeping window crops already sent to the local vision model. Never saved while a password field is visible. |
 | `OPEN_COMPUTER_USE_SEMANTIC_REPLIES` | on | Add a `Changes:` line to longer change-only replies. `0` restores the previous text exactly. |
 | `OPEN_COMPUTER_USE_AGENT_EVENTS` | on | Add popup, download and closed-tab lines from the Chrome extension to browser replies. |
 | `OPEN_COMPUTER_USE_RECIPES` | on | Saved recipes (settings key `recipes`). |
@@ -150,18 +184,23 @@ The MCP proxy uses known client names from initialization. Overlapping cursors w
 | Variable | Default | Meaning |
 |---|---|---|
 | `OPEN_COMPUTER_USE_VISUAL_CURSOR` | on | Show the cursor (settings key `cursor_visible`). |
-| `OPEN_COMPUTER_USE_CURSOR_COLOR` | original grey | `#RRGGBB` (settings key `cursor_color`). |
+| `OPEN_COMPUTER_USE_CURSOR_COLOR` | auto | Stable per-client tint; `default` selects Graphite, `#RRGGBB` selects a fixed accent. |
 | `OPEN_COMPUTER_USE_CURSOR_SPEED` | 4 | 2 calm, 4 normal, 8 fast, `instant` (settings key `cursor_speed`). |
+| `OPEN_COMPUTER_USE_CURSOR_MOTION` | system | Smooth motion respecting macOS Reduce Motion; `reduced` disables travel and lean. |
+| `OPEN_COMPUTER_USE_CURSOR_FEEDBACK` | on | Draw click pulses and action indicators without changing input delivery. |
+| `OPEN_COMPUTER_USE_CURSOR_LABEL` | on | Show the agent's name beside its cursor. |
 | `OPEN_COMPUTER_USE_CURSOR_FLOAT` | off | Draw above every window. |
-| `OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS` | 3 | Seconds before the idle cursor fades. |
+| `OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS` | 6 | Seconds before the idle cursor fades. |
 | `OPEN_COMPUTER_USE_CURSOR_ASYNC` | on | Cursor work is queued and played by a display-synced frame clock; actions never wait for it. Env only. |
 
 Helpers (referee and vision):
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `OPEN_COMPUTER_USE_MODEL_HELPERS` | on | Master switch for optional model inference, warmups and auto-start. `0` keeps execution deterministic. |
 | `OPEN_COMPUTER_USE_REFEREE_URL` | unset (off) | Helper service base URL, e.g. `http://127.0.0.1:8765`. |
-| `OPEN_COMPUTER_USE_HANDOFF_HELPER` | on with a configured referee | Set to `0` to skip local chooser calls during handoff. |
+| `OPEN_COMPUTER_USE_HANDOFF_HELPER` | on | Local chooser at the configured loopback referee or `127.0.0.1:8765`. Set `0` to disable; the master switch also applies. |
+| `OPEN_COMPUTER_USE_HANDOFF_URL` | unset | Separate loopback chooser endpoint, including when hints are off. Invalid explicit endpoints disable scoring without fallback. |
 | `OPEN_COMPUTER_USE_REFEREE_DONE_HINTS` | off | Optional model hints. `done_when` controls verified completion. |
 | `OPEN_COMPUTER_USE_REFEREE_TIMEOUT_MS` | 1500 | Longest wait for a verdict. |
 | `OPEN_COMPUTER_USE_REFEREE_MIN_CONFIDENCE` | 0.6 | Below this, no hint. |
@@ -172,7 +211,7 @@ Helpers (referee and vision):
 
 The local checker keeps the window title, focus and the lines most relevant to the goal. When it ranks actions, it also gets the candidate rows and nearby labels. The existing character limit still applies.
 
-To enable vision, set `find_on_screen` to `true` in `~/.godspeed/settings.json`. Godspeed looks for a named accessibility control first. If none matches, it tries Apple Vision text recognition, then asks the local helper for a point. It checks the window, the current pixels and the accessibility hit before clicking. Risky or ambiguous visual targets require another route.
+Godspeed looks for a named accessibility control first. A supported named-control miss can use Apple Vision text recognition locally even when model helpers are disabled. Set `find_on_screen` to `true` to additionally permit the optional local vision model after OCR misses. It checks the window, the current pixels and the accessibility hit before clicking. Risky or ambiguous visual targets require another route.
 
 With vision enabled, a thin native window view can include a window-only picture up to 1280 pixels on its long side. This needs a loopback helper that advertises picture support. See [the local helper experiment](../experiments/LocalHelper/README.md).
 
@@ -215,6 +254,38 @@ export OBU_RELAY_AUTHORITY_KEY="$("<GODSPEED app>/Contents/MacOS/OpenComputerUse
 The command creates the Keychain key on first use and prints the public key as unpadded base64url. The private key is never printed. Without the provisioned key, the browser tool reports "Chrome helper needs the Godspeed relay key; run the installer." Grants last at most 15 minutes and the helper renews them on its own.
 
 Grants are off by default, so today's Chrome helper keeps working unchanged. Turn them on only after installing the authenticated Chrome host with the key above: set `"relay_grant": true` in `~/.godspeed/settings.json` (or `OPEN_COMPUTER_USE_RELAY_GRANT=1`). With grants off, Godspeed never reads the Keychain key and sends no grant or renewal.
+
+## Semantic visual search and canvas interactions
+
+For an unlabeled icon or a canvas object, first read the app to obtain its Window ID. Then explicitly request visual search on that window:
+
+```json
+{"app":"Example","window_id":42,"include_ax":true,"include_screenshot":true,"visual_queries":["gear icon in the upper toolbar","blue circle on the canvas"],"visual_region":[0,0,1,1]}
+```
+
+The search first tries fast then accurate local OCR for exact unique text, without invoking the helper. Ambiguous text requires a narrower region or inspection. On an OCR miss, the optional loopback vision helper can return up to two **unverified** point proposals in the delivered screenshot's pixel coordinates. Use a single normalized top-left region [x,y,width,height] to limit search to a panel or canvas. Inspect the returned image before choosing an action; a model point is not evidence that an object exists or is safe to click. A two-point search can propose the start and end of a drag. No input is sent by visual search. It is off unless requested and the helper is configured.
+
+For a confirmed point, pass its screenshot token, the same window ID and pixel coordinates to the existing click or drag tool:
+
+```json
+{"app":"Example","window_id":42,"x":120,"y":84,"visual_snapshot":"<token returned by visual search>"}
+```
+
+The optional token checks both the cached screenshot and a fresh capture before dispatch. Changed pixels, a replaced read, a changed encoding configuration, or an unavailable capture cause a refusal; reread instead of retrying stale coordinates. Animated windows may require a new observation. The token does not authorize an action or prove its result. Normal accessibility actions and unguarded pixel operations are unchanged. Visual search suppresses helper input when secure-field evidence is present, but this is not a guarantee that every sensitive view can be recognized.
+
+Native control lookup misses also include a bounded ranked shortlist of observed names and indices (including common UI synonyms). These are recovery suggestions, not automatic clicks.
+
+### Deterministic typed form handoff
+
+Supply an exact `Click <label>` goal, named `values` and an independent `done_when` condition. For example:
+
+```json
+{"app":"Example","goal":"Click Save","values":{"Name":"Ann","Email":"ann@example.test"},"done_when":{"text":"Saved"}}
+```
+
+Godspeed preflights all named writable fields and the unique non-risky click control on the same observed window. It fills empty fields or fields whose current value matches explicit `expected_values`, checks readback, and clicks only after the fields match. It never delegates a failed typed-form precondition to the ranker. A missing field, changed value or different window stops the workflow. Choose an independent completion condition that establishes the intended final result, not just field values already satisfied before clicking. Other handoffs continue to use exact rules, verified recipes and the existing local ranker. Ranked field writes may automatically fill only a uniquely named empty field; approximate or populated destinations require caller review. Repeated returns to previously observed states can stop an otherwise cycling handoff without another model judgment.
+
+Use GSD1 for its existing typed advisory calls; the Action, Read and Recover checkpoints are not promoted to autonomous runtime routing without matched validation.
 
 ## Private clipboard
 
@@ -337,6 +408,8 @@ Use browser `close_tab` with the explicit `tab_id` returned by `open_tab`. Godsp
 
 ## Parallel browser work
 
+With the [Godspeed workspace extension](INSTALL.md#godspeed-browser-workspace), concurrent sessions share one purple **Godspeed** group in each normal Chrome window. The group settles at the far left after pinned tabs and is collapsed by default while inactive. Manual expansion is respected; Godspeed never switches to a different user tab merely to collapse the group. Pinned tabs stay pinned. Only explicit creation or a successful claim grants tab ownership; a group title, membership or popup opener does not. Retained results stay in the workspace without becoming another session's tabs.
+
 While the Mac is unlocked, up to four different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. An explicit `wait_for` of 1–3 seconds can also share admission. Each client has its own tab state and can have one read in flight. Native actions, mixed batches, and Locked Use recovery get exclusive access. Browser writes also run one at a time by default. Exclusive requests run in arrival order. A queued writer normally gets the next turn. When a reader has waited through two exclusive admissions, the oldest eligible reader gets a turn. One client cannot take multiple read slots. Set `OPEN_COMPUTER_USE_PARALLEL_READS` to 1, 2, 3, or 4 in the shared app agent environment to compare reader limits. The default is 3.
 
 If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.
@@ -347,7 +420,7 @@ The app agent accepts up to 32 connections and queues up to 32 admissions. Each 
 
 Set `OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES=1` in the app agent's launch environment to allow two or more clients to scroll or fill a named field in different tabs. Each call must name its tab ID. The current helper must have opened that tab. The same tab and the same client still run one write at a time.
 
-Local model calls release desktop admission while they wait for an answer. If another request takes admission in the meantime, Godspeed stops the interrupted workflow and asks for a fresh look. Calls skip the model during a focus borrow or Locked Use lease. The shared app agent uses an already-running model helper.
+Local model calls release desktop admission while they wait for an answer. If a potentially state-changing request takes admission in the meantime, Godspeed stops the interrupted workflow and asks for a fresh look. Pure browser reads do not invalidate that observation; writes and peeks that create temporary tabs still do. Calls skip the model during a focus borrow or Locked Use lease. The shared app agent uses an already-running model helper.
 
 ## Verified scroll chunks
 
@@ -377,13 +450,13 @@ Use `python3 scripts/godspeed-trace-summary.py` for aggregate timings and helper
 
 - macOS only. The app is built for the native arch. `obu` is built for arm64.
 - Keep steps that share input or depend on each other's output in one ordered batch.
-- The default cursor stays grey when agents overlap. Set a hex colour for a fixed custom tint, or set `OPEN_COMPUTER_USE_CURSOR_COLOR=auto` to opt into stable per-client colours.
+- The default cursor uses a stable per-client tint. Choose Graphite for the original grey or select a fixed accent in the terminal menu.
 - Background delivery depends on the app. Some dialogs, sheets and key chords require foreground input.
 - A batch is at most 40 steps.
-- The referee and vision are hints and fallbacks, off by default. Vision has been checked on one synthetic image, not on real apps.
+- Referee hints and model vision are off by default; the handoff chooser permits the default local helper unless disabled. Use Model-free to disable all optional model routes. Model quality still needs matched live evaluation.
 - The browser tool needs Chrome, the Open Browser Use extension, and the one-time setup step. It cannot use other browsers.
 - Model results are not measured yet. The fixed task set (steps, seconds, finish rate against Codex native) has not been run.
-- Apps with no usable accessibility tree can be clicked only by vision. That needs `find_on_screen` on and the helper service running.
+- Apps with limited accessibility can sometimes use local OCR or explicit screenshot coordinates. Arbitrary icon/canvas recognition still needs optional vision and verification; it is not guaranteed to succeed.
 
 See [training fixtures](training-fixtures.md) for reviewed vision annotations and verified decision labels.
 

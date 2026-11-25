@@ -53,6 +53,40 @@ final class ReadinessPollTests: XCTestCase {
         XCTAssertEqual(reads, 1)
     }
 
+    func testEnclosingDeadlineStopsPollingWithoutExtendingTheWorkflow() {
+        var now: TimeInterval = 100
+        var reads = 0
+        let ready: Bool? = BrowserCallBudget.withDeadline(100.1) {
+            ReadinessPoll.first(timeout: 10, interval: 0.05, now: { now }, sleep: { now += $0 }) {
+                reads += 1
+                return nil
+            }
+        }
+        XCTAssertNil(ready)
+        XCTAssertEqual(now, 100.1, accuracy: 0.0001)
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testExpiredEnclosingDeadlineDoesNotRead() {
+        let ready: Bool? = BrowserCallBudget.withDeadline(100) {
+            ReadinessPoll.first(timeout: 10, now: { 100 }, read: {
+                XCTFail("Expired workflow must not begin another read")
+                return true
+            })
+        }
+        XCTAssertNil(ready)
+    }
+
+    func testInvalidPollingIntervalsCannotBusyLoopOrWaitForever() {
+        for interval in [0.0, -1, Double.nan, Double.infinity] {
+            let ready: Bool? = ReadinessPoll.first(timeout: 1, interval: interval, read: {
+                XCTFail("Invalid polling interval must not start work")
+                return nil
+            })
+            XCTAssertNil(ready)
+        }
+    }
+
     func testLazyWebAreaReadsFullTreeOnceAfterMultipleProbes() {
         var probes = 0
         var renders = 0

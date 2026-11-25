@@ -91,7 +91,7 @@ enum FocusBorrow {
 
     /// Whether the app of `pid` is currently borrowed (so input may use the normal frontmost paths).
     static func isBorrowed(pid: pid_t) -> Bool {
-        !backgroundOnlyMode() && shared.isBorrowed(pid: pid)
+        !backgroundOnlyMode() && shared.isActiveBorrow(pid: pid)
     }
 
     /// Runs `work` with `pid` in front and gives focus back afterwards, also when `work` throws.
@@ -118,19 +118,22 @@ final class FocusBorrowSession {
     private let enabled: Bool
     private let backgroundOnly: () -> Bool
     private let secondsSinceUserInput: () -> TimeInterval
+    private let clock: () -> TimeInterval
     private var fellBackToBackground = false
     /// When the first borrow of this session started. The user's own keys go to the borrowed app while it is
     /// in front, so a session gives focus back after `maxAge` and later steps run in the background.
-    private var startedAt: Date?
+    private var startedAt: TimeInterval?
     static let maxAge: TimeInterval = 6
 
     init(controller: FocusBorrowController = FocusBorrow.shared, enabled: Bool = FocusBorrow.isEnabled,
          backgroundOnly: @escaping () -> Bool = { backgroundOnlyMode() },
-         secondsSinceUserInput: @escaping () -> TimeInterval = FocusBorrowController.secondsSinceUserInput) {
+         secondsSinceUserInput: @escaping () -> TimeInterval = FocusBorrowController.secondsSinceUserInput,
+         clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.controller = controller
         self.enabled = enabled
         self.backgroundOnly = backgroundOnly
         self.secondsSinceUserInput = secondsSinceUserInput
+        self.clock = clock
     }
 
     /// Brings `pid` forward and keeps it there until `close()`. Returns false when the app could not be
@@ -138,17 +141,26 @@ final class FocusBorrowSession {
     @discardableResult
     func ensure(pid: pid_t) -> Bool {
         guard enabled, !backgroundOnly(), !fellBackToBackground else { return false }
-        if let startedAt, Date().timeIntervalSince(startedAt) > Self.maxAge
-            || (isActive && secondsSinceUserInput() < Date().timeIntervalSince(startedAt)) {
+        if RequestCancellation.requested || (BrowserCallBudget.activeRemaining.map { !($0 > 0) } ?? false) {
+            fellBackToBackground = true
+            close()
+            return false
+        }
+        if let startedAt, clock() - startedAt >= Self.maxAge
+            || (isActive && (secondsSinceUserInput() < clock() - startedAt || !controller.ownsForeground)) {
             // Too long, or the user came back mid-borrow: hand focus back now and run the rest in the background.
             fellBackToBackground = true
             close()
             return false
         }
         if let existing = leases.last(where: { $0.pid == pid }) {
-            return existing.activated
+            guard existing.activated else { return false }
+            if controller.isActiveBorrow(pid: pid) { return true }
+            // A session can visit A, then B, then A again. An old A lease is
+            // not evidence that A is still frontmost; reacquire it while we
+            // still own B instead of routing keys as if A already had focus.
         }
-        if startedAt == nil { startedAt = Date() }
+        if startedAt == nil { startedAt = clock() }
         let lease = controller.acquire(pid: pid)
         leases.append(lease)
         return lease.activated
@@ -197,20 +209,40 @@ final class FocusBorrowController: @unchecked Sendable {
 
     /// Opens a borrow of `pid`: the first borrow records the app in front, then `pid` is brought forward.
     func acquire(pid: pid_t) -> Lease {
+        // Activation may cross to the main queue. Capture request ownership
+        // here; the task-local cancellation and thread-local deadline do not
+        // automatically follow that dispatch.
+        let cancellation = RequestCancellation.current
+        let deadline = BrowserCallBudget.activeDeadline
+        let requestIsActive = {
+            cancellation?.isCancelled != true
+                && (deadline.map { $0 > ProcessInfo.processInfo.systemUptime } ?? true)
+        }
+        guard requestIsActive() else {
+            let lease = Lease(pid: pid, activated: false)
+            lease.released = true
+            return lease
+        }
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        let initialFront = activator.frontmostPID()
         let needsActivation: Bool = lock.withLock {
             if activePIDs.isEmpty {
-                let front = activator.frontmostPID()
+                let front = initialFront
                 restorePID = (front == nil || front == pid || front == ownPID) ? nil : front
             }
             activePIDs.append(pid)
-            return activator.frontmostPID() != pid
+            return initialFront != pid
         }
         // Not in the middle of a word: wait for a short pause in the user's typing before taking focus. If the
         // user is still typing when the wait ends, focus is not taken at all; the steps then run in the background.
         var activated = true
         if needsActivation {
-            activated = activator.waitForTypingPause() && activator.activate(pid: pid)
+            // The pause check may yield. A user switching apps in that interval owns the new
+            // foreground; do not activate over it using the stale admission observation.
+            activated = activator.waitForTypingPause()
+                && activator.frontmostPID() == initialFront
+                && requestIsActive()
+                && activator.activate(pid: pid, requestIsActive: requestIsActive)
         }
         let lease = Lease(pid: pid, activated: activated)
         if !activated { release(lease) }
@@ -241,11 +273,13 @@ final class FocusBorrowController: @unchecked Sendable {
         case .none:
             break
         case .handOver(let pid):
-            if activator.isAlive(pid: pid) { _ = activator.activate(pid: pid) }
+            if activator.isAlive(pid: pid), activator.waitForTypingPause(),
+               activator.frontmostPID() == lease.pid { _ = activator.activate(pid: pid) }
         case .restore(let previous):
             // Restore only if this app is still the one in front (otherwise the user moved on by themselves), and
             // only once the user has paused: taking focus mid-sentence would send their keys to the other app.
-            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid, awaitTypingPause() {
+            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid, awaitTypingPause(),
+               activator.frontmostPID() == lease.pid {
                 _ = activator.activate(pid: previous)
             }
         }
@@ -255,16 +289,26 @@ final class FocusBorrowController: @unchecked Sendable {
 
     /// Polls for a typing pause for up to `timeout` seconds. False when the user is still typing at the end.
     private func awaitTypingPause(timeout: TimeInterval = 1.5) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         repeat {
             if activator.waitForTypingPause() { return true }
             Thread.sleep(forTimeInterval: 0.05)
-        } while Date() < deadline
+        } while ProcessInfo.processInfo.systemUptime < deadline
         return activator.waitForTypingPause()
     }
 
     func isBorrowed(pid: pid_t) -> Bool {
         lock.withLock { activePIDs.contains(pid) }
+    }
+
+    /// A retained lease alone does not prove the app is currently in front.
+    func isActiveBorrow(pid: pid_t) -> Bool {
+        isBorrowed(pid: pid) && activator.frontmostPID() == pid
+    }
+
+    var ownsForeground: Bool {
+        guard let last = lock.withLock({ activePIDs.last }) else { return false }
+        return activator.frontmostPID() == last
     }
 
     /// The app that focus will be given back to once the open borrows end (nil when none).
@@ -284,6 +328,9 @@ protocol FocusActivating: AnyObject {
     func frontmostPID() -> pid_t?
     /// Brings `pid` to the front and waits (capped at about one second) until it is frontmost.
     func activate(pid: pid_t) -> Bool
+    /// An acquisition also carries its originating request through main-queue
+    /// delays. Restoration uses the unconditional overload because it is cleanup.
+    func activate(pid: pid_t, requestIsActive: @escaping () -> Bool) -> Bool
     /// Whether the process is still running.
     func isAlive(pid: pid_t) -> Bool
     /// Blocks briefly while the user is typing, so focus is not taken in the middle of a word. Returns false
@@ -294,6 +341,9 @@ protocol FocusActivating: AnyObject {
 }
 
 extension FocusActivating {
+    func activate(pid: pid_t, requestIsActive: @escaping () -> Bool) -> Bool {
+        requestIsActive() && activate(pid: pid)
+    }
     func waitForTypingPause() -> Bool { true }
     func restoreVisibility(pid: pid_t) {}
 }
@@ -314,12 +364,15 @@ struct UnhiddenAppLedger {
     }
 
     /// Ends the record for `pid`. True when the app should be hidden again: this process unhid it and the user did not hide it since.
-    mutating func takeRehideNeeded(pid: pid_t) -> Bool {
+    mutating func takeRehideNeeded(pid: pid_t, frontmostPID: pid_t? = nil) -> Bool {
         guard unhidden.remove(pid) != nil else {
             hiddenByUser.remove(pid)
             return false
         }
-        return hiddenByUser.remove(pid) == nil
+        let wasHiddenByUser = hiddenByUser.remove(pid) != nil
+        // If restoration was skipped because the user is working in this app, re-hiding it
+        // would take away that same foreground indirectly. End the ledger entry either way.
+        return !wasHiddenByUser && frontmostPID != pid
     }
 }
 
@@ -327,6 +380,15 @@ struct UnhiddenAppLedger {
 /// is retried once. If it still fails, the caller is told the input went out, so the step is not sent again (a repeated
 /// click would click twice).
 enum SyntheticFocusTeardown {
+    /// A real user activation supersedes our temporary synthetic state. This
+    /// check belongs inside each teardown attempt, including a retry after an
+    /// earlier teardown failed, and does not depend on a live request lease.
+    static func endIfStillBackground(targetPID: pid_t, foregroundPID: () throws -> pid_t,
+                                    end: () throws -> Void) throws {
+        guard try foregroundPID() != targetPID else { return }
+        try end()
+    }
+
     static func endAfterDelivery(_ end: () throws -> Void) throws {
         do {
             try end()
@@ -358,8 +420,12 @@ final class WorkspaceFocusActivator: FocusActivating {
 
     private var hideObserver: NSObjectProtocol?
 
+    deinit {
+        if let hideObserver { NSWorkspace.shared.notificationCenter.removeObserver(hideObserver) }
+    }
+
     func frontmostPID() -> pid_t? {
-        NSWorkspace.shared.frontmostApplication?.processIdentifier
+        try? ForegroundApplication.pid()
     }
 
     func isAlive(pid: pid_t) -> Bool {
@@ -377,42 +443,62 @@ final class WorkspaceFocusActivator: FocusActivating {
     }
 
     func restoreVisibility(pid: pid_t) {
-        guard unhiddenLock.withLock({ unhiddenLedger.takeRehideNeeded(pid: pid) }),
+        guard unhiddenLock.withLock({ unhiddenLedger.takeRehideNeeded(pid: pid, frontmostPID: frontmostPID()) }),
               let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
-        Self.onMain { app.hide() }
+        Self.onMain {
+            if let front = self.frontmostPID(), front != pid { app.hide() }
+        }
     }
 
     func activate(pid: pid_t) -> Bool {
-        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return false }
+        activate(pid: pid, requestIsActive: { true })
+    }
+
+    func activate(pid: pid_t, requestIsActive: @escaping () -> Bool) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+              let previousForeground = frontmostPID() else { return false }
+        let idleNeeded = FocusBorrowController.userIdleNeeded
+        let userIsIdle = { FocusBorrowController.secondsSinceUserInput() >= idleNeeded }
+        var requested = false
         Self.onMain {
-            if app.isHidden {
-                self.unhiddenLock.withLock { self.unhiddenLedger.recordUnhide(pid: pid) }
-                app.unhide()
-            }
-            app.activate(options: [.activateIgnoringOtherApps])
+            requested = Self.activateIfUnchanged(expectedForeground: previousForeground,
+                foreground: { self.frontmostPID() }, userIsIdle: userIsIdle, requestIsActive: requestIsActive,
+                unhide: {
+                    if app.isHidden {
+                        self.unhiddenLock.withLock { self.unhiddenLedger.recordUnhide(pid: pid) }
+                        app.unhide()
+                    }
+                }, activate: { app.activate(options: [.activateIgnoringOtherApps]) })
         }
-        if waitForFront(pid: pid, timeout: 0.4) { return true }
-        if let bundleURL = app.bundleURL {
-            // The system can refuse a background app's own activate; LaunchServices (like `open -a`) can not be refused.
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            configuration.createsNewApplicationInstance = false
-            let group = DispatchGroup()
-            group.enter()
-            NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { _, _ in group.leave() }
-            _ = group.wait(timeout: .now() + 1.5)
+        guard requested else { return false }
+        // One bounded request. A forced asynchronous LaunchServices retry could
+        // activate much later, after the user returned or this request ended.
+        return waitForFront(pid: pid, timeout: Self.waitCap) {
+            guard requestIsActive(), userIsIdle(), let front = self.frontmostPID() else { return false }
+            return front == pid || front == previousForeground
         }
-        return waitForFront(pid: pid, timeout: Self.waitCap)
+    }
+
+    static func activateIfUnchanged(expectedForeground: pid_t, foreground: () -> pid_t?,
+                                    userIsIdle: () -> Bool, requestIsActive: () -> Bool,
+                                    unhide: () -> Void, activate: () -> Bool) -> Bool {
+        guard requestIsActive(), userIsIdle(), foreground() == expectedForeground else { return false }
+        unhide()
+        // Unhiding can also yield to AppKit. Recheck before the activation that
+        // would redirect the user's keyboard input.
+        guard requestIsActive(), userIsIdle(), foreground() == expectedForeground else { return false }
+        return activate()
     }
 
     /// Frontmost, and the app's focused window (its key window) exists. Polls every 50 ms up to `timeout`.
-    private func waitForFront(pid: pid_t, timeout: TimeInterval) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
+    private func waitForFront(pid: pid_t, timeout: TimeInterval, mayContinue: () -> Bool) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         repeat {
+            guard mayContinue() else { return false }
             if frontmostPID() == pid, hasFocusedWindow(pid: pid) { return true }
             Thread.sleep(forTimeInterval: 0.05)
-        } while Date() < deadline
-        return frontmostPID() == pid
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        return mayContinue() && frontmostPID() == pid
     }
 
     private func hasFocusedWindow(pid: pid_t) -> Bool {
@@ -445,9 +531,14 @@ extension FocusBorrowController {
     /// How long the user must have been hands-off (no key, click, scroll or mouse move) before focus may be
     /// taken. Taking focus while the user worked put their keys into the borrowed app and raised windows in
     /// front of them. `OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S` overrides it (a benchmark on an unattended Mac).
-    static let userIdleNeeded: TimeInterval = {
-        GodspeedSettings.environment["OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S"].flatMap(Double.init) ?? 4
-    }()
+    static var userIdleNeeded: TimeInterval { idleThreshold(environment: GodspeedSettings.environment) }
+
+    static func idleThreshold(environment: [String: String]) -> TimeInterval {
+        guard let raw = environment["OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S"],
+              let seconds = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              seconds.isFinite, seconds >= 0 else { return 4 }
+        return seconds
+    }
 
     /// Seconds since the user's last real input (`hidSystemState`; events this process posts do not count).
     /// Set by tests so they do not depend on whether someone is using the Mac while they run.
@@ -455,8 +546,9 @@ extension FocusBorrowController {
 
     static func secondsSinceUserInput() -> TimeInterval {
         if let idleSecondsForTests { return idleSecondsForTests }
-        let types: [CGEventType] = [.keyDown, .flagsChanged, .leftMouseDown, .rightMouseDown, .otherMouseDown,
-                                    .mouseMoved, .leftMouseDragged, .scrollWheel]
+        let types: [CGEventType] = [.keyDown, .keyUp, .flagsChanged,
+                                    .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
+                                    .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]
         return types.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? .infinity
     }
 }

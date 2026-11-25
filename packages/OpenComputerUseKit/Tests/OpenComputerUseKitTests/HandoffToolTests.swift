@@ -35,7 +35,9 @@ final class HandoffToolTests: XCTestCase {
         let ids = ["save", "close"]
         XCTAssertFalse(HandoffTool.needsVisualTieBreak(["save": 0.95, "close": 0.02, "none": 0.03], optionIDs: ids))
         XCTAssertTrue(HandoffTool.needsVisualTieBreak(["save": 0.47, "close": 0.46, "none": 0.07], optionIDs: ids))
-        XCTAssertTrue(HandoffTool.needsVisualTieBreak(["save": 0.11, "close": 0.09, "none": 0.80], optionIDs: ids))
+        XCTAssertFalse(HandoffTool.needsVisualTieBreak(["save": 0.11, "close": 0.09, "none": 0.80], optionIDs: ids))
+        XCTAssertFalse(HandoffTool.needsVisualTieBreak(["save": .nan, "none": 0], optionIDs: ids))
+        XCTAssertFalse(HandoffTool.needsVisualTieBreak(["save": 2, "none": 0], optionIDs: ids))
         XCTAssertFalse(HandoffTool.needsVisualTieBreak(["none": 1.0], optionIDs: ids))
     }
 
@@ -141,7 +143,6 @@ final class HandoffToolTests: XCTestCase {
                 return .init(ok: true, message: "", observedState: initial + "\n2 static text Exported")
             },
             choose: { _, _, _, _, _ in XCTFail("exact action called chooser"); return nil },
-            looksStuck: { _, _, _ in XCTFail("exact action called referee"); return false },
             check: { HandoffTool.check(request.doneWhen, screen: $0) },
             replay: { _ in XCTFail("exact action tried recipe first"); return nil }, now: { 0 }
         )
@@ -221,7 +222,7 @@ final class HandoffToolTests: XCTestCase {
             """
         }
 
-        func deps(choose: @escaping ([(id: String, text: String)]) -> [String: Double]?, stuck: Bool = false,
+        func deps(choose: @escaping ([(id: String, text: String)]) -> [String: Double]?,
                   replay: Bool? = nil, stepSeconds: TimeInterval = 0, changes: Bool = true) -> HandoffTool.Dependencies {
             HandoffTool.Dependencies(
                 readState: { self.reads += 1; return self.state },
@@ -238,7 +239,6 @@ final class HandoffToolTests: XCTestCase {
                     return HandoffTool.ActResult(ok: true, message: "")
                 },
                 choose: { _, _, _, _, options in self.chooseCalls += 1; return choose(options) },
-                looksStuck: { _, _, _ in stuck },
                 check: { state in
                     DoneCheck.check([.text("Saved")], evidence: DoneCheck.Evidence(screenText: state, pageURL: { nil }))
                 },
@@ -356,6 +356,93 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(app.reads, 3)
     }
 
+    func testExplicitFormWorkflowUsesRulesForInputsAndFinalClick() {
+        let app = FakeApp()
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [("Name", "Ann"), ("Email", "ann@example.test")],
+                                          maxSteps: 5, timeBudget: 10)
+        let outcome = HandoffTool.run(request, app.deps(choose: { _ in
+            XCTFail("a fully specified form must not need a chooser")
+            return nil
+        }))
+        XCTAssertEqual(outcome.kind, .done)
+        XCTAssertEqual(app.acts, ["fill \"Name\"", "fill \"Email\"", "click \"Save\""])
+        XCTAssertEqual(outcome.ruleActions, 3)
+        XCTAssertEqual(outcome.chooserCalls, 0)
+    }
+
+    func testTypedFormDoesNotOverwriteOrSubmitOnMissingField() {
+        for initialName in ["", "Existing"] {
+            let app = FakeApp()
+            app.name = initialName
+            let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                              values: [("Name", "Ann"), ("Missing field", "X")],
+                                              maxSteps: 5, timeBudget: 10)
+            let outcome = HandoffTool.run(request, app.deps(choose: { _ in
+                XCTFail("invalid typed form must not be handed to the ranker")
+                return nil
+            }, replay: true))
+            XCTAssertEqual(outcome.kind, .escalate)
+            XCTAssertTrue(app.acts.isEmpty)
+        }
+    }
+
+    func testTypedFormWillNotContinueAcrossWindowChanges() {
+        let app = FakeApp()
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [("Name", "Ann")], maxSteps: 5, timeBudget: 10)
+        var deps = app.deps(choose: { _ in XCTFail("must not rank after window changed"); return nil })
+        var reads = 0
+        deps.readState = {
+            reads += 1
+            return "App=x\nWindow: \"Form\"\nWindow ID: \(reads == 1 ? 12 : 13)\n1 text field Name =\n3 button Save"
+        }
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertNotEqual(outcome.kind, .done)
+        XCTAssertEqual(app.acts, ["fill \"Name\""])
+    }
+
+    func testRankedFieldWritesRequireExactUniqueEmptyDestination() {
+        let input = [("Name", "Ann")]
+        let candidates = build(values: input, state: HandoffTool.parseControls("1 text field Name ="))
+        let safe = candidates.first { $0.kind == .setValue }
+        XCTAssertEqual(safe?.risky, false)
+        XCTAssertEqual(safe?.expectedValue, "")
+        for state in ["1 text field Name = Existing", "1 text field Display Name =", "1 text field Name =\n2 text field Name ="] {
+            let proposals = build(values: input, state: HandoffTool.parseControls(state)).filter { $0.kind == .setValue }
+            XCTAssertFalse(proposals.isEmpty)
+            XCTAssertTrue(proposals.allSatisfy(\.risky))
+        }
+    }
+
+    func testNavigationCycleStopsWithoutAskingStuckModel() {
+        let request = HandoffTool.Request(app: "x", goal: "Navigate", doneWhen: [.text("Finished")],
+                                          values: [], maxSteps: 10, timeBudget: 20)
+        let first = "App=x\nWindow: Form\n1 button Next\n2 scroll area"
+        let second = "App=x\nWindow: Form\n3 button Continue\n4 scroll area"
+        var state = first
+        var acts = 0
+        let deps = HandoffTool.Dependencies(
+            readState: { state },
+            act: { _, _ in
+                acts += 1
+                state = acts % 2 == 0 ? first : second
+                return .init(ok: true, message: "", observedState: state)
+            },
+            choose: { _, _, _, _, options in
+                var result = Dictionary(uniqueKeysWithValues: options.map { ($0.id, 0.01) })
+                result["none"] = 0.01
+                if let option = options.first { result[option.id] = 0.95 }
+                return result
+            },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) }, replay: { _ in nil }, now: { 0 }
+        )
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .stuck)
+        XCTAssertEqual(acts, 3)
+        XCTAssertTrue(outcome.reason.contains("previously observed states"))
+    }
+
     func testGuardedLineEndingIsAddedOnlyWhenMissing() throws {
         for (kind, ending) in [("lf", "\n"), ("crlf", "\r\n")] {
             let request = try HandoffTool.parse([
@@ -420,7 +507,6 @@ final class HandoffToolTests: XCTestCase {
                 return .init(ok: true, message: "", delivery: .acknowledged, observedState: screen)
             },
             choose: { _, _, _, _, _ in XCTFail("guarded action called chooser"); return nil },
-            looksStuck: { _, _, _ in XCTFail("guarded action called referee"); return false },
             check: { HandoffTool.check(conditions, screen: $0, observedFields: observed) },
             replay: { _ in nil }, now: { 0 }
         )
@@ -509,6 +595,7 @@ final class HandoffToolTests: XCTestCase {
             app.saved = true
             return HandoffTool.ActResult(ok: false, message: "transport interrupted")
         }
+        deps.settleState = { _ in XCTFail("uncertain delivery must never start a retry or settling loop"); return nil }
         let outcome = HandoffTool.run(request(), deps, learning: log)
         XCTAssertEqual(outcome.kind, .escalate)
         XCTAssertEqual(outcome.deliveryState, .outcomeUnknown)
@@ -608,11 +695,19 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertLessThanOrEqual(app.acts.count, 3)
     }
 
-    func testStuckFromCheckerModel() {
+    func testStallsAfterRealProgressAreDetectedLocally() {
         let app = FakeApp()
-        let outcome = HandoffTool.run(request(), app.deps(choose: pick(["fill", "Next"]), stuck: true))
+        var deps = app.deps(choose: pick(["fill", "Next", "Save"]))
+        deps.act = { candidate, _ in
+            app.acts.append(candidate.text)
+            if candidate.kind == .setValue { app.name = "Ann" }
+            return .init(ok: true, message: "", delivery: .acknowledged)
+        }
+        let outcome = HandoffTool.run(request(), deps)
         XCTAssertEqual(outcome.kind, .stuck)
-        XCTAssertEqual(app.acts.count, 2, "the checker is asked from the second step")
+        XCTAssertEqual(app.acts.count, 3)
+        XCTAssertEqual(app.chooseCalls, 3, "only choosing actions uses the helper; stall detection is local")
+        XCTAssertTrue(outcome.reason.contains("last two actions changed nothing"))
     }
 
     func testStopsOnTimeBudgetAndStepCap() {
@@ -651,5 +746,166 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(Referee.parseChoose(["probs": ["a": 0.7, "none": 0.1]]) ?? [:], ["a": 0.7, "none": 0.1])
         XCTAssertNil(Referee.parseChoose(["probs": ["a": 7]]))
         XCTAssertNil(Referee.parseChoose([:]))
+    }
+
+    func testLocalSettlingBacksOffAndStopsAsSoonAsTheScreenChanges() {
+        var clock: TimeInterval = 0
+        var pauses: [TimeInterval] = []
+        var reads = 0
+        let state = "App=x\nWindow: w\nWindow ID: 31\n1 button Save"
+        let changed = state + "\n2 static text Saved"
+        let result = HandoffTool.settledState(after: state, deadline: 5, now: { clock },
+                                            pause: { pauses.append($0); clock += $0 }, read: {
+            reads += 1
+            return reads == 2 ? changed : state
+        })
+        XCTAssertEqual(result, changed)
+        XCTAssertEqual(pauses, [0.1, 0.2])
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testLocalSettlingHasAReadCapAndHonorsDeadline() {
+        var clock: TimeInterval = 0
+        var reads = 0
+        let result = HandoffTool.settledState(after: "same", deadline: 5, now: { clock },
+                                            pause: { clock += $0 }, read: { reads += 1; return "same" })
+        XCTAssertEqual(result, "same")
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(clock, 0.7, accuracy: 0.0001)
+        clock = 0
+        reads = 0
+        _ = HandoffTool.settledState(after: "same", deadline: 0.15, now: { clock },
+                                    pause: { clock += $0 }, read: { reads += 1; return "same" })
+        XCTAssertEqual(reads, 1)
+        XCTAssertLessThan(clock, 0.15)
+    }
+
+    func testLocalSettlingCancellationDoesNotReadAgain() {
+        let cancellation = RequestCancellation()
+        let result = RequestCancellation.$current.withValue(cancellation) {
+            HandoffTool.settledState(after: "same", deadline: 5, now: { 0 },
+                                    pause: { _ in cancellation.cancel() }, read: {
+                XCTFail("cancelled settling read the app")
+                return "changed"
+            })
+        }
+        XCTAssertNil(result)
+    }
+
+    func testDelayedExactClickCompletesWithReadOnlySettlingAndNoModel() {
+        let state = "App=x\nWindow: w\nWindow ID: 31\n1 button Save\n2 button Next"
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [], maxSteps: 5, timeBudget: 10)
+        var acts = 0
+        var settles = 0
+        let deps = HandoffTool.Dependencies(
+            readState: { state },
+            act: { _, _ in acts += 1; return .init(ok: true, message: "", delivery: .acknowledged, observedState: state) },
+            choose: { _, _, _, _, _ in XCTFail("an exact click must never ask a model"); return nil },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) },
+            replay: { _ in XCTFail("an exact click must never replay"); return nil },
+            now: { 0 },
+            allowsModelChoices: false,
+            settleState: { _ in settles += 1; return state + "\n3 static text Saved" }
+        )
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .done)
+        XCTAssertEqual(outcome.deliveryState, .verified)
+        XCTAssertEqual(acts, 1)
+        XCTAssertEqual(settles, 1)
+        XCTAssertEqual(outcome.chooserCalls, 0)
+    }
+
+    func testExactClickDoesNotFallBackToAnotherActionWhenCompletionIsMissing() {
+        let state = "App=x\nWindow: w\nWindow ID: 31\n1 button Save\n2 button Next"
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [], maxSteps: 5, timeBudget: 10)
+        var acts = 0
+        let deps = HandoffTool.Dependencies(
+            readState: { state },
+            act: { _, _ in acts += 1; return .init(ok: true, message: "", delivery: .acknowledged, observedState: state) },
+            choose: { _, _, _, _, _ in XCTFail("must not choose another button after the requested click"); return nil },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) },
+            replay: { _ in nil }, now: { 0 }, settleState: { $0 }
+        )
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .escalate)
+        XCTAssertEqual(outcome.deliveryState, .acknowledged)
+        XCTAssertEqual(acts, 1)
+        XCTAssertEqual(outcome.chooserCalls, 0)
+    }
+
+    func testMissingOrDuplicateExactClickStopsWithoutModelOrRecipe() {
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [], maxSteps: 5, timeBudget: 10)
+        for controls in ["1 button Next", "1 button Save\n2 button Save", "1 button (disabled) Save"] {
+            let deps = HandoffTool.Dependencies(
+                readState: { "App=x\nWindow: w\nWindow ID: 31\n" + controls },
+                act: { _, _ in XCTFail("unconfirmed exact click was sent"); return .init(ok: false, message: "") },
+                choose: { _, _, _, _, _ in XCTFail("exact instruction is deterministic"); return nil },
+                check: { HandoffTool.check(request.doneWhen, screen: $0) },
+                replay: { _ in XCTFail("must not replay a missing exact target"); return nil }, now: { 0 }
+            )
+            XCTAssertEqual(HandoffTool.run(request, deps).kind, .escalate)
+        }
+    }
+
+    func testGeneralHandoffPinsWindowAndProcessWithoutExplicitWindowID() {
+        let initial = "App=x (pid 10)\nWindow: w\nWindow ID: 31\n1 button Next\n2 button Continue"
+        let request = HandoffTool.Request(app: "x", goal: "Navigate", doneWhen: [.text("Finished")],
+                                          values: [], maxSteps: 5, timeBudget: 10)
+        for changed in [initial.replacingOccurrences(of: "Window ID: 31", with: "Window ID: 32"),
+                        initial.replacingOccurrences(of: "pid 10", with: "pid 11")] {
+            var acts = 0
+            var reads = 0
+            var choices = 0
+            let deps = HandoffTool.Dependencies(
+                readState: { reads += 1; return reads == 1 ? initial : changed + "\n3 static text Finished" },
+                act: { _, _ in
+                    acts += 1
+                    return .init(ok: true, message: "", delivery: .acknowledged,
+                                 observedState: changed + "\n3 static text Finished")
+                },
+                choose: { _, _, _, _, options in
+                    choices += 1
+                    return options.first.map { [$0.id: 1.0, "none": 0.0] }
+                },
+                check: { HandoffTool.check(request.doneWhen, screen: $0) }, replay: { _ in nil }, now: { 0 }
+            )
+            let outcome = HandoffTool.run(request, deps)
+            XCTAssertEqual(outcome.kind, .failed)
+            XCTAssertEqual(outcome.deliveryState, .acknowledged)
+            XCTAssertEqual(acts, 1)
+            XCTAssertEqual(choices, 1)
+            XCTAssertEqual(reads, 2)
+        }
+    }
+
+    func testLocalSettlingRejectsAnotherWindowAsCompletionEvidence() {
+        let initial = "App=x\nWindow: w\nWindow ID: 31\n1 button Save"
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [], maxSteps: 5, timeBudget: 10)
+        let deps = HandoffTool.Dependencies(
+            readState: { initial },
+            act: { _, _ in .init(ok: true, message: "", delivery: .acknowledged, observedState: initial) },
+            choose: { _, _, _, _, _ in XCTFail("must not ask a model"); return nil },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) }, replay: { _ in nil }, now: { 0 },
+            settleState: { _ in initial.replacingOccurrences(of: "Window ID: 31", with: "Window ID: 32") + "\nSaved" }
+        )
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .failed)
+        XCTAssertEqual(outcome.steps.count, 1)
+        XCTAssertEqual(outcome.deliveryState, .acknowledged)
+    }
+
+    func testModelFreeHandoffSkipsChooserPreparationAndCall() {
+        let app = FakeApp()
+        var deps = app.deps(choose: { _ in XCTFail("models are disabled"); return nil })
+        deps.allowsModelChoices = false
+        let outcome = HandoffTool.run(request(), deps)
+        XCTAssertEqual(outcome.kind, .escalate)
+        XCTAssertEqual(outcome.chooserCalls, 0)
+        XCTAssertEqual(app.chooseCalls, 0)
+        XCTAssertTrue(app.acts.isEmpty)
     }
 }

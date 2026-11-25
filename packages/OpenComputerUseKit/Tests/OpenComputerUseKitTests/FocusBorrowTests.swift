@@ -25,6 +25,7 @@ final class FocusBorrowTests: XCTestCase {
         func isAlive(pid: pid_t) -> Bool { alive.contains(pid) }
 
         var typing = false
+        var onPauseCheck: (() -> Void)?
 
         func activate(pid: pid_t) -> Bool {
             activations.append(pid)
@@ -33,7 +34,10 @@ final class FocusBorrowTests: XCTestCase {
             return true
         }
 
-        func waitForTypingPause() -> Bool { !typing }
+        func waitForTypingPause() -> Bool {
+            onPauseCheck?()
+            return !typing
+        }
     }
 
     private let user: pid_t = 100
@@ -72,6 +76,23 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "typo"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "0"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": " off "]))
+    }
+
+    func testIdleThresholdIsFiniteAndUsesTheCurrentRequest() {
+        let key = "OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S"
+        XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [:]), 4)
+        XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [key: " 8 "]), 8)
+        for value in ["-1", "nan", "inf", "invalid"] {
+            XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [key: value]), 4)
+        }
+        // Zero remains an explicit option for unattended benchmarks.
+        XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [key: "0"]), 0)
+        RequestConfiguration.withEnvironment([key: "7"]) {
+            XCTAssertEqual(FocusBorrowController.userIdleNeeded, 7)
+        }
+        RequestConfiguration.withEnvironment([key: "12"]) {
+            XCTAssertEqual(FocusBorrowController.userIdleNeeded, 12)
+        }
     }
 
     // MARK: - Bookkeeping
@@ -128,6 +149,83 @@ final class FocusBorrowTests: XCTestCase {
 
         XCTAssertEqual(activator.front, appB)
         XCTAssertEqual(activator.activations, [appA], "no restore once the user has moved focus")
+    }
+
+    func testUserSwitchDuringAdmissionDoesNotBorrowFromTheNewApp() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        activator.onPauseCheck = { activator.front = self.appB }
+
+        let lease = controller.acquire(pid: appA)
+
+        XCTAssertFalse(lease.activated)
+        XCTAssertEqual(activator.front, appB)
+        XCTAssertEqual(activator.activations, [])
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testCancelledBorrowDoesNotAlterAnotherOpenLease() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+        let first = controller.acquire(pid: appA)
+        let cancellation = RequestCancellation()
+        cancellation.cancel()
+        let refused = RequestCancellation.$current.withValue(cancellation) { controller.acquire(pid: appA) }
+        XCTAssertFalse(refused.activated)
+        controller.release(refused)
+        XCTAssertEqual(controller.openCount, 1)
+        XCTAssertEqual(activator.front, appA)
+        controller.release(first)
+        XCTAssertEqual(activator.front, user)
+    }
+
+    func testCancellationDuringBorrowAdmissionNeverActivates() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+        let cancellation = RequestCancellation()
+        activator.onPauseCheck = { cancellation.cancel() }
+        let lease = RequestCancellation.$current.withValue(cancellation) { controller.acquire(pid: appA) }
+        XCTAssertFalse(lease.activated)
+        XCTAssertTrue(activator.activations.isEmpty)
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testExpiredRequestDoesNotBorrowFocus() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+        let lease = BrowserCallBudget.withDeadline(0) { controller.acquire(pid: appA) }
+        XCTAssertFalse(lease.activated)
+        controller.release(lease)
+        XCTAssertTrue(activator.activations.isEmpty)
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testUserSwitchDuringRestorePauseIsNotOverridden() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        let lease = controller.acquire(pid: appA)
+        activator.onPauseCheck = { activator.front = self.appB }
+
+        controller.release(lease)
+
+        XCTAssertEqual(activator.front, appB)
+        XCTAssertEqual(activator.activations, [appA])
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testNestedReleaseDoesNotHandOverWhileTheUserIsTyping() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        let first = controller.acquire(pid: appA)
+        let second = controller.acquire(pid: appB)
+        activator.typing = true
+
+        controller.release(second)
+        controller.release(first)
+
+        XCTAssertEqual(activator.front, appB)
+        XCTAssertEqual(activator.activations, [appA, appB])
+        XCTAssertEqual(controller.openCount, 0)
     }
 
     func testNothingToRestoreWhenTargetWasAlreadyFrontmost() {
@@ -225,6 +323,99 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertEqual(activator.activations.last, user)
     }
 
+    func testSessionRevisitingAnEarlierAppReacquiresItsForeground() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        let session = FocusBorrowSession(controller: controller, enabled: true,
+            backgroundOnly: { false }, secondsSinceUserInput: { .infinity })
+        XCTAssertTrue(session.ensure(pid: appA))
+        XCTAssertTrue(session.ensure(pid: appB))
+        XCTAssertFalse(controller.isActiveBorrow(pid: appA))
+        XCTAssertTrue(session.ensure(pid: appA))
+        XCTAssertEqual(activator.front, appA)
+        XCTAssertEqual(activator.activations, [appA, appB, appA])
+        session.close()
+        XCTAssertEqual(activator.front, user)
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testSessionDoesNotReacquireAfterLosingForegroundOwnership() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        let session = FocusBorrowSession(controller: controller, enabled: true,
+            backgroundOnly: { false }, secondsSinceUserInput: { .infinity })
+        XCTAssertTrue(session.ensure(pid: appA))
+        activator.front = user
+        XCTAssertFalse(session.ensure(pid: appB))
+        XCTAssertFalse(session.ensure(pid: appA))
+        XCTAssertEqual(activator.activations, [appA])
+        XCTAssertEqual(activator.front, user)
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testSessionExpiresUsingItsMonotonicClock() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+        var now: TimeInterval = 10
+        let session = FocusBorrowSession(controller: controller, enabled: true,
+            backgroundOnly: { false }, secondsSinceUserInput: { .infinity }, clock: { now })
+        XCTAssertTrue(session.ensure(pid: appA))
+        now += FocusBorrowSession.maxAge
+        XCTAssertFalse(session.ensure(pid: appA))
+        XCTAssertEqual(activator.front, user)
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testCancelledSessionStillReturnsBorrowedFocus() {
+        let activator = FakeActivator(front: user, alive: [user, appA])
+        let controller = FocusBorrowController(activator: activator)
+        let session = FocusBorrowSession(controller: controller, enabled: true,
+            backgroundOnly: { false }, secondsSinceUserInput: { .infinity })
+        XCTAssertTrue(session.ensure(pid: appA))
+        let cancellation = RequestCancellation()
+        cancellation.cancel()
+        RequestCancellation.$current.withValue(cancellation) {
+            XCTAssertFalse(session.ensure(pid: appA))
+        }
+        XCTAssertEqual(activator.front, user, "Restoration is cleanup, not new work blocked by cancellation")
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testQueuedActivationRechecksUserActivityForegroundAndRequest() {
+        for reason in ["user", "foreground", "request", "unknown"] {
+            var unhideCalls = 0
+            var activationCalls = 0
+            let result = WorkspaceFocusActivator.activateIfUnchanged(expectedForeground: user,
+                foreground: { reason == "unknown" ? nil : reason == "foreground" ? self.appB : self.user },
+                userIsIdle: { reason != "user" }, requestIsActive: { reason != "request" },
+                unhide: { unhideCalls += 1 }, activate: { activationCalls += 1; return true })
+            XCTAssertFalse(result, reason)
+            XCTAssertEqual(unhideCalls, 0, reason)
+            XCTAssertEqual(activationCalls, 0, reason)
+        }
+    }
+
+    func testActivationRechecksOwnershipAfterUnhiding() {
+        for reason in ["user", "foreground", "request"] {
+            var unhidden = false
+            let result = WorkspaceFocusActivator.activateIfUnchanged(expectedForeground: user,
+                foreground: { unhidden && reason == "foreground" ? self.appB : self.user },
+                userIsIdle: { !(unhidden && reason == "user") },
+                requestIsActive: { !(unhidden && reason == "request") },
+                unhide: { unhidden = true }, activate: { XCTFail("Late activation after \(reason) changed"); return true })
+            XCTAssertTrue(unhidden)
+            XCTAssertFalse(result)
+        }
+    }
+
+    func testActivationRequestsTheTargetExactlyOnceWhileOwnershipIsUnchanged() {
+        var actions: [String] = []
+        XCTAssertTrue(WorkspaceFocusActivator.activateIfUnchanged(expectedForeground: user,
+            foreground: { self.user }, userIsIdle: { true }, requestIsActive: { true },
+            unhide: { actions.append("unhide") }, activate: { actions.append("activate"); return true }))
+        XCTAssertEqual(actions, ["unhide", "activate"])
+    }
+
     func testSessionStaysInBackgroundAfterReturningFocusForUserInput() {
         let activator = FakeActivator(front: user, alive: [user, appA, appB])
         let controller = FocusBorrowController(activator: activator)
@@ -268,6 +459,15 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertFalse(ledger.takeRehideNeeded(pid: appA))
     }
 
+    func testRehideDoesNotTakeAwayAnAppTheUserIsWorkingIn() {
+        var ledger = UnhiddenAppLedger()
+        ledger.recordUnhide(pid: appA)
+        XCTAssertFalse(ledger.takeRehideNeeded(pid: appA, frontmostPID: appA))
+        XCTAssertFalse(ledger.takeRehideNeeded(pid: appA), "skipping the hide also ends the old ownership record")
+        ledger.recordUnhide(pid: appB)
+        XCTAssertTrue(ledger.takeRehideNeeded(pid: appB, frontmostPID: appA))
+    }
+
     func testUserHidingAnAppThisProcessDidNotUnhideChangesNothing() {
         var ledger = UnhiddenAppLedger()
         ledger.recordUserHide(pid: appB)
@@ -280,6 +480,37 @@ final class FocusBorrowTests: XCTestCase {
         var calls = 0
         try SyntheticFocusTeardown.endAfterDelivery { calls += 1 }
         XCTAssertEqual(calls, 1)
+    }
+
+    func testSyntheticTeardownLeavesAUserActivatedTargetAlone() throws {
+        var calls = 0
+        try SyntheticFocusTeardown.endIfStillBackground(targetPID: appA, foregroundPID: { self.appA }) {
+            calls += 1
+        }
+        XCTAssertEqual(calls, 0)
+        try SyntheticFocusTeardown.endIfStillBackground(targetPID: appA, foregroundPID: { self.user }) {
+            calls += 1
+        }
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testSyntheticTeardownRetryRechecksUserOwnership() throws {
+        var foreground = user
+        var calls = 0
+        try SyntheticFocusTeardown.endAfterDelivery {
+            try SyntheticFocusTeardown.endIfStillBackground(targetPID: appA, foregroundPID: { foreground }) {
+                calls += 1
+                foreground = appA
+                throw ComputerUseError.message("First teardown failed while the user activated the target.")
+            }
+        }
+        XCTAssertEqual(calls, 1, "The retry must not deactivate the user's newly active app")
+    }
+
+    func testUnknownForegroundCannotAuthorizeSyntheticDeactivation() {
+        XCTAssertThrowsError(try SyntheticFocusTeardown.endIfStillBackground(targetPID: appA, foregroundPID: {
+            throw ComputerUseError.stateUnavailable("Foreground read failed.")
+        }, end: { XCTFail("Unknown ownership must not deactivate an app") }))
     }
 
     func testSyntheticTeardownRetriesOnceAndStaysSilentWhenTheRetryWorks() throws {

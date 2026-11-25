@@ -7,10 +7,11 @@ enum LocalDecisionTool {
     private static let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ocu-referee")
     private static let starter = HelperAutoStarter(launcher: directory.appendingPathComponent("run_gsd1.sh"),
                                                    log: directory.appendingPathComponent("gsd1-service.log"),
-                                                   restartLocalScorer: true)
+                                                   restartLocalScorer: true, managedPort: 18765)
 
     static func baseURL(environment: [String: String] = GodspeedSettings.environment) -> URL? {
-        guard let raw = environment["OPEN_COMPUTER_USE_GSD1_URL"], let url = URL(string: raw),
+        guard ModelHelperPolicy.isEnabled(environment: environment),
+              let raw = environment["OPEN_COMPUTER_USE_GSD1_URL"], let url = URL(string: raw),
               ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
               HelperAutoStarter.isLoopback(url), url.user == nil, url.password == nil,
               url.query == nil, url.fragment == nil else { return nil }
@@ -29,6 +30,9 @@ enum LocalDecisionTool {
                     recoverHelper: (URL) -> Void,
                     score: (URL, [String: Any], TimeInterval) -> [String: Any]?) throws -> ToolCallResult {
         try RequestCancellation.check(delivery: .notSent)
+        guard ModelHelperPolicy.isEnabled else {
+            return .text("No local recommendation. Model helpers are disabled in Godspeed settings.", deliveryState: .notSent)
+        }
         guard let baseURL, HelperAutoStarter.isLoopback(baseURL) else {
             throw ComputerUseError.invalidArguments("Configure the loopback GSD1 helper first.")
         }

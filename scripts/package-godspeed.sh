@@ -26,6 +26,7 @@ name="Godspeed-macOS-$([[ "${GODSPEED_ARCH:-native}" == native ]] && uname -m ||
 mkdir "$stage/payload"
 mv "$app" "$stage/payload/GODSPEED.app"
 install -m 755 "$repo_root/scripts/godspeed-mcp" "$stage/payload/godspeed-mcp"
+install -m 755 "$repo_root/scripts/godspeed" "$stage/payload/godspeed"
 cp "$repo_root/LICENSE" "$repo_root/THIRD_PARTY_NOTICES.md" "$stage/payload/"
 ditto -c -k --sequesterRsrc "$stage/payload" "$stage/$name"
 mv -f "$stage/$name" "$out/$name"

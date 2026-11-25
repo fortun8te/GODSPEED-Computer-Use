@@ -15,7 +15,8 @@ enum Referee {
     }
 
     static var baseURL: URL? {
-        guard let raw = environment("OPEN_COMPUTER_USE_REFEREE_URL"), !raw.isEmpty else { return nil }
+        guard ModelHelperPolicy.isEnabled,
+              let raw = environment("OPEN_COMPUTER_USE_REFEREE_URL"), !raw.isEmpty else { return nil }
         // Without a scheme and host ("127.0.0.1:8765") URL(string:) gives a URL no request can use.
         guard let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else { return nil }
         return url
@@ -53,23 +54,53 @@ enum Referee {
     /// Loads the decision model in the background, so the hint at the end of this batch is not lost to a
     /// cold load (about 2.3 s, longer than the hint timeout). Fire and forget, at most once a minute; the
     /// helper unloads it again after 3 idle minutes. Starts the helper when it is down.
-    static func warmInBackground(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard RequestInferenceAdmission.withoutExclusive == nil, let baseURL else { return }
-        warmLock.lock()
-        let due = lastWarm.map { now - $0 >= 60 } ?? true
-        if due { lastWarm = now }
-        warmLock.unlock()
-        guard due, var parts = URLComponents(url: baseURL.appendingPathComponent("warm"), resolvingAgainstBaseURL: false)
+    static func warmInBackground(now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+                                 requestClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                                 reserveWarmup: ((TimeInterval) -> Bool)? = nil,
+                                 recoverHelper: @escaping @Sendable (URL) -> Void = { HelperAutoStarter.shared.helperUnreachable($0) },
+                                 send: (URLRequest, @escaping @Sendable (Bool) -> Void) -> Void = { request, completion in
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            completion(error == nil && (response as? HTTPURLResponse)?.statusCode == 202)
+        }.resume()
+    }) {
+        let requestEnvironment = GodspeedSettings.environment
+        let cancellation = RequestCancellation.current
+        let deadline = BrowserCallBudget.activeDeadline
+        guard ModelHelperPolicy.isEnabled(environment: requestEnvironment), !RequestCancellation.requested,
+              RequestInferenceAdmission.withoutExclusive == nil, let baseURL,
+              let budget = HelperHTTP.Budget(timeout: 1, now: requestClock(), inheritedDeadline: deadline),
+              var parts = URLComponents(url: baseURL.appendingPathComponent("warm"), resolvingAgainstBaseURL: false)
         else { return }
         parts.queryItems = [URLQueryItem(name: "models", value: "d1")]
         guard let url = parts.url else { return }
-        var request = URLRequest(url: url, timeoutInterval: 1)
+        let due: Bool
+        if let reserveWarmup {
+            guard budget.remaining(now: requestClock()) != nil else { return }
+            due = reserveWarmup(now)
+        } else {
+            warmLock.lock()
+            due = budget.remaining(now: requestClock()) != nil && (lastWarm.map { now - $0 >= 60 } ?? true)
+            if due { lastWarm = now }
+            warmLock.unlock()
+        }
+        guard due, !RequestCancellation.requested, let remaining = budget.remaining(now: requestClock()) else { return }
+        var request = URLRequest(url: url, timeoutInterval: remaining)
         request.httpMethod = "GET"
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            if error != nil || (response as? HTTPURLResponse)?.statusCode != 202 {
-                HelperAutoStarter.shared.helperUnreachable(baseURL)
+        send(request) { succeeded in
+            guard !succeeded else { return }
+            // URLSession callbacks do not inherit the calling client's configuration.
+            RequestConfiguration.withEnvironment(requestEnvironment) {
+                RequestCancellation.$current.withValue(cancellation) {
+                    let recover = {
+                        guard !RequestCancellation.requested,
+                              deadline.map({ $0.isFinite && $0 > requestClock() }) ?? true else { return }
+                        recoverHelper(baseURL)
+                    }
+                    if let deadline { BrowserCallBudget.withDeadline(deadline, recover) }
+                    else { recover() }
+                }
             }
-        }.resume()
+        }
     }
 
     // Completion hints are experimental. Without independent calibration, use
@@ -127,22 +158,30 @@ enum Referee {
 
     /// Asks the helper to score candidate actions for a handoff (POST /choose): one probability per option id
     /// plus "none". Nil when the referee is off, down or answers badly, so the handoff escalates instead of guessing.
-    /// The handoff needs the helper even when batch hints are off, so it falls back to the default local helper.
-    static func localChooseURL(refereeURL: URL?, setting: String?) -> URL? {
-        if let setting, ["0", "false", "off", "no"].contains(setting.lowercased()) { return nil }
-        guard let url = refereeURL ?? URL(string: "http://127.0.0.1:8765"),
-              HelperAutoStarter.isLoopback(url) else { return nil }
+    /// A dedicated URL also works when hints are off. An invalid explicit endpoint disables handoff
+    /// scoring instead of silently sending evidence to a different helper.
+    static func localChooseURL(refereeURL: URL?, setting: String?, configuredURL: String? = nil) -> URL? {
+        if let setting, ["0", "false", "off", "no"].contains(setting.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+            return nil
+        }
+        let raw = configuredURL ?? refereeURL?.absoluteString ?? "http://127.0.0.1:8765"
+        guard let url = VisionFallback.localURL(raw),
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              url.port.map({ (1...65535).contains($0) }) ?? true else { return nil }
         return url
     }
 
     static var handoffURL: URL? {
-        localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"))
+        guard ModelHelperPolicy.isEnabled else { return nil }
+        return localChooseURL(refereeURL: baseURL, setting: environment("OPEN_COMPUTER_USE_HANDOFF_HELPER"),
+                              configuredURL: environment("OPEN_COMPUTER_USE_HANDOFF_URL"))
     }
 
     private static let pictureCapabilities = RefereePictureCapabilityCache()
 
     static func picture(url: URL?, state: String, remaining: TimeInterval?, allowRichTree: Bool = false, thin: Bool? = nil, capture: () -> Data?) -> String? {
-        RefereePicture.attachment(url: url, visionEnabled: VisionFallback.isEnabled, state: state, remaining: remaining,
+        guard ModelHelperPolicy.isEnabled, !RequestCancellation.requested else { return nil }
+        return RefereePicture.attachment(url: url, visionEnabled: VisionFallback.isEnabled, state: state, remaining: remaining,
             supportsPictures: { url, timeout in
                 pictureCapabilities.supports(url, now: ProcessInfo.processInfo.systemUptime) {
                     HelperHTTP.getJSON(url, timeout: timeout).map { $0["decision_image"] as? String == "v1" }
@@ -285,40 +324,88 @@ enum Referee {
 enum HelperHTTP {
     static let busyResponseKey = "_godspeed_helper_busy"
 
+    /// Keep one absolute deadline through encoding and temporary admission release.
+    /// A helper's timeout cannot extend the enclosing workflow's remaining time.
+    struct Budget {
+        let deadline: TimeInterval
+
+        init?(timeout: TimeInterval, now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+              inheritedDeadline: TimeInterval? = BrowserCallBudget.activeDeadline) {
+            guard now.isFinite, timeout.isFinite, timeout > 0 else { return nil }
+            let limit = now + timeout
+            guard limit.isFinite, inheritedDeadline?.isFinite != false else { return nil }
+            deadline = min(limit, inheritedDeadline ?? limit)
+            guard deadline > now else { return nil }
+        }
+
+        func remaining(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> TimeInterval? {
+            let remaining = deadline - now
+            return remaining.isFinite && remaining > 0 ? remaining : nil
+        }
+    }
+
     /// POST JSON. A busy helper returns a busy marker so callers abstain without scheduling a health probe.
-    static func postJSON(_ url: URL, body: [String: Any], timeout: TimeInterval, followRedirects: Bool = true) -> [String: Any]? {
-        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+    static func postJSON(_ url: URL, body: [String: Any], timeout: TimeInterval, followRedirects: Bool = true,
+                         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                         transport: ((URLRequest, TimeInterval, Bool, Bool) -> Data?)? = nil) -> [String: Any]? {
+        let requestEnvironment = GodspeedSettings.environment
+        let cancellation = RequestCancellation.current
+        guard ModelHelperPolicy.isEnabled(environment: requestEnvironment), !RequestCancellation.requested,
+              let budget = Budget(timeout: timeout, now: now()),
+              let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = payload
         let useProtectedSession = !followRedirects || body["image_base64"] != nil
+        let perform = { () -> Data? in
+            guard !RequestCancellation.requested, let remaining = budget.remaining(now: now()) else { return nil }
+            var boundedRequest = request
+            boundedRequest.timeoutInterval = remaining
+            if let transport { return transport(boundedRequest, remaining, useProtectedSession, true) }
+            return send(boundedRequest, budget: budget, containsImage: useProtectedSession, acceptBusy: true)
+        }
+        // Encoding can use the last of the budget. Do not release desktop ownership
+        // for inference that is already too late to start.
+        guard !RequestCancellation.requested, budget.remaining(now: now()) != nil else { return nil }
         let reply: Data?
         if let withoutExclusive = RequestInferenceAdmission.withoutExclusive {
             // Never release an active focus borrow or a protected desktop lease.
             guard !FocusBorrow.shared.isBorrowing, !LockedUseActionScope.requiresScreenCaptureKit else { return nil }
             do {
-                reply = try withoutExclusive { send(request, timeout: timeout, containsImage: useProtectedSession, acceptBusy: true) }
+                reply = try withoutExclusive {
+                    RequestConfiguration.withEnvironment(requestEnvironment) {
+                        RequestCancellation.$current.withValue(cancellation) {
+                            perform()
+                        }
+                    }
+                }
             } catch {
                 // The desktop gate was lost. Stop the request so no later step runs on stale observations.
                 RequestCancellation.current?.cancel()
                 return nil
             }
         } else {
-            reply = send(request, timeout: timeout, containsImage: useProtectedSession, acceptBusy: true)
+            reply = perform()
         }
-        guard let reply else { return nil }
-        return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        guard !RequestCancellation.requested, budget.remaining(now: now()) != nil, let reply else { return nil }
+        let object = try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        guard !RequestCancellation.requested, budget.remaining(now: now()) != nil else { return nil }
+        return object
     }
 
     static func getJSON(_ url: URL, timeout: TimeInterval) -> [String: Any]? {
-        guard let reply = send(URLRequest(url: url, timeoutInterval: timeout), timeout: timeout) else { return nil }
-        return try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        guard let budget = Budget(timeout: timeout),
+              let reply = send(URLRequest(url: url, timeoutInterval: timeout), budget: budget) else { return nil }
+        let object = try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        guard !RequestCancellation.requested, budget.remaining() != nil else { return nil }
+        return object
     }
 
     /// True when a GET answers 200 within `timeout`.
     static func isHealthy(_ url: URL, timeout: TimeInterval) -> Bool {
-        send(URLRequest(url: url, timeoutInterval: timeout), timeout: timeout) != nil
+        guard let budget = Budget(timeout: timeout) else { return false }
+        return send(URLRequest(url: url, timeoutInterval: timeout), budget: budget) != nil
     }
 
     private static let imageSession = URLSession(
@@ -332,9 +419,12 @@ enum HelperHTTP {
         }
     }
 
-    private static func send(_ request: URLRequest, timeout: TimeInterval, containsImage: Bool = false,
+    private static func send(_ request: URLRequest, budget: Budget, containsImage: Bool = false,
                              acceptBusy: Bool = false) -> Data? {
-        guard !RequestCancellation.requested else { return nil }
+        guard ModelHelperPolicy.isEnabled, !RequestCancellation.requested,
+              let remaining = budget.remaining() else { return nil }
+        var request = request
+        request.timeoutInterval = remaining
         let box = ReplyBox()
         let done = DispatchSemaphore(value: 0)
         let session = containsImage ? imageSession : URLSession.shared
@@ -347,11 +437,14 @@ enum HelperHTTP {
                 box.set(data)
             }
         }
+        guard !RequestCancellation.requested, budget.remaining() != nil else {
+            task.cancel()
+            return nil
+        }
         task.resume()
-        let deadline = DispatchTime.now() + timeout + 0.05
-        while !RequestCancellation.requested, DispatchTime.now() < deadline {
-            if done.wait(timeout: min(deadline, .now() + .milliseconds(50))) == .success {
-                return RequestCancellation.requested ? nil : box.get()
+        while !RequestCancellation.requested, let remaining = budget.remaining() {
+            if done.wait(timeout: .now() + min(remaining, 0.05)) == .success {
+                return RequestCancellation.requested || budget.remaining() == nil ? nil : box.get()
             }
         }
         task.cancel()
@@ -363,13 +456,14 @@ enum HelperHTTP {
 /// get it. The call that found it down is not held up: it skips its hint or fallback.
 ///
 /// Guards: only for a loopback URL, only when the launcher exists, only once per process, and at most one
-/// health check a minute while the helper stays down. The callers reach this only when the referee or
-/// vision URL is set, so nothing starts when hints and find-on-screen are off. The helper unloads its
+/// health check a minute while the helper stays down. The master model-helper switch also disables
+/// health probes and launches, including the default handoff helper. The helper unloads its
 /// models after 10 idle minutes; nothing here keeps it running.
 final class HelperAutoStarter: @unchecked Sendable {
     static let shared = HelperAutoStarter(
         launcher: URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ocu-referee/run_mlx.sh"),
-        log: URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ocu-referee/service.log")
+        log: URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ocu-referee/service.log"),
+        managedPort: 8765
     )
 
     /// Seconds between health checks while the helper is down.
@@ -379,35 +473,94 @@ final class HelperAutoStarter: @unchecked Sendable {
     private let log: URL
     private let lock = NSLock()
     private var lastCheck: TimeInterval?
+    private var pendingProbe: UUID?
     private var launched = false
     private let restartLocalScorer: Bool
+    private let managedPort: Int?
 
-    init(launcher: URL, log: URL, restartLocalScorer: Bool = false) {
+    init(launcher: URL, log: URL, restartLocalScorer: Bool = false, managedPort: Int? = nil) {
         self.launcher = launcher
         self.log = log
         self.restartLocalScorer = restartLocalScorer
+        self.managedPort = managedPort
+    }
+
+    /// The installed launchers receive no endpoint arguments. Starting one cannot repair an arbitrary
+    /// custom service, HTTPS proxy or prefixed URL. Other endpoints can still be queried normally.
+    func manages(_ url: URL) -> Bool {
+        guard Self.isLoopback(url) else { return false }
+        guard let managedPort else { return true }
+        return url.scheme?.lowercased() == "http" && url.port == managedPort
+            && ["127.0.0.1", "localhost"].contains(url.host?.lowercased() ?? "")
+            && (url.path.isEmpty || url.path == "/")
+            && url.user == nil && url.password == nil && url.query == nil && url.fragment == nil
     }
 
     /// Called after a helper call got no answer. Checks health off the calling thread and starts the
     /// launcher detached when the helper is really down.
-    func helperUnreachable(_ baseURL: URL, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard restartLocalScorer || RequestInferenceAdmission.withoutExclusive == nil, !RequestCancellation.requested,
-              Self.isLoopback(baseURL) else { return }
+    func helperUnreachable(_ baseURL: URL, now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+                           schedule: (@escaping @Sendable () -> Void) -> Void = { work in
+                               DispatchQueue.global(qos: .utility).async(execute: work)
+                           }, healthCheck: @escaping @Sendable (URL) -> Bool = {
+                               HelperHTTP.isHealthy($0, timeout: 0.5)
+                           }, requestClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        let requestEnvironment = GodspeedSettings.environment
+        let cancellation = RequestCancellation.current
+        let deadline = BrowserCallBudget.activeDeadline
+        let hasTime: @Sendable () -> Bool = {
+            deadline.map { $0.isFinite && $0 > requestClock() } ?? true
+        }
+        guard ModelHelperPolicy.isEnabled(environment: requestEnvironment),
+              restartLocalScorer || RequestInferenceAdmission.withoutExclusive == nil, !RequestCancellation.requested,
+              hasTime(), manages(baseURL) else { return }
+        let reservation = UUID()
         lock.lock()
-        let check = !launched && Self.shouldCheck(lastCheck: lastCheck, now: now, cooldown: restartLocalScorer ? 2 : Self.checkCooldown)
-        if check { lastCheck = now }
+        let check = hasTime() && !launched && Self.shouldCheck(lastCheck: lastCheck, now: now, cooldown: restartLocalScorer ? 2 : Self.checkCooldown)
+        let previousCheck = lastCheck
+        if check {
+            lastCheck = now
+            pendingProbe = reservation
+        }
         lock.unlock()
         guard check else { return }
 
         let healthURL = baseURL.appendingPathComponent("health")
-        DispatchQueue.global(qos: .utility).async { [self] in
-            let healthy = HelperHTTP.isHealthy(healthURL, timeout: 0.5)
-            let exists = FileManager.default.fileExists(atPath: launcher.path)
-            lock.lock()
-            let start = Self.shouldLaunch(loopback: true, healthy: healthy, launcherExists: exists, launchedBefore: launched)
-            if start { launched = true }
-            lock.unlock()
-            if start { launch() }
+        schedule { [self] in
+            RequestConfiguration.withEnvironment(requestEnvironment) {
+                RequestCancellation.$current.withValue(cancellation) {
+                    let probe = { [self] in
+                        guard !RequestCancellation.requested, hasTime() else {
+                            // Nothing ran. Return this reservation without clearing
+                            // a newer caller's independently scheduled probe.
+                            lock.withLock {
+                                if pendingProbe == reservation {
+                                    lastCheck = previousCheck
+                                    pendingProbe = nil
+                                }
+                            }
+                            return
+                        }
+                        let ownsProbe = lock.withLock {
+                            guard pendingProbe == reservation else { return false }
+                            pendingProbe = nil
+                            return true
+                        }
+                        guard ownsProbe else { return }
+                        // Once a probe begins, its cooldown remains even if the
+                        // deadline ends during the request; compute was consumed.
+                        let healthy = healthCheck(healthURL)
+                        let exists = FileManager.default.fileExists(atPath: launcher.path)
+                        guard !RequestCancellation.requested, hasTime() else { return }
+                        lock.lock()
+                        let start = Self.shouldLaunch(loopback: true, healthy: healthy, launcherExists: exists, launchedBefore: launched)
+                        if start { launched = true }
+                        lock.unlock()
+                        if start { launch() }
+                    }
+                    if let deadline { BrowserCallBudget.withDeadline(deadline, probe) }
+                    else { probe() }
+                }
+            }
         }
     }
 

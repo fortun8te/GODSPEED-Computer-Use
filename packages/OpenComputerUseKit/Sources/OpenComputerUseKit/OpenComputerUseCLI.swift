@@ -3,6 +3,7 @@ import Foundation
 public enum OpenComputerUseCLICommand: Equatable {
     case launchOnboarding
     case mcp
+    case settings(arguments: [String])
     case doctor(json: Bool = false)
     case lockedUseStatus(json: Bool)
     case lockedUseManagement(action: String, validation: Bool)
@@ -38,7 +39,7 @@ public func shouldUseMacOSAppAgentProxy(
         return !runningFromLaunchServicesAppInstance
     case .mcp, .doctor, .lockedUseStatus, .listApps, .snapshot, .call:
         return true
-    case .lockedUseManagement, .turnEnded, .help, .version, .relayAuthorityPublicKey:
+    case .settings, .lockedUseManagement, .turnEnded, .help, .version, .relayAuthorityPublicKey:
         return false
     }
 }
@@ -107,6 +108,12 @@ public func parseOpenComputerUseCLI(arguments: [String]) throws -> OpenComputerU
         }
 
         return .version
+    case "settings":
+        let options = Array(arguments.dropFirst())
+        guard options.isEmpty || [["--show"], ["--help"], ["-h"]].contains(options) else {
+            throw OpenComputerUseCLIError(message: "Expected settings [--show]", helpCommand: "settings")
+        }
+        return .settings(arguments: options)
     case "mcp":
         return try parseSimpleCommand(name: "mcp", arguments: Array(arguments.dropFirst()), result: .mcp)
     case "doctor":
@@ -149,6 +156,7 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
 
         Commands:
           mcp                  Start the stdio MCP server.
+          settings             Edit local preferences in the terminal.
           doctor               Print permission status and launch onboarding if needed.
           locked-use status    Print experimental macOS Locked Use readiness.
           list-apps            Print running or recently used apps.
@@ -166,6 +174,13 @@ public func openComputerUseHelpText(command: String? = nil) -> String {
         Notes:
           Running without a command launches the permission onboarding app.
           Use `open-computer-use help <command>` for command-specific help.
+        """
+    case "settings":
+        return """
+        Usage:
+          godspeed settings [--show]
+
+        Edit local settings or display them without writing.
         """
     case "mcp":
         return """

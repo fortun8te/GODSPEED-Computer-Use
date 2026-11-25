@@ -6,7 +6,7 @@ import Foundation
 /// profiled without changing tool output.
 enum TimingLog {
     static var enabled: Bool {
-        let value = RequestConfiguration.environment["OPEN_COMPUTER_USE_DEBUG_TIMING"]?
+        let value = GodspeedSettings.environment["OPEN_COMPUTER_USE_DEBUG_TIMING"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         return ["1", "true", "yes", "on"].contains(value)
     }

@@ -88,11 +88,21 @@ final class TypedNameReplacementTests: XCTestCase {
         XCTAssertEqual(SmartSteps.preferredNameFieldIndex(fields), 1)
     }
 
-    func testWhereFolderMatchesOnlyTheFoldersName() {
-        XCTAssertTrue(SmartSteps.whereMatches(popupValue: "godspeed-bench-sandbox", folder: "/Users/michael/godspeed-bench-sandbox"))
-        XCTAssertTrue(SmartSteps.whereMatches(popupValue: " work\n", folder: "/Users/michael/work"))
-        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "work", folder: "/Users/michael/godspeed-bench-sandbox"))
+    func testWhereFolderRequiresTheFullDestinationPath() {
+        XCTAssertTrue(SmartSteps.whereMatches(popupValue: "/Users/michael/work", folder: "/Users/michael/work"))
+        XCTAssertTrue(SmartSteps.whereMatches(popupValue: "/Users/michael/work/", folder: "/Users/michael/work"))
+        XCTAssertTrue(SmartSteps.whereMatches(popupValue: "/", folder: "/"))
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "work", folder: "/Users/michael/work"))
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "/Users/another/work", folder: "/Users/michael/work"))
         XCTAssertFalse(SmartSteps.whereMatches(popupValue: nil, folder: "/Users/michael/work"))
         XCTAssertFalse(SmartSteps.whereMatches(popupValue: "Macintosh HD", folder: "/"))
+    }
+
+    func testWhereFolderDoesNotGuessThroughSymlinksOrRelativePaths() {
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "/Users/michael/link/../work", folder: "/Users/michael/work"))
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "~/work", folder: "/Users/michael/work"))
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "work", folder: "work"))
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: "/Users/michael/work", folder: "/Users/michael/work "))
+        XCTAssertFalse(SmartSteps.whereMatches(popupValue: " /Users/michael/work/\n", folder: "/Users/michael/work"))
     }
 }

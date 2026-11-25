@@ -5,6 +5,48 @@ import XCTest
 @testable import OpenComputerUse
 
 final class AppAgentAdmissionTests: XCTestCase {
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: TimeInterval = 100
+        func read() -> TimeInterval { lock.withLock { value } }
+        func advance(_ amount: TimeInterval) { lock.withLock { value += amount } }
+    }
+
+    func testExpiredQueuedWorkDoesNotRunWhenAdmissionBecomesAvailable() throws {
+        let clock = Clock()
+        let gate = AppAgentAdmission(environment: [:], now: { clock.read() })
+        let finished = DispatchSemaphore(value: 0)
+        try gate.withAdmission(.exclusive) {
+            DispatchQueue.global().async {
+                defer { finished.signal() }
+                do {
+                    try gate.withAdmission(.exclusive, timeout: 1) {
+                        XCTFail("Expired queued work reached dispatch")
+                    }
+                } catch {
+                    XCTAssertTrue(error is AppAgentAdmission.Timeout, "\(error)")
+                }
+            }
+            XCTAssertTrue(waitForQueue(gate, count: 1))
+            clock.advance(2)
+        }
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(gate.waitingCount, 0)
+        // An expired ticket must not retain or poison the released gate.
+        try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testInvalidAdmissionBudgetsNeverRunEvenWhenGateIsFree() {
+        let gate = AppAgentAdmission(environment: [:])
+        for timeout in [TimeInterval.nan, .infinity, -.infinity, -1] {
+            XCTAssertThrowsError(try gate.withAdmission(.exclusive, timeout: timeout) {
+                XCTFail("Invalid admission budget reached dispatch")
+            }) { error in XCTAssertTrue(error is AppAgentAdmission.Timeout) }
+            XCTAssertEqual(gate.waitingCount, 0)
+        }
+        XCTAssertNoThrow(try gate.withAdmission(.exclusive, timeout: 0) {})
+    }
+
     func testAllowsThreeDistinctReadersAndOnlyOnePerClient() throws {
         let gate = AppAgentAdmission()
 
@@ -231,6 +273,48 @@ final class AppAgentAdmissionTests: XCTestCase {
             }
         }
         try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testInferenceSurvivesInterleavedReadOnlyBrowserRequests() throws {
+        let gate = AppAgentAdmission(environment: [:])
+        let token = RequestCancellation()
+        try RequestCancellation.$current.withValue(token) {
+            try gate.withAdmission(.exclusive) {
+                let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
+                let response = try outside {
+                    do {
+                        try gate.withAdmission(.browserRead(client: "reader-a"), timeout: 0) {
+                            try gate.withAdmission(.browserRead(client: "reader-b"), timeout: 0) {}
+                        }
+                    } catch { XCTFail("Read-only work could not run during inference: \(error)") }
+                    return Data([7])
+                }
+                XCTAssertEqual(response, Data([7]))
+                XCTAssertFalse(token.isCancelled)
+                XCTAssertThrowsError(try gate.withAdmission(.exclusive, timeout: 0) {})
+            }
+        }
+        try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testInferenceStillRejectsPeeksAndTabWritesThatCanChangeState() throws {
+        for mode in [AppAgentAdmission.Mode.browserPeek(client: "preview"),
+                     .browserTabWrite(client: "writer", tabID: 17)] {
+            let gate = AppAgentAdmission(environment: ["OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES": "1"])
+            let token = RequestCancellation()
+            try RequestCancellation.$current.withValue(token) {
+                try gate.withAdmission(.exclusive) {
+                    let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
+                    XCTAssertThrowsError(try outside {
+                        do { try gate.withAdmission(mode, timeout: 0) {} }
+                        catch { XCTFail("Interleaved work did not run: \(error)") }
+                        return Data([1])
+                    }) { error in XCTAssertTrue(error is AppAgentAdmission.AdmissionLost) }
+                    XCTAssertTrue(token.isCancelled)
+                }
+            }
+            try gate.withAdmission(.exclusive, timeout: 0) {}
+        }
     }
 
     func testInferenceThrowsInsteadOfContinuingWhenTheGateIsHeldPastTwoSeconds() throws {

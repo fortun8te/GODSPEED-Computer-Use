@@ -16,8 +16,16 @@ enum SemanticChanges {
     /// is empty (there is nothing to compare with).
     static func events(before: String, after: String, limit: Int = 8) -> [String] {
         guard limit > 0, !before.isEmpty else { return [] }
-        let oldSnap = Snapshot(text: before)
-        let newSnap = Snapshot(text: after)
+        var oldSnap = Snapshot(text: before)
+        var newSnap = Snapshot(text: after)
+        // Names repeat in forms (Billing/Shipping, source/destination, editor/preview).
+        // Resolve those relationships locally instead of making the host guess which changed.
+        let oldCounts = Dictionary(grouping: oldSnap.tracked, by: \.baseKey).mapValues(\.count)
+        let newCounts = Dictionary(grouping: newSnap.tracked, by: \.baseKey).mapValues(\.count)
+        let duplicateNames = Set(oldCounts.keys.filter { (oldCounts[$0] ?? 0) > 1 || (newCounts[$0] ?? 0) > 1 })
+            .union(newCounts.keys.filter { (newCounts[$0] ?? 0) > 1 })
+        oldSnap.qualify(duplicateNames)
+        newSnap.qualify(duplicateNames)
 
         var titleEvents: [String] = []
         var dialogEvents: [String] = []
@@ -39,6 +47,7 @@ enum SemanticChanges {
 
         // 3. Matched controls: value, checked state and enabled state.
         let controls = pair(oldSnap.tracked, newSnap.tracked)
+        fieldEvents += controls.ambiguous.map { "\(cap(describe($0))) changed among duplicate controls; inspect current indexes" }
         for (a, b) in controls.matched {
             if a.isToggle {
                 if let x = a.checked, let y = b.checked, x != y {
@@ -57,8 +66,8 @@ enum SemanticChanges {
         let oldSelected = oldSnap.tracked.filter(\.isSelected)
         let newSelected = newSnap.tracked.filter(\.isSelected)
         if Set(oldSelected.map(\.key)) != Set(newSelected.map(\.key)) {
-            let from = oldSelected.first?.label ?? ""
-            let to = newSelected.first?.label ?? ""
+            let from = oldSelected.first?.displayLabel ?? ""
+            let to = newSelected.first?.displayLabel ?? ""
             switch (from.isEmpty, to.isEmpty) {
             case (true, true): selectionEvents.append("Selection changed")
             case (true, false): selectionEvents.append("Selected: \(clip(to))")
@@ -98,7 +107,7 @@ enum SemanticChanges {
     ]
 
     private static let dialogRoles: Set<String> = ["dialog", "sheet", "alert"]
-    private static let toggleRoles: Set<String> = ["check box", "radio button", "toggle", "switch"]
+    private static let toggleRoles: Set<String> = ["check box", "checkbox", "radio button", "toggle", "switch"]
     private static let textRoles: Set<String> = ["text", "static text"]
 
     /// Roles that carry no event of their own: containers, plain text, the window and decoration.
@@ -109,7 +118,7 @@ enum SemanticChanges {
 
     /// Trait words that may appear in parentheses, such as `(w:str)` or `(selected, focused)`.
     private static let knownTraits: Set<String> = [
-        "selected", "focused", "offscreen", "expanded", "disabled", "settable", "hidden",
+        "selected", "focused", "offscreen", "expanded", "collapsed", "checked", "disabled", "settable", "hidden",
         "w", "w:str", "w:bool", "w:float", "string", "boolean", "float",
     ]
 
@@ -134,6 +143,21 @@ enum SemanticChanges {
 
     // MARK: - Items
 
+    private struct Name: Hashable {
+        let role: String
+        let label: String
+    }
+
+    private struct Identity: Hashable {
+        let name: Name
+        let scope: [Name]
+    }
+
+    private struct State: Hashable {
+        let value: String?
+        let traits: Set<String>
+    }
+
     /// One element line, reduced to what the events need.
     private struct Item {
         var role: String
@@ -143,9 +167,17 @@ enum SemanticChanges {
         var depth: Int
         /// True when the element sits under a sheet, dialog or alert.
         var insideDialog = false
+        var scope: [Name] = []
+        var needsQualifier = false
 
-        /// Matching key: same role and same label. Element numbers are not part of it.
-        var key: String { role + "|" + label }
+        /// A named ancestor is part of identity. Bare wrappers and element renumbering are not.
+        var baseKey: Name { Name(role: role, label: label) }
+        var key: Identity { Identity(name: baseKey, scope: scope) }
+        var state: State { State(value: value, traits: traits) }
+        var displayLabel: String {
+            guard needsQualifier, !scope.isEmpty else { return label }
+            return (label.isEmpty ? cap(role) : label) + " [" + scope.map(\.label).joined(separator: " / ") + "]"
+        }
         var isSelected: Bool { traits.contains("selected") }
         var isDisabled: Bool { traits.contains("disabled") }
         var isToggle: Bool { toggleRoles.contains(role) }
@@ -162,7 +194,7 @@ enum SemanticChanges {
 
         /// Secure fields, and labels with a secret term (such as "PIN code" or "Wachtwoord"), never show values.
         var isSecret: Bool {
-            role == "secure text field" || containsSecretTerm(label)
+            role == "secure text field" || containsSecretTerm(label) || scope.contains { containsSecretTerm($0.label) }
         }
     }
 
@@ -197,6 +229,21 @@ enum SemanticChanges {
                     j += 1
                 }
             }
+            var ancestors: [Int] = []
+            for i in elements.indices {
+                while let last = ancestors.last, elements[last].depth >= elements[i].depth { ancestors.removeLast() }
+                let scope: [Name] = ancestors.compactMap { parent in
+                    let item = elements[parent]
+                    guard item.role != "window", !textRoles.contains(item.role), !item.label.isEmpty else { return nil }
+                    return item.baseKey
+                }
+                elements[i].scope = scope
+                ancestors.append(i)
+            }
+        }
+
+        mutating func qualify(_ names: Set<Name>) {
+            for i in elements.indices { elements[i].needsQualifier = names.contains(elements[i].baseKey) }
         }
     }
 
@@ -232,7 +279,10 @@ enum SemanticChanges {
         let (plain, traits) = splitTraits(remainder)
         var label = plain
         var value: String?
-        if let split = plain.range(of: " = ") {
+        if plain == "=" || plain.hasPrefix("= ") {
+            label = ""
+            value = String(plain.dropFirst()).trimmingCharacters(in: .whitespaces)
+        } else if let split = plain.range(of: " = ") {
             label = String(plain[..<split.lowerBound])
             value = String(plain[split.upperBound...]).trimmingCharacters(in: .whitespaces)
         } else if plain.hasSuffix(" =") {
@@ -250,21 +300,35 @@ enum SemanticChanges {
 
     /// Separates `(trait, trait)` groups from the text. Other parentheses stay in the text.
     private static func splitTraits(_ text: String) -> (text: String, traits: Set<String>) {
-        // Splitting on both brackets puts plain text at even offsets and group contents at odd ones.
-        let pieces = text.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "(" || $0 == ")" })
         var plain = ""
         var traits = Set<String>()
-        for (offset, piece) in pieces.enumerated() {
-            if offset % 2 == 0 {
-                plain += piece
-                continue
+        var cursor = text.startIndex
+        var hasLeadingTraits = false
+        while cursor < text.endIndex {
+            guard text[cursor] == "(" else {
+                plain.append(text[cursor]); cursor = text.index(after: cursor); continue
             }
+            var end = text.index(after: cursor)
+            var depth = 1
+            while end < text.endIndex {
+                if text[end] == "(" { depth += 1 }
+                if text[end] == ")" { depth -= 1 }
+                if depth == 0 { break }
+                end = text.index(after: end)
+            }
+            guard end < text.endIndex else { plain += text[cursor...]; break }
+            let piece = text[text.index(after: cursor)..<end]
             let tokens = piece.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-            if tokens.allSatisfy(knownTraits.contains) {
+            let isLeading = plain.trimmingCharacters(in: .whitespaces).isEmpty
+            // Native snapshots put traits before the label. Once that is explicit, `(selected)`
+            // in a later user value is literal text. Legacy trailing-trait trees still work.
+            if (!hasLeadingTraits || isLeading), !tokens.isEmpty, tokens.allSatisfy(knownTraits.contains) {
                 traits.formUnion(tokens)
+                if isLeading { hasLeadingTraits = true }
             } else {
-                plain += "(" + piece + ")"
+                plain += text[cursor...end]
             }
+            cursor = text.index(after: end)
         }
         return (plain.trimmingCharacters(in: .whitespaces), traits)
     }
@@ -275,26 +339,38 @@ enum SemanticChanges {
         var matched: [(old: Item, new: Item)] = []
         var removed: [Item] = []
         var added: [Item] = []
+        var ambiguous: [Item] = []
     }
 
-    /// Pairs items with the same key, in order. Items left over on one side are added or removed.
-    /// Pairing ignores position, so a reordered list gives no events.
+    /// Match within semantic ancestry. Duplicated controls with no unique context are compared
+    /// as multisets of states; their order cannot establish a value transition. Indexes may
+    /// renumber, so this summary never silently uses an old index as an identity guarantee.
     private static func pair(_ old: [Item], _ new: [Item]) -> Pairing {
-        var waiting: [String: [Int]] = [:]
-        for (index, item) in old.enumerated() { waiting[item.key, default: []].append(index) }
-        var used = Set<Int>()
+        let oldGroups = Dictionary(grouping: old, by: \.key)
+        let newGroups = Dictionary(grouping: new, by: \.key)
+        var processed = Set<Identity>()
         var result = Pairing()
-        for item in new {
-            if var queue = waiting[item.key], !queue.isEmpty {
-                let index = queue.removeFirst()
-                waiting[item.key] = queue
-                used.insert(index)
-                result.matched.append((old[index], item))
-            } else {
-                result.added.append(item)
+        for item in new + old where processed.insert(item.key).inserted {
+            let before = oldGroups[item.key] ?? []
+            let after = newGroups[item.key] ?? []
+            if before.count <= 1, after.count <= 1 {
+                if let a = before.first, let b = after.first { result.matched.append((a, b)) }
+                else { result.removed += before; result.added += after }
+                continue
             }
+            var available = Dictionary(grouping: before.indices, by: { before[$0].state })
+            var used = Set<Int>()
+            var unmatched: [Item] = []
+            for candidate in after {
+                if let index = available[candidate.state]?.popLast() {
+                    used.insert(index)
+                    result.matched.append((before[index], candidate))
+                } else { unmatched.append(candidate) }
+            }
+            let remaining = before.indices.filter { !used.contains($0) }.map { before[$0] }
+            if !remaining.isEmpty, let changed = unmatched.first { result.ambiguous.append(changed) }
+            else { result.removed += remaining; result.added += unmatched }
         }
-        result.removed = old.indices.filter { !used.contains($0) }.map { old[$0] }
         return result
     }
 
@@ -306,11 +382,11 @@ enum SemanticChanges {
 
     /// `button "Send"`, or just the role when there is no label.
     private static func describe(_ item: Item) -> String {
-        item.label.isEmpty ? item.role : "\(item.role) \"\(clip(item.label, to: 60))\""
+        item.displayLabel.isEmpty ? item.role : "\(item.role) \"\(clip(item.displayLabel, to: 100))\""
     }
 
     private static func fieldName(_ item: Item) -> String {
-        item.label.isEmpty ? cap(item.role) : item.label
+        item.displayLabel.isEmpty ? cap(item.role) : item.displayLabel
     }
 
     private static func fieldChange(_ item: Item, from: String, to: String) -> String {

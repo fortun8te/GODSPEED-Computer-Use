@@ -48,8 +48,11 @@ struct BackgroundDragIO {
     var endFocus: (SkyLightSyntheticFocusContext) throws -> Void
     var setWindowLocation: (CGEvent, CGPoint) throws -> Void
     var post: (CGEvent, pid_t) -> Void
-    var release: (CGEvent, BackgroundDragTarget) -> Void
+    /// False means cleanup was intentionally not posted because the original
+    /// target no longer exists. Presentation must not invent a delivered release.
+    var release: (CGEvent, BackgroundDragTarget) -> Bool
     var pause: (TimeInterval) -> Void
+    var clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
     static func system(spi: SkyLightSPI = .shared) -> BackgroundDragIO {
         func windows() -> [[String: Any]] {
@@ -65,19 +68,7 @@ struct BackgroundDragIO {
                 try validateBackgroundDragWindow(target, windowInfo: windows())
             },
             needsFocus: { pid in
-                // NSWorkspace's frontmostApplication can be stale in a long-lived
-                // CLI/MCP process without a pumping AppKit run loop. Read the
-                // current system-wide focused app synchronously instead.
-                var value: CFTypeRef?
-                let status = AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &value)
-                guard status == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-                    throw ComputerUseError.stateUnavailable("drag cannot determine the current foreground application")
-                }
-                var frontPID: pid_t = 0
-                guard AXUIElementGetPid(value as! AXUIElement, &frontPID) == .success, frontPID > 0 else {
-                    throw ComputerUseError.stateUnavailable("drag cannot determine the current foreground PID")
-                }
-                return frontPID != pid
+                try ForegroundApplication.pid() != pid
             },
             beginFocus: { try spi.beginSyntheticTargetFocus(targetPID: $0.pid, targetWindowID: $0.windowID) },
             makeKey: { try spi.makeSyntheticTargetWindowKey($0) },
@@ -89,7 +80,9 @@ struct BackgroundDragIO {
                 // session lease, but never post to an unrelated/reused window.
                 if skyKeyWindowMatchesTarget(windowInfo: windows(), windowID: target.windowID, pid: target.pid) {
                     event.postToPid(target.pid)
+                    return true
                 }
+                return false
             },
             pause: { Thread.sleep(forTimeInterval: $0) }
         )
@@ -109,8 +102,10 @@ enum BackgroundDragDispatcher {
     static func hover(
         target: BackgroundDragTarget,
         io: BackgroundDragIO = .system(),
+        delivery: NativeInputDelivery = NativeInputDelivery(),
         validateSession: () throws -> Void = { try requireUsableComputerUseSession() }
     ) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
@@ -118,6 +113,7 @@ enum BackgroundDragDispatcher {
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
+        try delivery.check()
         try io.validateWindow(target)
 
         guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
@@ -131,14 +127,18 @@ enum BackgroundDragDispatcher {
         try io.setWindowLocation(event, local)
         try validateSession()
         try io.validateWindow(target)
+        try delivery.check()
         event.timestamp = DispatchTime.now().uptimeNanoseconds
         io.post(event, target.pid)
+        delivery.didPost()
     }
 
     static func click(target: BackgroundDragTarget, button: MouseButtonKind, count: Int, flags: CGEventFlags,
                       io: BackgroundDragIO = .system(),
+                      delivery: NativeInputDelivery = NativeInputDelivery(),
                       validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
                       validateHit: () throws -> Void) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard (1...3).contains(count), button == .left || count == 1 else {
@@ -149,6 +149,7 @@ enum BackgroundDragDispatcher {
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
+        try delivery.check()
         try io.validateWindow(target)
         func prepare(_ type: CGEventType, beat: Int, group: Int64?) throws -> CGEvent {
             guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target.start, mouseButton: button.cgButton) else {
@@ -169,29 +170,41 @@ enum BackgroundDragDispatcher {
         var sent = 0
         do {
             for (press, release) in pairs {
+                try delivery.check()
                 try validateSession()
                 try io.validateWindow(target)
                 try validateHit()
                 try validateSession()
                 try io.validateWindow(target)
+                try delivery.check()
                 press.timestamp = DispatchTime.now().uptimeNanoseconds
                 io.post(press, target.pid)
+                delivery.didPost()
                 release.timestamp = DispatchTime.now().uptimeNanoseconds
-                io.release(release, target)
+                guard io.release(release, target) else {
+                    throw ComputerUseError.message("The click release could not be posted to the original target. Inspect the app before repeating the action.")
+                }
                 sent += 1
+                try delivery.check()
                 if sent < count { io.pause(0.05) }
             }
+        } catch let error as RequestCancellation.Cancelled {
+            throw delivery.failure(error)
+        } catch ComputerUseError.timedOut(let message, _) {
+            throw ComputerUseError.timedOut(message, delivery: delivery.state)
         } catch {
             if sent > 0 {
                 throw ComputerUseError.stateUnavailable("Sent \(sent) of \(count) clicks. Inspect the window before repeating.")
             }
-            throw error
+            throw delivery.failure(error)
         }
     }
 
     static func scroll(target: BackgroundDragTarget, direction: String, unit: ScrollChunks.Unit, size: Int,
                        io: BackgroundDragIO = .system(),
+                       delivery: NativeInputDelivery = NativeInputDelivery(),
                        validateSession: () throws -> Void = { try requireUsableComputerUseSession() }) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
@@ -204,8 +217,10 @@ enum BackgroundDragDispatcher {
                                                 y: target.start.y - target.windowBounds.minY))
         try validateSession()
         try io.validateWindow(target)
+        try delivery.check()
         event.timestamp = DispatchTime.now().uptimeNanoseconds
         io.post(event, target.pid)
+        delivery.didPost()
     }
 
     static func scrollEvent(direction: String, unit: ScrollChunks.Unit, size: Int) throws -> CGEvent {
@@ -229,9 +244,12 @@ enum BackgroundDragDispatcher {
         steps stepCount: Int = 10,
         hold: TimeInterval = 0,
         io: BackgroundDragIO = .system(),
+        delivery: NativeInputDelivery = NativeInputDelivery(),
+        onProgress: (NativeDragProgress) -> Void = { _ in },
         validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
         validateEndpoints: () throws -> Void = {}
     ) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard (2...30).contains(stepCount), (0...1).contains(hold) else {
@@ -242,6 +260,7 @@ enum BackgroundDragDispatcher {
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
+        try delivery.check()
         try io.validateWindow(target)
 
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
@@ -276,13 +295,16 @@ enum BackgroundDragDispatcher {
         }
         func send(_ event: CGEvent) throws {
             // The deferred release still runs if cancellation interrupts a press.
-            try RequestCancellation.check()
+            try delivery.check()
             try validateSession()
             try io.validateWindow(target)
+            try delivery.check()
             // Events were prepared earlier; AppKit must see delivery time, not
             // allocation time. The entire sequence remains process-addressed.
             event.timestamp = DispatchTime.now().uptimeNanoseconds
             io.post(event, target.pid)
+            delivery.didPost()
+            if let progress = NativeDragProgress(event: event) { onProgress(progress) }
         }
 
         // If the user genuinely activates the target during a gesture, it now
@@ -292,34 +314,49 @@ enum BackgroundDragDispatcher {
         }
         var focus: SkyLightSyntheticFocusContext?
         do {
+            try delivery.check()
             if try io.needsFocus(target.pid) {
                 try validateSession()
                 guard io.focusCapability.isAvailable else {
                     throw ComputerUseError.backgroundUnsupported("background drag is unavailable: \(io.focusCapability.unavailableReason)")
                 }
+                try delivery.check()
                 let context = try io.beginFocus(target)
                 focus = context
                 try validateSession()
+                try delivery.check()
                 try io.makeKey(context)
+                try delivery.check()
                 io.pause(0.01)
             }
             try send(move)
+            try delivery.check()
             io.pause(eventDelay)
             try validateEndpoints()
+            var releasePosted = false
             try InputSimulation.withPressedMouseButton(press: {
                 try send(down)
             }, release: {
                 release.timestamp = DispatchTime.now().uptimeNanoseconds
-                io.release(release, target)
+                releasePosted = io.release(release, target)
+                if releasePosted, let progress = NativeDragProgress(event: release) { onProgress(progress) }
                 io.pause(eventDelay)
             }) {
-                io.pause(max(eventDelay, hold))
+                try delivery.wait(max(eventDelay, hold), validate: {
+                    try validateSession()
+                    try io.validateWindow(target)
+                }, clock: io.clock, pause: io.pause)
                 for step in steps {
                     try send(step.drag)
                     release = step.up
+                    try delivery.check()
                     io.pause(eventDelay)
                 }
             }
+            guard releasePosted else {
+                throw ComputerUseError.message("The drag release could not be posted to the original target. Inspect the app before repeating the action.")
+            }
+            try delivery.check()
         } catch {
             if let focus {
                 do { try endFocus(focus) }
@@ -327,7 +364,7 @@ enum BackgroundDragDispatcher {
                     throw ComputerUseError.message("\(error); background drag focus cleanup also failed: \(cleanupError)")
                 }
             }
-            throw error
+            throw delivery.failure(error)
         }
         if let focus { try endFocus(focus) }
     }

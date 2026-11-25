@@ -3,6 +3,24 @@ import XCTest
 @testable import OpenComputerUseKit
 
 final class LocalPerceptionTests: XCTestCase {
+    func testModelFreeLabelMissKeepsOCRButNeverBroadensDelivery() {
+        RequestConfiguration.withEnvironment(["OPEN_COMPUTER_USE_MODEL_HELPERS": "0"]) {
+            XCTAssertFalse(VisionFallback.isEnabled)
+            func allowed(_ error: ComputerUseError = .targetNotFound("no match"), strict: Bool = false,
+                         pinned: Bool = false, count: Int = 1, button: String = "left") -> Bool {
+                ComputerUseService.allowsLocalPerceptionFallback(error: error, strict: strict,
+                    windowBound: pinned, clickCount: count, mouseButton: button)
+            }
+            XCTAssertTrue(allowed())
+            XCTAssertFalse(allowed(.ambiguousTarget("several matches")))
+            XCTAssertFalse(allowed(.staleTarget("changed")))
+            XCTAssertFalse(allowed(strict: true))
+            XCTAssertFalse(allowed(pinned: true))
+            XCTAssertFalse(allowed(count: 2))
+            XCTAssertFalse(allowed(button: "right"))
+        }
+    }
+
     func testFastOCRSkipsAccurateAndHelper() {
         let expected = CGPoint(x: 0.2, y: 0.3)
         let candidate = VisionFallback.candidate(scan: { accurate in

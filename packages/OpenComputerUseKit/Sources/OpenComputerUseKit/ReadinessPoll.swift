@@ -13,12 +13,17 @@ enum ReadinessPoll {
         monitor: AXChangeMonitor? = nil,
         read: () -> Value?
     ) -> Value? {
-        let deadline = now() + timeout
+        let started = now()
+        let limit = started + timeout
+        let inherited = BrowserCallBudget.activeDeadline
+        guard started.isFinite, timeout.isFinite, timeout > 0, limit.isFinite,
+              interval.isFinite, interval > 0, inherited?.isFinite != false else { return nil }
+        let deadline = min(limit, inherited ?? limit)
         while !RequestCancellation.requested, now() < deadline {
             // Note the generation before the read, so a change during the read ends the next sleep at once.
             let watch = pid.map { (monitor ?? AXChangeMonitor.shared, $0) }
             let token = watch.map { $0.0.track($0.1) }
-            guard now() < deadline else { return nil }
+            guard !RequestCancellation.requested, now() < deadline else { return nil }
             let value = read()
             guard !RequestCancellation.requested, now() < deadline else { return nil }
             if let value { return value }

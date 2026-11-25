@@ -111,6 +111,8 @@ enum SkyClickDispatcher {
         clickCount: Int,
         spi: SkyLightSPI = .shared
     ) throws {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         try requireUsableComputerUseSession()
         guard spi.capability.isAvailable else {
             throw ComputerUseError.message(
@@ -125,6 +127,7 @@ enum SkyClickDispatcher {
             dispatchLock.unlock()
         }
 
+        try delivery.check()
         try validate(target: target)
         let recipe = try skyClickEventRecipe(clickCount: clickCount)
         guard let source = CGEventSource(stateID: .hidSystemState) else {
@@ -136,8 +139,23 @@ enum SkyClickDispatcher {
         // WindowServer does not publish field 58's accepted width.
         let clickGroupID = Int64(DispatchTime.now().uptimeNanoseconds % 1_000_000_000)
 
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        // Prepare and stamp releases before taking focus or pressing. A later
+        // allocation, expired lease or cancellation cannot leave a button held.
+        let prepared = try recipe.map { step -> (step: SkyClickEventStep, event: CGEvent) in
+            let screenPoint = step.pointKind == .target ? target.screenPoint : primerScreenPoint
+            let windowPoint = step.pointKind == .target ? target.windowPoint : primerWindowPoint
+            guard let event = CGEvent(mouseEventSource: source, mouseType: step.kind.cgEventType,
+                                      mouseCursorPosition: screenPoint, mouseButton: .left) else {
+                throw ComputerUseError.message("Failed to prepare sky_click mouse event \(step.kind.cgEventType.rawValue).")
+            }
+            try stamp(event, target: target, windowPoint: windowPoint, clickState: step.clickState,
+                      phase: step.phase, clickGroupID: clickGroupID, spi: spi)
+            return (step, event)
+        }
+
+        let frontmostPID = try ForegroundApplication.pid()
         let focusContext: SkyLightSyntheticFocusContext?
+        try delivery.check()
         if frontmostPID == target.pid {
             focusContext = nil
         } else {
@@ -148,43 +166,22 @@ enum SkyClickDispatcher {
         }
 
         do {
-            for step in recipe {
+            try deliverPreparedEvents(prepared, delivery: delivery, validate: {
                 try requireUsableComputerUseSession()
-                let screenPoint = step.pointKind == .target ? target.screenPoint : primerScreenPoint
-                let windowPoint = step.pointKind == .target ? target.windowPoint : primerWindowPoint
-                guard let event = CGEvent(
-                    mouseEventSource: source,
-                    mouseType: step.kind.cgEventType,
-                    mouseCursorPosition: screenPoint,
-                    mouseButton: .left
-                ) else {
-                    throw ComputerUseError.message(
-                        "Failed to create sky_click mouse event \(step.kind.cgEventType.rawValue)."
-                    )
-                }
-
-                try stamp(
-                    event,
-                    target: target,
-                    windowPoint: windowPoint,
-                    clickState: step.clickState,
-                    phase: step.phase,
-                    clickGroupID: clickGroupID,
-                    spi: spi
-                )
-
+                try validate(target: target)
+            }, post: { event in
                 // The current Cua Driver Chromium recipe deliberately posts through
                 // both channels: SkyLight reaches Chromium/Catalyst while the public
                 // path preserves AppKit compatibility. This is one dispatch policy,
                 // not a retry after an observed failure.
-                try spi.postToPid(event, pid: target.pid)
+                try spi.postToPid(event, pid: target.pid, delivery: delivery)
                 event.postToPid(target.pid)
-
-                let delay = step.delayAfter * InputTiming.skyClickDelayScale
-                if delay > 0 {
-                    Thread.sleep(forTimeInterval: delay)
-                }
-            }
+            }, release: { event in
+                let windows = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+                guard skyClickWindowMatchesTarget(windowInfo: windows, windowID: target.windowID, pid: target.pid) else { return }
+                spi.releaseMouseToPid(event, pid: target.pid)
+                event.postToPid(target.pid)
+            }, delayScale: InputTiming.skyClickDelayScale)
         } catch {
             if let focusContext {
                 try? spi.endSyntheticTargetFocus(focusContext)
@@ -201,6 +198,62 @@ enum SkyClickDispatcher {
                 Thread.sleep(forTimeInterval: rendererSettle)
             }
             try SyntheticFocusTeardown.endAfterDelivery { try spi.endSyntheticTargetFocus(focusContext) }
+        }
+    }
+
+    /// The recipe contains adjacent down/up pairs. Keep the up ready before its
+    /// down and send it without cancellation/session checks once that down posts.
+    static func deliverPreparedEvents(
+        _ prepared: [(step: SkyClickEventStep, event: CGEvent)],
+        delivery: NativeInputDelivery = NativeInputDelivery(),
+        validate: () throws -> Void,
+        post: (CGEvent) throws -> Void,
+        release: (CGEvent) -> Void,
+        delayScale: TimeInterval = 1,
+        pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) throws {
+        for index in prepared.indices {
+            switch prepared[index].step.kind {
+            case .down:
+                guard index + 1 < prepared.count, prepared[index + 1].step.kind == .up else {
+                    throw ComputerUseError.notSent("The click recipe has no matching release. Nothing was sent.")
+                }
+            case .up:
+                guard index > 0, prepared[index - 1].step.kind == .down else {
+                    throw ComputerUseError.notSent("The click recipe contains an unmatched release. Nothing was sent.")
+                }
+            case .moved: break
+            }
+        }
+        var pendingRelease: CGEvent?
+        defer {
+            if let pendingRelease {
+                pendingRelease.timestamp = DispatchTime.now().uptimeNanoseconds
+                release(pendingRelease)
+            }
+        }
+        do {
+            for (index, item) in prepared.enumerated() {
+                if item.step.kind == .up {
+                    item.event.timestamp = DispatchTime.now().uptimeNanoseconds
+                    release(item.event)
+                    pendingRelease = nil
+                } else {
+                    try delivery.check()
+                    try validate()
+                    try delivery.check()
+                    item.event.timestamp = DispatchTime.now().uptimeNanoseconds
+                    try post(item.event)
+                    delivery.didPost()
+                    if item.step.kind == .down { pendingRelease = prepared[index + 1].event }
+                }
+                try delivery.check()
+                let delay = item.step.delayAfter * delayScale
+                if delay > 0 { pause(delay) }
+            }
+            try delivery.check()
+        } catch {
+            throw delivery.failure(error)
         }
     }
 

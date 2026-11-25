@@ -36,6 +36,68 @@ final class NegativeLookupCacheTests: XCTestCase {
         XCTAssertFalse(cache.isKnownMiss(key: key(), generation: 4, now: 10.5))
     }
 
+    func testObservedChangeInvalidatesMissWithoutAStoredSnapshot() {
+        let cache = NegativeLookupCache(ttl: 2)
+        cache.recordMiss(key: key(), generation: 5, changeGeneration: 8, now: 10)
+        XCTAssertTrue(cache.isKnownMiss(key: key(), generation: 5, changeGeneration: 8, now: 10.1))
+        XCTAssertFalse(cache.isKnownMiss(key: key(), generation: 5, changeGeneration: 9, now: 10.1))
+        XCTAssertFalse(cache.isKnownMiss(key: key(), generation: 5, now: 10.1))
+    }
+
+    func testObservedChangeRereadsAndFindsANewControlWithinTTL() {
+        let cache = NegativeLookupCache(ttl: 2)
+        var change: UInt64 = 0
+        var liveNames = ["Cancel"]
+        var reads = 0
+        func run() -> (state: [String], hit: String?, freshRead: Bool) {
+            cache.searchTwoStep(
+                keyFor: { _ in key() }, cached: ["Cancel"], generation: { 1 },
+                changeGeneration: { _ in change }, now: { 10 },
+                find: { $0.first { $0 == "Save" } },
+                readFresh: { reads += 1; return liveNames })
+        }
+        XCTAssertTrue(run().freshRead)
+        XCTAssertFalse(run().freshRead)
+        XCTAssertEqual(reads, 1)
+        change += 1
+        liveNames.append("Save")
+        let found = run()
+        XCTAssertTrue(found.freshRead)
+        XCTAssertEqual(found.hit, "Save")
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testChangeDuringFreshReadCannotCacheItsMiss() {
+        let cache = NegativeLookupCache(ttl: 2)
+        var change: UInt64 = 0
+        var reads = 0
+        func run() -> (state: [String], hit: String?, freshRead: Bool) {
+            cache.searchTwoStep(
+                keyFor: { _ in key() }, cached: ["Cancel"], generation: { 1 },
+                changeGeneration: { _ in change }, now: { 10 },
+                find: { $0.first { $0 == "Save" } },
+                readFresh: {
+                    reads += 1
+                    if reads == 1 { change += 1; return ["Cancel"] }
+                    return ["Cancel", "Save"]
+                })
+        }
+        XCTAssertNil(run().hit)
+        let next = run()
+        XCTAssertTrue(next.freshRead)
+        XCTAssertEqual(next.hit, "Save")
+        XCTAssertEqual(reads, 2)
+    }
+
+    func testFirstUnobservedReadCannotCacheAnObservedMiss() {
+        let cache = NegativeLookupCache(ttl: 2)
+        let result: (state: [String], hit: String?, freshRead: Bool) = cache.searchTwoStep(
+            keyFor: { _ in key() }, cached: nil, generation: { 1 },
+            changeGeneration: { _ in 7 }, now: { 10 }, find: { _ in nil }, readFresh: { ["Cancel"] })
+        XCTAssertTrue(result.freshRead)
+        XCTAssertFalse(cache.isKnownMiss(key: key(), generation: 1, changeGeneration: 7, now: 10))
+    }
+
     func testDifferentWindowIsUnknown() {
         let cache = NegativeLookupCache(ttl: 2)
         cache.recordMiss(key: key(window: 1), generation: 5, now: 10)

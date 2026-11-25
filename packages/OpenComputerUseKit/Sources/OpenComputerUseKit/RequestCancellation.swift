@@ -7,6 +7,10 @@ public final class RequestCancellation: @unchecked Sendable {
     public struct Cancelled: LocalizedError {
         public var deliveryState: DeliveryState = .outcomeUnknown
 
+        public init(deliveryState: DeliveryState = .outcomeUnknown) {
+            self.deliveryState = deliveryState
+        }
+
         public var errorDescription: String? { "Request cancelled. Inspect any steps already in flight before retrying." }
     }
 

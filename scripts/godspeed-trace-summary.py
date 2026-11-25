@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report counts, timing and reply size from local Godspeed metadata."""
+"""Report call-level reliability, local routes, timing and reply size from metadata."""
 
 import argparse
 from collections import Counter
@@ -7,16 +7,33 @@ import json
 import math
 from pathlib import Path
 
-FAILURE_CODES = (
-    "unsupported_tool", "invalid_arguments", "app_not_found", "permission_denied",
-    "state_unavailable", "stale_state", "timeout", "cancelled", "recipe_verification",
-    "tool_error", "internal_error",
-)
-BATCH_STOPS = ("step_failure", "time_budget", "window_changed", "recipe_verification")
-STEP_OBSERVATIONS = ("not_sent", "no_effect_seen", "outcome_unknown")
-BATCH_OBSERVATIONS = ("returned", "failed", "unavailable")
 DELIVERY_STATES = ("not_sent", "outcome_unknown", "acknowledged", "verified")
-DONE_CHECKS = ("not_requested", "skipped", "verified", "unmet")
+# helper_image_requests overlaps these routes; it is not an additional request.
+HELPER_ROUTES = ("decide", "choose", "locate", "gsd1_action", "gsd1_read", "gsd1_recover")
+VISUAL_ROUTES = ("ocr_fast", "ocr_accurate", "vision", "ambiguous")
+
+
+def nonnegative_number(value):
+    if type(value) not in (int, float) or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def record_label(totals, value):
+    # Retain new receipt codes from newer drivers instead of silently dropping them.
+    if isinstance(value, str) and value:
+        totals[value] += 1
+
+
+def percentiles(out, values, sample_key, metric):
+    out[sample_key] = len(values)
+    if values:
+        values.sort()
+        for percentile in (50, 95):
+            out[f"p{percentile}_{metric}"] = values[math.ceil(len(values) * percentile / 100) - 1]
 
 
 def summarize(directory, run_id=None, driver_build=None):
@@ -28,10 +45,15 @@ def summarize(directory, run_id=None, driver_build=None):
     handoffs = Counter()
     batch_stops = Counter()
     step_observations = Counter()
+    step_deliveries = Counter()
+    step_failures = Counter()
     batch_observations = Counter()
     done_checks = Counter()
+    helper_requests = Counter()
+    handoff_routes = Counter()
     durations = []
     admissions = []
+    queue_inclusive = []
     reply_sizes = []
     for path in sorted(directory.glob("*.jsonl")):
         with path.open(encoding="utf-8", errors="replace") as stream:
@@ -53,17 +75,34 @@ def summarize(directory, run_id=None, driver_build=None):
                 if isinstance(row.get("tool"), str):
                     tools[row["tool"]] += 1
                 delivery = row.get("delivery_state")
-                if delivery in DELIVERY_STATES:
-                    delivery_states[delivery] += 1
+                record_label(delivery_states, delivery)
+                counts["delivery_state_samples"] += delivery in DELIVERY_STATES
                 for field, totals in (("telemetry", telemetry), ("handoff_metrics", handoffs)):
                     metrics = row.get(field)
                     if isinstance(metrics, dict):
+                        counts[f"{field}_calls"] += 1
                         for key, value in metrics.items():
-                            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                            if nonnegative_number(value):
                                 totals[key] += value
+                metrics = row.get("telemetry")
+                if isinstance(metrics, dict):
+                    requests = 0
+                    for route in HELPER_ROUTES:
+                        value = metrics.get(f"{route}_requests")
+                        if nonnegative_number(value):
+                            helper_requests[route] += value
+                            requests += value
+                    counts["calls_with_helper_requests"] += requests > 0
+                metrics = row.get("handoff_metrics")
+                if isinstance(metrics, dict) and all(nonnegative_number(metrics.get(key)) for key in ("rules", "model")):
+                    counts["handoff_routing_calls"] += 1
+                    for key in ("rules", "model"):
+                        handoff_routes[key] += metrics[key]
+                counts["error_flag_samples"] += type(row.get("is_error")) is bool
                 counts["tool_errors"] += row.get("is_error") is True
                 counts["screenshots_returned"] += row.get("screenshot_returned") is True
                 if row.get("schema_version") == 2:
+                    counts["calls_v2"] += 1
                     counts["batch_failures_v2"] += row.get("batch_failed") is True
                     counts["decision_hints_v2"] += row.get("decision_hint") is True
                     counts["vision_clicks_v2"] += row.get("vision_click") is True
@@ -72,65 +111,86 @@ def summarize(directory, run_id=None, driver_build=None):
                     counts["batch_failures_v3"] += row.get("batch_failed") is True
                     counts["decision_hints_v3"] += row.get("decision_hint") is True
                     counts["vision_clicks_v3"] += row.get("vision_click") is True
-                    code = row.get("failure_code")
-                    if code in FAILURE_CODES:
-                        failures[code] += 1
-                    stop = row.get("batch_stop_code")
-                    if stop in BATCH_STOPS:
-                        batch_stops[stop] += 1
-                    observation = row.get("batch_observation")
-                    if observation in BATCH_OBSERVATIONS:
-                        batch_observations[observation] += 1
-                    check = row.get("batch_done_check")
-                    if check in DONE_CHECKS:
-                        done_checks[check] += 1
+                    record_label(failures, row.get("failure_code"))
+                    record_label(batch_stops, row.get("batch_stop_code"))
+                    record_label(batch_observations, row.get("batch_observation"))
+                    record_label(done_checks, row.get("batch_done_check"))
+                    not_run = row.get("batch_not_run")
+                    if type(not_run) is int and not_run >= 0:
+                        counts["batch_not_run_samples"] += 1
+                        counts["batch_not_run_total"] += not_run
                     steps = row.get("batch_step_receipts")
                     if isinstance(steps, list):
                         for step in steps:
-                            observation = step.get("observation") if isinstance(step, dict) else None
-                            if observation in STEP_OBSERVATIONS:
-                                step_observations[observation] += 1
+                            if isinstance(step, dict):
+                                counts["batch_step_samples"] += 1
+                                record_label(step_observations, step.get("observation"))
+                                record_label(step_deliveries, step.get("delivery_state"))
+                                record_label(step_failures, step.get("failure_code"))
                 else:
                     counts["legacy_calls"] += 1
                 counts["admission_timeouts"] += row.get("admission_timed_out") is True
                 admission = row.get("admission_ms")
-                if type(admission) in (int, float) and math.isfinite(admission) and admission >= 0:
+                if nonnegative_number(admission):
                     admissions.append(admission)
                 value = row.get("duration_ms")
-                if row.get("admission_timed_out") is not True and type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                timed_out = row.get("admission_timed_out") is True
+                if not timed_out and nonnegative_number(value):
                     durations.append(value)
+                # Timeout records have a dummy execution duration: only admission ran.
+                # Missing admission is unknown, not a zero-length queue wait.
+                if nonnegative_number(admission) and (timed_out or nonnegative_number(value)):
+                    total = admission if timed_out else admission + value
+                    if nonnegative_number(total):
+                        queue_inclusive.append(total)
+                        counts["queue_inclusive_timeout_samples"] += timed_out
                 reply_size = row.get("reply_text_bytes")
                 if type(reply_size) is int and reply_size >= 0:
                     reply_sizes.append(reply_size)
-    durations.sort()
-    admissions.sort()
     out = {key: counts[key] for key in (
         "calls", "legacy_calls", "tool_errors", "screenshots_returned", "batch_failures_v2",
-        "decision_hints_v2", "vision_clicks_v2", "calls_v3", "batch_failures_v3",
+        "calls_v2", "decision_hints_v2", "vision_clicks_v2", "calls_v3", "batch_failures_v3",
         "decision_hints_v3", "vision_clicks_v3", "malformed_rows", "admission_timeouts",
+        "error_flag_samples", "delivery_state_samples", "batch_step_samples",
+        "batch_not_run_samples", "batch_not_run_total", "queue_inclusive_timeout_samples",
     )}
     out["tool_counts"] = dict(sorted(tools.items()))
     out["delivery_states"] = dict(sorted(delivery_states.items()))
     out["telemetry_totals"] = dict(sorted(telemetry.items()))
     out["handoff_totals"] = dict(sorted(handoffs.items()))
+    requests = sum(helper_requests.values())
+    out["helper_activity"] = {
+        "telemetry_calls": counts["telemetry_calls"],
+        "calls_without_telemetry": counts["calls"] - counts["telemetry_calls"],
+        "calls_with_helper_requests": counts["calls_with_helper_requests"],
+        "requests_by_route": dict(sorted(helper_requests.items())),
+        "requests_total": requests,
+        "requests_per_telemetry_call": requests / counts["telemetry_calls"] if counts["telemetry_calls"] else None,
+    }
+    actions = sum(handoff_routes.values())
+    out["local_routing"] = {
+        "handoff_metric_calls": counts["handoff_metrics_calls"],
+        "handoff_routing_calls": counts["handoff_routing_calls"],
+        "rule_actions": handoff_routes["rules"],
+        "model_actions": handoff_routes["model"],
+        "rule_action_fraction": handoff_routes["rules"] / actions if actions else None,
+        "visual_search_routes": {route: telemetry[f"visual_search_{route}"] for route in VISUAL_ROUTES
+                                 if f"visual_search_{route}" in telemetry},
+    }
     out["failure_codes"] = dict(sorted(failures.items()))
     out["batch_stops"] = dict(sorted(batch_stops.items()))
     out["step_observations"] = dict(sorted(step_observations.items()))
+    out["step_delivery_states"] = dict(sorted(step_deliveries.items()))
+    out["step_failure_codes"] = dict(sorted(step_failures.items()))
     out["batch_observations"] = dict(sorted(batch_observations.items()))
     out["done_checks"] = dict(sorted(done_checks.items()))
-    if durations:
-        for percentile in (50, 95):
-            out[f"p{percentile}_duration_ms"] = durations[math.ceil(len(durations) * percentile / 100) - 1]
-    if admissions:
-        out["admission_samples"] = len(admissions)
-        for percentile in (50, 95):
-            out[f"p{percentile}_admission_ms"] = admissions[math.ceil(len(admissions) * percentile / 100) - 1]
+    out["done_check_samples"] = sum(done_checks.values())
+    percentiles(out, durations, "duration_samples", "duration_ms")
+    percentiles(out, admissions, "admission_samples", "admission_ms")
+    percentiles(out, queue_inclusive, "queue_inclusive_samples", "queue_inclusive_ms")
+    percentiles(out, reply_sizes, "reply_size_samples", "reply_text_bytes")
     if reply_sizes:
-        reply_sizes.sort()
-        out["reply_size_samples"] = len(reply_sizes)
         out["reply_text_bytes_total"] = sum(reply_sizes)
-        for percentile in (50, 95):
-            out[f"p{percentile}_reply_text_bytes"] = reply_sizes[math.ceil(len(reply_sizes) * percentile / 100) - 1]
     return out
 
 

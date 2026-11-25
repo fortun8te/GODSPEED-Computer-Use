@@ -9,6 +9,35 @@ final class GroundingCascadeTests: XCTestCase {
 
     // Step 2: rule-based prefilter, capped at 12.
 
+    func testDiscoveryFindsUnfamiliarSynonymsWithoutGuessingAnAction() {
+        let candidates = options(["Print", "Preferences", "Account Settings", "Configuration", "Help"])
+        let found = GroundingCascade.discoverySuggestions(label: "settings", options: candidates)
+        XCTAssertEqual(found.first?.text, "Account Settings")
+        XCTAssertTrue(found.map(\.text).contains("Preferences"))
+        XCTAssertTrue(found.map(\.text).contains("Configuration"))
+        XCTAssertFalse(found.map(\.text).contains("Print"))
+    }
+
+    func testDiscoveryPreservesDuplicateControlsAndBoundsOutput() {
+        let candidates = options(["Preferences", "Preferences", "Configuration", "Print"])
+        let found = GroundingCascade.discoverySuggestions(label: "settings", options: candidates, limit: 2)
+        XCTAssertEqual(found.map(\.id), ["1", "2"])
+        XCTAssertTrue(GroundingCascade.discoverySuggestions(label: "Quasar", options: candidates).isEmpty)
+        XCTAssertTrue(GroundingCascade.discoverySuggestions(label: "settings", options: candidates, limit: 0).isEmpty)
+    }
+
+    func testDiscoveryDoesNotChangeAutomaticResolution() {
+        let candidates = options(["Preferences", "Configuration"])
+        var asked = false
+        let decision = GroundingCascade.resolve(label: "settings", options: candidates) { _ in
+            asked = true
+            return nil
+        }
+        XCTAssertEqual(decision, .abstain("no close control"))
+        XCTAssertFalse(asked)
+        XCTAssertEqual(GroundingCascade.discoverySuggestions(label: "settings", options: candidates).count, 2)
+    }
+
     func testPrefilterKeepsSpellingAndTypoMatchesAndDropsUnrelatedControls() {
         let names = ["Save", "Cancel", "Opslaan", "Print", "Sharpen", "Share", "Zoom In"]
         let picked = GroundingCascade.prefilter(label: "Sve", options: options(names))
@@ -143,6 +172,92 @@ final class GroundingCascadeTests: XCTestCase {
         }))
         XCTAssertNil(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5), locate: { _ in CGPoint(x: 1.5, y: 0.5) }, verify: { _ in true }))
         XCTAssertEqual(verified, 0)
+    }
+
+    func testRetinaCropMappingAccountsForOddPixelDimensions() throws {
+        let rect = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        let pixels = try XCTUnwrap(VisionFallback.pixelCrop(rect, width: 2561, height: 1601))
+        XCTAssertEqual(pixels, CGRect(x: 640, y: 400, width: 1281, height: 801))
+        let local = CGPoint(x: 0.2, y: 0.8)
+        let adjusted = try XCTUnwrap(VisionFallback.remapCropPoint(local, pixels: pixels, requested: rect,
+                                                                    width: 2561, height: 1601))
+        let mapped = try XCTUnwrap(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5),
+                                                               locate: { _ in adjusted }, verify: { _ in true }))
+        XCTAssertEqual(mapped.x, (640 + 0.2 * 1281) / 2561, accuracy: 0.000001)
+        XCTAssertEqual(mapped.y, (400 + 0.8 * 801) / 1601, accuracy: 0.000001)
+    }
+
+    func testCropRejectsInvalidGeometryAndOutOfBoundsPoints() throws {
+        let rect = CGRect(x: 0.5, y: 0.5, width: 0.5, height: 0.5)
+        let pixels = try XCTUnwrap(VisionFallback.pixelCrop(rect, width: 101, height: 99))
+        XCTAssertEqual(pixels.maxX, 101)
+        XCTAssertEqual(pixels.maxY, 99)
+        XCTAssertNil(VisionFallback.pixelCrop(rect, width: 0, height: 99))
+        XCTAssertNil(VisionFallback.pixelCrop(CGRect(x: -0.1, y: 0, width: 0.5, height: 0.5), width: 101, height: 99))
+        XCTAssertNil(VisionFallback.remapCropPoint(CGPoint(x: 1, y: 0.5), pixels: pixels, requested: rect,
+                                                 width: 101, height: 99))
+    }
+
+    func testDuplicateExactNamesAreOfferedWithoutRanking() {
+        let candidates = options(["Open", "Open", "Other"])
+        let decision = GroundingCascade.resolve(label: "Open", options: candidates) { _ in
+            XCTFail("ambiguous exact targets must not be ranked into an action")
+            return nil
+        }
+        XCTAssertEqual(decision, .offer(ids: ["1", "2"]))
+    }
+
+    func testInvalidRankingAndStrongNonePreventAction() {
+        let invalid = GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in
+            ["1": 1.2, "2": 0.1, "none": 0.0]
+        }
+        XCTAssertEqual(invalid, .abstain("the local helper gave invalid probabilities"))
+        let uncertain = GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in
+            ["1": 0.71, "2": 0.02, "3": 0.0, "none": 0.69]
+        }
+        XCTAssertEqual(uncertain, .abstain("the top choice does not lead by 0.35"))
+    }
+
+    func testIncompleteRankingCannotManufactureAConfidentWinner() {
+        for scores in [
+            ["1": 0.99],
+            ["1": 0.99, "2": 0.0, "3": 0.0],
+            ["1": 0.99, "2": 0.0, "none": 0.01],
+            ["1": 0.99, "2": 0.0, "3": 0.0, "none": 0.01, "unexpected": 0.0],
+        ] {
+            XCTAssertEqual(GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in scores },
+                           .abstain("the local helper gave an incomplete ranking"))
+        }
+    }
+
+    func testDuplicateCandidateIDsNeverReachTheChooser() {
+        let candidates = [GroundingCascade.Option(id: "1", text: "Save"),
+                          GroundingCascade.Option(id: "1", text: "Saves")]
+        XCTAssertEqual(GroundingCascade.resolve(label: "Sav", options: candidates) { _ in
+            XCTFail("duplicate IDs cannot name one target")
+            return ["1": 0.99, "none": 0.01]
+        }, .abstain("control identifiers are ambiguous"))
+    }
+
+    func testFuzzyWorkIsBoundedButExactLongNamesStillResolve() {
+        let long = String(repeating: "s", count: GroundingCascade.maxFuzzyCharacters + 1)
+        XCTAssertTrue(GroundingCascade.prefilter(label: long, options: options([long + "x", "Save"])).isEmpty)
+        XCTAssertTrue(GroundingCascade.prefilter(label: "Sav", options: options([long]), limit: 1).isEmpty)
+        XCTAssertTrue(GroundingCascade.prefilter(label: "Sav", options: threeNames, limit: -1).isEmpty)
+        XCTAssertEqual(GroundingCascade.resolve(label: long, options: options([long])) { _ in
+            XCTFail("an exact name does not need fuzzy ranking")
+            return nil
+        }, .act(id: "1", provenance: .ax, probability: nil, lead: nil))
+    }
+
+    func testInvalidFirstPointDoesNotStartAnotherModelCall() {
+        for point in [CGPoint(x: .nan, y: 0.5), CGPoint(x: .infinity, y: 0.5),
+                      CGPoint(x: -0.1, y: 0.5), CGPoint(x: 1, y: 0.5)] {
+            XCTAssertNil(GroundingCascade.secondLook(at: point, locate: { _ in
+                XCTFail("invalid input must not trigger a second inference")
+                return CGPoint(x: 0.5, y: 0.5)
+            }, verify: { _ in XCTFail("invalid input must not be verified"); return true }))
+        }
     }
 
     func testZoomProvenanceIsNamedInTheLearningLog() {

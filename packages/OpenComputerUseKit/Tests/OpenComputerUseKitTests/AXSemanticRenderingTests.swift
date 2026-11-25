@@ -53,6 +53,7 @@ final class AXSemanticRenderingTests: XCTestCase {
             let cache = AXSnapshotReadCache(batch: { element in
                 let node = self.node(element)
                 var values = node.attributes.mapValues { AXSnapshotReadCache.Attribute.value($0) }
+                for name in AXSnapshotReadCache.arrayNames where values[name] == nil { values[name] = .absent }
                 values["AXChildren"] = .value(node.children.map { self.nodes[$0]!.element } as CFArray)
                 return values
             }, single: { _, _ in (.attributeUnsupported, nil) }, actions: { element in

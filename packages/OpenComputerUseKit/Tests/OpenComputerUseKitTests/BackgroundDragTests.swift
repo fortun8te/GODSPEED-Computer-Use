@@ -13,6 +13,7 @@ final class BackgroundDragTests: XCTestCase {
         var locations: [CGPoint] = []
         var lifecycle: [String] = []
         var pauses: [TimeInterval] = []
+        var now: TimeInterval = 0
         var foreground = false
         var validations = 0
         var failValidation: Int?
@@ -33,7 +34,8 @@ final class BackgroundDragTests: XCTestCase {
                 needsFocus: { _ in !self.foreground },
                 beginFocus: { target in
                     self.lifecycle.append("activate")
-                    return SkyLightSyntheticFocusContext(deactivateTarget: SkyLightActivationCommand(psn: [], windowID: target.windowID, focused: false))
+                    return SkyLightSyntheticFocusContext(targetPID: target.pid,
+                        deactivateTarget: SkyLightActivationCommand(psn: [], windowID: target.windowID, focused: false))
                 },
                 makeKey: { _ in
                     self.lifecycle.append("key")
@@ -55,8 +57,10 @@ final class BackgroundDragTests: XCTestCase {
                 release: { event, _ in
                     self.events.append(event)
                     self.lifecycle.append("release")
+                    return true
                 },
-                pause: { self.pauses.append($0) }
+                pause: { self.pauses.append($0); self.now += $0 },
+                clock: { self.now }
             )
         }
     }
@@ -111,11 +115,56 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertEqual(probe.locations.last, CGPoint(x: 180, y: 120))
     }
 
+    func testProgressFollowsPostedEventsAndUsesTheirDeliveryTimestamps() throws {
+        let probe = Probe()
+        var progress: [NativeDragProgress] = []
+        try BackgroundDragDispatcher.drag(target: target, steps: 4, io: probe.io, onProgress: { sample in
+            XCTAssertEqual(probe.events.last?.location, sample.point, "Presentation cannot run ahead of input submission.")
+            XCTAssertEqual(probe.events.last?.timestamp, sample.timestamp)
+            XCTAssertEqual(probe.events.count, progress.count + 1)
+            progress.append(sample)
+        }, validateSession: {})
+        XCTAssertEqual(progress.map(\.phase), [.moved, .pressed, .dragged, .dragged, .dragged, .dragged, .released])
+        XCTAssertEqual(progress.map(\.point), probe.events.map(\.location))
+        XCTAssertTrue(progress.allSatisfy { $0.timestamp > 0 })
+        XCTAssertTrue(zip(progress, progress.dropFirst()).allSatisfy { $0.timestamp <= $1.timestamp })
+        XCTAssertEqual(progress.last?.point, target.end)
+    }
+
+    func testCancelledProgressReleasesAtLastPostedPointWithoutInventingTheDrop() {
+        let probe = Probe()
+        let cancellation = RequestCancellation()
+        probe.posted = { if $0.type == .leftMouseDragged { cancellation.cancel() } }
+        var progress: [NativeDragProgress] = []
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(cancellation) {
+            try BackgroundDragDispatcher.drag(target: target, steps: 4, io: probe.io,
+                onProgress: { progress.append($0) }, validateSession: {})
+        })
+        XCTAssertEqual(progress.map(\.phase), [.moved, .pressed, .dragged, .released])
+        XCTAssertEqual(progress.map(\.point), probe.events.map(\.location))
+        XCTAssertEqual(progress.last?.point, progress.dropLast().last?.point)
+        XCTAssertNotEqual(progress.last?.point, target.end)
+        XCTAssertEqual(probe.events.filter { $0.type == .leftMouseUp }.count, 1)
+        XCTAssertEqual(probe.lifecycle.last, "deactivate")
+    }
+
+    func testRejectedDragHasNoPresentationProgress() {
+        let probe = Probe()
+        probe.failStamp = true
+        var progress: [NativeDragProgress] = []
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: probe.io,
+            onProgress: { progress.append($0) }, validateSession: {}))
+        XCTAssertTrue(progress.isEmpty)
+        XCTAssertTrue(probe.events.isEmpty)
+        XCTAssertTrue(probe.lifecycle.isEmpty)
+    }
+
     func testDragHonorsHoldStepsAndRefusesChangedEndpointsBeforeDown() throws {
         let probe = Probe()
         try BackgroundDragDispatcher.drag(target: target, steps: 4, hold: 0.4, io: probe.io, validateSession: {})
         XCTAssertEqual(probe.events.filter { $0.type == .leftMouseDragged }.count, 4)
-        XCTAssertTrue(probe.pauses.contains(0.4))
+        XCTAssertTrue(probe.pauses.allSatisfy { $0 <= 0.05 })
+        XCTAssertEqual(probe.pauses.reduce(0, +), 0.01 + 0.03 + 0.4 + 4 * 0.03 + 0.03, accuracy: 0.0001)
         XCTAssertEqual(probe.events.last?.location, target.end)
 
         let stale = Probe()
@@ -123,6 +172,44 @@ final class BackgroundDragTests: XCTestCase {
             throw ComputerUseError.stateUnavailable("Endpoint moved.")
         })
         XCTAssertEqual(stale.events.map(\.type), [.mouseMoved])
+    }
+
+    func testCancellationDuringDragHoldReleasesWithoutWaitingTheFullSecond() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        var io = probe.io
+        io.pause = { duration in
+            probe.pauses.append(duration)
+            probe.now += duration
+            if probe.events.last?.type == .leftMouseDown { token.cancel() }
+        }
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.drag(target: target, hold: 1, io: io, validateSession: {})
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertLessThan(probe.now, 0.2)
+        XCTAssertEqual(probe.lifecycle.last, "deactivate")
+    }
+
+    func testWindowChangeDuringDragHoldReleasesAtThePressLocation() {
+        let probe = Probe()
+        var io = probe.io
+        var changed = false
+        io.pause = { duration in
+            probe.now += duration
+            if probe.events.last?.type == .leftMouseDown { changed = true }
+        }
+        io.validateWindow = { _ in
+            if changed { throw ComputerUseError.notSent("The user moved the window.") }
+        }
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, hold: 1, io: io, validateSession: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(probe.events.last?.location, target.start)
+        XCTAssertLessThan(probe.now, 0.2)
     }
 
     func testModifiedDragKeepsFlagsAndMotionTogetherUntilRelease() throws {
@@ -198,8 +285,8 @@ final class BackgroundDragTests: XCTestCase {
     }
 
     func testWindowFailureAtEverySendReleasesOnlyAfterOurPress() {
-        // validateWindow is called once before setup and before each send.
-        for failingValidation in 1...13 {
+        // Window checks cover setup, every send, and both ends of the hold.
+        for failingValidation in 1...15 {
             let probe = Probe(); probe.failValidation = failingValidation
             XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {}))
             let pressed = probe.events.contains { $0.type == .leftMouseDown }
@@ -259,6 +346,120 @@ final class BackgroundDragTests: XCTestCase {
         XCTAssertEqual(Array(probe.lifecycle.suffix(2)), ["release", "deactivate"])
     }
 
+    func testHoverDeadlineExpiresInsideTheLastWindowValidation() {
+        let probe = Probe()
+        var remaining: TimeInterval = 1
+        let delivery = NativeInputDelivery(remaining: { remaining })
+        var io = probe.io
+        io.validateWindow = { _ in
+            // The initial lookup happens before stamping; the final one can
+            // consume the remaining request budget while checking the window.
+            if !probe.locations.isEmpty { remaining = 0 }
+        }
+        XCTAssertThrowsError(try BackgroundDragDispatcher.hover(target: target, io: io,
+            delivery: delivery, validateSession: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .notSent)
+        }
+        XCTAssertTrue(probe.events.isEmpty)
+    }
+
+    func testClickCancellationDuringHitValidationSendsNothing() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.click(target: target, button: .left, count: 2, flags: [],
+                io: probe.io, validateSession: {}) { token.cancel() }
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+        }
+        XCTAssertTrue(probe.events.isEmpty)
+    }
+
+    func testClickCancellationAfterOnePressReleasesAndReportsPartialDelivery() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        probe.posted = { if $0.type == .leftMouseDown { token.cancel() } }
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.click(target: target, button: .left, count: 2, flags: [],
+                io: probe.io, validateSession: {}) {}
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.leftMouseDown, .leftMouseUp])
+    }
+
+    func testScrollDeadlineExpiresInsideWindowValidation() {
+        let probe = Probe()
+        var remaining: TimeInterval = 1
+        let delivery = NativeInputDelivery(remaining: { remaining })
+        var io = probe.io
+        io.validateWindow = { _ in remaining = 0 }
+        XCTAssertThrowsError(try BackgroundDragDispatcher.scroll(target: target, direction: "down", unit: .lines,
+            size: 3, io: io, delivery: delivery, validateSession: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .notSent)
+        }
+        XCTAssertTrue(probe.events.isEmpty)
+    }
+
+    func testDragCancellationDuringFocusLookupDoesNotActivateTheApp() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        var io = probe.io
+        io.needsFocus = { _ in token.cancel(); return true }
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.drag(target: target, io: io, validateSession: {})
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+        }
+        XCTAssertTrue(probe.lifecycle.isEmpty)
+    }
+
+    func testDragDeadlineDuringWindowValidationReleasesAtTheLastSentPoint() {
+        let probe = Probe()
+        var remaining: TimeInterval = 1
+        let delivery = NativeInputDelivery(remaining: { remaining })
+        var io = probe.io
+        io.validateWindow = { _ in
+            if probe.events.contains(where: { $0.type == .leftMouseDragged }) { remaining = 0 }
+        }
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, steps: 2, io: io,
+            delivery: delivery, validateSession: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp])
+        XCTAssertEqual(probe.events.last?.location, CGPoint(x: 0, y: 180))
+        XCTAssertEqual(Array(probe.lifecycle.suffix(2)), ["release", "deactivate"])
+    }
+
+    func testLaterValidationCannotDowngradePartialClickOrDragToNotSent() {
+        let failures: [Error] = [
+            RequestCancellation.Cancelled(deliveryState: .notSent),
+            ComputerUseError.timedOut("Later validation expired", delivery: .notSent),
+            ComputerUseError.notSent("Later validation refused"),
+        ]
+        for failure in failures {
+            let click = Probe()
+            XCTAssertThrowsError(try BackgroundDragDispatcher.click(target: target, button: .left,
+                count: 2, flags: [], io: click.io, validateSession: {}) {
+                if !click.events.isEmpty { throw failure }
+            }) { error in
+                XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+            }
+            XCTAssertEqual(click.events.map(\.type), [.leftMouseDown, .leftMouseUp])
+
+            let drag = Probe()
+            var io = drag.io
+            io.validateWindow = { _ in
+                if drag.events.contains(where: { $0.type == .leftMouseDown }) { throw failure }
+            }
+            XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: io,
+                validateSession: {})) { error in
+                XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+            }
+            XCTAssertEqual(drag.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        }
+    }
+
     func testCleanupErrorIsReportedEvenWhenAnInputCheckAlsoFailed() {
         let probe = Probe(); probe.failValidation = 4; probe.failEnd = true
         XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {})) { error in
@@ -266,6 +467,31 @@ final class BackgroundDragTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("cleanup failed"))
         }
         XCTAssertEqual(probe.events.last?.type, .leftMouseUp)
+    }
+
+    func testMissingReleaseIsUncertainAndDoesNotInventDeliveredProgress() {
+        let probe = Probe()
+        var io = probe.io
+        io.release = { _, _ in false }
+        var progress: [NativeDragProgress] = []
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: io,
+            onProgress: { progress.append($0) }, validateSession: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+        }
+        XCTAssertEqual(progress.last?.phase, .dragged)
+        XCTAssertFalse(progress.contains { $0.phase == .released })
+        XCTAssertEqual(probe.lifecycle.last, "deactivate")
+    }
+
+    func testClickStopsBeforeAnotherPressWhenTheTargetCannotReceiveRelease() {
+        let probe = Probe()
+        var io = probe.io
+        io.release = { _, _ in false }
+        XCTAssertThrowsError(try BackgroundDragDispatcher.click(target: target, button: .left, count: 2,
+            flags: [], io: io, validateSession: {}, validateHit: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.leftMouseDown])
     }
 
     func testTargetGeometryRejectsNonFiniteOutsideAndEmptyBoundsBeforeFocus() {
