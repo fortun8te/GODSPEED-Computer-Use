@@ -1011,13 +1011,15 @@ public final class ComputerUseService {
             chosen = (candidate, firstPoint)
         } else if candidate.evidence == .model, clock.systemUptime < deadline,
                   let zoomed = GroundingCascade.secondLook(at: candidate.fraction, locate: { rect in
-                      let width = CGFloat(crop.width), height = CGFloat(crop.height)
-                      let pixels = CGRect(x: rect.minX * width, y: rect.minY * height,
-                                          width: rect.width * width, height: rect.height * height).integral
-                      guard clock.systemUptime < deadline, let sub = crop.cropping(to: pixels),
-                            let jpeg = LocalWindowImage.jpeg(sub) else { return nil }
-                      return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
-                                                   remaining: deadline - clock.systemUptime)
+                      guard clock.systemUptime < deadline,
+                            let pixels = VisionFallback.pixelCrop(rect, width: original.width, height: original.height),
+                            let sub = original.cropping(to: pixels),
+                            let detail = LocalWindowImage.downscaled(sub),
+                            let jpeg = LocalWindowImage.jpeg(detail),
+                            let local = VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
+                                                              remaining: deadline - clock.systemUptime) else { return nil }
+                      return VisionFallback.remapCropPoint(local, pixels: pixels, requested: rect,
+                                                           width: original.width, height: original.height)
                   }, verify: { fraction in
                       guard let zoomPoint = VisionFallback.windowPoint(fraction, bounds: bounds) else { return false }
                       return confirms(zoomPoint, VisionFallback.Candidate(fraction: fraction, evidence: .zoom))
