@@ -91,6 +91,82 @@ final class NativeInputDeliveryTests: XCTestCase {
         XCTAssertEqual(events.last?.flags, [])
     }
 
+    func testCancellationDuringLongHoldReleasesAfterOneShortPause() throws {
+        let chord = try KeyPressParser.parse("shift+Down", layout: { _ in nil })
+        let token = RequestCancellation()
+        var events: [CGEvent] = []
+        var elapsed: TimeInterval = 0
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try InputSimulation.deliverHeldKey(chord, hold: 1, validate: {},
+                post: { events.append($0) }, release: { events.append($0) }, clock: { elapsed },
+                pause: { elapsed += $0; token.cancel() })
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .outcomeUnknown)
+        }
+        XCTAssertEqual(elapsed, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(events.map(\.type), [.flagsChanged, .keyDown, .keyUp, .flagsChanged])
+        XCTAssertEqual(events.last?.flags, [])
+    }
+
+    func testChangedFocusDuringHoldReleasesBeforeTheFullDuration() throws {
+        let chord = try KeyPressParser.parse("Down", layout: { _ in nil })
+        var events: [CGEvent] = []
+        var elapsed: TimeInterval = 0
+        XCTAssertThrowsError(try InputSimulation.deliverHeldKey(chord, hold: 1, validate: {
+            if elapsed > 0 { throw ComputerUseError.notSent("The user changed windows.") }
+        }, post: { events.append($0) }, release: { events.append($0) }, clock: { elapsed },
+        pause: { elapsed += $0 })) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+        }
+        XCTAssertEqual(elapsed, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(events.map(\.type), [.keyDown, .keyUp])
+    }
+
+    func testHoldWaitCapsItsSleepToTheRemainingRequestBudget() throws {
+        let chord = try KeyPressParser.parse("Down", layout: { _ in nil })
+        var elapsed: TimeInterval = 0
+        var events: [CGEventType] = []
+        let delivery = NativeInputDelivery(remaining: { 0.012 - elapsed })
+        XCTAssertThrowsError(try InputSimulation.deliverHeldKey(chord, hold: 1, validate: {},
+            post: { events.append($0.type) }, release: { events.append($0.type) }, delivery: delivery,
+            clock: { elapsed }, pause: { elapsed += $0 })) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+            guard case ComputerUseError.timedOut = error else { return XCTFail("Expected a deadline failure") }
+        }
+        XCTAssertEqual(elapsed, 0.012, accuracy: 0.0001)
+        XCTAssertEqual(events, [.keyDown, .keyUp])
+    }
+
+    func testHoldDurationIncludesTimeSpentValidatingTheTarget() throws {
+        var elapsed: TimeInterval = 0
+        var pauses: [TimeInterval] = []
+        try NativeInputDelivery().wait(0.12, validate: { elapsed += 0.04 }, clock: { elapsed },
+            pause: { pauses.append($0); elapsed += $0 })
+        XCTAssertEqual(pauses.count, 1)
+        XCTAssertEqual(pauses.first ?? 0, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(elapsed, 0.13, accuracy: 0.0001)
+    }
+
+    func testSuccessfulHoldPreservesItsRequestedDuration() throws {
+        let chord = try KeyPressParser.parse("Down", layout: { _ in nil })
+        var elapsed: TimeInterval = 0
+        var events: [CGEventType] = []
+        try InputSimulation.deliverHeldKey(chord, hold: 0.12, validate: {},
+            post: { events.append($0.type) }, release: { events.append($0.type) },
+            clock: { elapsed }, pause: { elapsed += $0 })
+        XCTAssertEqual(elapsed, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(events, [.keyDown, .keyUp])
+    }
+
+    func testInvalidHoldCannotPressAnyKey() throws {
+        let chord = try KeyPressParser.parse("Down", layout: { _ in nil })
+        for hold in [TimeInterval.nan, .infinity, -1] {
+            XCTAssertThrowsError(try InputSimulation.deliverHeldKey(chord, hold: hold, validate: {},
+                post: { _ in XCTFail("Invalid hold pressed a key") },
+                release: { _ in XCTFail("Invalid hold released an unpressed key") }))
+        }
+    }
+
     func testFailedKeyPostDoesNotReleaseAnUnpressedMainKey() throws {
         let chord = try KeyPressParser.parse("shift+Down", layout: { _ in nil })
         var events: [CGEvent] = []

@@ -64,6 +64,11 @@ enum BatchResume {
         var strictBackground: Bool? = nil
         var backgroundOnly: Bool? = nil
         var completion: [Completion]? = nil
+        /// PIDs and window IDs can be reused after an application exits. A
+        /// continuation belongs to the original application lifetime as well.
+        var processLaunchDate: Date? = nil
+
+        var targetWindowID: UInt32? { windowID ?? originalWindowID }
 
         var slotNames: [String] {
             (pending.flatMap { $0.slots.values } + (completion ?? []).flatMap { $0.slots.values }).sorted()
@@ -74,7 +79,8 @@ enum BatchResume {
     static func record(steps: [BatchTool.Step], receipt: TrajectoryLog.BatchReceipt, goal: String, doneWhen: Any?,
                        app: String?, windowID: UInt32?, processID: Int32?, now: Date = Date(),
                        originalWindowID: UInt32? = nil, browserTabs: [Int: Int] = [:],
-                       requiresFreshSteps: Bool = false, continuing prior: Record? = nil) -> Record? {
+                       requiresFreshSteps: Bool = false, continuing prior: Record? = nil,
+                       processLaunchDate: Date? = nil) -> Record? {
         guard prior == nil || prior?.pending.count == steps.count,
               prior?.doneWhen == nil,
               let completion = try? completionTemplate(doneWhen) else { return nil }
@@ -115,7 +121,8 @@ enum BatchResume {
                       originalWindowID: prior == nil ? originalWindowID : prior?.originalWindowID,
                       requiresFreshSteps: prior?.requiresFreshSteps ?? requiresFreshSteps,
                       strictBackground: StrictBackground.enabled(), backgroundOnly: backgroundOnlyMode(),
-                      completion: prior?.completion ?? completion)
+                      completion: prior?.completion ?? completion,
+                      processLaunchDate: prior == nil ? processLaunchDate : prior?.processLaunchDate)
     }
 
     private static func strings(in value: Any?) -> [String] {
@@ -254,15 +261,19 @@ enum BatchResume {
     }
 
     /// Refuses an expired token, or one whose app process or pinned window is no longer the same.
-    static func check(_ record: Record, now: Date, liveProcessID: Int32?, liveWindowID: UInt32?) throws {
+    static func check(_ record: Record, now: Date, liveProcessID: Int32?, liveWindowID: UInt32?,
+                      liveProcessLaunchDate: Date? = nil) throws {
         guard now < record.expiresAt else {
             throw ComputerUseError.invalidArguments("RESUME_EXPIRED. The resume token is older than 24 hours. Read the app and send the remaining steps again.")
         }
-        let window = record.windowID ?? record.originalWindowID
+        let window = record.targetWindowID
         guard let processID = record.processID, processID == liveProcessID,
               let window, window == liveWindowID else {
             if let windowID = window { throw ComputerUseError.windowChanged(windowID) }
             throw ComputerUseError.invalidArguments("WINDOW_CHANGED. The app changed since the batch stopped. Read it again and send the remaining steps.")
+        }
+        guard let launch = record.processLaunchDate, launch == liveProcessLaunchDate else {
+            throw ComputerUseError.notSent("The original application lifetime could not be confirmed. The app may have restarted. Read it again and send the remaining steps explicitly.")
         }
     }
 
@@ -329,10 +340,10 @@ enum BatchResume {
     }
 
     /// Resolves the process and requested or current window from the same app descriptor.
-    static func liveState(app: String?, windowID: UInt32?) -> (processID: Int32?, windowID: UInt32?) {
-        guard let app, let descriptor = try? AppDiscovery.resolveRunning(app) else { return (nil, nil) }
+    static func liveState(app: String?, windowID: UInt32?) -> (processID: Int32?, windowID: UInt32?, processLaunchDate: Date?) {
+        guard let app, let descriptor = try? AppDiscovery.resolveRunning(app) else { return (nil, nil, nil) }
         let window = (try? SnapshotBuilder.resolveTargetWindow(for: descriptor, windowID: windowID))?.windowID
-        return (descriptor.pid, window)
+        return (descriptor.pid, window, descriptor.runningApplication.launchDate)
     }
 
     private static func prune(_ folder: URL, now: Date) {
@@ -355,7 +366,7 @@ enum BatchResume {
         } else if record.pending.contains(where: { $0.tool == "browser" }) || record.sent.contains(where: { $0.tool == "browser" }) {
             lines.append("Inspect the browser tab and send the remaining steps explicitly.")
         } else if !record.pending.isEmpty, record.requiresFreshSteps == true || record.app == nil || record.processID == nil
-                    || (record.windowID ?? record.originalWindowID) == nil {
+                    || record.targetWindowID == nil || record.processLaunchDate == nil {
             lines.append("Read the target and send the remaining steps explicitly.")
         } else if !record.pending.isEmpty {
             lines.append("Send batch with resume \"\(record.id)\" to continue if the original target still matches (valid 24 hours).")

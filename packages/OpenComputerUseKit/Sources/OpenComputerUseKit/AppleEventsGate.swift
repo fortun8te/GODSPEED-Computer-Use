@@ -28,32 +28,47 @@ enum AppleEventsGate {
         return false
     }
 
-    /// Runs AppleScript source only when allowed; nil otherwise or on error. A 6 s Apple Event timeout applies.
+    /// Read-only convenience. Mutating callers use `send` so a failure cannot
+    /// silently fall through into a second action.
     static func run(_ source: String, bundle: String, limit: TimeInterval = 7) -> NSAppleEventDescriptor? {
         try? send(source, bundle: bundle, limit: limit)
     }
 
     /// Nil means the permission gate stopped the script before sending. A failure after dispatch
     /// must reach the caller, since falling through to input could repeat the same mutation.
-    static func send(_ source: String, bundle: String, limit: TimeInterval = 7) throws -> NSAppleEventDescriptor? {
-        guard allowed(bundle: bundle) else { return nil }
-        // The script runs on its own thread and is given up on after `limit`: an app showing a modal sheet
-        // answered nothing for minutes, which held every other agent's calls.
-        final class Box: @unchecked Sendable { var value: NSAppleEventDescriptor?; var failed = false }
-        let box = Box()
-        let done = DispatchSemaphore(value: 0)
-        let wrapped = "with timeout of \(Int(limit) - 1) seconds\n\(source)\nend timeout"
-        Thread.detachNewThread {
-            var error: NSDictionary?
-            let result = NSAppleScript(source: wrapped)?.executeAndReturnError(&error)
-            box.value = result
-            box.failed = error != nil
-            done.signal()
+    static func send(
+        _ source: String, bundle: String, limit: TimeInterval = 7,
+        permission: (String) -> Bool = { allowed(bundle: $0) },
+        schedule: (@escaping @Sendable () -> Void) -> Void = { Thread.detachNewThread($0) },
+        execute: @escaping @Sendable (String) throws -> NSAppleEventDescriptor = { try executeScript($0) }
+    ) throws -> NSAppleEventDescriptor? {
+        let operation = try LocalOperation<NSAppleEventDescriptor>(timeout: limit, action: "Apple Event")
+        let permitted = permission(bundle)
+        try operation.check()
+        guard permitted else { return nil }
+        let environment = RequestConfiguration.environment
+        schedule {
+            RequestConfiguration.withEnvironment(environment) {
+                RequestCancellation.$current.withValue(operation.cancellation) {
+                    BrowserCallBudget.withDeadline(operation.deadline) {
+                        operation.perform {
+                            // AppleScript accepts whole seconds. The outer wait
+                            // still enforces subsecond deadlines and marks an
+                            // in-flight timeout as uncertain delivery.
+                            let seconds = max(1, Int(min(60, ceil(operation.remaining))))
+                            return try execute("with timeout of \(seconds) seconds\n\(source)\nend timeout")
+                        }
+                    }
+                }
+            }
         }
-        guard done.wait(timeout: .now() + limit) == .success else {
-            throw ComputerUseError.timedOut("The app did not acknowledge the Apple Event.", delivery: .outcomeUnknown)
-        }
-        guard !box.failed, let result = box.value else {
+        return try operation.wait()
+    }
+
+    private static func executeScript(_ source: String) throws -> NSAppleEventDescriptor {
+        var error: NSDictionary?
+        let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
+        guard error == nil, let result else {
             throw ComputerUseError.stateUnavailable("The app did not confirm the Apple Event. Inspect it before retrying.")
         }
         return result

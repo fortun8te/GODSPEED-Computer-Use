@@ -50,6 +50,7 @@ struct BackgroundDragIO {
     var post: (CGEvent, pid_t) -> Void
     var release: (CGEvent, BackgroundDragTarget) -> Void
     var pause: (TimeInterval) -> Void
+    var clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
     static func system(spi: SkyLightSPI = .shared) -> BackgroundDragIO {
         func windows() -> [[String: Any]] {
@@ -65,19 +66,7 @@ struct BackgroundDragIO {
                 try validateBackgroundDragWindow(target, windowInfo: windows())
             },
             needsFocus: { pid in
-                // NSWorkspace's frontmostApplication can be stale in a long-lived
-                // CLI/MCP process without a pumping AppKit run loop. Read the
-                // current system-wide focused app synchronously instead.
-                var value: CFTypeRef?
-                let status = AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &value)
-                guard status == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-                    throw ComputerUseError.stateUnavailable("drag cannot determine the current foreground application")
-                }
-                var frontPID: pid_t = 0
-                guard AXUIElementGetPid(value as! AXUIElement, &frontPID) == .success, frontPID > 0 else {
-                    throw ComputerUseError.stateUnavailable("drag cannot determine the current foreground PID")
-                }
-                return frontPID != pid
+                try ForegroundApplication.pid() != pid
             },
             beginFocus: { try spi.beginSyntheticTargetFocus(targetPID: $0.pid, targetWindowID: $0.windowID) },
             makeKey: { try spi.makeSyntheticTargetWindowKey($0) },
@@ -343,8 +332,10 @@ enum BackgroundDragDispatcher {
                 io.release(release, target)
                 io.pause(eventDelay)
             }) {
-                try delivery.check()
-                io.pause(max(eventDelay, hold))
+                try delivery.wait(max(eventDelay, hold), validate: {
+                    try validateSession()
+                    try io.validateWindow(target)
+                }, clock: io.clock, pause: io.pause)
                 for step in steps {
                     try send(step.drag)
                     release = step.up

@@ -184,14 +184,29 @@ enum MacOSAppAgentProxy {
         while let request = requests.next() {
             let line = request.line
             if request.cancellation.isCancelled {
-                if let id = jsonRPCRequestID(line),
-                   let reply = try? JSONSerialization.data(withJSONObject: [
-                       "jsonrpc": "2.0", "id": id,
-                       "error": ["code": -32000, "message": "Request cancelled before dispatch. No steps ran."],
-                   ]) {
-                    output.writeLine(reply)
+                if let id = jsonRPCRequestID(line) {
+                    let reply = Self.mcpFailureReply(id: id, message: "Request cancelled before dispatch. No steps ran.",
+                                                     delivery: .notSent)
+                    if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
+                        output.writeLine(data)
+                    }
                 }
                 continue
+            }
+            // Reconnect only when there is another live request to serve.
+            // A cancelled final call or a closed MCP client must not relaunch
+            // the app agent solely to replace an unused socket.
+            if client.needsReconnect {
+                do { client = try connectOrLaunchAgent(socketPath: socketPath) }
+                catch {
+                    if let id = jsonRPCRequestID(line) {
+                        let reply = Self.mcpFailureReply(id: id, message: error.localizedDescription, delivery: .notSent)
+                        if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
+                            output.writeLine(data)
+                        }
+                    }
+                    continue
+                }
             }
             if canIdentifyClient {
                 canIdentifyClient = false
@@ -220,7 +235,23 @@ enum MacOSAppAgentProxy {
                             output.writeLine(data)
                         }
                     }
-                    client = try connectOrLaunchAgent(socketPath: socketPath)
+                } catch let cancelled as RequestCancellation.Cancelled {
+                    if let id = jsonRPCRequestID(line) {
+                        let message = cancelled.deliveryState == .notSent
+                            ? "Request cancelled before dispatch. No steps ran."
+                            : "Request cancelled while communicating with the app agent. Inspect the current state before retrying."
+                        let reply = Self.mcpFailureReply(id: id, message: message, delivery: cancelled.deliveryState)
+                        if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
+                            output.writeLine(data)
+                        }
+                    }
+                } catch let lost as AppAgentConnectionLost {
+                    if let id = jsonRPCRequestID(line) {
+                        let reply = Self.mcpFailureReply(id: id, message: lost.localizedDescription, delivery: .outcomeUnknown)
+                        if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
+                            output.writeLine(data)
+                        }
+                    }
                 }
             }
         }
@@ -773,7 +804,7 @@ private final class AppAgentConnection: @unchecked Sendable {
                 return ["error": "Unknown app-agent request kind: \(kind)"]
             }
         } catch {
-            let message = error is RequestCancellation.Cancelled
+            let message = (error as? RequestCancellation.Cancelled)?.deliveryState == .notSent
                 ? "Request cancelled before dispatch. No steps ran."
                 : (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             // Preserve the native RPC id even when lease acquisition fails
@@ -965,14 +996,54 @@ struct AppAgentResponseTimeout: LocalizedError {
     }
 }
 
-private final class AppAgentSocketClient: @unchecked Sendable {
+struct AppAgentConnectionLost: LocalizedError {
+    var errorDescription: String? {
+        "Open Computer Use.app agent closed the connection. The action may have taken effect. Inspect the current state before retrying."
+    }
+}
+
+/// A cancellation can arrive while stdio is still flushing the request. Sending
+/// a cancellation frame then would splice it into the request, so interrupt
+/// that connection instead. After a complete flush the normal RPC cancellation
+/// can use the same connection without discarding later queued work.
+private final class AppAgentSocketCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let descriptor: Int32
+    private let envelope: Data?
+    private var frameSent = false
+    private var interrupted = false
+
+    init(descriptor: Int32, envelope: Data?) {
+        self.descriptor = descriptor
+        self.envelope = envelope
+    }
+
+    var interruptedConnection: Bool { lock.withLock { interrupted } }
+
+    func didSendFrame() { lock.withLock { frameSent = true } }
+
+    func cancel(disconnected: Bool) {
+        lock.withLock {
+            if !disconnected, frameSent, let envelope {
+                let count = envelope.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, MSG_DONTWAIT) }
+                if count == envelope.count { return }
+            }
+            interrupted = true
+            shutdown(descriptor, SHUT_RDWR)
+        }
+    }
+}
+
+final class AppAgentSocketClient: @unchecked Sendable {
     private let file: UnsafeMutablePointer<FILE>
     private let descriptor: Int32
 
-    private init(file: UnsafeMutablePointer<FILE>) {
+    init(file: UnsafeMutablePointer<FILE>) {
         self.file = file
         descriptor = fileno(file)
         _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
+        var noSigpipe: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
     }
 
     deinit {
@@ -1017,9 +1088,7 @@ private final class AppAgentSocketClient: @unchecked Sendable {
             return nil
         }
 
-        // A hung agent must not hold the caller forever; a write to a dead agent must not raise SIGPIPE.
-        var noSigpipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        // A hung agent must not hold the caller forever.
         var timeout = timeval(tv_sec: Int(responseTimeout), tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
@@ -1027,46 +1096,61 @@ private final class AppAgentSocketClient: @unchecked Sendable {
         return AppAgentSocketClient(file: file)
     }
 
-    /// Seconds one request waits for the agent's answer before it is stopped. The agent itself keeps its work.
+    /// Seconds one request waits for an answer before its connection is closed.
+    /// Other clients of the shared agent remain connected.
     static let responseTimeout: TimeInterval = 120
 
-    /// Set once a request timed out: the late reply would otherwise be read as the answer to the next request.
-    private var timedOut = false
+    /// An interrupted/closed stream cannot be reused: a late or partial reply
+    /// must never become the answer to a later request.
+    private(set) var needsReconnect = false
+
+    private func invalidateConnection() {
+        needsReconnect = true
+        // Signal the reader immediately, so its active worker is cancelled
+        // even when no later MCP request arrives to replace this client.
+        shutdown(descriptor, SHUT_RDWR)
+    }
 
     func request(
         _ object: [String: Any], cancellation: RequestCancellation? = nil, rpcID: Any? = nil
     ) throws -> [String: Any] {
-        if timedOut { throw AppAgentResponseTimeout() }
+        if needsReconnect { throw AppAgentConnectionLost() }
+        if cancellation?.isCancelled == true { throw RequestCancellation.Cancelled(deliveryState: .notSent) }
         let data = try JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])
         guard let line = String(data: data, encoding: .utf8) else {
             throw ComputerUseError.message("Failed to encode app-agent request.")
         }
+        if cancellation?.isCancelled == true { throw RequestCancellation.Cancelled(deliveryState: .notSent) }
 
-        // Only the worker writes normal requests. The reader can send one
-        // cancellation after this line is flushed, while the worker awaits its reply.
-        writeAgentLine(line, to: file)
-        let cancel = Self.cancellationEnvelope(id: rpcID)
-        cancellation?.onCancel { [self] disconnected in
-            if disconnected {
-                shutdown(descriptor, SHUT_RDWR)
-            } else if let cancel {
-                let count = cancel.withUnsafeBytes { send(descriptor, $0.baseAddress, $0.count, MSG_DONTWAIT) }
-                if count != cancel.count { shutdown(descriptor, SHUT_RDWR) }
-            }
+        let cancellationState = AppAgentSocketCancellation(descriptor: descriptor, envelope: Self.cancellationEnvelope(id: rpcID))
+        cancellation?.onCancel { disconnected in cancellationState.cancel(disconnected: disconnected) }
+        defer {
+            // onCancel(nil) waits for an in-flight callback before the file can
+            // be reused or closed, then exposes its final transport state.
+            cancellation?.onCancel(nil)
+            if cancellationState.interruptedConnection { invalidateConnection() }
         }
-        defer { cancellation?.onCancel(nil) }
+        if cancellation?.isCancelled == true { throw RequestCancellation.Cancelled(deliveryState: .notSent) }
+        guard writeAgentLine(line, to: file) else {
+            invalidateConnection()
+            if cancellation?.isCancelled == true { throw RequestCancellation.Cancelled(deliveryState: .outcomeUnknown) }
+            throw AppAgentConnectionLost()
+        }
+        cancellationState.didSendFrame()
 
         let responseLine = readAgentLine(file)
         // A read that hit the timeout returns what arrived so far (possibly a partial line): check it before using it.
         if ferror(file) != 0, errno == EAGAIN || errno == EWOULDBLOCK {
-            timedOut = true
+            invalidateConnection()
             throw AppAgentResponseTimeout()
         }
 
         guard let responseLine,
-              let response = try JSONSerialization.jsonObject(with: Data(responseLine.utf8)) as? [String: Any]
+              let response = try? JSONSerialization.jsonObject(with: Data(responseLine.utf8)) as? [String: Any]
         else {
-            throw ComputerUseError.message("Open Computer Use.app agent closed the connection.")
+            invalidateConnection()
+            if cancellation?.isCancelled == true { throw RequestCancellation.Cancelled(deliveryState: .outcomeUnknown) }
+            throw AppAgentConnectionLost()
         }
 
         if let error = response["error"] as? String {
@@ -1192,10 +1276,9 @@ private func writeAgentLine(_ object: [String: Any], to file: UnsafeMutablePoint
     }
 }
 
-private func writeAgentLine(_ line: String, to file: UnsafeMutablePointer<FILE>) {
+@discardableResult
+private func writeAgentLine(_ line: String, to file: UnsafeMutablePointer<FILE>) -> Bool {
     let output = line + "\n"
-    _ = output.withCString { pointer in
-        fputs(pointer, file)
-    }
-    fflush(file)
+    let written = output.withCString { pointer in fputs(pointer, file) != EOF }
+    return written && fflush(file) == 0
 }

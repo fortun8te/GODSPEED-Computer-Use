@@ -29,6 +29,40 @@ enum BatchTool {
 
     /// Tools that only read; a batch made only of these never triggers the unchanged-screen note.
     static let readOnlyTools: Set<String> = ["query", "list_apps", "get_app_state", "wait_for", LocalDecisionTool.name]
+
+    /// Use the same binding before claiming a continuation and when building
+    /// its execution plan. The plan pin also binds waits and final checks.
+    static func binding(_ steps: [Step], to windowID: UInt32?, app: String?) throws -> [Step] {
+        guard let windowID else { return steps }
+        guard let app, !app.isEmpty else {
+            throw ComputerUseError.invalidArguments("A window-bound batch requires an app.")
+        }
+        let windowTools = ArgumentNormalizer.windowBoundTools.union(["query", "get_app_state", HandoffTool.name])
+        return try steps.map { step in
+            var args = step.arguments
+            // A wait can observe its existing window, but cannot switch to a
+            // newly opened window while carrying the old window binding.
+            if step.tool == waitName {
+                if args["window"] != nil || BatchEffects.Wait.keyAliases.contains(where: { $0.value == "window" && args[$0.key] != nil }) {
+                    throw ComputerUseError.invalidArguments("A window-bound batch cannot wait for another window. Drop window_id to wait for a new window.")
+                }
+                if let targetApp = args["app"] as? String, targetApp != app {
+                    throw ComputerUseError.invalidArguments("A wait in a window-bound batch reads its own app.")
+                }
+                args["app"] = app
+                return Step(tool: step.tool, arguments: args)
+            }
+            guard (args["app"] as? String) == app, windowTools.contains(step.tool) else {
+                throw ComputerUseError.invalidArguments("A window-bound batch accepts \(step.tool) only as one of: \(windowTools.sorted().joined(separator: ", ")), wait, on \(app). Drop window_id to use other steps.")
+            }
+            if let override = try validatedQueryWindowID(args["window_id"]), override != windowID {
+                throw ComputerUseError.invalidArguments("A batch step cannot override the pinned window.")
+            }
+            args["window_id"] = windowID
+            return Step(tool: step.tool, arguments: args)
+        }
+    }
+
     private static let readOnlyBrowserActions: Set<String> = [
         "read", "state", "look", "snapshot", "screenshot", "see", "look_at", "location", "info", "page", "page_info",
         "outline", "frames", "read_text", "link_destination", "control_state", "value", "tabs", "list",
@@ -613,9 +647,11 @@ extension ComputerUseToolDispatcher {
         let background = backgroundOnlyMode() || record.backgroundOnly == true
         return try BackgroundContinuation.$required.withValue(background) {
             try StrictBackground.$requested.withValue(strict) {
-                let live = BatchResume.liveState(app: record.app, windowID: record.windowID)
-                try BatchResume.check(record, now: Date(), liveProcessID: live.processID, liveWindowID: live.windowID)
-                let steps = try BatchResume.steps(of: record, values: resumedValues)
+                let live = BatchResume.liveState(app: record.app, windowID: record.targetWindowID)
+                try BatchResume.check(record, now: Date(), liveProcessID: live.processID, liveWindowID: live.windowID,
+                                      liveProcessLaunchDate: live.processLaunchDate)
+                let steps = try BatchTool.binding(BatchResume.steps(of: record, values: resumedValues),
+                                                 to: record.targetWindowID, app: app)
                 for step in steps {
                     let normalized = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
                     if let window = try validatedQueryWindowID(normalized["window_id"]), window != live.windowID {
@@ -637,12 +673,13 @@ extension ComputerUseToolDispatcher {
                     monitor.finishRead(pid: pid, startedAt: generation,
                                        complete: preflightState.map(BatchEffects.Watch.isComplete) ?? false)
                 }
-                let afterRead = BatchResume.liveState(app: app, windowID: record.windowID)
-                try BatchResume.check(record, now: Date(), liveProcessID: afterRead.processID, liveWindowID: afterRead.windowID)
+                let afterRead = BatchResume.liveState(app: app, windowID: record.targetWindowID)
+                try BatchResume.check(record, now: Date(), liveProcessID: afterRead.processID, liveWindowID: afterRead.windowID,
+                                      liveProcessLaunchDate: afterRead.processLaunchDate)
                 try BatchResume.claim(token, deadline: inheritedDeadline)
                 var planArguments: [String: Any] = ["goal": record.goal, "remember": false]
                 if let app = record.app { planArguments["app"] = app }
-                if let windowID = record.windowID { planArguments["window_id"] = NSNumber(value: windowID) }
+                if let windowID = record.targetWindowID { planArguments["window_id"] = NSNumber(value: windowID) }
                 if let resumedCompletion { planArguments["done_when"] = resumedCompletion }
                 for key in ["screenshot", "compact", "effects", "return_state"] { planArguments[key] = arguments[key] }
                 return try OperationJournal.withBatchGoal(record.goal) {
@@ -748,31 +785,7 @@ extension ComputerUseToolDispatcher {
         if replayed != nil, let defaultApp, !parsedSteps.allSatisfy({ HandoffTool.isSafeRecipeStep($0, app: defaultApp) }) {
             throw ComputerUseError.invalidArguments("Some saved steps need fresh instructions. Read the app and provide explicit steps.")
         }
-        let steps = try parsedSteps.map { step in
-            guard let pinnedWindow, let defaultApp else { return step }
-            var args = step.arguments
-            // A wait only reads state. In a window-bound batch it reads the pinned window, so it is safe
-            // unless it waits for a different window to appear.
-            if step.tool == BatchTool.waitName {
-                if args["window"] != nil || BatchEffects.Wait.keyAliases.contains(where: { $0.value == "window" && args[$0.key] != nil }) {
-                    throw ComputerUseError.invalidArguments("A window-bound batch cannot wait for another window. Drop window_id to wait for a new window.")
-                }
-                if let app = args["app"] as? String, app != defaultApp {
-                    throw ComputerUseError.invalidArguments("A wait in a window-bound batch reads its own app.")
-                }
-                args["app"] = defaultApp
-                return BatchTool.Step(tool: step.tool, arguments: args)
-            }
-            guard (args["app"] as? String) == defaultApp,
-                  ArgumentNormalizer.windowBoundTools.contains(step.tool) || step.tool == HandoffTool.name else {
-                throw ComputerUseError.invalidArguments("A window-bound batch accepts \(step.tool) only as one of: \(ArgumentNormalizer.windowBoundTools.sorted().joined(separator: ", ")), wait, on \(defaultApp). Drop window_id to use other steps.")
-            }
-            if let override = try validatedQueryWindowID(args["window_id"]), override != pinnedWindow {
-                throw ComputerUseError.invalidArguments("A batch step cannot override the pinned window.")
-            }
-            args["window_id"] = pinnedWindow
-            return BatchTool.Step(tool: step.tool, arguments: args)
-        }
+        let steps = try BatchTool.binding(parsedSteps, to: pinnedWindow, app: defaultApp)
         // Check explicit target arguments before any step can change an app or a page.
         for (offset, step) in steps.enumerated() {
             do {
@@ -868,7 +881,8 @@ extension ComputerUseToolDispatcher {
             guard let record = BatchResume.record(steps: steps, receipt: receipt, goal: goal, doneWhen: arguments["done_when"],
                                                   app: singleApp, windowID: pinnedWindow, processID: resumeStart.processID,
                                                   originalWindowID: resumeStart.windowID, browserTabs: resumeBrowserTabs,
-                                                  requiresFreshSteps: replayed != nil, continuing: resumed?.record) else { return }
+                                                  requiresFreshSteps: replayed != nil, continuing: resumed?.record,
+                                                  processLaunchDate: resumeStart.processLaunchDate) else { return }
             do { try BatchResume.save(record) } catch { return }
             lines += BatchResume.replyLines(for: record)
         }
@@ -1030,10 +1044,10 @@ extension ComputerUseToolDispatcher {
             let number = offset + 1
             if stopIfCancelled() || stopIfOutOfTime(before: number) { break }
             if let resumed {
-                let live = BatchResume.liveState(app: resumed.record.app, windowID: resumed.record.windowID)
+                let live = BatchResume.liveState(app: resumed.record.app, windowID: resumed.record.targetWindowID)
                 do {
                     try BatchResume.check(resumed.record, now: Date(), liveProcessID: live.processID,
-                                          liveWindowID: live.windowID)
+                                          liveWindowID: live.windowID, liveProcessLaunchDate: live.processLaunchDate)
                 } catch {
                     lines.append("The original batch target is unavailable. Step \(resumed.record.pending[offset].number) was not sent. Inspect the app before continuing.")
                     receipt.stop = .windowChanged
@@ -1251,8 +1265,8 @@ extension ComputerUseToolDispatcher {
             let defersNavigationRead = step.tool == "browser"
                 && (isLastStep || ((step.arguments["action"] as? String) == "click" && nextReadsBrowser))
             var stepArguments = step.arguments
-            if let originalWindow = resumed?.record.originalWindowID,
-               ArgumentNormalizer.windowBoundTools.contains(step.tool) || step.tool == HandoffTool.name {
+            if let originalWindow = resumed?.record.targetWindowID,
+               ArgumentNormalizer.windowBoundTools.contains(step.tool) || ["query", "get_app_state", HandoffTool.name].contains(step.tool) {
                 stepArguments["window_id"] = originalWindow
             }
             if isLastStep, step.tool == "get_app_state", wantsScreenshot {
