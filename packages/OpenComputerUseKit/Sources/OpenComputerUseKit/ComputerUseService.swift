@@ -981,7 +981,9 @@ public final class ComputerUseService {
         }
         let candidate = VisionFallback.candidate(scan: { accurate in
             guard clock.systemUptime < deadline else { return .missing }
-            return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
+            // Preserve small toolbar labels and dense canvas text on the accurate pass.
+            let image = accurate ? (LocalWindowImage.downscaled(original, maxSide: VisionFallback.accurateOCRMaxSide) ?? crop) : crop
+            return LocalOCR.scan(image, label: label, level: accurate ? .accurate : .fast)
         }, locate: {
             guard clock.systemUptime < deadline,
                   let overview = LocalWindowImage.downscaled(crop, maxSide: VisionFallback.overviewMaxSide),
@@ -1009,13 +1011,15 @@ public final class ComputerUseService {
             chosen = (candidate, firstPoint)
         } else if candidate.evidence == .model, clock.systemUptime < deadline,
                   let zoomed = GroundingCascade.secondLook(at: candidate.fraction, locate: { rect in
-                      let width = CGFloat(crop.width), height = CGFloat(crop.height)
-                      let pixels = CGRect(x: rect.minX * width, y: rect.minY * height,
-                                          width: rect.width * width, height: rect.height * height).integral
-                      guard clock.systemUptime < deadline, let sub = crop.cropping(to: pixels),
-                            let jpeg = LocalWindowImage.jpeg(sub) else { return nil }
-                      return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
-                                                   remaining: deadline - clock.systemUptime)
+                      guard clock.systemUptime < deadline,
+                            let pixels = VisionFallback.pixelCrop(rect, width: original.width, height: original.height),
+                            let sub = original.cropping(to: pixels),
+                            let detail = LocalWindowImage.downscaled(sub),
+                            let jpeg = LocalWindowImage.jpeg(detail),
+                            let local = VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
+                                                              remaining: deadline - clock.systemUptime) else { return nil }
+                      return VisionFallback.remapCropPoint(local, pixels: pixels, requested: rect,
+                                                           width: original.width, height: original.height)
                   }, verify: { fraction in
                       guard let zoomPoint = VisionFallback.windowPoint(fraction, bounds: bounds) else { return false }
                       return confirms(zoomPoint, VisionFallback.Candidate(fraction: fraction, evidence: .zoom))
@@ -1027,7 +1031,11 @@ public final class ComputerUseService {
             return nil
         }
         let point = chosen.point
-        guard clock.systemUptime < deadline, liveWindow() != nil else { return nil }
+        // The helper can take seconds; reject any changed screen before delivering input.
+        guard clock.systemUptime < deadline, let finalWindow = liveWindow(),
+              let finalImage = SnapshotBuilder.localWindowImage(finalWindow),
+              VisionFallback.sameCapture(original, finalImage),
+              confirms(point, chosen.candidate), clock.systemUptime < deadline else { return nil }
         verified = true
 
         let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
@@ -3256,10 +3264,24 @@ public final class ComputerUseService {
         if LabelSpellings.menuBarTitles.contains(given[0]) {
             throw ComputerUseError.invalidArguments("'\(labels[0])' is a menu bar menu, not a window control. Use press_menu, e.g. {\"app\": \"\(query)\", \"path\": \"\(labels[0]) > Save\"}; press_menu with just \"\(labels[0])\" lists its items.")
         }
+        // A miss is a discovery opportunity, not permission to guess an action.
+        // Do not expose field values or document contents in the recovery shortlist.
+        let options = fresh.elements.values.sorted { $0.index < $1.index }.compactMap { record -> GroundingCascade.Option? in
+            guard clickable.contains(roleKey(record.role)) else { return nil }
+            let name = [record.title, record.identity?.name, record.identifier]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            guard let name else { return nil }
+            return GroundingCascade.Option(id: String(record.index), text: String(name.prefix(120)))
+        }
+        let suggestions = GroundingCascade.discoverySuggestions(label: labels[0], options: options)
         let shown = avail.isEmpty
             ? "none with a name; use element_index from the state, or query to find text"
             : avail.prefix(60).joined(separator: ", ")
-        throw ComputerUseError.targetNotFound("no element labelled '\(labels[0])'. Clickable labels now: \(shown)")
+        let recovery = suggestions.isEmpty ? "" :
+            " Possible controls (not verified matches): " + suggestions.map { "\($0.id) \($0.text)" }.joined(separator: "; ") +
+            ". Read the same window and inspect the intended control before acting."
+        throw ComputerUseError.targetNotFound("no element labelled '\(labels[0])'.\(recovery) Clickable labels now: \(shown)")
     }
 
     static func isToggleRole(_ role: String?) -> Bool {
