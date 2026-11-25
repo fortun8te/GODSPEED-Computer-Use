@@ -6,6 +6,8 @@ import ImageIO
 enum VisionFallback {
     // Keep OCR and the targeted second look at their original resolution.
     static let overviewMaxSide = 640
+    // Bound the accurate OCR pass while retaining Retina-size toolbar text.
+    static let accurateOCRMaxSide = 2560
     /// Read per request (L6): the settings file and each caller's options can change it.
     static var baseURL: URL? { localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]) }
 
