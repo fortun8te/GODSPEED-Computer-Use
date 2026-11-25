@@ -408,6 +408,8 @@ Use browser `close_tab` with the explicit `tab_id` returned by `open_tab`. Godsp
 
 ## Parallel browser work
 
+With the [Godspeed workspace extension](INSTALL.md#godspeed-browser-workspace), concurrent sessions share one purple **Godspeed** group in each normal Chrome window. The group settles at the far left after pinned tabs and is collapsed by default while inactive. Manual expansion is respected; Godspeed never switches to a different user tab merely to collapse the group. Pinned tabs stay pinned. Only explicit creation or a successful claim grants tab ownership; a group title, membership or popup opener does not. Retained results stay in the workspace without becoming another session's tabs.
+
 While the Mac is unlocked, up to four different MCP clients can make read-only browser requests at once. Use the canonical `read`, `peek`, `info`, `tabs`, or `screenshot` action. An explicit `wait_for` of 1–3 seconds can also share admission. Each client has its own tab state and can have one read in flight. Native actions, mixed batches, and Locked Use recovery get exclusive access. Browser writes also run one at a time by default. Exclusive requests run in arrival order. A queued writer normally gets the next turn. When a reader has waited through two exclusive admissions, the oldest eligible reader gets a turn. One client cannot take multiple read slots. Set `OPEN_COMPUTER_USE_PARALLEL_READS` to 1, 2, 3, or 4 in the shared app agent environment to compare reader limits. The default is 3.
 
 If the Mac session changes mid-read, Godspeed stops issuing browser commands and reports the interruption. Check the tab before retrying.
@@ -418,7 +420,7 @@ The app agent accepts up to 32 connections and queues up to 32 admissions. Each 
 
 Set `OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES=1` in the app agent's launch environment to allow two or more clients to scroll or fill a named field in different tabs. Each call must name its tab ID. The current helper must have opened that tab. The same tab and the same client still run one write at a time.
 
-Local model calls release desktop admission while they wait for an answer. If another request takes admission in the meantime, Godspeed stops the interrupted workflow and asks for a fresh look. Calls skip the model during a focus borrow or Locked Use lease. The shared app agent uses an already-running model helper.
+Local model calls release desktop admission while they wait for an answer. If a potentially state-changing request takes admission in the meantime, Godspeed stops the interrupted workflow and asks for a fresh look. Pure browser reads do not invalidate that observation; writes and peeks that create temporary tabs still do. Calls skip the model during a focus borrow or Locked Use lease. The shared app agent uses an already-running model helper.
 
 ## Verified scroll chunks
 

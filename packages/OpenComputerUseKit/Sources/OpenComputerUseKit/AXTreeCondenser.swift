@@ -77,7 +77,7 @@ enum AXTreeCondenser {
                 continue
             }
 
-            let depth = packedIndentation ? original.width : original.indent.count
+            let depth = packedIndentation ? original.width : original.indent.utf8.count
             while let last = removedDepths.last, last >= depth {
                 removedDepths.removeLast()
             }
@@ -95,7 +95,7 @@ enum AXTreeCondenser {
                !isProtectedLine(original), let parent = structure.parents[position],
                (actionableRoles.contains(lines[parent].role) || lines[parent].role == "link"),
                let payload = textParts(original.rest)?.payload, !payload.isEmpty,
-               simpleName(lines[parent]) == payload {
+               let name = simpleName(lines[parent]), name[...] == payload {
                 continue
             }
 
@@ -209,14 +209,17 @@ enum AXTreeCondenser {
     private struct Line {
         var raw: String = ""
         var isTree = false
-        var indent = ""
+        var indent = "" {
+            didSet { width = indent.utf8.reduce(0) { $0 + ($1 == 9 ? 4 : 1) } }
+        }
         var index = ""
         /// Everything after `<index> `, for example `button Play (selected)`.
         var rest = ""
         var role = ""
 
-        /// Tabs count four columns, spaces one. Only used for ordering lines by depth.
-        var width: Int { indent.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) } }
+        /// Cached ASCII indentation width. Hierarchy passes can compare depth without
+        /// rescanning the same String characters at every comparison.
+        var width = 0
 
         func render() -> String { isTree ? indent + index + " " + rest : raw }
     }
@@ -225,7 +228,11 @@ enum AXTreeCondenser {
         // Byte scan: indentation, then ASCII digits, then one space. Avoids counting the whole line.
         let bytes = line.utf8
         var cursor = bytes.startIndex
-        while cursor < bytes.endIndex, bytes[cursor] == 9 || bytes[cursor] == 32 { cursor = bytes.index(after: cursor) }
+        var width = 0
+        while cursor < bytes.endIndex, bytes[cursor] == 9 || bytes[cursor] == 32 {
+            width += bytes[cursor] == 9 ? 4 : 1
+            cursor = bytes.index(after: cursor)
+        }
         let digitStart = cursor
         while cursor < bytes.endIndex, (48...57).contains(bytes[cursor]) { cursor = bytes.index(after: cursor) }
         guard cursor > digitStart, cursor < bytes.endIndex, bytes[cursor] == 32 else { return Line(raw: line) }
@@ -233,7 +240,7 @@ enum AXTreeCondenser {
         let rest = String(line[restStart...])
         return Line(
             raw: line, isTree: true, indent: String(line[..<digitStart]), index: String(line[digitStart..<cursor]),
-            rest: rest, role: roleName(of: rest)
+            rest: rest, role: roleName(of: rest), width: width
         )
     }
 
@@ -316,29 +323,36 @@ enum AXTreeCondenser {
         "search field", "web area", "split group", "tab group", "color well", "disclosure triangle", "date field",
     ]
 
-    /// The multi-word roles with their trailing space, built once (they were rebuilt for every line).
-    private static let multiWordRolePrefixes = multiWordRoles.map { (role: $0, prefix: $0 + " ") }
+    /// A row, button or ordinary text line should not test every multi-word role.
+    private static let multiWordRolePrefixes: [String: [(role: String, prefix: String)]] = Dictionary(
+        grouping: multiWordRoles.map { (role: $0, prefix: $0 + " ") },
+        by: { String($0.role.prefix(while: { $0 != " " })) }
+    )
 
     private static func roleName(of rest: String) -> String {
-        for entry in multiWordRolePrefixes where rest == entry.role || rest.hasPrefix(entry.prefix) { return entry.role }
-        if textParts(rest) != nil { return "text" }
-        return String(rest.prefix(while: { $0 != " " }))
+        let firstWord = String(rest.prefix(while: { $0 != " " }))
+        if let candidates = multiWordRolePrefixes[firstWord] {
+            for entry in candidates where rest == entry.role || rest.hasPrefix(entry.prefix) { return entry.role }
+        }
+        if firstWord == "static", rest == "static text" || rest.hasPrefix("static text ") { return "text" }
+        return firstWord
     }
 
     /// For text lines: the prefix kept as-is (`text ` or `static text `) and the text itself.
-    private static func textParts(_ rest: String) -> (head: String, payload: String)? {
+    private static func textParts(_ rest: String) -> (head: String, payload: Substring)? {
         // "text field ..." and "text area ..." are inputs, not text lines.
         if rest.hasPrefix("text field") || rest.hasPrefix("text area") || rest.hasPrefix("text entry area") { return nil }
         for head in ["static text ", "text "] where rest.hasPrefix(head) {
-            return (head, String(rest.dropFirst(head.count)))
+            return (head, rest.dropFirst(head.count))
         }
-        if rest == "static text" { return ("static text", "") }
-        if rest == "text" { return ("text", "") }
+        if rest == "static text" { return ("static text", rest[rest.endIndex...]) }
+        if rest == "text" { return ("text", rest[rest.endIndex...]) }
         return nil
     }
 
     /// Parenthesised trait groups, split on ", ". For example `(w:str, selected)` gives `w:str` and `selected`.
     private static func traitTokens(_ rest: String) -> [String] {
+        guard rest.utf8.contains(40) else { return [] }
         let pieces = rest.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "(" || $0 == ")" })
         var tokens: [String] = []
         for (offset, piece) in pieces.enumerated() where offset % 2 == 1 {
@@ -360,7 +374,12 @@ enum AXTreeCondenser {
         result.reserveCapacity(lines.count)
         // Widths of removed containers that still enclose the current line.
         var removedWidths: [Int] = []
-        let structure = TreeStructure(lines)
+        // Bare wrappers never need child-count metadata. Only named candidates can
+        // use the single-child rule; avoid building a whole graph when there are none.
+        let needsStructure = unwrapSingleChild && lines.contains {
+            $0.isTree && wrapperRoles.contains($0.role) && !isUnlabeledContainer($0)
+        }
+        let structure = needsStructure ? TreeStructure(lines) : nil
         for (position, original) in lines.enumerated() {
             var line = original
             guard line.isTree else {
@@ -388,9 +407,9 @@ enum AXTreeCondenser {
     private static let wrapperRoles: Set<String> = ["group", "generic", "section", "layout area"]
 
     /// A neutral group with exactly one child, no traits or actions, and no name or the child's own name.
-    private static func isSingleChildWrapper(_ lines: [Line], _ position: Int, structure: TreeStructure) -> Bool {
+    private static func isSingleChildWrapper(_ lines: [Line], _ position: Int, structure: TreeStructure?) -> Bool {
         let line = lines[position]
-        guard wrapperRoles.contains(line.role), !line.rest.contains("("), !line.rest.contains("Secondary Actions:"),
+        guard let structure, wrapperRoles.contains(line.role), !line.rest.contains("("), !line.rest.contains("Secondary Actions:"),
               position + 1 < lines.count, lines[position + 1].isTree, lines[position + 1].width > line.width else { return false }
         guard structure.childCounts[position] == 1 else { return false }
         let name = String(line.rest.dropFirst(line.role.count)).trimmingCharacters(in: .whitespaces)
@@ -419,9 +438,9 @@ enum AXTreeCondenser {
         var result: [Line] = []
         result.reserveCapacity(lines.count)
         for line in lines {
-            if line.isTree, !isProtectedLine(line), let current = textParts(line.rest),
+            if line.isTree, let current = textParts(line.rest),
                let previous = result.last, previous.isTree, previous.indent == line.indent,
-               let before = textParts(previous.rest), before.payload == current.payload {
+               let before = textParts(previous.rest), before.payload == current.payload, !isProtectedLine(line) {
                 continue
             }
             result.append(line)
@@ -541,7 +560,7 @@ enum AXTreeCondenser {
     private static func truncateText(_ lines: [Line], limit: Int) -> [Line] {
         let cap = max(0, limit)
         return lines.map { line in
-            guard line.isTree, !isProtectedLine(line), !statusLikeText(line),
+            guard line.isTree, !isProtectedLine(line),
                   let parts = textParts(line.rest), parts.payload.count > cap else { return line }
             var copy = line
             copy.rest = parts.head + String(parts.payload.prefix(cap)) + "…"
@@ -569,6 +588,12 @@ enum AXTreeCondenser {
     }
 
     private static func dropHidden(_ lines: [Line]) -> [Line] {
+        // Most observations have neither hidden nodes nor bare decoration. Do not
+        // construct ancestry and scan every line's state just to return the same tree.
+        guard lines.contains(where: {
+            $0.isTree && (isHiddenMarked($0) || (decorationRoles.contains($0.role)
+                && $0.rest.trimmingCharacters(in: .whitespaces) == $0.role))
+        }) else { return lines }
         var result: [Line] = []
         result.reserveCapacity(lines.count)
         let structure = TreeStructure(lines)
@@ -621,7 +646,8 @@ enum AXTreeCondenser {
 
     private static func cutDescriptions(_ lines: [Line], limit: Int) -> [Line] {
         lines.map { line in
-            guard line.isTree, let range = descriptionPayload(line.rest), line.rest[range].count > limit else { return line }
+            guard line.isTree, line.rest.utf8.contains(58),
+                  let range = descriptionPayload(line.rest), line.rest[range].count > limit else { return line }
             var copy = line
             let cut = line.rest[range].prefix(limit)
             copy.rest = String(line.rest[..<range.lowerBound]) + cut + "…" + String(line.rest[range.upperBound...])
@@ -643,12 +669,19 @@ enum AXTreeCondenser {
 
     /// Removes a `Help:` or `Description:` that equals the previous sibling's of the same role, when the line keeps a name.
     private static func dropRepeatedProperties(_ lines: [Line]) -> [Line] {
+        guard lines.contains(where: {
+            $0.isTree && $0.rest.utf8.contains(58) && ($0.rest.contains("Help: ") || $0.rest.contains("Description: "))
+        }) else { return lines }
         var previous: [Int: (role: String, help: String?, description: String?)] = [:]
         return lines.map { line in
             guard line.isTree else { return line }
             let width = line.width
             // Forget deeper levels: a new row starts a new family.
             for key in previous.keys where key > width { previous[key] = nil }
+            guard line.rest.utf8.contains(58) else {
+                previous[width] = (line.role, nil, nil)
+                return line
+            }
             var copy = line
             var help: String?
             var description: String?
@@ -689,13 +722,12 @@ enum AXTreeCondenser {
     // MARK: - Rule 9: budget
 
     private static func applyBudget(_ lines: [Line], headerCount: Int, budget: Int) -> [Line] {
-        var total = headerCount
-        for line in lines { total += line.render().count + 1 }
+        let sizes = lines.map { $0.render().count + 1 }
+        let total = headerCount + sizes.reduce(0, +)
         guard total > budget else { return lines }
 
         let hardCap = budget + budget / 2
         let structure = TreeStructure(lines)
-        let sizes = lines.map { $0.render().count + 1 }
         var used = headerCount
         var selected = Set<Int>()
         for i in lines.indices {

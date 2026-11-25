@@ -43,11 +43,13 @@ Run `godspeed` (or `godspeed settings`) for a terminal menu with cursor accent p
 
 Choose the **Model-free** preset to keep accessibility, local OCR, verified recipes and checks available while disabling Godspeed's optional model helpers, warmups and auto-start. **Quiet** reduces the cursor's visual footprint; **Balanced** keeps smooth visible feedback and compact observations. [Configuration reference](docs/GODSPEED.md#terminal-settings) · [Reliability design](docs/local-first-reliability.md).
 
+The optional [Godspeed browser workspace](docs/INSTALL.md#godspeed-browser-workspace) keeps owned Chrome work in a purple **Godspeed** group at the left after pinned tabs, collapsed by default while inactive. It shares the visible group across agents while preserving their separate tab ownership. This behavior requires the workspace extension build.
+
 ## How Godspeed works
 
 1. **Read the app or tab.** Mac apps expose named controls through macOS Accessibility. Chrome uses the optional extension bridge to read page controls. Ask for just one control, a compact window read, or a screenshot when the UI needs it.
 2. **Run a batch.** Send related actions together. Native steps can bind to a window Godspeed has already observed. The on-screen software cursor shows where the agent is working, including on a different display.
-3. **Verify and recover.** Give the batch an expected result with `done_when`. Godspeed distinguishes whether an action was sent from whether the result appeared. Unfinished native steps can be resumed against their saved window.
+3. **Verify and recover.** Give the batch an expected result with `done_when`. Godspeed distinguishes whether an action was sent from whether the result appeared. Unfinished native steps can be resumed against their saved window. After a context reset, `batch` with `inspect_resume` and the saved token returns compact progress and the next recovery action without sending input or consuming the token.
 
 The optional GSD1 Action, Read, and Recover models score choices on Apple Silicon. They advise the caller. Ordinary reads, exact control actions, and deterministic checks can run without model inference. The driver keeps timing and action outcomes in [local traces](docs/GODSPEED.md#local-traces). The current source also records model activity by role. [Model setup](experiments/LocalHelper/README.md) · [Adapter weights](https://github.com/fortun8te/godspeed/releases/tag/gsd1-v0.1.0)
 

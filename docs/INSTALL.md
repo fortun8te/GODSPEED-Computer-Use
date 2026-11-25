@@ -66,7 +66,7 @@ If the wrapper cannot find the app, check that you installed one copy where expe
 
 Native app tools work on their own. Chrome needs the [Open Browser Use CLI and extension](https://github.com/iFurySt/open-browser-use#quick-start).
 
-1. Run the optional setup script with Node.js 18 or newer. It installs the Chrome CLI for your user and opens the extension setup.
+1. Run the optional setup script. It reuses an existing Chrome CLI, or installs one for your user with Node.js 18 or newer, then opens the extension setup.
 
    ```sh
    curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/setup-godspeed-chrome.sh
@@ -84,6 +84,29 @@ Native app tools work on their own. Chrome needs the [Open Browser Use CLI and e
 If npm installed the long executable name only, try `open-browser-use setup` and `open-browser-use ping`. If the CLI works in your terminal and the MCP client omits `browser`, the client may have a different shell path. Use `command -v obu` (or `command -v open-browser-use`) and set `OPEN_COMPUTER_USE_OBU_BIN` to that executable’s **absolute path** in your client’s MCP environment. Remove or correct a stale path before reconnecting. If `ping` itself fails, check that the extension is enabled in the current profile and rerun setup.
 
 The [upstream setup guide](https://github.com/iFurySt/open-browser-use#quick-start) includes the Homebrew alternative and the keyed extension ZIP fallback. Keep the CLI and extension versions compatible. For background and browser access details, see the [tool guide](GODSPEED.md#browser-observations).
+
+### Godspeed browser workspace
+
+The development workspace extension puts Godspeed's owned tabs in a purple **Godspeed** group, at the left of each normal Chrome window after pinned tabs. Inactive groups start collapsed. Selecting a tab or manually expanding its group leaves it visible. The extension keeps concurrent agents' ownership separate even though they share the visible group. Native Chrome groups cannot span multiple windows or include pinned tabs.
+
+This behavior ships in the separate **Godspeed Browser Workspace** extension. Updating the native app alone does not replace an installed Open Browser Use extension. From this checkout, with Python 3, Git and Node available, build the pinned workspace ZIP:
+
+```sh
+python3 scripts/package-godspeed-browser.py --fetch
+```
+
+The command writes `dist/chrome-workspace/Godspeed-Chrome-Workspace-1.1.0.1.zip`, prints its SHA-256, and installs nothing. The macOS verification workflow also uploads the ZIP as **Godspeed-Chrome-Workspace**. Its `PROVENANCE.json` records the upstream revision and hashes of the packaged files.
+
+To prepare that ZIP using your existing compatible helper:
+
+```sh
+bash scripts/setup-godspeed-chrome.sh --workspace-zip \
+  "$PWD/dist/chrome-workspace/Godspeed-Chrome-Workspace-1.1.0.1.zip" --no-open
+```
+
+For a custom or authenticated helper, set `OPEN_COMPUTER_USE_OBU_BIN` to its absolute path first. This route reuses that executable and requires its `setup beta --zip` support; it never installs or downgrades the helper. Follow the helper's instructions to approve the prepared extension in the intended Chrome profile, then run `bash scripts/setup-godspeed-chrome.sh --check` and reconnect the MCP client. Use one connected browser extension for that helper/profile at a time to avoid competing native-host connections. The workspace ZIP has its own stable extension identity and does not silently replace the Web Store extension.
+
+See the [workspace implementation and verification guide](../integrations/chrome-workspace/README.md) for ownership, popup, restart and live verification details.
 
 ## Optional local models
 
