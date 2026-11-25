@@ -33,6 +33,25 @@ final class VisualSearchTests: XCTestCase {
                                              width: 2561, height: 1601))
     }
 
+    func testVisualSnapshotTokenBindsWindowAndBytes() throws {
+        let bytes = Data([1, 2, 3])
+        let token = VisualSearch.observationToken(windowID: 42, bytes: bytes)
+        XCTAssertEqual(token.count, 64)
+        XCTAssertEqual(token, VisualSearch.observationToken(windowID: 42, bytes: bytes))
+        XCTAssertNotEqual(token, VisualSearch.observationToken(windowID: 43, bytes: bytes))
+        XCTAssertNotEqual(token, VisualSearch.observationToken(windowID: 42, bytes: Data([1, 2, 4])))
+        let args: [String: Any] = ["window_id": 42, "x": 12, "y": 34, "visual_snapshot": token]
+        XCTAssertEqual(try VisualSearch.actionToken(tool: "click", arguments: args), token)
+        XCTAssertThrowsError(try VisualSearch.actionToken(tool: "query", arguments: args))
+        var mixed = args
+        mixed["label"] = "Other"
+        XCTAssertThrowsError(try VisualSearch.actionToken(tool: "click", arguments: mixed))
+        var unbound = args
+        unbound.removeValue(forKey: "window_id")
+        XCTAssertThrowsError(try VisualSearch.actionToken(tool: "click", arguments: unbound))
+        XCTAssertNil(try VisualSearch.actionToken(tool: "click", arguments: [:]))
+    }
+
     func testNoScreenshotDoesNotInvokeHelper() throws {
         let state = ToolCallResult.text("Window ID: 42")
         let result = try VisualSearch.annotate(state, queries: ["icon"], region: nil, windowID: 42)
