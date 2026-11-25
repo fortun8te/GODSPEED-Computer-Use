@@ -87,6 +87,16 @@ if [[ -e "$launcher" ]] && ! cmp -s "$staging/godspeed-mcp" "$launcher"; then
   cp -p "$launcher" "$previous"
 fi
 install -m 755 "$staging/godspeed-mcp" "$launcher"
+# Older releases contain only the MCP launcher. Keep their installer compatible.
+if [[ -x "$staging/godspeed" ]]; then
+  settings_launcher="$launcher_dir/godspeed"
+  if [[ -e "$settings_launcher" ]] && ! cmp -s "$staging/godspeed" "$settings_launcher"; then
+    previous="$(mktemp "$launcher_dir/godspeed.previous.XXXXXX")"
+    cp -p "$settings_launcher" "$previous"
+  fi
+  install -m 755 "$staging/godspeed" "$settings_launcher"
+  printf 'Settings launcher %s\\n' "$settings_launcher"
+fi
 printf 'Installed %s\nMCP launcher %s\n' "$target" "$launcher"
 if [[ -n "$backup" ]]; then printf 'Previous app saved under %s\n' "$backup"; fi
 printf 'Open Godspeed and follow the macOS permissions prompts.\n'
