@@ -391,8 +391,12 @@ enum HandoffTool {
         return label.isEmpty ? nil : label
     }
 
+    static func isTypedForm(_ request: Request) -> Bool {
+        !request.values.isEmpty && explicitClickLabel(request.goal) != nil
+    }
+
     static func exactAction(request: Request, controls: [Control], tried: Set<String>) -> Candidate? {
-        if let fill = exactFieldFill(request: request, controls: controls, tried: tried) { return fill }
+        if !isTypedForm(request), let fill = exactFieldFill(request: request, controls: controls, tried: tried) { return fill }
         // A whole "click <label>" instruction plus explicit values is a typed form workflow.
         // Preflight every field on the same observation, fill only uniquely named empty/guarded
         // fields, then click only after every value has been read back as requested.
@@ -704,9 +708,12 @@ enum HandoffTool {
                                 learning: LearningLog) -> Outcome {
         let deadline = deadline ?? deps.now() + request.timeBudget
         func hasTime() -> Bool { deps.now() < deadline }
+        let typedForm = isTypedForm(request)
+        var formWindow = request.windowID
         func readState() -> String? {
             guard !RequestCancellation.requested, hasTime(),
-                  let state = deps.readState(), matchesWindow(state, windowID: request.windowID) else { return nil }
+                  let state = deps.readState(), matchesWindow(state, windowID: formWindow) else { return nil }
+            if typedForm, formWindow == nil { formWindow = observedWindowID(in: state) }
             return state
         }
         var steps: [String] = []
@@ -829,6 +836,10 @@ enum HandoffTool {
             }
         }
         var initialExact = exactAction(request: request, controls: initialControls, tried: tried)
+        if initialExact == nil, typedForm {
+            return finish(.escalate, "the typed form's fields or exact submit control could not be confirmed; no action was sent",
+                          initial: initial, latest: state)
+        }
         if initialExact == nil, request.expectedValues.isEmpty, request.windowID == nil, let replayed = deps.replay(state) {
             if case .cancelled(let receipt, let delivery) = replayed {
                 steps.append(receipt)
@@ -876,6 +887,10 @@ enum HandoffTool {
             }
             let controls = number == 1 ? initialControls : deps.controls(state)
             let exact = number == 1 ? initialExact : exactAction(request: request, controls: controls, tried: tried)
+            if exact == nil, typedForm {
+                return finish(.escalate, "the typed form changed or a requested field could not be confirmed; inspect before continuing",
+                              initial: initial, latest: state)
+            }
             if exact == nil, !request.expectedValues.isEmpty {
                 return finish(.escalate, "a field did not match its expected current value or could not be verified", initial: initial, latest: state)
             }
@@ -949,7 +964,7 @@ enum HandoffTool {
                 // A piggyback text snapshot cannot bind typed field observations. Require
                 // scoped readback before comparing fields, even when its text is identical.
                 let actionState = needsFreshFields ? nil : result.observedState.flatMap {
-                    matchesWindow($0, windowID: request.windowID) ? $0 : nil
+                    matchesWindow($0, windowID: formWindow) ? $0 : nil
                 }
                 if !hasTime(), needsFreshFields || result.observedState == nil {
                     steps.append(result.ok ? choice.text : "\(choice.text) failed")
