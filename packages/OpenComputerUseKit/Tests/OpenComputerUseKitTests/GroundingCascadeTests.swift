@@ -9,6 +9,35 @@ final class GroundingCascadeTests: XCTestCase {
 
     // Step 2: rule-based prefilter, capped at 12.
 
+    func testDiscoveryFindsUnfamiliarSynonymsWithoutGuessingAnAction() {
+        let candidates = options(["Print", "Preferences", "Account Settings", "Configuration", "Help"])
+        let found = GroundingCascade.discoverySuggestions(label: "settings", options: candidates)
+        XCTAssertEqual(found.first?.text, "Account Settings")
+        XCTAssertTrue(found.map(\.text).contains("Preferences"))
+        XCTAssertTrue(found.map(\.text).contains("Configuration"))
+        XCTAssertFalse(found.map(\.text).contains("Print"))
+    }
+
+    func testDiscoveryPreservesDuplicateControlsAndBoundsOutput() {
+        let candidates = options(["Preferences", "Preferences", "Configuration", "Print"])
+        let found = GroundingCascade.discoverySuggestions(label: "settings", options: candidates, limit: 2)
+        XCTAssertEqual(found.map(\.id), ["1", "2"])
+        XCTAssertTrue(GroundingCascade.discoverySuggestions(label: "Quasar", options: candidates).isEmpty)
+        XCTAssertTrue(GroundingCascade.discoverySuggestions(label: "settings", options: candidates, limit: 0).isEmpty)
+    }
+
+    func testDiscoveryDoesNotChangeAutomaticResolution() {
+        let candidates = options(["Preferences", "Configuration"])
+        var asked = false
+        let decision = GroundingCascade.resolve(label: "settings", options: candidates) { _ in
+            asked = true
+            return nil
+        }
+        XCTAssertEqual(decision, .abstain("no close control"))
+        XCTAssertFalse(asked)
+        XCTAssertEqual(GroundingCascade.discoverySuggestions(label: "settings", options: candidates).count, 2)
+    }
+
     func testPrefilterKeepsSpellingAndTypoMatchesAndDropsUnrelatedControls() {
         let names = ["Save", "Cancel", "Opslaan", "Print", "Sharpen", "Share", "Zoom In"]
         let picked = GroundingCascade.prefilter(label: "Sve", options: options(names))
