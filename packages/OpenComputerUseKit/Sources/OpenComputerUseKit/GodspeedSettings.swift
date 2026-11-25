@@ -128,13 +128,32 @@ final class SettingsFileCache: @unchecked Sendable {
     private let lock = NSLock()
     private let url: URL
     private let clock: () -> TimeInterval
+    private let readAttributes: (URL) throws -> [FileAttributeKey: Any]
     private var signature: Signature?
     private var checked: TimeInterval?
     private var values: [String: Any] = [:]
 
-    init(url: URL = GodspeedSettings.fileURL, clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+    init(url: URL = GodspeedSettings.fileURL,
+         clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         attributes: @escaping (URL) throws -> [FileAttributeKey: Any] = {
+             try FileManager.default.attributesOfItem(atPath: $0.path)
+         }) {
         self.url = url
         self.clock = clock
+        readAttributes = attributes
+    }
+
+    private static func isMissing(_ error: Error) -> Bool {
+        let error = error as NSError
+        if error.domain == NSCocoaErrorDomain {
+            return error.code == CocoaError.Code.fileNoSuchFile.rawValue
+                || error.code == CocoaError.Code.fileReadNoSuchFile.rawValue
+        }
+        if error.domain == NSPOSIXErrorDomain {
+            return error.code == Int(POSIXErrorCode.ENOENT.rawValue)
+                || error.code == Int(POSIXErrorCode.ENOTDIR.rawValue)
+        }
+        return false
     }
 
     func load() -> [String: Any] {
@@ -144,8 +163,14 @@ final class SettingsFileCache: @unchecked Sendable {
         let now = clock()
         if let checked, now >= checked, now - checked < 0.5 { return values }
         checked = now
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-            if !FileManager.default.fileExists(atPath: url.path) {
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try readAttributes(url)
+        } catch {
+            // fileExists also returns false for inaccessible paths. Only positive evidence of
+            // deletion may reset preferences; a permission or I/O failure must not re-enable
+            // helpers (or other defaults) the user previously disabled.
+            if Self.isMissing(error) {
                 values = [:]
                 signature = nil
             }
