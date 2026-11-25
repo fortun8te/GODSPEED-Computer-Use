@@ -366,7 +366,8 @@ enum HandoffTool {
             guard expected.count <= 1, field.value == (expected.first?.value ?? ""),
                   field.value != value else { continue }
             var candidate = fill(field, value: value)
-            candidate.expectedValue = expected.first?.value
+            // Even an initially empty field must still be empty at dispatch.
+            candidate.expectedValue = expected.first?.value ?? ""
             if !tried.contains(candidate.key) { return candidate }
         }
         return nil
@@ -764,6 +765,8 @@ enum HandoffTool {
             return finish(.failed, "could not read \(target)", initial: nil, latest: nil)
         }
         var initial = state
+        var recentStates = [state]
+        var cycleReturns = 0
         // Already true: nothing to do, and no saved recipe may run (it could undo or repeat the work).
         if let met = matched(state) {
             return Outcome(kind: .done, reason: "already true (\(met.joined(separator: "; ")))", steps: [], changes: nil, options: [])
@@ -832,6 +835,8 @@ enum HandoffTool {
             }
             steps[steps.count - 1] = "the saved recipe did not finish; continued by hand"
             initial = fresh
+            recentStates = [fresh]
+            cycleReturns = 0
             if case .missing = deps.check(fresh) { initialHadMissing = true } else { initialHadMissing = false }
             initialControls = deps.controls(fresh)
             initialExact = exactAction(request: request, controls: initialControls, tried: tried)
@@ -958,6 +963,19 @@ enum HandoffTool {
                 outcome.readback = unchanged ? "unchanged" : "changed"
                 noChange = unchanged ? noChange + 1 : 0
                 state = next
+                // Repeated navigation cycles can keep changing the tree without progressing.
+                // Require two non-consecutive returns so a single legitimate round trip is allowed.
+                if !unchanged {
+                    let revisited = recentStates.contains { AXStateDiff.sameContent(previous: $0, current: next) }
+                    cycleReturns = revisited ? cycleReturns + 1 : 0
+                    recentStates.append(next)
+                    if recentStates.count > 8 { recentStates.removeFirst() }
+                    if cycleReturns >= 2 {
+                        ToolTelemetry.current?.add("handoff_cycle_stops")
+                        return finish(.stuck, "the workflow returned to previously observed states without satisfying the goal",
+                                      initial: initial, latest: state)
+                    }
+                }
                 if noChange >= 2 {
                     return finish(.stuck, "the last two actions changed nothing on screen", initial: initial, latest: state)
                 }
@@ -1010,10 +1028,11 @@ extension ComputerUseToolDispatcher {
 
         func controlsFor(_ state: String) -> [HandoffTool.Control] {
             let parsed = HandoffTool.parseControls(state)
-            guard readFixtureState == nil, !request.expectedValues.isEmpty,
+            guard readFixtureState == nil, !request.values.isEmpty,
                   let windowID = HandoffTool.observedWindowID(in: state) else { return parsed }
+            // Bind typed field candidates to the real AX value, not the display line's formatting.
             return service.handoffTextControls(app: app, windowID: windowID,
-                                               labels: Array(request.expectedValues.keys), parsed: parsed)
+                                               labels: request.values.map(\.key), parsed: parsed)
         }
 
         var fieldObservation: (state: String, fields: [DoneCheck.Field])?
