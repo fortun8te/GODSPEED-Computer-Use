@@ -529,6 +529,10 @@ public final class ComputerUseToolDispatcher {
             let stateApp = try requireString("app", in: arguments)
             let stateWindow = try validatedQueryWindowID(arguments["window_id"])
             let visualQueries = try VisualSearch.queries(arguments["visual_queries"])
+            let visualRegion = try VisualSearch.region(arguments["visual_region"])
+            if visualRegion != nil, visualQueries.isEmpty {
+                throw ComputerUseError.invalidArguments("visual_region requires visual_queries.")
+            }
             if !visualQueries.isEmpty {
                 guard stateWindow != nil,
                       try strictObservationBool("include_ax", in: arguments),
@@ -556,15 +560,15 @@ public final class ComputerUseToolDispatcher {
                     includeMenuBar: try strictObservationBool("include_menu_bar", in: arguments, default: false)
                 ),
                 settleMs: settle.wait,
-                compact: try strictObservationBool(
+                compact: visualQueries.isEmpty ? try strictObservationBool(
                     "compact", in: arguments,
                     default: LeanOutput.usesCompactReads
-                ),
+                ) : false,
                 windowID: stateWindow
             )
             ReadRouting.recordSettle(settle.tuned, result: state, startedAt: settleStarted, app: stateApp)
             if let stateWindow, !visualQueries.isEmpty {
-                return try VisualSearch.annotate(state, queries: visualQueries, windowID: stateWindow)
+                return try VisualSearch.annotate(state, queries: visualQueries, region: visualRegion, windowID: stateWindow)
             }
             return state
         case "click":
