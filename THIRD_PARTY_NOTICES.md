@@ -1,5 +1,14 @@
 # Third-Party Notices
 
+## Open Browser Use
+
+The separately packaged Godspeed Browser Workspace extension includes source from Open Browser Use with the local integration patch:
+
+- Project: https://github.com/iFurySt/open-browser-use
+- Source revision: `97ca258065fc285991c46a65007d823de2996fd9`
+- License: MIT; the full notice is preserved in [UPSTREAM-LICENSE.txt](integrations/chrome-workspace/UPSTREAM-LICENSE.txt) and every workspace ZIP.
+- Copyright (c) 2026 Leo.
+
 ## Cua Driver
 
 The macOS `sky_click` event recipe, the private SkyLight bridge shared by `sky_click` and `sky_key`, and the target-only activation record are derived from Cua Driver:

@@ -41,12 +41,25 @@ jobs:
           node-version: '24'
       - name: Verify the JavaScript API
         run: node --test scripts/node-repl/open-computer-use-repl.test.mjs scripts/node-repl/page-api.test.mjs scripts/node-repl/page-precise.test.mjs scripts/node-repl/native-precise.test.mjs scripts/node-repl/precise-actions.test.mjs
+      - name: Build and verify the pinned Chrome workspace
+        env:
+          GODSPEED_CHROME_WORKSPACE_DIR: ${{ runner.temp }}/godspeed-chrome-workspace
+        run: |
+          python3 scripts/package-godspeed-browser.py --fetch
+          python3 -m zipfile -e dist/chrome-workspace/Godspeed-Chrome-Workspace-1.1.0.1.zip "$GODSPEED_CHROME_WORKSPACE_DIR"
+          node --test integrations/chrome-workspace/test/*.test.mjs
       - name: Verify matched benchmark scoring
         run: python3 -I -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Reject stale packages after a failed build
         run: ./scripts/tests/godspeed-package-guard.sh
       - name: Verify settings launcher and argument forwarding
         run: ./scripts/tests/godspeed-launcher.sh
+      - name: Preserve the verified Chrome workspace package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Godspeed-Chrome-Workspace
+          path: dist/chrome-workspace/Godspeed-Chrome-Workspace-*.zip
+          if-no-files-found: error
       - name: Package a development build
         if: github.event_name == 'workflow_dispatch'
         run: |
