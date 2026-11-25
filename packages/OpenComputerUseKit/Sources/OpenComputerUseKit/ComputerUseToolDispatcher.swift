@@ -528,6 +528,14 @@ public final class ComputerUseToolDispatcher {
             // A settle wait the caller asked for is capped by the tuned wait when that is shorter (ReadRouting).
             let stateApp = try requireString("app", in: arguments)
             let stateWindow = try validatedQueryWindowID(arguments["window_id"])
+            let visualQueries = try VisualSearch.queries(arguments["visual_queries"])
+            if !visualQueries.isEmpty {
+                guard stateWindow != nil,
+                      try strictObservationBool("include_ax", in: arguments),
+                      try strictObservationBool("include_screenshot", in: arguments, default: false) else {
+                    throw ComputerUseError.invalidArguments("visual_queries requires window_id, include_ax and include_screenshot: true.")
+                }
+            }
             let settle = ReadRouting.settlePlan(requested: try optionalSettleMs(in: arguments), app: stateApp, windowID: stateWindow)
             let settleStarted = Date()
             let state = try service.getAppState(
@@ -555,6 +563,9 @@ public final class ComputerUseToolDispatcher {
                 windowID: stateWindow
             )
             ReadRouting.recordSettle(settle.tuned, result: state, startedAt: settleStarted, app: stateApp)
+            if let stateWindow, !visualQueries.isEmpty {
+                return try VisualSearch.annotate(state, queries: visualQueries, windowID: stateWindow)
+            }
             return state
         case "click":
             // Precise clicks use one window-addressed route and never fall back to vision.
