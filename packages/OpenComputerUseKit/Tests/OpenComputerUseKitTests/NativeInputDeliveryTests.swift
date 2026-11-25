@@ -1,4 +1,5 @@
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import XCTest
 @testable import OpenComputerUseKit
@@ -52,7 +53,7 @@ final class NativeInputDeliveryTests: XCTestCase {
         }) { error in
             XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .outcomeUnknown)
         }
-        XCTAssertEqual(events.map(\.type), [.keyDown, .keyUp])
+        XCTAssertEqual(events.map(\.type), [.flagsChanged, .flagsChanged])
         XCTAssertEqual(events.map { $0.getIntegerValueField(.keyboardEventKeycode) },
                        Array(repeating: Int64(chord.modifiers[0].keyCode), count: 2))
         XCTAssertFalse(events.last?.flags.contains(.maskShift) ?? true)
@@ -68,7 +69,7 @@ final class NativeInputDeliveryTests: XCTestCase {
             post: { events.append($0) }, release: { events.append($0) }, delivery: delivery)) { error in
             XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
         }
-        XCTAssertEqual(events.map(\.type), [.keyDown, .keyUp])
+        XCTAssertEqual(events.map(\.type), [.flagsChanged, .flagsChanged])
         XCTAssertTrue(events.allSatisfy { $0.getIntegerValueField(.keyboardEventKeycode) == Int64(chord.modifiers[0].keyCode) })
     }
 
@@ -85,7 +86,8 @@ final class NativeInputDeliveryTests: XCTestCase {
         let codes = chord.modifiers.map(\.keyCode) + [chord.keyCode]
         XCTAssertEqual(events.map { $0.getIntegerValueField(.keyboardEventKeycode) },
                        (codes + Array(codes.reversed())).map(Int64.init))
-        XCTAssertEqual(events.map(\.type), Array(repeating: .keyDown, count: codes.count) + Array(repeating: .keyUp, count: codes.count))
+        XCTAssertEqual(events.map(\.type), Array(repeating: CGEventType.flagsChanged, count: chord.modifiers.count)
+            + [.keyDown, .keyUp] + Array(repeating: .flagsChanged, count: chord.modifiers.count))
         XCTAssertEqual(events.last?.flags, [])
     }
 
@@ -100,7 +102,7 @@ final class NativeInputDeliveryTests: XCTestCase {
         }, release: { events.append($0) })) { error in
             XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
         }
-        XCTAssertEqual(events.map(\.type), [.keyDown, .keyUp])
+        XCTAssertEqual(events.map(\.type), [.flagsChanged, .flagsChanged])
         XCTAssertTrue(events.allSatisfy { $0.getIntegerValueField(.keyboardEventKeycode) == Int64(chord.modifiers[0].keyCode) })
     }
 
@@ -117,6 +119,45 @@ final class NativeInputDeliveryTests: XCTestCase {
                 keyEventUsesAuthentication(flags: $0.flags, authenticated: authentication) == expected
             }, specification)
             XCTAssertFalse(keyChordUsesAuthentication(chord, authenticated: false))
+        }
+    }
+
+    func testProductionReleaseGuardRejectsModifierDownAndUnknownFlagChanges() throws {
+        let modifiers: [(Int, CGEventFlags)] = [
+            (kVK_Command, .maskCommand), (kVK_RightCommand, .maskCommand),
+            (kVK_Shift, .maskShift), (kVK_RightShift, .maskShift),
+            (kVK_Option, .maskAlternate), (kVK_RightOption, .maskAlternate),
+            (kVK_Control, .maskControl), (kVK_RightControl, .maskControl),
+            (kVK_CapsLock, .maskAlphaShift),
+        ]
+        for (code, flag) in modifiers {
+            let down = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: true))
+            let up = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: false))
+            let otherFlag: CGEventFlags = flag == .maskShift ? .maskControl : .maskShift
+            down.flags = otherFlag.union(flag)
+            up.flags = otherFlag
+            XCTAssertEqual(down.type, .flagsChanged)
+            XCTAssertEqual(up.type, .flagsChanged)
+            XCTAssertFalse(keyEventIsRelease(down), "modifier-down \(code)")
+            XCTAssertTrue(keyEventIsRelease(up), "modifier-up \(code)")
+        }
+        let ordinary = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_ANSI_A), keyDown: false))
+        XCTAssertTrue(keyEventIsRelease(ordinary))
+        ordinary.type = .flagsChanged
+        ordinary.flags = []
+        XCTAssertFalse(keyEventIsRelease(ordinary), "An arbitrary flagsChanged event is not cleanup")
+        ordinary.type = .keyDown
+        XCTAssertFalse(keyEventIsRelease(ordinary))
+    }
+
+    func testPreparedChordAndCapsLockReleasesPassTheProductionGuard() throws {
+        for specification in ["control+option+shift+command+Down", "caps_lock"] {
+            let chord = try KeyPressParser.parse(specification, layout: { _ in nil })
+            var releases: [CGEvent] = []
+            try InputSimulation.deliverHeldKey(chord, hold: 0, validate: {}, post: { _ in },
+                release: { releases.append($0) })
+            XCTAssertEqual(releases.count, chord.modifiers.count + 1)
+            XCTAssertTrue(releases.allSatisfy(keyEventIsRelease), specification)
         }
     }
 

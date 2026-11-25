@@ -1,4 +1,5 @@
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Darwin
 import Foundation
@@ -83,6 +84,25 @@ func keyEventUsesAuthentication(flags: CGEventFlags, authenticated: Bool) -> Boo
 /// the final Command release whose flags correctly no longer contain Command.
 func keyChordUsesAuthentication(_ parsed: ParsedKeyPress, authenticated: Bool) -> Bool {
     authenticated && !parsed.modifiers.contains { $0.flag.contains(.maskCommand) }
+}
+
+/// Modifier releases are flagsChanged events, not keyUp. Cleanup still owns
+/// the matching prior press; this guard refuses new modifier-down events.
+func keyEventIsRelease(_ event: CGEvent) -> Bool {
+    if event.type == .keyUp { return true }
+    guard event.type == .flagsChanged else { return false }
+    let flag: CGEventFlags
+    switch event.getIntegerValueField(.keyboardEventKeycode) {
+    case Int64(kVK_Command), Int64(kVK_RightCommand): flag = .maskCommand
+    case Int64(kVK_Shift), Int64(kVK_RightShift): flag = .maskShift
+    case Int64(kVK_Option), Int64(kVK_RightOption): flag = .maskAlternate
+    case Int64(kVK_Control), Int64(kVK_RightControl): flag = .maskControl
+    // The catalog's standalone Caps Lock release is also flagsChanged, with
+    // alpha-shift cleared. Do not treat an enabled status flag as cleanup.
+    case Int64(kVK_CapsLock): flag = .maskAlphaShift
+    default: return false
+    }
+    return !event.flags.contains(flag)
 }
 
 /// Probes the CGEvent's embedded SLSEventRecord pointer at the offsets Cua uses
@@ -361,9 +381,9 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
     }
 
     /// Balance a key-down already sent by this action, even if its lease ended.
-    /// Keep the same authentication/transport; only prepared key-up is allowed.
+    /// Keep the same transport; only prepared key or modifier release is allowed.
     func releaseKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) {
-        guard event.type == .keyUp else { return }
+        guard keyEventIsRelease(event) else { return }
         _ = postPreparedKeyToPid(event, pid: pid, authenticated: authenticated)
     }
 
