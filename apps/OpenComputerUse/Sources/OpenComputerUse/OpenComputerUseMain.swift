@@ -38,6 +38,8 @@ enum OpenComputerUseMain {
         }
 
         switch command {
+        case let .settings(arguments):
+            try GodspeedTerminalSettings.run(arguments: arguments)
         case .lockedUseManagement:
             _ = try LockedUseSettings.handle(arguments: arguments)
         case .mcp:
