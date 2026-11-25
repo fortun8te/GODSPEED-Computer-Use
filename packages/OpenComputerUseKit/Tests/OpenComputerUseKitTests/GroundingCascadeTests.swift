@@ -9,6 +9,35 @@ final class GroundingCascadeTests: XCTestCase {
 
     // Step 2: rule-based prefilter, capped at 12.
 
+    func testDiscoveryFindsUnfamiliarSynonymsWithoutGuessingAnAction() {
+        let candidates = options(["Print", "Preferences", "Account Settings", "Configuration", "Help"])
+        let found = GroundingCascade.discoverySuggestions(label: "settings", options: candidates)
+        XCTAssertEqual(found.first?.text, "Account Settings")
+        XCTAssertTrue(found.map(\.text).contains("Preferences"))
+        XCTAssertTrue(found.map(\.text).contains("Configuration"))
+        XCTAssertFalse(found.map(\.text).contains("Print"))
+    }
+
+    func testDiscoveryPreservesDuplicateControlsAndBoundsOutput() {
+        let candidates = options(["Preferences", "Preferences", "Configuration", "Print"])
+        let found = GroundingCascade.discoverySuggestions(label: "settings", options: candidates, limit: 2)
+        XCTAssertEqual(found.map(\.id), ["1", "2"])
+        XCTAssertTrue(GroundingCascade.discoverySuggestions(label: "Quasar", options: candidates).isEmpty)
+        XCTAssertTrue(GroundingCascade.discoverySuggestions(label: "settings", options: candidates, limit: 0).isEmpty)
+    }
+
+    func testDiscoveryDoesNotChangeAutomaticResolution() {
+        let candidates = options(["Preferences", "Configuration"])
+        var asked = false
+        let decision = GroundingCascade.resolve(label: "settings", options: candidates) { _ in
+            asked = true
+            return nil
+        }
+        XCTAssertEqual(decision, .abstain("no close control"))
+        XCTAssertFalse(asked)
+        XCTAssertEqual(GroundingCascade.discoverySuggestions(label: "settings", options: candidates).count, 2)
+    }
+
     func testPrefilterKeepsSpellingAndTypoMatchesAndDropsUnrelatedControls() {
         let names = ["Save", "Cancel", "Opslaan", "Print", "Sharpen", "Share", "Zoom In"]
         let picked = GroundingCascade.prefilter(label: "Sve", options: options(names))
@@ -143,6 +172,30 @@ final class GroundingCascadeTests: XCTestCase {
         }))
         XCTAssertNil(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5), locate: { _ in CGPoint(x: 1.5, y: 0.5) }, verify: { _ in true }))
         XCTAssertEqual(verified, 0)
+    }
+
+    func testRetinaCropMappingAccountsForOddPixelDimensions() throws {
+        let rect = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        let pixels = try XCTUnwrap(VisionFallback.pixelCrop(rect, width: 2561, height: 1601))
+        XCTAssertEqual(pixels, CGRect(x: 640, y: 400, width: 1281, height: 801))
+        let local = CGPoint(x: 0.2, y: 0.8)
+        let adjusted = try XCTUnwrap(VisionFallback.remapCropPoint(local, pixels: pixels, requested: rect,
+                                                                    width: 2561, height: 1601))
+        let mapped = try XCTUnwrap(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5),
+                                                               locate: { _ in adjusted }, verify: { _ in true }))
+        XCTAssertEqual(mapped.x, (640 + 0.2 * 1281) / 2561, accuracy: 0.000001)
+        XCTAssertEqual(mapped.y, (400 + 0.8 * 801) / 1601, accuracy: 0.000001)
+    }
+
+    func testCropRejectsInvalidGeometryAndOutOfBoundsPoints() throws {
+        let rect = CGRect(x: 0.5, y: 0.5, width: 0.5, height: 0.5)
+        let pixels = try XCTUnwrap(VisionFallback.pixelCrop(rect, width: 101, height: 99))
+        XCTAssertEqual(pixels.maxX, 101)
+        XCTAssertEqual(pixels.maxY, 99)
+        XCTAssertNil(VisionFallback.pixelCrop(rect, width: 0, height: 99))
+        XCTAssertNil(VisionFallback.pixelCrop(CGRect(x: -0.1, y: 0, width: 0.5, height: 0.5), width: 101, height: 99))
+        XCTAssertNil(VisionFallback.remapCropPoint(CGPoint(x: 1, y: 0.5), pixels: pixels, requested: rect,
+                                                 width: 101, height: 99))
     }
 
     func testZoomProvenanceIsNamedInTheLearningLog() {
