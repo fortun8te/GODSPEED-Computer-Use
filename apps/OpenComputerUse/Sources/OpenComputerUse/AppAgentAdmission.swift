@@ -25,6 +25,14 @@ final class AppAgentAdmission: @unchecked Sendable {
             if case .browserPeek = self { return true }
             return false
         }
+
+        /// Ordinary browser observations cannot invalidate a paused native
+        /// action's evidence. Peeks create temporary tabs, so they still count
+        /// as mutations even though their returned result is informational.
+        var canChangeObservedState: Bool {
+            if case .browserRead = self { return false }
+            return true
+        }
     }
 
     struct Timeout: LocalizedError {
@@ -52,7 +60,7 @@ final class AppAgentAdmission: @unchecked Sendable {
     private var active: [UUID: Mode] = [:]
     private var queued: [Ticket] = []
     private var writesWhileReaderWaiting = 0
-    private var generation: UInt64 = 0
+    private var mutationGeneration: UInt64 = 0
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
          now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
@@ -114,13 +122,13 @@ final class AppAgentAdmission: @unchecked Sendable {
         // nonblocking attempt and is allowed only when no wait was needed.
         guard timeout == 0 || now() < deadline else { throw Timeout() }
         active[ticket.id] = ticket.mode
-        generation &+= 1
+        if ticket.mode.canChangeObservedState { mutationGeneration &+= 1 }
         if ticket.mode == .exclusive {
             writesWhileReaderWaiting = queued.contains { $0.mode != .exclusive } ? writesWhileReaderWaiting + 1 : 0
         } else {
             writesWhileReaderWaiting = 0
         }
-        return generation
+        return mutationGeneration
     }
 
     private func release(_ ticket: Ticket) {
@@ -137,11 +145,12 @@ final class AppAgentAdmission: @unchecked Sendable {
         defer { release(ticket) }
         if mode == .exclusive, let token = RequestCancellation.current {
             return try RequestInferenceAdmission.$withoutExclusive.withValue({ [self] work in
-                let before = condition.withLock { generation }
+                let before = condition.withLock { mutationGeneration }
                 release(ticket)
                 let result = work()
                 // The caller can only continue with its prior observations if
-                // no other admission intervened and it still owns the gate.
+                // no potentially mutating admission intervened and it still
+                // owns the gate. Other clients may safely read while it waits.
                 // Losing the gate stops the request: a typed cancellation, never a silent nil.
                 let after: UInt64
                 do { after = try acquire(ticket, timeout: 2) } catch {

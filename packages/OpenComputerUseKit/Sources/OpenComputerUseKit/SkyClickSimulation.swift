@@ -153,7 +153,7 @@ enum SkyClickDispatcher {
             return (step, event)
         }
 
-        let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let frontmostPID = try ForegroundApplication.pid()
         let focusContext: SkyLightSyntheticFocusContext?
         try delivery.check()
         if frontmostPID == target.pid {

@@ -5,8 +5,9 @@ Use Godspeed for Mac apps and Chrome.
 
 - Start with the outcome. For a familiar workflow, use batch with app, the exact saved goal and current values to replay a verified recipe. For known steps, use one batch with done_when and compact:true. A verified receipt is enough to finish.
 - For a bounded Mac task with a concrete final check but unknown steps, use handoff with app, goal, done_when and any text values. It reads and acts locally. If it stops, use its receipt and continue only the remaining work.
+- Keep a stopped batch's token across context resets. Use batch with inspect_resume to recover compact progress, then resume only eligible unsent steps with fresh values. Inspection does not execute or consume the checkpoint.
 - For a single action, use its tool. Use query or compact get_app_state to identify controls and browser find for web controls. Request screenshots when needed.
-- Keep work in the background. Check uncertain delivery before retrying. Ask before sending, deleting or purchasing.
+- Keep work in the background. Check uncertain delivery before retrying. Sending, deleting or purchasing needs user authorization; honor authorization already given for this task.
 """
 
 public final class StdioMCPServer {

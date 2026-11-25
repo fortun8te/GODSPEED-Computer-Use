@@ -10,6 +10,34 @@ An unattended task keeps its original application lifetime, window, deadline and
 
 Local actions, accessibility reads, OCR and verification carry routine work. Optional models handle unresolved choices under the same task budget. Progress and recovery should be useful to the host agent without requiring the user to supervise every click.
 
+Pure browser observations from another client can run while a native task waits for inference without cancelling that task. Any intervening potentially mutating admission still invalidates the old observations, including previews that create temporary tabs. Focus restoration uses the live foreground owner and rechecks it across accessibility reads, so changing apps or windows does not restore the person's previous focus.
+
+## Continuing with a small context window
+
+Keep the resume token from a stopped batch in the host's short task summary. After a context reset, call `batch {"inspect_resume":"TOKEN"}`. This local read returns compact JSON containing the original step numbers, pending tools, dispatched and uncertain steps, required fresh value slots, target identity and next action. It does not execute actions, consume the token, expose stored argument payloads, or claim that saved evidence is the current screen.
+
+An eligible continuation uses `batch {"resume":"TOKEN","values":{...}}`. The existing resume path rechecks process lifetime and window identity, reads the target again, and claims the token only after preflight. Uncertain delivery, browser continuations, unbound steps and legacy process identities require fresh inspection and explicit remaining steps. A dispatched step is not automatically a completed goal.
+
+This keeps progress outside the model's transcript and can help hosts with 16–32K context windows. It does not establish a completion rate for a particular 9B model; that needs a matched task evaluation with the selected model and tokenizer.
+
+## Local tree interpretation
+
+Accessibility traversal fetches scalar attributes separately from child arrays. It asks for child counts, reads only the prefix permitted by the remaining discovery budget, and reuses successful counts and pages within the snapshot. Short or failed pages remain incomplete evidence; they do not become proof that a target disappeared.
+
+Compaction builds a local parent/sibling index. It preserves named groups, distinct controls, adjacent field labels, validation/status text, state traits and explicitly retained refs. A repeated plain label directly under its own control can be omitted. Budget selection carries the selected control's real ancestor path, avoiding misleading placements under an unrelated section.
+
+Semantic changes match names within their parent context. Repeated unqualified controls use state multisets; ambiguous differences are reported as ambiguity. Values containing literal parentheses remain values, and sensitive ancestor labels suppress field-value summaries. The diff reply computes semantic events once and reuses them for summarization and trimming.
+
+## Delivered motion and activity
+
+Drag presentation receives positions and monotonic timestamps after input events are posted. One pending display update takes the latest delivered point rather than replaying an accumulated path after release. Cancellation retains that last point, and a skipped release cannot generate a delivered-release indication.
+
+The active target gets a passive, click-through window-edge bloom with a dark accent core and broad soft falloff. Its label follows action state: Working, Dragging, Typing, Scrolling, Waiting or Delivered. The treatment stays at the target window's layer, leaves document contents clear, hides at idle/reset/cancellation, and follows existing feedback, label and Reduce Motion preferences. Delivered indicates posted input, not independently verified task completion.
+
+## Bounded local improvement
+
+The [local evaluation runner](local-evaluation.md) compares declared parameter neighbours with interleaved controls, independent completion/safety checks, explicit metric coverage and held-out qualification. It logs unsuccessful trials and emits a recommended profile plus rollback baseline only after qualification. It does not invoke a model, apply settings or modify code on its own.
+
 ## Configuration
 
 Open `godspeed` and choose **Presets → Model-free** to stage compact reads, verified recipes, change-only batch replies, screenshots on request, and disabled optional model helpers. Review the changes and save. The host agent still uses its own configured model; this preset controls inference inside Godspeed.

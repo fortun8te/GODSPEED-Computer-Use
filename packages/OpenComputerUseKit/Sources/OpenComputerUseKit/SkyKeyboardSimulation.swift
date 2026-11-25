@@ -162,10 +162,17 @@ struct UserKeyWindow: Equatable {
     let windowID: CGWindowID
 
     static func capture(excludingPID targetPID: pid_t, spi: SkyLightSPI) -> UserKeyWindow? {
-        guard let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != targetPID,
-              let windowID = focusedWindowID(pid: front.processIdentifier, spi: spi)
+        capture(excludingPID: targetPID, foregroundPID: ForegroundApplication.pid,
+                focusedWindow: { focusedWindowID(pid: $0, spi: spi) })
+    }
+
+    static func capture(excludingPID targetPID: pid_t, foregroundPID: () throws -> pid_t,
+                        focusedWindow: (pid_t) -> CGWindowID?) -> UserKeyWindow? {
+        guard let front = try? foregroundPID(), front > 0, front != targetPID,
+              let windowID = focusedWindow(front), windowID != 0,
+              (try? foregroundPID()) == front
         else { return nil }
-        return UserKeyWindow(pid: front.processIdentifier, windowID: windowID)
+        return UserKeyWindow(pid: front, windowID: windowID)
     }
 
     static func focusedWindowID(pid: pid_t, spi: SkyLightSPI) -> CGWindowID? {
@@ -180,10 +187,20 @@ struct UserKeyWindow: Equatable {
 
     /// Only when the user's app is still in front: a user who switched apps meanwhile is left alone.
     func giveBack(spi: SkyLightSPI) {
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
-        // The user may have moved to another window of the same app meanwhile: leave that alone too.
-        guard Self.focusedWindowID(pid: pid, spi: spi) == windowID else { return }
-        spi.returnKeyFocus(pid: pid, windowID: windowID)
+        giveBack(foregroundPID: ForegroundApplication.pid,
+                 focusedWindow: { Self.focusedWindowID(pid: $0, spi: spi) },
+                 returnFocus: { spi.returnKeyFocus(pid: pid, windowID: windowID) })
+    }
+
+    func giveBack(foregroundPID: () throws -> pid_t, focusedWindow: (pid_t) -> CGWindowID?,
+                  returnFocus: () -> Void) {
+        guard pid > 0, windowID != 0, (try? foregroundPID()) == pid,
+              focusedWindow(pid) == windowID else { return }
+        // AX reads can yield while the person switches apps or windows. A
+        // cached NSWorkspace owner must never restore their previous focus.
+        guard (try? foregroundPID()) == pid, focusedWindow(pid) == windowID,
+              (try? foregroundPID()) == pid else { return }
+        returnFocus()
     }
 }
 
@@ -374,7 +391,7 @@ enum SkyKeyboardDispatcher {
         try validate(target: target)
         try delivery.check()
 
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid {
+        if try ForegroundApplication.pid() == target.pid {
             try body()
             return
         }

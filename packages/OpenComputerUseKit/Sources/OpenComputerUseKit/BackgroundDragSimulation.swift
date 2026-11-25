@@ -48,7 +48,9 @@ struct BackgroundDragIO {
     var endFocus: (SkyLightSyntheticFocusContext) throws -> Void
     var setWindowLocation: (CGEvent, CGPoint) throws -> Void
     var post: (CGEvent, pid_t) -> Void
-    var release: (CGEvent, BackgroundDragTarget) -> Void
+    /// False means cleanup was intentionally not posted because the original
+    /// target no longer exists. Presentation must not invent a delivered release.
+    var release: (CGEvent, BackgroundDragTarget) -> Bool
     var pause: (TimeInterval) -> Void
     var clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
@@ -78,7 +80,9 @@ struct BackgroundDragIO {
                 // session lease, but never post to an unrelated/reused window.
                 if skyKeyWindowMatchesTarget(windowInfo: windows(), windowID: target.windowID, pid: target.pid) {
                     event.postToPid(target.pid)
+                    return true
                 }
+                return false
             },
             pause: { Thread.sleep(forTimeInterval: $0) }
         )
@@ -177,7 +181,9 @@ enum BackgroundDragDispatcher {
                 io.post(press, target.pid)
                 delivery.didPost()
                 release.timestamp = DispatchTime.now().uptimeNanoseconds
-                io.release(release, target)
+                guard io.release(release, target) else {
+                    throw ComputerUseError.message("The click release could not be posted to the original target. Inspect the app before repeating the action.")
+                }
                 sent += 1
                 try delivery.check()
                 if sent < count { io.pause(0.05) }
@@ -239,6 +245,7 @@ enum BackgroundDragDispatcher {
         hold: TimeInterval = 0,
         io: BackgroundDragIO = .system(),
         delivery: NativeInputDelivery = NativeInputDelivery(),
+        onProgress: (NativeDragProgress) -> Void = { _ in },
         validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
         validateEndpoints: () throws -> Void = {}
     ) throws {
@@ -297,6 +304,7 @@ enum BackgroundDragDispatcher {
             event.timestamp = DispatchTime.now().uptimeNanoseconds
             io.post(event, target.pid)
             delivery.didPost()
+            if let progress = NativeDragProgress(event: event) { onProgress(progress) }
         }
 
         // If the user genuinely activates the target during a gesture, it now
@@ -325,11 +333,13 @@ enum BackgroundDragDispatcher {
             try delivery.check()
             io.pause(eventDelay)
             try validateEndpoints()
+            var releasePosted = false
             try InputSimulation.withPressedMouseButton(press: {
                 try send(down)
             }, release: {
                 release.timestamp = DispatchTime.now().uptimeNanoseconds
-                io.release(release, target)
+                releasePosted = io.release(release, target)
+                if releasePosted, let progress = NativeDragProgress(event: release) { onProgress(progress) }
                 io.pause(eventDelay)
             }) {
                 try delivery.wait(max(eventDelay, hold), validate: {
@@ -342,6 +352,9 @@ enum BackgroundDragDispatcher {
                     try delivery.check()
                     io.pause(eventDelay)
                 }
+            }
+            guard releasePosted else {
+                throw ComputerUseError.message("The drag release could not be posted to the original target. Inspect the app before repeating the action.")
             }
             try delivery.check()
         } catch {
