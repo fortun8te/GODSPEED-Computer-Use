@@ -39,7 +39,9 @@ curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/instal
 
 ## Settings
 
-Run `godspeed settings` (or simply `godspeed`) for the terminal preferences menu in builds that include the launcher. Use `godspeed settings --show` for read-only output. [Configuration reference](docs/GODSPEED.md#terminal-settings).
+Run `godspeed` (or `godspeed settings`) for a terminal menu with cursor accent presets, motion and feedback controls, background preferences, local compute, and privacy settings. Changes are previewed and saved explicitly. Use `godspeed settings --show` for a read-only summary. These commands require a build that includes the new launcher.
+
+Choose the **Model-free** preset to keep accessibility, local OCR, verified recipes and checks available while disabling Godspeed's optional model helpers, warmups and auto-start. **Quiet** reduces the cursor's visual footprint; **Balanced** keeps smooth visible feedback and compact observations. [Configuration reference](docs/GODSPEED.md#terminal-settings) · [Reliability design](docs/local-first-reliability.md).
 
 ## How Godspeed works
 

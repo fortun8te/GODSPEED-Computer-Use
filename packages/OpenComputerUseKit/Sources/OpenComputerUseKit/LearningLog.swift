@@ -22,7 +22,8 @@ final class LearningLog: @unchecked Sendable {
 
     /// The log the driver's hooks write to. Tests inject their own instance instead, and under XCTest this one
     /// is always off, so no test can write into the real ~/.godspeed folder.
-    static let shared = LearningLog(enabled: isEnabled(environment: ProcessInfo.processInfo.environment) && NSClassFromString("XCTestCase") == nil)
+    static let shared = LearningLog(enabled: NSClassFromString("XCTestCase") == nil,
+                                    imagesEnabled: true, followsSettings: true)
 
     static func isEnabled(environment: [String: String]) -> Bool {
         !disabledValues.contains(flag(environment[enabledVariable]))
@@ -38,8 +39,15 @@ final class LearningLog: @unchecked Sendable {
 
     let directory: URL
     let maxBytes: UInt64
-    let isEnabled: Bool
-    let imagesEnabled: Bool
+    private let configuredEnabled: Bool
+    private let configuredImagesEnabled: Bool
+    private let followsSettings: Bool
+    var isEnabled: Bool {
+        configuredEnabled && (!followsSettings || Self.isEnabled(environment: GodspeedSettings.environment))
+    }
+    var imagesEnabled: Bool {
+        configuredImagesEnabled && (!followsSettings || Self.imagesEnabled(environment: GodspeedSettings.environment))
+    }
     let runID: String
     private let clock: () -> Date
     private let lock = NSLock()
@@ -49,13 +57,15 @@ final class LearningLog: @unchecked Sendable {
         maxBytes: UInt64 = LearningLog.defaultMaxBytes,
         enabled: Bool = LearningLog.isEnabled(environment: ProcessInfo.processInfo.environment),
         imagesEnabled: Bool = LearningLog.imagesEnabled(environment: ProcessInfo.processInfo.environment),
+        followsSettings: Bool = false,
         runID: String? = ProcessInfo.processInfo.environment[LearningLog.runIDVariable],
         clock: @escaping () -> Date = { Date() }
     ) {
         self.directory = directory
         self.maxBytes = maxBytes
-        isEnabled = enabled
-        self.imagesEnabled = imagesEnabled
+        configuredEnabled = enabled
+        configuredImagesEnabled = imagesEnabled
+        self.followsSettings = followsSettings
         self.runID = runID ?? UUID().uuidString.lowercased()
         self.clock = clock
     }

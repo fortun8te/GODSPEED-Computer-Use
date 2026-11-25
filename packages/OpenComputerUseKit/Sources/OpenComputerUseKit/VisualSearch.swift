@@ -61,11 +61,15 @@ enum VisualSearch {
     static func actionToken(tool: String, arguments: [String: Any]) throws -> String? {
         guard let raw = arguments["visual_snapshot"] else { return nil }
         let coordinates = tool == "click" ? ["x", "y"] : ["from_x", "from_y", "to_x", "to_y"]
-        let namedTargets = ["ref", "label", "labels", "element_index", "from_label", "to_label", "from_index", "to_index"]
-        guard ["click", "drag"].contains(tool), arguments["window_id"] != nil,
+        let namedTargets = ["ref", "label", "labels", "element_index", "from_label", "to_label", "from_index", "to_index", "files"]
+        let windowID = try validatedQueryWindowID(arguments["window_id"])
+        guard ["click", "drag"].contains(tool), windowID != nil,
               let token = raw as? String, token.utf8.count == 64,
               token.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
-              coordinates.allSatisfy({ arguments[$0] != nil }),
+              coordinates.allSatisfy({ key in
+                  guard let value = arguments[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else { return false }
+                  return value.doubleValue.isFinite && value.doubleValue >= 0
+              }),
               namedTargets.allSatisfy({ arguments[$0] == nil }) else {
             throw ComputerUseError.invalidArguments("visual_snapshot requires a window-bound pixel click or drag with the token from visual search.")
         }

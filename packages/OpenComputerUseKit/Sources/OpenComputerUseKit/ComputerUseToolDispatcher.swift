@@ -413,8 +413,10 @@ public final class ComputerUseToolDispatcher {
     private func dispatchHealingStaleIndex(name: String, arguments: [String: Any], app: String, log: SmartLog) throws -> ToolCallResult {
         let priorIndex = normalizedElementIndexArgument(arguments["element_index"])
         var prior: (role: String?, label: String?)?
+        var priorWindow: NativeWindowObservation?
         if let index = priorIndex {
             let snapshot = try? service.currentSnapshot(for: app, needScreenshot: false)
+            priorWindow = snapshot?.nativeWindow
             if let record = snapshot?.elements.values.first(where: { String($0.index) == index }) {
                 prior = (SmartSteps.roleKey(record.role), SmartSteps.name(of: record))
             } else if let snapshot, let number = Int(index),
@@ -428,17 +430,26 @@ public final class ComputerUseToolDispatcher {
         do {
             return try dispatchTool(name: name, arguments: arguments, log: log)
         } catch let error as ComputerUseError where SmartSteps.isStale(error) || ElementNumbering.isGone(error) {
-            guard let index = priorIndex, let prior, prior.label != nil else { throw error }
-            guard let fresh = SmartSteps.freshSnapshot(app: app, service: service) else { throw error }
-            switch StaleHealing.resolve(index: index, role: prior.role, label: prior.label, nodes: SmartSteps.nodes(of: fresh)) {
+            guard let index = priorIndex, let prior, prior.label != nil, let priorWindow else { throw error }
+            // A new front window can contain an identical control. Read the original window only;
+            // neither a user's window switch nor a process restart may redirect a healed action.
+            _ = try service.getAppState(app: app,
+                observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false), windowID: priorWindow.id)
+            let fresh = try service.currentSnapshot(for: app, needScreenshot: false, recoveryPolicy: .readOnly)
+            switch StaleHealing.recover(index: index, role: prior.role, label: prior.label,
+                                        observedWindow: priorWindow, currentWindow: fresh.nativeWindow,
+                                        nodes: SmartSteps.nodes(of: fresh)) {
             case .refuse(let message):
                 throw ComputerUseError.staleTarget(message)
             case .use(let now, let note):
                 log.note(note)
                 var retried = arguments
                 retried["element_index"] = String(now)
-                try authorizeNativeAction(name: name, arguments: retried)
-                return try dispatchTool(name: name, arguments: retried, log: log)
+                retried["window_id"] = priorWindow.id
+                return try ComputerUseService.$requiredWindowID.withValue(priorWindow.id) {
+                    try authorizeNativeAction(name: name, arguments: retried)
+                    return try dispatchTool(name: name, arguments: retried, log: log)
+                }
             }
         }
     }
@@ -611,10 +622,9 @@ public final class ComputerUseToolDispatcher {
             } catch let error as ComputerUseError {
                 // Only a real, unambiguous label miss can use the local perception path (OCR, then the vision
                 // model), never in strict background mode or for a window-bound action.
-                if !StrictBackground.enabled(), ComputerUseService.requiredWindowID == nil,
-                   SmartSteps.isNotFound(error), !SmartSteps.isAmbiguous(error),
-                   VisionFallback.isEnabled, clickCount == 1,
-                   (optionalString("mouse_button", in: arguments) ?? "left").lowercased() == "left",
+                if ComputerUseService.allowsLocalPerceptionFallback(error: error, strict: StrictBackground.enabled(),
+                   windowBound: ComputerUseService.requiredWindowID != nil, clickCount: clickCount,
+                   mouseButton: optionalString("mouse_button", in: arguments) ?? "left"),
                    let label = labelArguments(in: arguments)?.first,
                    let result = try service.visionClick(app: requireString("app", in: arguments), label: label,
                                                        method: parseClickMethod(optionalString("click_method", in: arguments))) {

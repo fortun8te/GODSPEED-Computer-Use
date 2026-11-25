@@ -571,7 +571,7 @@ final class GodspeedLeanTests: XCTestCase {
         XCTAssertNil(vars["OPEN_COMPUTER_USE_VISION_URL"])
         XCTAssertEqual(vars["OPEN_COMPUTER_USE_RECIPES"], "0")
         XCTAssertEqual(vars["OPEN_COMPUTER_USE_BROWSER"], "1")
-        XCTAssertNil(GodspeedSettings.mappedVariables(from: ["cursor_color": "default"])["OPEN_COMPUTER_USE_CURSOR_COLOR"])
+        XCTAssertEqual(GodspeedSettings.mappedVariables(from: ["cursor_color": "default"])["OPEN_COMPUTER_USE_CURSOR_COLOR"], "default")
     }
 
     func testEnvironmentWinsOverSettingsFile() {

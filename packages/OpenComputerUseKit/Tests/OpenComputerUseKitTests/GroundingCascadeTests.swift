@@ -213,9 +213,51 @@ final class GroundingCascadeTests: XCTestCase {
         }
         XCTAssertEqual(invalid, .abstain("the local helper gave invalid probabilities"))
         let uncertain = GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in
-            ["1": 0.71, "2": 0.02, "none": 0.69]
+            ["1": 0.71, "2": 0.02, "3": 0.0, "none": 0.69]
         }
         XCTAssertEqual(uncertain, .abstain("the top choice does not lead by 0.35"))
+    }
+
+    func testIncompleteRankingCannotManufactureAConfidentWinner() {
+        for scores in [
+            ["1": 0.99],
+            ["1": 0.99, "2": 0.0, "3": 0.0],
+            ["1": 0.99, "2": 0.0, "none": 0.01],
+            ["1": 0.99, "2": 0.0, "3": 0.0, "none": 0.01, "unexpected": 0.0],
+        ] {
+            XCTAssertEqual(GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in scores },
+                           .abstain("the local helper gave an incomplete ranking"))
+        }
+    }
+
+    func testDuplicateCandidateIDsNeverReachTheChooser() {
+        let candidates = [GroundingCascade.Option(id: "1", text: "Save"),
+                          GroundingCascade.Option(id: "1", text: "Saves")]
+        XCTAssertEqual(GroundingCascade.resolve(label: "Sav", options: candidates) { _ in
+            XCTFail("duplicate IDs cannot name one target")
+            return ["1": 0.99, "none": 0.01]
+        }, .abstain("control identifiers are ambiguous"))
+    }
+
+    func testFuzzyWorkIsBoundedButExactLongNamesStillResolve() {
+        let long = String(repeating: "s", count: GroundingCascade.maxFuzzyCharacters + 1)
+        XCTAssertTrue(GroundingCascade.prefilter(label: long, options: options([long + "x", "Save"])).isEmpty)
+        XCTAssertTrue(GroundingCascade.prefilter(label: "Sav", options: options([long]), limit: 1).isEmpty)
+        XCTAssertTrue(GroundingCascade.prefilter(label: "Sav", options: threeNames, limit: -1).isEmpty)
+        XCTAssertEqual(GroundingCascade.resolve(label: long, options: options([long])) { _ in
+            XCTFail("an exact name does not need fuzzy ranking")
+            return nil
+        }, .act(id: "1", provenance: .ax, probability: nil, lead: nil))
+    }
+
+    func testInvalidFirstPointDoesNotStartAnotherModelCall() {
+        for point in [CGPoint(x: .nan, y: 0.5), CGPoint(x: .infinity, y: 0.5),
+                      CGPoint(x: -0.1, y: 0.5), CGPoint(x: 1, y: 0.5)] {
+            XCTAssertNil(GroundingCascade.secondLook(at: point, locate: { _ in
+                XCTFail("invalid input must not trigger a second inference")
+                return CGPoint(x: 0.5, y: 0.5)
+            }, verify: { _ in XCTFail("invalid input must not be verified"); return true }))
+        }
     }
 
     func testZoomProvenanceIsNamedInTheLearningLog() {

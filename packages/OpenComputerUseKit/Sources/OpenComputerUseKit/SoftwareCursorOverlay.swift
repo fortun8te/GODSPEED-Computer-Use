@@ -213,6 +213,9 @@ struct VisualCursorSettings: Equatable, Sendable {
     var speed: CGFloat
     var floats: Bool
     var lensEnabled: Bool
+    var feedbackEnabled: Bool
+    var labelEnabled: Bool
+    var reducedMotion: Bool
     var idleHideDelay: TimeInterval
     var observationFilePath: String?
     var traceFilePath: String?
@@ -222,16 +225,26 @@ struct VisualCursorSettings: Equatable, Sendable {
     var agentName: String?
 
     init(environment: [String: String]) {
-        let rawColor = environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]
+        let rawColor = environment["OPEN_COMPUTER_USE_CURSOR_COLOR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         color = CursorColor(hex: rawColor)
         automaticTint = rawColor == nil || rawColor?.lowercased() == "auto"
         agentName = cursorAgentName(environment["OPEN_COMPUTER_USE_CURSOR_NAME"])
+            ?? cursorAgentName(environment["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME"])
         enabled = visualCursorEnabled(environment: environment)
         speed = visualCursorSpeed(environment: environment)
         floats = visualCursorFloats(environment: environment)
         lensEnabled = ["1", "true", "on", "yes"].contains(
             environment["OPEN_COMPUTER_USE_CURSOR_LENS"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         )
+        feedbackEnabled = !["0", "false", "off", "no"].contains(
+            environment["OPEN_COMPUTER_USE_CURSOR_FEEDBACK"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
+        labelEnabled = !["0", "false", "off", "no"].contains(
+            environment["OPEN_COMPUTER_USE_CURSOR_LABEL"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
+        reducedMotion = environment["OPEN_COMPUTER_USE_CURSOR_MOTION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "reduced"
         idleHideDelay = visualCursorPostInteractionIdleTimeout(environment: environment)
         observationFilePath = visualCursorObservationFileURL(environment: environment)?.path
         let trace = environment["OPEN_COMPUTER_USE_CURSOR_TRACE_FILE"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -295,14 +308,16 @@ func visualCursorTravelDuration(distance: CGFloat, speed: CGFloat, queuedBehind:
     guard speed.isFinite, speed > 0, distance.isFinite, distance > 0 else { return 0 }
     let base = 0.15 + 0.30 * (1 - exp(-Double(distance) / 800))
     let duration = base / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind)
-    let bounded = queuedBehind >= 2 ? min(duration, 0.16) : duration
+    // An extremely small positive numeric setting can overflow division to infinity. A cosmetic
+    // move must still finish and release its frame clock, even with malformed external settings.
+    let bounded = min(duration, queuedBehind >= 2 ? 0.16 : 2)
     return bounded < visualCursorMinimumAnimatedDuration ? 0 : bounded
 }
 
 /// Seconds one click pulse takes at `speed` (150 ms at 1x). 0 means skip the pulse.
 func visualCursorClickPulseDuration(speed: CGFloat, queuedBehind: Int = 0) -> TimeInterval {
     guard speed.isFinite, speed > 0 else { return 0 }
-    let duration = 0.15 / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind)
+    let duration = min(0.4, 0.15 / Double(speed) * visualCursorCatchUpFactor(queuedBehind: queuedBehind))
     return duration < visualCursorMinimumAnimatedDuration ? 0 : duration
 }
 
@@ -327,10 +342,14 @@ func visualCursorFreshStartPoint(
 ) -> CGPoint {
     let plain = visualCursorFreshStartPoint(target: target, forward: forward, distance: distance)
     guard frame.contains(target) else { return plain }
-    return CGPoint(
+    let mirrored = CGPoint(
         x: plain.x < frame.minX || plain.x > frame.maxX ? target.x + (target.x - plain.x) : plain.x,
         y: plain.y < frame.minY || plain.y > frame.maxY ? target.y + (target.y - plain.y) : plain.y
     )
+    // A small window can be narrower than the approach on both sides. Mirroring alone then
+    // puts the arrival on the opposite edge, outside the target window.
+    return CGPoint(x: mirrored.x.clamped(to: frame.minX...frame.maxX.nextDown),
+                   y: mirrored.y.clamped(to: frame.minY...frame.maxY.nextDown))
 }
 
 func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
@@ -338,7 +357,7 @@ func visualCursorNearDisplayEdge(_ point: CGPoint, in frame: CGRect) -> Bool {
 }
 
 func visualCursorFloats(environment: [String: String] = RequestConfiguration.environment) -> Bool {
-    let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.lowercased() ?? "0"
+    let raw = environment["OPEN_COMPUTER_USE_CURSOR_FLOAT"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "0"
     return ["1", "true", "yes", "on"].contains(raw)
 }
 
@@ -1325,23 +1344,27 @@ final class CursorStage {
 
     private func adopt(_ settings: VisualCursorSettings) {
         let nameChanged = activeSettings.agentName != settings.agentName
+        let labelChanged = activeSettings.labelEnabled != settings.labelEnabled
         activeSettings = settings
         if nameChanged || currentAgentName == nil {
             currentAgentName = SoftwareCursorOverlay.nameForCursor(client: client, preferred: settings.agentName ?? fallbackName)
             updateNameTag()
         }
+        if labelChanged { updateNameTag() }
         if settings.automaticTint && assignedTint == nil {
             assignedTint = SoftwareCursorOverlay.tintForCursor(client: client)
         }
         cursorView?.tint = settings.color ?? (settings.automaticTint ? assignedTint : nil)
         cursorView?.lensEnabled = settings.lensEnabled
+        cursorView?.prefersReducedMotion = settings.reducedMotion
     }
 
     private var targetAppName: String?
 
     private func updateNameTag() {
-        guard let currentAgentName else { return }
-        let label = targetAppName.map { "\(currentAgentName) · \($0)" } ?? currentAgentName
+        let label = activeSettings.labelEnabled ? currentAgentName.map { name in
+            targetAppName.map { "\(name) · \($0)" } ?? name
+        } : nil
         if cursorView?.agentName != label {
             cursorView?.agentName = label
             cursorView?.needsDisplay = true
@@ -1349,7 +1372,7 @@ final class CursorStage {
     }
 
     private var reducesMotion: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        activeSettings.reducedMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
     private func beginGlide(
@@ -1508,7 +1531,8 @@ final class CursorStage {
             ), at: 0)
             return
         }
-        let duration = visualCursorClickPulseDuration(speed: activeSettings.speed, queuedBehind: timeline.count)
+        let duration = activeSettings.feedbackEnabled
+            ? visualCursorClickPulseDuration(speed: activeSettings.speed, queuedBehind: timeline.count) : 0
         guard panel?.isVisible == true, let point = restingTipPosition else { return }
         trace("pulse at=(\(Int(point.x)),\(Int(point.y))) count=\(clickCount) ms=\(Int(duration * 1000))")
         observationPhase = "pulse"
@@ -1649,6 +1673,11 @@ final class CursorStage {
         } else if let tail = releaseTail {
             if let sample = tail.sample(at: now) { (press, ripple) = sample } else { releaseTail = nil }
         }
+        if !activeSettings.feedbackEnabled {
+            press = 0
+            ripple = nil
+            releaseTail = nil
+        }
 
         let origin = artwork.geometry.origin(forTipPosition: state.tipPosition)
         // Whole-pixel steps on a 1x display and half-pixel on Retina keep the glyph crisp at rest
@@ -1662,6 +1691,9 @@ final class CursorStage {
             badgeFrame.intersection(screen.frame.insetBy(dx: 2, dy: 2).offsetBy(dx: -snapped.x, dy: -snapped.y))
         } ?? badgeFrame
 
+        // Keep the internal drag/typing lifecycle even when its visual badge is hidden: drag
+        // paths still need their straight-line motion and balanced begin/end boundaries.
+        let visibleIndicator = activeSettings.feedbackEnabled ? interactionIndicator : nil
         let changed = cursorView.rotation != state.rotation
             || cursorView.cursorBodyOffset != state.cursorBodyOffset
             || cursorView.fogOffset != state.fogOffset
@@ -1670,7 +1702,7 @@ final class CursorStage {
             || cursorView.clickProgress != press
             || (cursorView.ripple == nil) != (ripple == nil)
             || ripple != nil
-            || cursorView.indicator != interactionIndicator
+            || cursorView.indicator != visibleIndicator
             || cursorView.lensEnabled != activeSettings.lensEnabled
         let labelMoved = cursorView.labelViewport != labelViewport
         cursorView.rotation = state.rotation
@@ -1680,7 +1712,7 @@ final class CursorStage {
         cursorView.fogScale = state.fogScale
         cursorView.clickProgress = press
         cursorView.ripple = ripple
-        cursorView.indicator = interactionIndicator
+        cursorView.indicator = visibleIndicator
         cursorView.lensEnabled = activeSettings.lensEnabled
         cursorView.labelViewport = labelViewport
         // Per frame only the glyph square is redrawn; the wide window's name-tag room is redrawn only when the
@@ -1941,6 +1973,7 @@ final class CursorStage {
         cursorView = view
         updateNameTag()
         view.tint = activeSettings.color ?? (activeSettings.automaticTint ? assignedTint : nil)
+        view.prefersReducedMotion = activeSettings.reducedMotion
     }
 
     private func configureOrdering(relativeTo targetWindow: CursorTargetWindow?) -> Bool {
@@ -2349,12 +2382,15 @@ private final class SoftwareCursorView: NSView {
     }
     private var typingBlend: CGFloat = 0
     private var typingTimer: Timer?
+    var prefersReducedMotion = false {
+        didSet { if oldValue != prefersReducedMotion { updateTypingBlend() } }
+    }
 
     private func updateTypingBlend() {
         typingTimer?.invalidate()
         typingTimer = nil
         let target: CGFloat = indicator?.feedback == .typing ? 1 : 0
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+        guard !prefersReducedMotion, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             typingBlend = target
             needsDisplay = true
             return

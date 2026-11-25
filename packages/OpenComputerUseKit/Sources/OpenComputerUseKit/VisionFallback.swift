@@ -9,7 +9,10 @@ enum VisionFallback {
     // Bound the accurate OCR pass while retaining Retina-size toolbar text.
     static let accurateOCRMaxSide = 2560
     /// Read per request (L6): the settings file and each caller's options can change it.
-    static var baseURL: URL? { localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"]) }
+    static var baseURL: URL? {
+        guard ModelHelperPolicy.isEnabled else { return nil }
+        return localURL(GodspeedSettings.environment["OPEN_COMPUTER_USE_VISION_URL"])
+    }
 
     static func localURL(_ raw: String?) -> URL? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -53,6 +56,7 @@ enum VisionFallback {
             case .missing: continue
             }
         }
+        guard ModelHelperPolicy.isEnabled else { return nil }
         return locate().map { Candidate(fraction: $0, evidence: .model) }
     }
 

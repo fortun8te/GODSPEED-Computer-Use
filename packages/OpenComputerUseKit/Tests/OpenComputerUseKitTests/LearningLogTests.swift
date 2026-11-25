@@ -349,7 +349,6 @@ final class LearningLogTests: XCTestCase {
             act: { _, _ in .init(ok: true, message: "", delivery: .acknowledged,
                                  observedState: initial + "\n2 static text Exported") },
             choose: { _, _, _, _, _ in nil },
-            looksStuck: { _, _, _ in false },
             check: { HandoffTool.check(request.doneWhen, screen: $0) },
             replay: { _ in nil },
             now: { 0 }
@@ -384,7 +383,6 @@ final class LearningLogTests: XCTestCase {
             act: { _, _ in .init(ok: true, message: "", delivery: .acknowledged,
                                  observedState: initial + "\n2 static text Exported") },
             choose: { _, _, _, _, _ in nil },
-            looksStuck: { _, _, _ in false },
             check: { HandoffTool.check(request.doneWhen, screen: $0) },
             replay: { _ in nil },
             now: { 0 }
