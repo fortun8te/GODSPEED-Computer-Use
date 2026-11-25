@@ -142,17 +142,22 @@ enum GroundingCascade {
         if exact.count == 1, let only = exact.first {
             return .act(id: only.id, provenance: .ax, probability: nil, lead: nil)
         }
+        // Identical names are not evidence of which instance the caller meant.
+        if exact.count > 1 { return .offer(ids: exact.map(\.id)) }
         // Step 2.
         let candidates = prefilter(label: label, options: options)
         guard candidates.count >= 2 else { return .abstain("no close control") }
         // Step 3.
         guard let probabilities = choose(candidates) else { return .abstain("the local helper gave no ranking") }
+        guard probabilities.values.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+            return .abstain("the local helper gave invalid probabilities")
+        }
         let ranked = candidates.sorted { (probabilities[$0.id] ?? 0) > (probabilities[$1.id] ?? 0) }
         guard let top = ranked.first, let topProbability = probabilities[top.id] else {
             return .abstain("the local helper gave no ranking")
         }
         if (probabilities["none"] ?? 0) >= topProbability { return .abstain("the helper chose none") }
-        let next = ranked.dropFirst().map { probabilities[$0.id] ?? 0 }.max() ?? 0
+        let next = max(probabilities["none"] ?? 0, ranked.dropFirst().map { probabilities[$0.id] ?? 0 }.max() ?? 0)
         let lead = topProbability - next
         guard topProbability >= minProbability else { return .abstain("the top choice is below 0.70") }
         guard lead >= minLead else { return .abstain("the top choice does not lead by 0.35") }
