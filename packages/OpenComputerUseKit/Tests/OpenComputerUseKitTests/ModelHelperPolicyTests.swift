@@ -67,7 +67,7 @@ final class ModelHelperPolicyTests: XCTestCase {
             XCTAssertEqual(Referee.handoffURL?.absoluteString, custom)
             XCTAssertFalse(Referee.isEnabled)
             XCTAssertFalse(VisionFallback.isEnabled)
-            Referee.warmInBackground { _, _ in XCTFail("A handoff URL must not enable hint warmup") }
+            Referee.warmInBackground(send: { _, _ in XCTFail("A handoff URL must not enable hint warmup") })
         }
     }
 
@@ -162,16 +162,16 @@ final class ModelHelperPolicyTests: XCTestCase {
     func testDisabledWarmupDoesNotSubmitOrConsumeCooldown() {
         let now = ProcessInfo.processInfo.systemUptime + 120
         RequestConfiguration.withEnvironment(environment("off")) {
-            Referee.warmInBackground(now: now) { _, _ in XCTFail("Disabled warmup submitted HTTP") }
+            Referee.warmInBackground(now: now, send: { _, _ in XCTFail("Disabled warmup submitted HTTP") })
         }
         var submissions = 0
         RequestConfiguration.withEnvironment(environment("on")) {
-            Referee.warmInBackground(now: now) { request, completion in
+            Referee.warmInBackground(now: now, send: { request, completion in
                 submissions += 1
                 XCTAssertEqual(request.url?.path, "/warm")
                 XCTAssertEqual(request.url?.query, "models=d1")
                 completion(true)
-            }
+            })
         }
         XCTAssertEqual(submissions, 1)
     }
