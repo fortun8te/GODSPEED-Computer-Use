@@ -622,6 +622,16 @@ extension ComputerUseToolDispatcher {
 
     func runBatch(arguments: [String: Any], inheritedDeadline: TimeInterval? = nil,
                   validatedHandoffRecipe: BatchRecipes.Recipe? = nil) throws -> ToolCallResult {
+        if let raw = arguments["inspect_resume"] {
+            guard let token = raw as? String, !token.isEmpty,
+                  Set(arguments.keys).isSubset(of: ["inspect_resume", "strict_background"]) else {
+                throw ComputerUseError.invalidArguments("Send only inspect_resume with the checkpoint token. Inspection does not run steps or consume the token.")
+            }
+            try BatchResume.checkRequest(deadline: inheritedDeadline)
+            let record = try BatchResume.load(token)
+            try BatchResume.checkRequest(deadline: inheritedDeadline)
+            return try BatchResume.inspection(of: record)
+        }
         guard let token = arguments["resume"] as? String else {
             return try runBatchPlan(arguments: arguments, inheritedDeadline: inheritedDeadline,
                                     validatedHandoffRecipe: validatedHandoffRecipe)

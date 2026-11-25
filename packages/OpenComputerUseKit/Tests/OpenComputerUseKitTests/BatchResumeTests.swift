@@ -475,6 +475,177 @@ final class BatchResumeTests: XCTestCase {
 
     private func dispatcher() -> ComputerUseToolDispatcher { ComputerUseToolDispatcher(service: ComputerUseService()) }
 
+    func testCheckpointInspectionSurvivesContextResetWithoutDispatchOrClaim() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: clicks(4), receipt: receipt([.verified, .acknowledged], stop: .timeBudget, total: 4),
+                goal: "Finish the list", doneWhen: nil, app: "Notes", windowID: 42, processID: 7,
+                processLaunchDate: Date()))
+            try BatchResume.save(record)
+            // A fresh dispatcher stands in for a new host turn with no history.
+            for _ in 0..<2 {
+                let reply = try dispatcher().callTool(name: "batch", arguments: ["inspect_resume": record.id])
+                XCTAssertEqual(reply.deliveryState, .notSent)
+                let object = try inspectionObject(reply)
+                XCTAssertEqual(object["source"] as? String, "saved_checkpoint_not_live_state")
+                XCTAssertEqual(object["actions_sent"] as? Int, 0)
+                XCTAssertEqual(object["token_consumed"] as? Bool, false)
+                XCTAssertEqual(object["next_action"] as? String, "resume_with_fresh_values")
+                let progress = try XCTUnwrap(object["progress"] as? [String: Any])
+                XCTAssertEqual(progress["pending_steps"] as? [Int], [3, 4])
+                XCTAssertEqual(progress["dispatched_steps"] as? [Int], [1, 2])
+                XCTAssertEqual(progress["verified_delivery_steps"] as? [Int], [1])
+                XCTAssertEqual(try BatchResume.load(record.id).id, record.id)
+            }
+        }
+    }
+
+    func testCheckpointInspectionKeepsUncertaintySeparateFromPendingWork() throws {
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: clicks(3), receipt: receipt([.acknowledged, .outcomeUnknown], stop: .stepFailure, total: 3),
+            goal: "Finish list", doneWhen: nil, app: "Notes", windowID: 42, processID: 7,
+            processLaunchDate: Date()))
+        let object = try inspectionObject(BatchResume.inspection(of: record))
+        XCTAssertEqual(object["next_action"] as? String, "inspect_uncertain_delivery")
+        let progress = try XCTUnwrap(object["progress"] as? [String: Any])
+        XCTAssertEqual(progress["uncertain_steps"] as? [Int], [2])
+        XCTAssertEqual(progress["pending_steps"] as? [Int], [3])
+    }
+
+    func testCheckpointInspectionDoesNotExposeStoredPayloadsOrCompletionValues() throws {
+        let steps = [BatchTool.Step(tool: "type_text", arguments: ["app": "Notes", "text": "private-text-123"])]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([], stop: .timeBudget, total: 1),
+            goal: "Insert private-text-123", doneWhen: ["text": "secret-outcome-456"],
+            app: "Notes", windowID: 42, processID: 7, processLaunchDate: Date()))
+        let reply = try BatchResume.inspection(of: record)
+        XCTAssertFalse(reply.textContent.contains("private-text-123"))
+        XCTAssertFalse(reply.textContent.contains("secret-outcome-456"))
+        let object = try inspectionObject(reply)
+        XCTAssertEqual(record.privacyVersion, 1)
+        XCTAssertEqual(object["goal"] as? String, "Insert [value omitted]")
+        XCTAssertEqual(Set(object["required_values"] as? [String] ?? []), Set(record.slotNames))
+        XCTAssertFalse((object["pending_tools"] as? [[String: Any]] ?? []).contains { $0["arguments"] != nil })
+    }
+
+    func testCheckpointInspectionOmitsLegacyGoalsEvenWhenStructureIsOtherwiseResumable() throws {
+        let privateValue = "private-legacy-value-789"
+        let raw = try JSONSerialization.data(withJSONObject: ["app": "Notes", "text": privateValue])
+        let slotted = try XCTUnwrap(BatchResume.stored(
+            .init(tool: "type_text", arguments: ["app": "Notes", "text": privateValue]),
+            number: 1, batchWindowID: 42))
+        for pending in [BatchResume.Stored(number: 1, tool: "type_text", arguments: raw, slots: [:]), slotted] {
+            for legacyCompletion in [nil, try JSONSerialization.data(withJSONObject: ["text": privateValue])] as [Data?] {
+                let record = BatchResume.Record(
+                    id: UUID().uuidString, createdAt: Date(), expiresAt: Date().addingTimeInterval(60),
+                    app: "Notes", goal: "Insert \(privateValue)", doneWhen: legacyCompletion,
+                    windowID: 42, processID: 7, total: 1, pending: [pending], sent: [], processLaunchDate: Date())
+                let restored = try JSONDecoder().decode(BatchResume.Record.self, from: JSONEncoder().encode(record))
+                XCTAssertNil(restored.privacyVersion)
+                let reply = try BatchResume.inspection(of: restored)
+                XCTAssertFalse(reply.textContent.contains(privateValue))
+                XCTAssertNil(try inspectionObject(reply)["goal"])
+            }
+        }
+    }
+
+    func testContinuingLegacyCheckpointDoesNotMarkItsGoalAsPayloadRedacted() throws {
+        let stored = try XCTUnwrap(BatchResume.stored(clicks(1)[0], number: 1, batchWindowID: 42))
+        let legacy = BatchResume.Record(
+            id: UUID().uuidString, createdAt: Date(), expiresAt: Date().addingTimeInterval(60),
+            app: "Notes", goal: "An older goal containing private-previous-value", doneWhen: nil,
+            windowID: 42, processID: 7, total: 1, pending: [stored], sent: [], processLaunchDate: Date())
+        let continued = try XCTUnwrap(BatchResume.record(
+            steps: try BatchResume.steps(of: legacy, values: [:]), receipt: receipt([], stop: .timeBudget, total: 1),
+            goal: "Current goal", doneWhen: nil, app: "Notes", windowID: 42, processID: 7, continuing: legacy))
+        XCTAssertNil(continued.privacyVersion)
+        XCTAssertNil(try inspectionObject(BatchResume.inspection(of: continued))["goal"])
+    }
+
+    func testCheckpointInspectionDoesNotOfferUnboundOrLegacyContinuation() throws {
+        for tool in ["browser", "press_menu"] {
+            let step = BatchTool.Step(tool: tool, arguments: ["app": "Notes", "path": "File > New"])
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: [step], receipt: receipt([], stop: .timeBudget, total: 1),
+                goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7,
+                processLaunchDate: Date()))
+            let object = try inspectionObject(BatchResume.inspection(of: record))
+            XCTAssertEqual(object["next_action"] as? String, "read_target_and_send_fresh_steps")
+        }
+        let legacy = try XCTUnwrap(BatchResume.record(
+            steps: clicks(2), receipt: receipt([.verified], stop: .timeBudget, total: 2),
+            goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7))
+        XCTAssertEqual(try inspectionObject(BatchResume.inspection(of: legacy))["next_action"] as? String,
+                       "read_target_and_send_fresh_steps")
+    }
+
+    func testCheckpointInspectionSharesStaleTargetAndLegacyPayloadRefusalsWithExecution() throws {
+        let fixtures: [(String, [String: Any])] = [
+            ("click", ["element_index": "12"]), ("click", ["index": 12]),
+            ("click", ["ref": "native-old-reference"]), ("click", ["x": 20, "y": 30]),
+            ("type_text", ["content": "old private text"]),
+            ("handoff", ["values": ["Name": "old private value"]]),
+        ]
+        for (tool, payload) in fixtures {
+            let arguments = payload.merging(["app": "Notes"]) { _, new in new }
+            let stored = BatchResume.Stored(number: 1, tool: tool,
+                arguments: try JSONSerialization.data(withJSONObject: arguments), slots: [:])
+            let now = Date()
+            let record = BatchResume.Record(id: UUID().uuidString, createdAt: now,
+                expiresAt: now.addingTimeInterval(BatchResume.lifetime), app: "Notes", goal: "",
+                doneWhen: nil, windowID: 42, processID: 7, total: 1, pending: [stored], sent: [],
+                processLaunchDate: now)
+            let object = try inspectionObject(BatchResume.inspection(of: record))
+            XCTAssertEqual(object["next_action"] as? String, "read_target_and_send_fresh_steps", "\(tool): \(payload)")
+            XCTAssertThrowsError(try BatchResume.steps(of: record, values: [:]))
+        }
+    }
+
+    func testCheckpointInspectionWithNoPendingStepsRequiresOutcomeVerification() throws {
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: clicks(1), receipt: receipt([.acknowledged], stop: .stepFailure, total: 1),
+            goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7,
+            processLaunchDate: Date()))
+        let object = try inspectionObject(BatchResume.inspection(of: record))
+        XCTAssertEqual(object["next_action"] as? String, "verify_current_state")
+    }
+
+    func testCheckpointInspectionRejectsMixedExecutionAndInvalidTokens() {
+        let token = UUID().uuidString
+        let executionArguments: [[String: Any]] = [["resume": token], ["steps": [["tool": "click", "label": "Send"]]],
+                                                   ["app": "Notes"], ["values": ["text": "payload"]], ["foreground": true]]
+        for extra in executionArguments {
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: extra.merging(["inspect_resume": token]) { _, new in new }))
+        }
+        let invalidTokens: [Any] = [123, "", "../etc/passwd"]
+        for token in invalidTokens {
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["inspect_resume": token]))
+        }
+    }
+
+    func testCheckpointInspectionBoundsContextWithoutDiscardingStepNumbers() throws {
+        let steps = (1...40).map { number in
+            BatchTool.Step(tool: "click", arguments: ["app": "Notes", "label": String(repeating: "large label \(number)", count: 200)])
+        }
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt(Array(repeating: .acknowledged, count: 20), stop: .timeBudget, total: 40),
+            goal: String(repeating: "long goal\n", count: 400), doneWhen: nil,
+            app: "Notes", windowID: 42, processID: 7, processLaunchDate: Date()))
+        let reply = try BatchResume.inspection(of: record)
+        XCTAssertLessThan(reply.textContent.utf8.count, 4_096)
+        let object = try inspectionObject(reply)
+        let progress = try XCTUnwrap(object["progress"] as? [String: Any])
+        XCTAssertEqual(progress["pending_steps"] as? [Int], Array(21...40))
+        XCTAssertEqual(progress["dispatched_steps"] as? [Int], Array(1...20))
+        XCTAssertFalse((object["goal"] as? String ?? "").contains("\n"))
+    }
+
+    private func inspectionObject(_ reply: ToolCallResult) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(reply.textContent.utf8)) as? [String: Any])
+    }
+
     /// Unknown and expired tokens are refused before any step is sent, and the stored token survives a refusal.
     func testUnknownAndExpiredTokensAreRefusedBeforeAnyStepRuns() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

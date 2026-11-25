@@ -232,29 +232,36 @@ enum InputSimulation {
         return event
     }
 
-    private static func postPreparedRelease(_ event: CGEvent, pid: pid_t? = nil) {
+    private static func postPreparedRelease(_ event: CGEvent, pid: pid_t? = nil,
+                                            onPosted: (CGEvent) -> Void = { _ in }) {
         // Creation preceded the press; delivery must carry the current time.
         event.timestamp = DispatchTime.now().uptimeNanoseconds
         if let pid { event.postToPid(pid) } else { event.post(tap: .cghidEventTap) }
+        onPosted(event)
         Thread.sleep(forTimeInterval: 0.03)
     }
 
-    static func dragTargeted(from start: CGPoint, to end: CGPoint, windowBounds: CGRect, windowID: CGWindowID, pid: pid_t, flags: CGEventFlags = []) throws {
+    static func dragTargeted(from start: CGPoint, to end: CGPoint, windowBounds: CGRect, windowID: CGWindowID, pid: pid_t, flags: CGEventFlags = [],
+                             onProgress: (NativeDragProgress) -> Void = { _ in }) throws {
         try BackgroundDragDispatcher.drag(target: BackgroundDragTarget(
             start: start, end: end, windowBounds: windowBounds, windowID: windowID, pid: pid
-        ), flags: flags)
+        ), flags: flags, onProgress: onProgress)
     }
 
-    static func dragGlobally(from start: CGPoint, to end: CGPoint, flags: CGEventFlags = []) throws {
+    static func dragGlobally(from start: CGPoint, to end: CGPoint, flags: CGEventFlags = [],
+                            onProgress: (NativeDragProgress) -> Void = { _ in }) throws {
         let delivery = NativeInputDelivery()
         try delivery.check()
+        func posted(_ event: CGEvent) {
+            if let progress = NativeDragProgress(event: event) { onProgress(progress) }
+        }
         let gesture = dragGestureEventNumber()
         let release = try mouseRelease(source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
         release.flags = flags
-        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1, flags: flags, delivery: delivery)
+        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1, flags: flags, delivery: delivery, onPosted: posted)
         try withPressedMouseButton(press: {
-            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, flags: flags, delivery: delivery)
-        }, release: { postPreparedRelease(release) }) {
+            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, flags: flags, delivery: delivery, onPosted: posted)
+        }, release: { postPreparedRelease(release, onPosted: posted) }) {
             Thread.sleep(forTimeInterval: 0.05)
             var previous = start
             let steps = dragStepCount(from: start, to: end)
@@ -262,7 +269,7 @@ enum InputSimulation {
                 let progress = CGFloat(step) / CGFloat(steps)
                 let point = CGPoint(x: start.x + ((end.x - start.x) * progress), y: start.y + ((end.y - start.y) * progress))
                 let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
-                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture, flags: flags, delivery: delivery)
+                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture, flags: flags, delivery: delivery, onPosted: posted)
                 previous = point
                 release.location = point
             }
@@ -429,7 +436,7 @@ enum InputSimulation {
     }
 
     private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, flags: CGEventFlags? = nil,
-                                       delivery: NativeInputDelivery) throws {
+                                       delivery: NativeInputDelivery, onPosted: (CGEvent) -> Void = { _ in }) throws {
         try delivery.check()
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
@@ -445,8 +452,10 @@ enum InputSimulation {
             try requireUserHandsOff()
         }
         try delivery.check()
+        event.timestamp = DispatchTime.now().uptimeNanoseconds
         event.post(tap: .cghidEventTap)
         delivery.didPost()
+        onPosted(event)
         Thread.sleep(forTimeInterval: 0.03)
     }
 

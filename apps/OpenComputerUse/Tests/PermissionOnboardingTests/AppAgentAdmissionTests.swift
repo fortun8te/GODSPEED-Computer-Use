@@ -275,6 +275,48 @@ final class AppAgentAdmissionTests: XCTestCase {
         try gate.withAdmission(.exclusive, timeout: 0) {}
     }
 
+    func testInferenceSurvivesInterleavedReadOnlyBrowserRequests() throws {
+        let gate = AppAgentAdmission(environment: [:])
+        let token = RequestCancellation()
+        try RequestCancellation.$current.withValue(token) {
+            try gate.withAdmission(.exclusive) {
+                let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
+                let response = try outside {
+                    do {
+                        try gate.withAdmission(.browserRead(client: "reader-a"), timeout: 0) {
+                            try gate.withAdmission(.browserRead(client: "reader-b"), timeout: 0) {}
+                        }
+                    } catch { XCTFail("Read-only work could not run during inference: \(error)") }
+                    return Data([7])
+                }
+                XCTAssertEqual(response, Data([7]))
+                XCTAssertFalse(token.isCancelled)
+                XCTAssertThrowsError(try gate.withAdmission(.exclusive, timeout: 0) {})
+            }
+        }
+        try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testInferenceStillRejectsPeeksAndTabWritesThatCanChangeState() throws {
+        for mode in [AppAgentAdmission.Mode.browserPeek(client: "preview"),
+                     .browserTabWrite(client: "writer", tabID: 17)] {
+            let gate = AppAgentAdmission(environment: ["OPEN_COMPUTER_USE_PARALLEL_BROWSER_WRITES": "1"])
+            let token = RequestCancellation()
+            try RequestCancellation.$current.withValue(token) {
+                try gate.withAdmission(.exclusive) {
+                    let outside = try XCTUnwrap(RequestInferenceAdmission.withoutExclusive)
+                    XCTAssertThrowsError(try outside {
+                        do { try gate.withAdmission(mode, timeout: 0) {} }
+                        catch { XCTFail("Interleaved work did not run: \(error)") }
+                        return Data([1])
+                    }) { error in XCTAssertTrue(error is AppAgentAdmission.AdmissionLost) }
+                    XCTAssertTrue(token.isCancelled)
+                }
+            }
+            try gate.withAdmission(.exclusive, timeout: 0) {}
+        }
+    }
+
     func testInferenceThrowsInsteadOfContinuingWhenTheGateIsHeldPastTwoSeconds() throws {
         let gate = AppAgentAdmission(environment: [:])
         let token = RequestCancellation()

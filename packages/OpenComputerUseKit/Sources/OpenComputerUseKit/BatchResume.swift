@@ -67,6 +67,9 @@ enum BatchResume {
         /// PIDs and window IDs can be reused after an application exits. A
         /// continuation belongs to the original application lifetime as well.
         var processLaunchDate: Date? = nil
+        /// Only records created with payload-redacted goals may expose their
+        /// goal in a progress capsule. Missing markers belong to older records.
+        var privacyVersion: Int? = nil
 
         var targetWindowID: UInt32? { windowID ?? originalWindowID }
 
@@ -122,7 +125,8 @@ enum BatchResume {
                       requiresFreshSteps: prior?.requiresFreshSteps ?? requiresFreshSteps,
                       strictBackground: StrictBackground.enabled(), backgroundOnly: backgroundOnlyMode(),
                       completion: prior?.completion ?? completion,
-                      processLaunchDate: prior == nil ? processLaunchDate : prior?.processLaunchDate)
+                      processLaunchDate: prior == nil ? processLaunchDate : prior?.processLaunchDate,
+                      privacyVersion: prior == nil ? 1 : prior?.privacyVersion)
     }
 
     private static func strings(in value: Any?) -> [String] {
@@ -208,14 +212,47 @@ enum BatchResume {
         return Stored(number: number, tool: step.tool, arguments: data, slots: slots)
     }
 
-    /// Steps ready to run again: arguments decoded, slot values filled from `values`. Throws when a slot is missing.
-    static func steps(of record: Record, values: [String: Any]) throws -> [BatchTool.Step] {
+    /// Validate persisted structure without supplying or reading private values.
+    /// Inspection and execution share these rules, so recovery guidance cannot
+    /// advertise a plan that execution will always refuse.
+    static func pendingStructure(of record: Record) throws -> [BatchTool.Step] {
         guard !record.pending.contains(where: { $0.tool == "browser" }) else {
             throw ComputerUseError.notSent("Inspect the browser tab and send the remaining steps explicitly.")
         }
         if record.requiresFreshSteps == true {
             throw ComputerUseError.notSent("Read the recipe target and send the remaining steps explicitly.")
         }
+        return try record.pending.map { stored in
+            guard let object = try JSONSerialization.jsonObject(with: stored.arguments) as? [String: Any] else {
+                throw ComputerUseError.invalidArguments("The saved resume step \(stored.number) is unreadable. Send the steps again.")
+            }
+            let normalized = ArgumentNormalizer.normalize(tool: stored.tool, arguments: object, lastApp: record.app)
+            if BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: object)])
+                || BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: normalized)]) {
+                throw ComputerUseError.notSent("Resume step \(stored.number) uses a target tied to an old snapshot. Read the target and send the remaining steps with fresh targets.")
+            }
+            // Older checkpoints could retain a typed alias without a slot. Do
+            // not silently reuse that value after reconnecting or restarting.
+            if (slotKeys + ["values", "expected_values", "done_when"]).contains(where: { normalized[$0] != nil && stored.slots[$0] == nil }) {
+                throw ComputerUseError.notSent("Resume step \(stored.number) contains a saved value without a fresh-value slot. Send the remaining steps explicitly with current values.")
+            }
+            var arguments = normalized
+            // Handoff resolves its own initial observation. Give it the original
+            // window explicitly, just like the native steps bound at dispatch.
+            // A front-window switch between preflight and dispatch must not move it.
+            if stored.tool == HandoffTool.name, let window = record.windowID ?? record.originalWindowID {
+                if let explicit = try validatedQueryWindowID(arguments["window_id"]), explicit != window {
+                    throw ComputerUseError.windowChanged(window)
+                }
+                arguments["window_id"] = window
+            }
+            return BatchTool.Step(tool: stored.tool, arguments: arguments)
+        }
+    }
+
+    /// Steps ready to run again: validated structure with fresh caller values.
+    static func steps(of record: Record, values: [String: Any]) throws -> [BatchTool.Step] {
+        let structure = try pendingStructure(of: record)
         let missing = record.pending.flatMap { step in
             step.slots.compactMap { key, slot -> String? in
                 let value = values[slot]
@@ -231,32 +268,10 @@ enum BatchResume {
         guard missing.isEmpty else {
             throw ComputerUseError.invalidArguments("Provide these values again to resume: \(missing.joined(separator: ", ")).")
         }
-        return try record.pending.map { stored in
-            guard let object = try JSONSerialization.jsonObject(with: stored.arguments) as? [String: Any] else {
-                throw ComputerUseError.invalidArguments("The saved resume step \(stored.number) is unreadable. Send the steps again.")
-            }
-            let normalized = ArgumentNormalizer.normalize(tool: stored.tool, arguments: object, lastApp: record.app)
-            if BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: object)])
-                || BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: normalized)]) {
-                throw ComputerUseError.notSent("Resume step \(stored.number) uses a target tied to an old snapshot. Read the target and send the remaining steps with fresh targets.")
-            }
-            // Older checkpoints could retain a typed alias without a slot. Do
-            // not silently reuse that value after reconnecting or restarting.
-            if slotKeys.contains(where: { normalized[$0] != nil && stored.slots[$0] == nil }) {
-                throw ComputerUseError.notSent("Resume step \(stored.number) contains a saved value without a fresh-value slot. Send the remaining steps explicitly with current values.")
-            }
-            var arguments = normalized
+        return zip(record.pending, structure).map { stored, step in
+            var arguments = step.arguments
             for (key, slot) in stored.slots { arguments[key] = values[slot] }
-            // Handoff resolves its own initial observation. Give it the original
-            // window explicitly, just like the native steps bound at dispatch.
-            // A front-window switch between preflight and dispatch must not move it.
-            if stored.tool == HandoffTool.name, let window = record.windowID ?? record.originalWindowID {
-                if let explicit = try validatedQueryWindowID(arguments["window_id"]), explicit != window {
-                    throw ComputerUseError.windowChanged(window)
-                }
-                arguments["window_id"] = window
-            }
-            return BatchTool.Step(tool: stored.tool, arguments: arguments)
+            return BatchTool.Step(tool: step.tool, arguments: arguments)
         }
     }
 

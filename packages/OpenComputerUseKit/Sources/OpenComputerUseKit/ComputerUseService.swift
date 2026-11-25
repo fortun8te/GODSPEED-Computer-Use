@@ -1816,17 +1816,18 @@ public final class ComputerUseService {
 
         let start = try screenshotToGlobalPoint(snapshot: snapshot, x: fromX, y: fromY)
         let end = try screenshotToGlobalPoint(snapshot: snapshot, x: toX, y: toY)
-        let startTarget = makeVisualCursorTarget(at: start, targetWindowID: snapshot.targetWindowID, targetWindowLayer: snapshot.targetWindowLayer)
-        let endTarget = makeVisualCursorTarget(at: end, targetWindowID: snapshot.targetWindowID, targetWindowLayer: snapshot.targetWindowLayer)
-        moveVisualCursor(to: startTarget)
-        let path = try withVisualFeedback(.drag, at: startTarget, completingAt: endTarget) {
+        let cursor = CursorDragPresentation(
+            window: snapshot.targetWindowID.map { CursorTargetWindow(windowID: $0, layer: snapshot.targetWindowLayer ?? 0) },
+            windowBounds: snapshot.windowBounds, frameSource: snapshot.windowElement.map(CursorFrameSource.init))
+        let path = try cursor.delivering { onProgress in
             try performDragEvent(
                 from: start,
                 to: end,
                 targetDescription: "from=(\(fromX), \(fromY)) to=(\(toX), \(toY))",
                 snapshot: snapshot,
                 path: deliveryPath,
-                flags: flags
+                flags: flags,
+                onProgress: onProgress
             )
         }
         return appendingDragDeliveryNote(
@@ -1879,10 +1880,11 @@ public final class ComputerUseService {
         guard start != end else { throw ComputerUseError.invalidArguments("Drag endpoints must be distinct.") }
         let target = BackgroundDragTarget(start: inputEventPoint(fromScreenStatePoint: start),
             end: inputEventPoint(fromScreenStatePoint: end), windowBounds: bounds, windowID: id, pid: snapshot.app.pid)
-        let visual = makeVisualCursorTarget(at: start, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
-        let finish = makeVisualCursorTarget(at: end, targetWindowID: id, targetWindowLayer: snapshot.targetWindowLayer)
-        try withVisualFeedback(.drag, at: visual, completingAt: finish) {
+        let cursor = CursorDragPresentation(window: CursorTargetWindow(windowID: id, layer: snapshot.targetWindowLayer ?? 0),
+            windowBounds: bounds, frameSource: CursorFrameSource(window))
+        try cursor.delivering { onProgress in
             try BackgroundDragDispatcher.drag(target: target, flags: flags, steps: options.steps ?? 10, hold: options.hold,
+                onProgress: onProgress,
                 validateEndpoints: {
                     try checkStart()
                     try checkEnd()
@@ -2071,7 +2073,7 @@ public final class ComputerUseService {
         let pid = snapshot.app.pid
         return shouldRouteKeysThroughSkyLight(KeyRouteContext(
             backgroundOnly: backgroundOnlyMode(),
-            targetIsFrontmost: NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+            targetIsFrontmost: (try? ForegroundApplication.pid()) == pid,
             borrowed: FocusBorrow.isBorrowed(pid: pid),
             skyLightAvailable: SkyLightSPI.shared.capability.isAvailable,
             hasTargetWindow: snapshot.targetWindowID != nil || hasLiveTextFocus,
@@ -2477,7 +2479,7 @@ public final class ComputerUseService {
         }
         if let windowID = Self.requiredWindowID {
             try requireBoundFocusedWindow(in: snapshot)
-            if keyMethod == .auto, NSWorkspace.shared.frontmostApplication?.processIdentifier == snapshot.app.pid {
+            if keyMethod == .auto, (try? ForegroundApplication.pid()) == snapshot.app.pid {
                 try InputSimulation.pressKey(key, pid: snapshot.app.pid)
             } else {
                 try SkyKeyboardDispatcher.pressKey(
@@ -4669,7 +4671,8 @@ public final class ComputerUseService {
         targetDescription: String,
         snapshot: AppSnapshot,
         path: DragDeliveryPath,
-        flags: CGEventFlags
+        flags: CGEventFlags,
+        onProgress: (NativeDragProgress) -> Void = { _ in }
     ) throws -> DragDeliveryPath {
         let eventStart = inputEventPoint(fromScreenStatePoint: start)
         let eventEnd = inputEventPoint(fromScreenStatePoint: end)
@@ -4682,12 +4685,12 @@ public final class ComputerUseService {
                 snapshot: snapshot
             )
             try raiseForGlobalPointerInput(snapshot.app)
-            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, flags: flags)
+            try InputSimulation.dragGlobally(from: eventStart, to: eventEnd, flags: flags, onProgress: onProgress)
         case .appPost:
             guard let windowID = snapshot.targetWindowID, let windowBounds = snapshot.windowBounds else {
                 throw ComputerUseError.stateUnavailable("drag requires an observed target window; run get_app_state again")
             }
-            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid, flags: flags)
+            try InputSimulation.dragTargeted(from: eventStart, to: eventEnd, windowBounds: windowBounds, windowID: windowID, pid: snapshot.app.pid, flags: flags, onProgress: onProgress)
         }
 
         return path

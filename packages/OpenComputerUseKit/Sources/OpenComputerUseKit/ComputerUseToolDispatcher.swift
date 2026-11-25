@@ -292,7 +292,7 @@ public final class ComputerUseToolDispatcher {
 
         let frontmostPID = (try? AppDiscovery.resolveRunning(app))?.pid
         let frontmost: () -> Bool = {
-            frontmostPID != nil && NSWorkspace.shared.frontmostApplication?.processIdentifier == frontmostPID
+            frontmostPID != nil && (try? ForegroundApplication.pid()) == frontmostPID
         }
         let wasFrontmost = frontmost()
         // Escape for a background app with a dialog open means "cancel the dialog": keys do not reach a

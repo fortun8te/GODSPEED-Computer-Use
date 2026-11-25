@@ -1390,23 +1390,31 @@ private struct TreeRenderer {
 
     private func rawChildren(of element: AXUIElement, limit: Int, truncated: inout Bool) -> (children: [AXUIElement], inspected: Int) {
         let role = stringValue(of: element, attribute: kAXRoleAttribute)
-        let rows = copyArray(element, attribute: kAXRowsAttribute) ?? []
-        let visible = copyArray(element, attribute: axVisibleChildrenAttribute) ?? []
-        let attributes = childTraversalAttributes(role: role, hasRows: !rows.isEmpty, hasVisibleChildren: !visible.isEmpty)
+        // Scalar prefetch must not materialize an unbounded child array. Counts select the
+        // traversal lane, then the provider receives only the remaining discovery budget.
+        let reader = AXSnapshotReadCache.current ?? AXSnapshotReadCache(batch: { _ in [:] })
+        let collection = usesRowsAsPrimaryRole(role) || usesVisibleChildrenAsPrimaryRole(role)
+        let rowCount = collection ? reader.arrayCount(element, kAXRowsAttribute) : 0
+        let visibleCount = collection ? reader.arrayCount(element, axVisibleChildrenAttribute) : 0
+        if rowCount == nil || visibleCount == nil { truncated = true }
+        let attributes = childTraversalAttributes(role: role, hasRows: (rowCount ?? 0) > 0,
+                                                  hasVisibleChildren: (visibleCount ?? 0) > 0)
         var children: [AXUIElement] = []
         var inspected = 0
         var seen: Set<TraversalElementKey> = []
         for attribute in attributes {
-            var source = attribute == kAXRowsAttribute ? rows : attribute == axVisibleChildrenAttribute ? visible : copyArray(element, attribute: attribute) ?? []
+            let page = reader.array(element, attribute, limit: max(0, limit - inspected))
+            if page.truncated { truncated = true }
+            var source = page.values
+            inspected += source.count
             // OCU Fast: keep only the on-screen rows of a list/table/outline (capped), as before the
             // upstream planner. Some apps (SwiftUI lists such as Calculator's history) report every row
             // as visible and answer AX slowly, so rendering hundreds of off-screen rows took 15-30 s.
             if attribute == kAXRowsAttribute || (attribute == axVisibleChildrenAttribute && usesRowsAsPrimaryRole(role)) {
                 source = visibleCollectionRows(in: source, parent: element)
+                if source.count < page.values.count { truncated = true }
             }
             for child in source {
-                guard inspected < limit else { truncated = true; return (children, inspected) }
-                inspected += 1
                 guard seen.insert(.init(element: child)).inserted else { continue }
                 if !shouldSkipChild(child, of: element) { children.append(child) }
             }
@@ -1572,11 +1580,14 @@ func isSecureTextField(subrole: String?) -> Bool {
 }
 
 private func attributeValue(of element: AXUIElement, attribute: String) -> CFTypeRef? {
-    if (attribute == kAXValueAttribute as String || attribute == kAXSelectedTextAttribute as String),
-       isSecureTextField(subrole: attributeValue(of: element, attribute: kAXSubroleAttribute) as? String) {
-        return nil
-    }
     if let cache = AXSnapshotReadCache.current { return cache.value(element, attribute) }
+    if attribute == kAXValueAttribute as String || attribute == kAXSelectedTextAttribute as String {
+        var subrole: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole)
+        // Query/action paths do not enter the snapshot cache. A failed classification is
+        // still not permission to fetch a possible password value on those paths.
+        guard AXSnapshotReadCache.permitsTextRead(subroleError: error, subrole: subrole) else { return nil }
+    }
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
     guard error == .success else {
@@ -2921,19 +2932,36 @@ extension SnapshotBuilder {
             &values
         )
         let raw: [AnyObject]
+        var subroleError = AXError.failure
+        var subroleValue: CFTypeRef?
         if error == .success, let array = values as? [AnyObject], array.count == searchScanAttributes.count {
             raw = array
+            // Reuse the batched classification. Re-reading AXSubrole for every ordinary
+            // search node adds an avoidable IPC call; an unknown result must stay closed.
+            if let classification = AXSnapshotReadCache.decodeBatch(array, names: searchScanAttributes)["AXSubrole"] {
+                switch classification {
+                case .absent: subroleError = .noValue
+                case .value(let value): subroleError = .success; subroleValue = value
+                }
+            }
         } else {
             raw = searchScanAttributes.map { attribute -> AnyObject in
                 var v: CFTypeRef?
-                _ = AXUIElementCopyAttributeValue(element, attribute as CFString, &v)
+                let status = AXUIElementCopyAttributeValue(element, attribute as CFString, &v)
+                if attribute == kAXSubroleAttribute as String { subroleError = status; subroleValue = v }
                 return v ?? (NSNull() as AnyObject)
             }
         }
         func str(_ i: Int) -> String? { (raw[i] as? String).map { String($0.prefix(1001)) } }
         // Password classification precedes any value request, including batch fallback.
-        let value = isSecureTextField(subrole: str(6)) ? nil
-            : stringValue(of: element, attribute: kAXValueAttribute).map { String($0.prefix(1001)) }
+        var value: String?
+        if AXSnapshotReadCache.permitsTextRead(subroleError: subroleError, subrole: subroleValue) {
+            var rawValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &rawValue) == .success,
+               let string = rawValue as? String, !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                value = String(string.prefix(1001))
+            }
+        }
         return NodeScan(
             role: str(0), title: str(1), description: str(2),
             value: value, identifier: str(3),

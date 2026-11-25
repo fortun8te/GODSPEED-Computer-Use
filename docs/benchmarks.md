@@ -1,5 +1,7 @@
 # Benchmarks
 
+For bounded local parameter search with matched controls, explicit measurement coverage and held-out qualification, see [Local evaluation and hill climbing](local-evaluation.md). The runner produces an evaluated recommendation; it does not apply settings or change code automatically.
+
 ## Release checks
 
 These runs measure the UTF-8 text passed back to the agent. Input token counts depend on the host model and how it serializes tool results.
