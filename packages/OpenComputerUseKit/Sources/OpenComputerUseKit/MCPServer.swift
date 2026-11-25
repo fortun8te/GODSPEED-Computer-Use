@@ -47,10 +47,11 @@ public final class StdioMCPServer {
     public func run() throws {
         defer { endSession() }
         let requests = MCPRequestStream()
+        let output = MCPLineWriter()
         Thread.detachNewThread {
             while let line = readLine(strippingNewline: true) {
-                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
-                if !accepted { break }
+                let keepReading = autoreleasepool { requests.receiveRPCLine(line, reply: output.writeLine) }
+                if !keepReading { break }
             }
             requests.disconnect()
         }
@@ -58,7 +59,7 @@ public final class StdioMCPServer {
             autoreleasepool {
                 RequestCancellation.$current.withValue(request.cancellation) {
                     if let response = withOperationJournal({ handle(line: request.line) }) {
-                        FileHandle.standardOutput.write(Data((response + "\n").utf8))
+                        output.writeLine(response)
                     }
                 }
             }

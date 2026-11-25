@@ -54,6 +54,56 @@ final class ActionHardeningTests: XCTestCase {
         XCTAssertTrue(steps.allSatisfy(\.isReadOnly))
     }
 
+    func testCancelledControlWaitSkipsItsFirstRead() throws {
+        let wait = try XCTUnwrap(ControlWait(["label": "Ready", "condition": "appears"]))
+        let cancellation = RequestCancellation()
+        cancellation.cancel()
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(cancellation) {
+            try wait.run(pause: { _ in XCTFail("Cancelled wait slept") }) { () -> ControlWait.Sample<Int> in
+                XCTFail("Cancelled wait read the app")
+                return .present
+            }
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+        }
+    }
+
+    func testControlWaitDoesNotAcceptReadinessAfterCancellationDuringRead() throws {
+        let wait = try XCTUnwrap(ControlWait(["label": "Ready", "condition": "appears"]))
+        let cancellation = RequestCancellation()
+        var reads = 0
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(cancellation) {
+            try wait.run(pause: { _ in XCTFail("Cancelled wait slept") }) { () -> ControlWait.Sample<Int> in
+                reads += 1
+                cancellation.cancel()
+                return .present
+            }
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+        }
+        XCTAssertEqual(reads, 1)
+    }
+
+    func testControlWaitStopsBeforeAnotherReadAfterCancellationDuringPause() throws {
+        let wait = try XCTUnwrap(ControlWait(["label": "Ready", "condition": "appears", "timeout": 1]))
+        let cancellation = RequestCancellation()
+        var reads = 0
+        var time: TimeInterval = 0
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(cancellation) {
+            try wait.run(now: { time }, pause: { interval in
+                time += interval
+                cancellation.cancel()
+            }) { () -> ControlWait.Sample<Int> in
+                reads += 1
+                return .absent
+            }
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+        }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(time, 0.15, accuracy: 0.0001)
+    }
+
     func testValueWaitRejectsAReplacementWithTheSameLabel() throws {
         let wait = try XCTUnwrap(ControlWait(["label": "Volume", "condition": "value_changed"]))
         var samples: [ControlWait.Sample<Int>] = [.value(1, "20"), .value(2, "22")]

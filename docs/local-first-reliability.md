@@ -8,6 +8,8 @@ Open `godspeed` and choose **Presets → Model-free** to stage compact reads, ve
 
 The master switch is `model_helpers: false` in `~/.godspeed/settings.json`, or `OPEN_COMPUTER_USE_MODEL_HELPERS=0` for a client. It disables decision/vision/GSD1 helpers, the default localhost handoff chooser, warmups, model picture capture, health probes and auto-start. Explicit process environment values take precedence over file preferences. AX inspection, local OCR, exact actions, verified recipes and deterministic checks remain available.
 
+Optional helper requests share the enclosing task's deadline. Encoding, admission handoff and HTTP waiting consume the same budget; expired work does not start a request, and late replies are discarded. Background health checks and warmup recovery retain the originating deadline. A queued probe that expires before starting releases its cooldown reservation without overwriting a newer caller's reservation.
+
 **Quiet** reduces visual feedback while keeping apps in the background. **Balanced** uses normal cursor motion and compact observations. Neither silently turns model helpers on or changes the selected accent. For a completely hidden software cursor, turn off **Show agent cursor**. The real pointer remains separate.
 
 ## Execution rules
@@ -34,6 +36,8 @@ The settling budget is a maximum of 700 ms of deliberate delay plus at most thre
 Accessibility notifications invalidate cached misses immediately. A fresh search that overlaps a notification does not save its negative result. Observer callbacks and read generations are tied to the observer's lifetime, so an expired observer cannot alter a replacement observer for the same process number.
 
 Notification waits check cancellation at intervals of at most 50 ms without replacing the request's cancellation callback. Readiness and settling check again after native reads, before accepting completion. A transient attribute failure is not evidence that a window is quiet. Parallel scans carry the request cancellation token into their workers and stop before subsequent reads; an AX call already in flight still depends on the operating system to return.
+
+Control-condition waits check cancellation before reading, after reading and between polls. A ready sample received after cancellation cannot become a successful completion. The stdio request queue refuses only the excess request when full, keeps reading cancellation messages and preserves active and previously queued work. The request worker and overflow reader serialize whole reply lines so concurrent responses cannot corrupt the JSON-RPC stream.
 
 The action monitor records the generation before dispatch, so a notification received during dispatch establishes that the app reports changes. A delivered action still invalidates reusable read evidence: a preflight notification or read cannot prove its later effect. It does not start an action grace period for input reported as unsent or uncertain. Text values are withheld while secure-field classification is unavailable, with a retry once classification resolves.
 

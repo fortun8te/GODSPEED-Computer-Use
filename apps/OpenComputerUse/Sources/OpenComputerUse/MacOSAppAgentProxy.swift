@@ -173,10 +173,11 @@ enum MacOSAppAgentProxy {
         var environment = proxiedEnvironment(mcpSession: UUID())
         var canIdentifyClient = environment[cursorNameEnvironmentKey] == nil
         let requests = MCPRequestStream()
+        let output = MCPLineWriter()
         Thread.detachNewThread {
             while let line = readLine(strippingNewline: true) {
-                let accepted = autoreleasepool { requests.receive(line, rpcLine: line) }
-                if !accepted { break }
+                let keepReading = autoreleasepool { requests.receiveRPCLine(line, reply: output.writeLine) }
+                if !keepReading { break }
             }
             requests.disconnect()
         }
@@ -188,7 +189,7 @@ enum MacOSAppAgentProxy {
                        "jsonrpc": "2.0", "id": id,
                        "error": ["code": -32000, "message": "Request cancelled before dispatch. No steps ran."],
                    ]) {
-                    FileHandle.standardOutput.write(reply + Data([10]))
+                    output.writeLine(reply)
                 }
                 continue
             }
@@ -207,7 +208,7 @@ enum MacOSAppAgentProxy {
                     ], cancellation: request.cancellation, rpcID: jsonRPCRequestID(line))
 
                     if let responseLine = response["response"] as? String {
-                        FileHandle.standardOutput.write(Data((responseLine + "\n").utf8))
+                        output.writeLine(responseLine)
                     }
                 } catch let timeout as AppAgentResponseTimeout {
                     // Answer this request with an error, then continue on a fresh connection: the late reply
@@ -216,7 +217,7 @@ enum MacOSAppAgentProxy {
                         let reply = Self.mcpFailureReply(id: id, message: timeout.errorDescription ?? "timed out",
                                                          delivery: .outcomeUnknown)
                         if let data = try? JSONSerialization.data(withJSONObject: reply, options: [.withoutEscapingSlashes]) {
-                            FileHandle.standardOutput.write(data + Data("\n".utf8))
+                            output.writeLine(data)
                         }
                     }
                     client = try connectOrLaunchAgent(socketPath: socketPath)
