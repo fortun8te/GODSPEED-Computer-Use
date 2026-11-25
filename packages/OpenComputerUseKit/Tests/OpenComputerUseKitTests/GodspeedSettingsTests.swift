@@ -71,11 +71,11 @@ final class GodspeedSettingsTests: XCTestCase {
         try withFile { url in
             var now: TimeInterval = 0
             let stamp = Date(timeIntervalSince1970: 1_700_000_000)
-            try Data(#"{"cursor_color":"#123456"}"#.utf8).write(to: url, options: .atomic)
+            try Data(##"{"cursor_color":"#123456"}"##.utf8).write(to: url, options: .atomic)
             try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: url.path)
             let cache = SettingsFileCache(url: url, clock: { now })
             XCTAssertEqual(cache.load()["cursor_color"] as? String, "#123456")
-            try Data(#"{"cursor_color":"#abcdef"}"#.utf8).write(to: url, options: .atomic)
+            try Data(##"{"cursor_color":"#abcdef"}"##.utf8).write(to: url, options: .atomic)
             try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: url.path)
             now = 1
             XCTAssertEqual(cache.load()["cursor_color"] as? String, "#abcdef")
@@ -109,6 +109,54 @@ final class GodspeedSettingsTests: XCTestCase {
             try Data(repeating: 32, count: 1_048_577).write(to: url)
             now = 1
             XCTAssertEqual(cache.load()["model_helpers"] as? Bool, false)
+        }
+    }
+
+    func testCacheKeepsDisabledHelpersThroughPermissionAndIOFailures() throws {
+        try withFile { url in
+            var now: TimeInterval = 0
+            var failure: NSError?
+            try Data(#"{"model_helpers":false}"#.utf8).write(to: url)
+            let cache = SettingsFileCache(url: url, clock: { now }, attributes: { url in
+                if let failure { throw failure }
+                return try FileManager.default.attributesOfItem(atPath: url.path)
+            })
+            XCTAssertEqual(cache.load()["model_helpers"] as? Bool, false)
+            for error in [
+                NSError(domain: NSCocoaErrorDomain, code: CocoaError.Code.fileReadNoPermission.rawValue),
+                NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.EACCES.rawValue)),
+                NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.EIO.rawValue)),
+                NSError(domain: "UnknownAttributeFailure", code: 1),
+            ] {
+                failure = error
+                now += 1
+                XCTAssertEqual(cache.load()["model_helpers"] as? Bool, false, error.description)
+            }
+            failure = nil
+            try Data(#"{"model_helpers":true}"#.utf8).write(to: url, options: .atomic)
+            now += 1
+            XCTAssertEqual(cache.load()["model_helpers"] as? Bool, true)
+        }
+    }
+
+    func testCacheResetsOnlyOnAnExplicitMissingFileError() throws {
+        try withFile { url in
+            try Data(#"{"model_helpers":false}"#.utf8).write(to: url)
+            for error in [
+                NSError(domain: NSCocoaErrorDomain, code: CocoaError.Code.fileNoSuchFile.rawValue),
+                NSError(domain: NSCocoaErrorDomain, code: CocoaError.Code.fileReadNoSuchFile.rawValue),
+                NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOENT.rawValue)),
+                NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOTDIR.rawValue)),
+            ] {
+                var now: TimeInterval = 0
+                let cache = SettingsFileCache(url: url, clock: { now }, attributes: { url in
+                    if now > 0 { throw error }
+                    return try FileManager.default.attributesOfItem(atPath: url.path)
+                })
+                XCTAssertEqual(cache.load()["model_helpers"] as? Bool, false)
+                now = 1
+                XCTAssertTrue(cache.load().isEmpty, error.description)
+            }
         }
     }
 

@@ -8,6 +8,8 @@ import Glibc
 
 /// User-local preferences only. No permission grants, daemon changes or input actions.
 public enum GodspeedTerminalSettings {
+    static let maximumFileBytes = 1024 * 1024
+
     enum Section: Int, CaseIterable, Sendable {
         case cursor, compute, workspace, privacy
 
@@ -240,11 +242,11 @@ public enum GodspeedTerminalSettings {
             defer { try? handle.close() }
             var info = stat()
             guard fstat(descriptor, &info) == 0, info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-                  info.st_uid == getuid(), info.st_size >= 0, info.st_size <= 1024 * 1024 else {
+                  info.st_uid == getuid(), info.st_size >= 0, info.st_size <= off_t(maximumFileBytes) else {
                 throw Failure.invalid("Settings must be a user-owned regular file of at most 1 MiB.")
             }
-            let data = try handle.read(upToCount: 1024 * 1024 + 1) ?? Data()
-            guard data.count <= 1024 * 1024 else { throw Failure.invalid("Settings exceed 1 MiB.") }
+            let data = try handle.read(upToCount: maximumFileBytes + 1) ?? Data()
+            guard data.count <= maximumFileBytes else { throw Failure.invalid("Settings exceed 1 MiB.") }
             return data
         }
 
@@ -344,7 +346,16 @@ public enum GodspeedTerminalSettings {
             defer { flock(lock, LOCK_UN) }
             guard try Self.read(url) == original else { throw Failure.changed }
 
-            let data = try JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted, .sortedKeys])
+            var data = try JSONSerialization.data(withJSONObject: values,
+                                                  options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            // Indentation can expand a valid compact file several times over, particularly when
+            // retaining an unrelated array. Never save a file that the menu/runtime cannot reopen.
+            if data.count >= maximumFileBytes {
+                data = try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys, .withoutEscapingSlashes])
+            }
+            guard data.count < maximumFileBytes else {
+                throw Failure.invalid("Settings would exceed 1 MiB after saving. Nothing was replaced; reduce the file size before saving.")
+            }
             let output = data + Data([10])
             var template = Array(directory.appendingPathComponent(".settings.XXXXXX").path.utf8CString)
             let descriptor = template.withUnsafeMutableBufferPointer { mkstemp($0.baseAddress!) }

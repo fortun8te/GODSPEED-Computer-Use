@@ -75,9 +75,45 @@ final class GodspeedTerminalSettingsTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), bytes, "A net no-op must preserve original bytes.")
     }
 
+    func testLargeUnknownArrayUsesCompactOutputAndCanBeReopened() throws {
+        let url = try directory().appendingPathComponent("settings.json")
+        let retained = Array(repeating: 0, count: 180_000)
+        let bytes = try JSONSerialization.data(withJSONObject: ["unknown": retained])
+        XCTAssertLessThan(bytes.count, Settings.maximumFileBytes)
+        try bytes.write(to: url)
+        var draft = try Settings.Draft(url: url)
+        try draft.apply(item("cursor_color"), input: "Blue")
+        let indented = try JSONSerialization.data(withJSONObject: draft.values, options: [.prettyPrinted, .sortedKeys])
+        XCTAssertGreaterThan(indented.count, Settings.maximumFileBytes, "This case must exercise the compact fallback.")
+        try draft.save()
+        let saved = try Data(contentsOf: url)
+        XCTAssertLessThanOrEqual(saved.count, Settings.maximumFileBytes)
+        XCTAssertEqual(saved.last, 10)
+        let reopened = try Settings.Draft(url: url)
+        XCTAssertEqual(reopened.values["unknown"] as? [Int], retained)
+        XCTAssertEqual(reopened.values["cursor_color"] as? String, "#2f6fde")
+        XCTAssertFalse(draft.changed)
+    }
+
+    func testOversizedDraftKeepsOriginalFileAndUnsavedChanges() throws {
+        let url = try directory().appendingPathComponent("settings.json")
+        let bytes = try JSONSerialization.data(withJSONObject: [
+            "unknown": String(repeating: "x", count: Settings.maximumFileBytes - 20),
+        ])
+        XCTAssertLessThanOrEqual(bytes.count, Settings.maximumFileBytes)
+        try bytes.write(to: url)
+        var draft = try Settings.Draft(url: url)
+        try draft.apply(item("cursor_color"), input: "Blue")
+        XCTAssertThrowsError(try draft.save())
+        XCTAssertTrue(draft.changed)
+        XCTAssertEqual(draft.values["cursor_color"] as? String, "#2f6fde")
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        XCTAssertNil(try Settings.Draft(url: url).values["cursor_color"])
+    }
+
     func testPresetsStageOnlyTheirDeclaredValuesAndNeverEnableModels() throws {
         let url = try directory().appendingPathComponent("settings.json")
-        let bytes = Data(#"{"cursor_color":"#2f6fde","gsd1_url":"http://127.0.0.1:18765","unknown":9}"#.utf8)
+        let bytes = Data(##"{"cursor_color":"#2f6fde","gsd1_url":"http://127.0.0.1:18765","unknown":9}"##.utf8)
         try bytes.write(to: url)
         var draft = try Settings.Draft(url: url)
         let preview = try Settings.presetPreview(Settings.presets[0], draft: draft)
@@ -227,7 +263,7 @@ final class GodspeedTerminalSettingsTests: XCTestCase {
 
     func testInteractiveResetUndoAndCancelledEditPreserveOriginalBytes() throws {
         let url = try directory().appendingPathComponent("settings.json")
-        let bytes = Data(#"{"cursor_color":"#2f6fde","cursor_speed":"fast","unknown":7}"#.utf8)
+        let bytes = Data(##"{"cursor_color":"#2f6fde","cursor_speed":"fast","unknown":7}"##.utf8)
         try bytes.write(to: url)
         var draft = try Settings.Draft(url: url)
         let transcript = interact(["1", "2", "r", "r", "b", "u", "1", "2", "", "q"], draft: &draft)

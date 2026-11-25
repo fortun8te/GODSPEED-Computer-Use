@@ -266,7 +266,7 @@ final class BatchResumeTests: XCTestCase {
             try BatchResume.save(record)
             let cancellation = RequestCancellation()
             cancellation.cancel()
-            RequestCancellation.$current.withValue(cancellation) {
+            try RequestCancellation.$current.withValue(cancellation) {
                 XCTAssertThrowsError(try BatchResume.claim(record.id)) { error in
                     XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
                 }
