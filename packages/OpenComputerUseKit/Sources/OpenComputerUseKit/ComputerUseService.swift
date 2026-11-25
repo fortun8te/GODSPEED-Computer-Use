@@ -975,6 +975,7 @@ public final class ComputerUseService {
         var verified = false
         // Password and secure fields keep their row but never their crop image.
         var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
+        guard !secure else { return nil }
         defer {
             VisionFallback.recordLocate(query: label, crop: crop, candidate: located, verified: verified,
                                         secure: secure, log: LearningLog.shared)
@@ -999,7 +1000,10 @@ public final class ComputerUseService {
         // A point is confirmed only when the control under it carries the label and no risky name.
         func confirms(_ point: CGPoint, _ candidate: VisionFallback.Candidate) -> Bool {
             guard let hit = try? hitTestElement(at: point, in: snapshot)?.element else { return false }
-            if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) { secure = true }
+            if isSecureTextField(subrole: stringValue(of: hit, attribute: kAXSubroleAttribute)) {
+                secure = true
+                return false
+            }
             guard SnapshotBuilder.belongsToWindow(hit, window: live.windowElement),
                   let names = visualHitNames(hit, window: live.windowElement) else { return false }
             return VisionFallback.allowsHit(candidate: candidate, label: label, hitNames: names)
@@ -1068,7 +1072,8 @@ public final class ComputerUseService {
             if role == kAXStaticTextRole as String, let value = stringValue(of: element, attribute: kAXValueAttribute) {
                 current.append(value)
             }
-            if current.contains(where: VisionFallback.risky) { return nil }
+            if isSecureTextField(subrole: stringValue(of: element, attribute: kAXSubroleAttribute)) ||
+               current.contains(where: VisionFallback.risky) { return nil }
             let actions = copyActions(for: element) ?? []
             if !sawAction, CFEqual(element, leaf) || actions.contains(kAXPressAction as String) {
                 names.append(contentsOf: current.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
