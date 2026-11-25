@@ -37,6 +37,10 @@ curl -fLO https://github.com/fortun8te/godspeed/releases/download/v1.1.12/instal
 
 [Check the connection](docs/INSTALL.md#first-mcp-check) · [Set up Chrome](docs/INSTALL.md#chrome-setup) · [Build from source](docs/INSTALL.md#build-from-source)
 
+## Settings
+
+Run `godspeed settings` (or simply `godspeed`) for the terminal preferences menu in builds that include the launcher. Use `godspeed settings --show` for read-only output. [Configuration reference](docs/GODSPEED.md#terminal-settings).
+
 ## How Godspeed works
 
 1. **Read the app or tab.** Mac apps expose named controls through macOS Accessibility. Chrome uses the optional extension bridge to read page controls. Ask for just one control, a compact window read, or a screenshot when the UI needs it.
