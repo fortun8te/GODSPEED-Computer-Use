@@ -224,7 +224,7 @@ For an unlabeled icon or a canvas object, first read the app to obtain its Windo
 {"app":"Example","window_id":42,"include_ax":true,"include_screenshot":true,"visual_queries":["gear icon in the upper toolbar","blue circle on the canvas"],"visual_region":[0,0,1,1]}
 ```
 
-The optional loopback vision helper returns up to two **unverified** point proposals in the delivered screenshot's pixel coordinates. Use a single normalized top-left region [x,y,width,height] to limit search to a panel or canvas. Inspect the returned image before choosing an action; a model point is not evidence that an object exists or is safe to click. A two-point search can propose the start and end of a drag. No input is sent by visual search. It is off unless requested and the helper is configured.
+The search first tries fast then accurate local OCR for exact unique text, without invoking the helper. Ambiguous text requires a narrower region or inspection. On an OCR miss, the optional loopback vision helper can return up to two **unverified** point proposals in the delivered screenshot's pixel coordinates. Use a single normalized top-left region [x,y,width,height] to limit search to a panel or canvas. Inspect the returned image before choosing an action; a model point is not evidence that an object exists or is safe to click. A two-point search can propose the start and end of a drag. No input is sent by visual search. It is off unless requested and the helper is configured.
 
 For a confirmed point, pass its screenshot token, the same window ID and pixel coordinates to the existing click or drag tool:
 
@@ -235,6 +235,18 @@ For a confirmed point, pass its screenshot token, the same window ID and pixel c
 The optional token checks both the cached screenshot and a fresh capture before dispatch. Changed pixels, a replaced read, a changed encoding configuration, or an unavailable capture cause a refusal; reread instead of retrying stale coordinates. Animated windows may require a new observation. The token does not authorize an action or prove its result. Normal accessibility actions and unguarded pixel operations are unchanged. Visual search suppresses helper input when secure-field evidence is present, but this is not a guarantee that every sensitive view can be recognized.
 
 Native control lookup misses also include a bounded ranked shortlist of observed names and indices (including common UI synonyms). These are recovery suggestions, not automatic clicks.
+
+### Deterministic typed form handoff
+
+Supply an exact `Click <label>` goal, named `values` and an independent `done_when` condition. For example:
+
+```json
+{"app":"Example","goal":"Click Save","values":{"Name":"Ann","Email":"ann@example.test"},"done_when":{"text":"Saved"}}
+```
+
+Godspeed preflights all named writable fields and the unique non-risky click control on the same observed window. It fills empty fields or fields whose current value matches explicit `expected_values`, checks readback, and clicks only after the fields match. It never delegates a failed typed-form precondition to the ranker. A missing field, changed value or different window stops the workflow. Choose an independent completion condition that establishes the intended final result, not just field values already satisfied before clicking. Other handoffs continue to use exact rules, verified recipes and the existing local ranker. Ranked field writes may automatically fill only a uniquely named empty field; approximate or populated destinations require caller review. Repeated returns to previously observed states can stop an otherwise cycling handoff without another model judgment.
+
+Use GSD1 for its existing typed advisory calls; the Action, Read and Recover checkpoints are not promoted to autonomous runtime routing without matched validation.
 
 ## Private clipboard
 
