@@ -194,7 +194,7 @@ enum MacOSAppAgentProxy {
             }
             if canIdentifyClient {
                 canIdentifyClient = false
-                environment[cursorNameEnvironmentKey] = knownCursorClientName(initializeLine: line)
+                environment = addingCursorClientName(to: environment, initializeLine: line)
             }
 
             // No run loop drains this thread's autorelease pool either: one per request.
@@ -241,6 +241,14 @@ enum MacOSAppAgentProxy {
         case "opencode": return "OpenCode"
         default: return nil
         }
+    }
+
+    /// Inferred client identity is a fallback, not an explicit preference. Keeping it separate
+    /// lets a saved nickname take effect on the next request without reconnecting the proxy.
+    static func addingCursorClientName(to environment: [String: String], initializeLine: String) -> [String: String] {
+        var result = environment
+        result[cursorClientNameEnvironmentKey] = knownCursorClientName(initializeLine: initializeLine)
+        return result
     }
 
     static func mcpFailureReply(id: Any, message: String, delivery: DeliveryState) -> [String: Any] {
@@ -853,6 +861,7 @@ private final class AppAgentConnection: @unchecked Sendable {
 /// The environment key that names the agent a proxy works for.
 private let clientEnvironmentKey = "OPEN_COMPUTER_USE_CLIENT"
 private let cursorNameEnvironmentKey = "OPEN_COMPUTER_USE_CURSOR_NAME"
+private let cursorClientNameEnvironmentKey = "OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME"
 
 /// Match only canonical requests. Batches and actions with shared side
 /// effects use exclusive admission.
@@ -937,7 +946,11 @@ enum AppAgentEnvironment {
     }
 
     static func effectiveEnvironment(_ overrides: [String: String]) -> [String: String] {
-        var environment = appAgentLaunchEnvironment
+        effectiveEnvironment(overrides, launchEnvironment: appAgentLaunchEnvironment)
+    }
+
+    static func effectiveEnvironment(_ overrides: [String: String], launchEnvironment: [String: String]) -> [String: String] {
+        var environment = launchEnvironment
         for key in requestEnvironmentKeys { environment[key] = nil }
         return environment.merging(overrides.filter { $0.key.hasPrefix("OPEN_COMPUTER_USE_") }) { _, request in request }
     }

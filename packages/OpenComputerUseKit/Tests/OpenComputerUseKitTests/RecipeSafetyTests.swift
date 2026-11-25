@@ -321,7 +321,7 @@ final class RecipeSafetyTests: XCTestCase {
         let deps = HandoffTool.Dependencies(
             readState: { screen }, act: { _, _ in XCTFail("acted after blocked recipe"); return .init(ok: false, message: "") },
             choose: { _, _, _, _, _ in XCTFail("called chooser after blocked recipe"); return nil },
-            looksStuck: { _, _, _ in false }, check: { HandoffTool.check(request.doneWhen, screen: $0) },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) },
             replay: { _ in .blocked("Confirm the recipient.") }, now: { 0 }
         )
         let outcome = HandoffTool.run(request, deps)
@@ -366,7 +366,7 @@ final class RecipeSafetyTests: XCTestCase {
         var replayed = false
         let deps = HandoffTool.Dependencies(
             readState: { "App=x\nWindow: \"w\"\n\t1 static text Saved" }, act: { _, _ in .init(ok: true, message: "") },
-            choose: { _, _, _, _, _ in nil }, looksStuck: { _, _, _ in false },
+            choose: { _, _, _, _, _ in nil },
             check: { DoneCheck.check([.text("Saved")], evidence: .init(screenText: $0, pageURL: { nil })) },
             replay: { _ in replayed = true; return .verified }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "g", doneWhen: [.text("Saved")], values: [], maxSteps: 3, timeBudget: 30), deps)
@@ -379,7 +379,6 @@ final class RecipeSafetyTests: XCTestCase {
         let deps = HandoffTool.Dependencies(
             readState: { "App=x\nWindow: \"Calc\"\n\t1 button Add\n\t2 button Subtract" }, act: { _, _ in .init(ok: true, message: "") },
             choose: { _, _, _, _, options in Dictionary(uniqueKeysWithValues: options.map { ($0.id, 0.4) }).merging(["none": 0.1]) { a, _ in a } },
-            looksStuck: { _, _, _ in false },
             check: { DoneCheck.check([.text("42")], evidence: .init(screenText: $0, pageURL: { nil })) },
             replay: { _ in nil }, now: { 0 })
         let outcome = HandoffTool.run(.init(app: "x", goal: "add numbers", doneWhen: [.text("42")], values: [], maxSteps: 3, timeBudget: 30), deps)

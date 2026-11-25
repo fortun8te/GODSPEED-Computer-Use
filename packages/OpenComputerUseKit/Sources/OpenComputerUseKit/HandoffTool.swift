@@ -6,8 +6,8 @@ import Foundation
 ///
 /// Loop: resolve exact actions first, then try a verified recipe or ask the local helper to rank
 /// up to 12 relevant actions. Check `done_when` after every action.
-/// It stops on done, on stuck (two steps that changed nothing, two failed steps, or the checker's stuck
-/// verdict), on a risky control (Delete, Send, Buy, Pay ...: escalated, never pressed), and on budget.
+/// It stops on done, on locally observed stalls or navigation cycles, on two failed steps,
+/// on a risky control (Delete, Send, Buy, Pay ...: escalated, never pressed), and on budget.
 enum HandoffTool {
     static let name = "handoff"
     static let defaultMaxSteps = 15
@@ -117,9 +117,16 @@ enum HandoffTool {
     }
 
     /// Pinned handoffs need positive evidence of the requested window on every observation.
-    static func matchesWindow(_ state: String, windowID: UInt32?) -> Bool {
+    static func matchesWindow(_ state: String, windowID: UInt32?, process: String? = nil) -> Bool {
+        if let process, observedProcess(in: state) != process { return false }
         guard let windowID else { return true }
         return observedWindowID(in: state) == windowID
+    }
+
+    /// The bundle identifier and PID are stable across navigation and window-title changes.
+    static func observedProcess(in state: String) -> String? {
+        guard let header = state.split(separator: "\n").first, header.hasPrefix("App=") else { return nil }
+        return String(header)
     }
 
     static func observedWindowID(in state: String) -> UInt32? {
@@ -456,9 +463,14 @@ enum HandoffTool {
     /// Acts only on a clear winner: probability at least `minProbability`, a lead of at least `minMargin` over
     /// the runner-up (any other option or "none"), and not a risky control. Anything else is the model's call.
     static func needsVisualTieBreak(_ scores: [String: Double], optionIDs: [String]) -> Bool {
+        guard scores.values.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else { return false }
         let ranked = optionIDs.compactMap { scores[$0] }.sorted(by: >)
         guard let best = ranked.first else { return false }
-        let runnerUp = max(ranked.dropFirst().first ?? 0, scores["none"] ?? 0)
+        let none = scores["none"] ?? 0
+        // A clear abstention is already a usable answer. Another image/model call must not
+        // turn an explicit rejection into pressure to choose one of the same targets.
+        if none >= minProbability, none - best >= minMargin { return false }
+        let runnerUp = max(ranked.dropFirst().first ?? 0, none)
         return best < minProbability || best - runnerUp < minMargin
     }
 
@@ -634,13 +646,36 @@ enum HandoffTool {
         /// Runs one candidate in the window it was selected from.
         var act: (Candidate, _ state: String) -> ActResult
         var choose: (_ goal: String, _ doneWhen: String, _ history: String, _ screen: DecisionView, _ options: [(id: String, text: String)]) -> [String: Double]?
-        /// The checker model's stuck verdict for a short summary.
-        var looksStuck: (_ goal: String, _ lastStep: String, _ summary: DecisionView) -> Bool
         var check: (_ state: String) -> DoneCheck.Result
         /// Replay is based on this handoff's original window.
         var replay: (String) -> Replay?
         var now: () -> TimeInterval
+        var allowsModelChoices = true
         var controls: (String) -> [Control] = HandoffTool.parseControls
+        /// After an acknowledged action with unchanged readback, observe briefly before
+        /// offering another action. This hook is read-only and never asks a model.
+        var settleState: ((_ previous: String) -> String?)? = nil
+    }
+
+    /// A delayed UI response must not lead straight to another click. Poll only while
+    /// unchanged, at most three times, with bounded backoff inside the request deadline.
+    /// No action is retried, including when delivery was uncertain.
+    static func settledState(after previous: String, deadline: TimeInterval,
+                             now: () -> TimeInterval, pause: (TimeInterval) -> Void,
+                             read: () -> String?) -> String? {
+        var latest = previous
+        for delay in [TimeInterval(0.1), 0.2, 0.4] {
+            guard !RequestCancellation.requested else { return nil }
+            let remaining = deadline - now()
+            guard remaining > delay else { return latest }
+            pause(delay)
+            guard !RequestCancellation.requested else { return nil }
+            guard now() < deadline else { return latest }
+            guard let fresh = read() else { return nil }
+            latest = fresh
+            if !AXStateDiff.sameContent(previous: previous, current: fresh) { break }
+        }
+        return latest
     }
 
     enum Replay: Equatable { case verified, incomplete, uncertain, blocked(String), alreadySatisfied(String), cancelled(String, DeliveryState) }
@@ -709,11 +744,16 @@ enum HandoffTool {
         let deadline = deadline ?? deps.now() + request.timeBudget
         func hasTime() -> Bool { deps.now() < deadline }
         let typedForm = isTypedForm(request)
-        var formWindow = request.windowID
+        let explicitClick = explicitClickLabel(request.goal) != nil
+        var targetWindow = request.windowID
+        var targetProcess: String?
         func readState() -> String? {
             guard !RequestCancellation.requested, hasTime(),
-                  let state = deps.readState(), matchesWindow(state, windowID: formWindow) else { return nil }
-            if typedForm, formWindow == nil { formWindow = observedWindowID(in: state) }
+                  let state = deps.readState(), matchesWindow(state, windowID: targetWindow, process: targetProcess) else { return nil }
+            // Pin every workflow, not just forms. The user may select another window while
+            // a local chooser runs; its contents must never become this handoff's next target.
+            if targetWindow == nil { targetWindow = observedWindowID(in: state) }
+            if targetProcess == nil { targetProcess = observedProcess(in: state) }
             return state
         }
         var steps: [String] = []
@@ -836,8 +876,8 @@ enum HandoffTool {
             }
         }
         var initialExact = exactAction(request: request, controls: initialControls, tried: tried)
-        if initialExact == nil, typedForm {
-            return finish(.escalate, "the typed form's fields or exact submit control could not be confirmed; no action was sent",
+        if initialExact == nil, explicitClick {
+            return finish(.escalate, "the exact click target or supplied fields could not be confirmed; no action was sent",
                           initial: initial, latest: state)
         }
         if initialExact == nil, request.expectedValues.isEmpty, request.windowID == nil, let replayed = deps.replay(state) {
@@ -887,8 +927,8 @@ enum HandoffTool {
             }
             let controls = number == 1 ? initialControls : deps.controls(state)
             let exact = number == 1 ? initialExact : exactAction(request: request, controls: controls, tried: tried)
-            if exact == nil, typedForm {
-                return finish(.escalate, "the typed form changed or a requested field could not be confirmed; inspect before continuing",
+            if exact == nil, explicitClick {
+                return finish(.escalate, "the requested click was already attempted or its target changed; inspect before continuing",
                               initial: initial, latest: state)
             }
             if exact == nil, !request.expectedValues.isEmpty {
@@ -912,7 +952,7 @@ enum HandoffTool {
             } else if !options.isEmpty, options.allSatisfy(\.risky) {
                 decision = .escalate("the only available actions are risky")
             } else {
-                if !options.isEmpty {
+                if !options.isEmpty, deps.allowsModelChoices {
                     let history = steps.suffix(4).joined(separator: "\n")
                     let targets = options.compactMap { Int($0.arguments["element_index"] as? String ?? "") }
                     let view = RefereeView.prepare(state: state, goal: request.goal, doneWhen: doneSummary,
@@ -964,7 +1004,7 @@ enum HandoffTool {
                 // A piggyback text snapshot cannot bind typed field observations. Require
                 // scoped readback before comparing fields, even when its text is identical.
                 let actionState = needsFreshFields ? nil : result.observedState.flatMap {
-                    matchesWindow($0, windowID: formWindow) ? $0 : nil
+                    matchesWindow($0, windowID: targetWindow, process: targetProcess) ? $0 : nil
                 }
                 if !hasTime(), needsFreshFields || result.observedState == nil {
                     steps.append(result.ok ? choice.text : "\(choice.text) failed")
@@ -992,7 +1032,7 @@ enum HandoffTool {
                 }
                 failures = 0
                 steps.append(choice.text)
-                guard let next = actionState ?? readState() else {
+                guard var next = actionState ?? readState() else {
                     if RequestCancellation.requested { return cancelled() }
                     return finish(.failed, "lost sight of \(request.app) after \(choice.text)", initial: initial, latest: state)
                 }
@@ -1000,6 +1040,20 @@ enum HandoffTool {
                     outcome.readback = "goal_verified"
                     deliveryState = .verified
                     return finish(.done, met.joined(separator: "; "), initial: initial, latest: next)
+                }
+                if AXStateDiff.sameContent(previous: state, current: next), hasTime(), let settle = deps.settleState {
+                    guard let settled = settle(next), matchesWindow(settled, windowID: targetWindow, process: targetProcess) else {
+                        if RequestCancellation.requested { return cancelled() }
+                        return finish(.failed, "lost sight of the original window while waiting for the last action",
+                                      initial: initial, latest: nil)
+                    }
+                    if RequestCancellation.requested { return cancelled() }
+                    next = settled
+                    if let met = matched(next, since: initial) {
+                        outcome.readback = "goal_verified"
+                        deliveryState = .verified
+                        return finish(.done, met.joined(separator: "; "), initial: initial, latest: next)
+                    }
                 }
                 let unchanged = AXStateDiff.sameContent(previous: state, current: next)
                 outcome.readback = unchanged ? "unchanged" : "changed"
@@ -1020,22 +1074,6 @@ enum HandoffTool {
                 }
                 if noChange >= 2 {
                     return finish(.stuck, "the last two actions changed nothing on screen", initial: initial, latest: state)
-                }
-                // A changed screen already gives the next step new evidence. Ask the checker
-                // only on a stall that the two-action rule has not yet handled.
-                if exact == nil, unchanged, number >= 2, number < request.maxSteps,
-                   hasTime() {
-                    let view = RefereeView.prepare(state: state, goal: request.goal, doneWhen: doneSummary,
-                                                   limit: Referee.maxViewCharacters / 2)
-                    let summary = RefereeSummary.build(
-                        goal: request.goal, steps: steps.map { ($0, "ok") }, repeatedFailures: failures,
-                        screenChanged: false, dialogOpen: RefereeSummary.dialogOpen(in: state),
-                        changes: nil, screen: view.text,
-                        maxCharacters: Referee.maxViewCharacters
-                    )
-                    if deps.looksStuck(request.goal, choice.text, DecisionView(state: state, text: summary, thin: view.thin)) {
-                        return finish(.stuck, "the checker model says no progress is being made", initial: initial, latest: state)
-                    }
                 }
             }
         }
@@ -1078,23 +1116,35 @@ extension ComputerUseToolDispatcher {
         }
 
         var fieldObservation: (state: String, fields: [DoneCheck.Field])?
+        var targetWindow = request.windowID
+        var targetProcess: String?
+        func captureState(settleMs: Int) -> String? {
+            if let readFixtureState {
+                guard let state = readFixtureState(), HandoffTool.matchesWindow(state, windowID: targetWindow, process: targetProcess) else { return nil }
+                if targetWindow == nil { targetWindow = HandoffTool.observedWindowID(in: state) }
+                if targetProcess == nil { targetProcess = HandoffTool.observedProcess(in: state) }
+                return state
+            }
+            let remaining = max(0, deadline - clock.systemUptime)
+            guard remaining > 0, !RequestCancellation.requested else { return nil }
+            var args: [String: Any] = ["app": app, "include_screenshot": false, "compact": false,
+                                       "settle_ms": min(settleMs, Int(remaining * 1_000))]
+            args["window_id"] = targetWindow
+            let read = BrowserCallBudget.withDeadline(deadline) {
+                callToolAsResult(name: "get_app_state", arguments: args)
+            }
+            guard !captureRefusal(read), !read.isError else { return nil }
+            guard let state = LeanOutput.stateText(of: read),
+                  let id = HandoffTool.observedWindowID(in: state), matchesDocument(id),
+                  HandoffTool.matchesWindow(state, windowID: targetWindow, process: targetProcess) else { return nil }
+            if targetWindow == nil { targetWindow = id }
+            if targetProcess == nil { targetProcess = HandoffTool.observedProcess(in: state) }
+            let text = BatchTool.stateText(ofText: state)
+            fieldObservation = (text, read.observedFields ?? [])
+            return text
+        }
         let deps = HandoffTool.Dependencies(
-            readState: { [self] in
-                if let readFixtureState { return readFixtureState() }
-                let remaining = max(0, deadline - clock.systemUptime)
-                let settleMs = min(LeanDefaults.batchSettleMs, Int(remaining * 1_000))
-                var args: [String: Any] = ["app": app, "include_screenshot": false, "compact": false, "settle_ms": settleMs]
-                args["window_id"] = request.windowID
-                let read = BrowserCallBudget.withDeadline(deadline) {
-                    callToolAsResult(name: "get_app_state", arguments: args)
-                }
-                guard !captureRefusal(read), !read.isError else { return nil }
-                guard let state = LeanOutput.stateText(of: read),
-                      let id = HandoffTool.observedWindowID(in: state), matchesDocument(id) else { return nil }
-                let text = BatchTool.stateText(ofText: state)
-                fieldObservation = (text, read.observedFields ?? [])
-                return text
-            },
+            readState: { captureState(settleMs: LeanDefaults.batchSettleMs) },
             act: { [self] candidate, state in
                 guard let window = request.windowID ?? HandoffTool.observedWindowID(in: state) else {
                     return HandoffTool.ActResult(ok: false, message: "the target window could not be confirmed", delivery: .notSent)
@@ -1145,14 +1195,6 @@ extension ComputerUseToolDispatcher {
                                       options: options, imageBase64: retryPicture, remaining: deadline - clock.systemUptime)
                     ?? scores
             },
-            looksStuck: { [self] goal, lastStep, summary in
-                let picture = Referee.picture(url: Referee.baseURL, state: summary.state, remaining: deadline - clock.systemUptime, thin: summary.thin) {
-                    localDecisionImage(app: app, state: summary.state)
-                }
-                guard let verdict = Referee.decide(goal: goal, lastStep: lastStep, result: "ok", summary: summary.text,
-                                                   imageBase64: picture, remaining: deadline - clock.systemUptime) else { return false }
-                return verdict.label == "stuck" && verdict.confidence >= Referee.minimumConfidence
-            },
             check: { state in
                 let fields = fieldObservation.flatMap { $0.state == state ? $0.fields : nil }
                 return HandoffTool.check(request.doneWhen, screen: state,
@@ -1188,7 +1230,13 @@ extension ComputerUseToolDispatcher {
                 return HandoffTool.replayResult(result)
             },
             now: { clock.systemUptime },
-            controls: controlsFor
+            allowsModelChoices: Referee.handoffURL != nil,
+            controls: controlsFor,
+            settleState: { previous in
+                HandoffTool.settledState(after: previous, deadline: deadline, now: { clock.systemUptime },
+                                        pause: { Thread.sleep(forTimeInterval: $0) },
+                                        read: { captureState(settleMs: 0) })
+            }
         )
         let outcome = HandoffTool.run(request, deps, deadline: deadline)
         if let refusal { return refusal }

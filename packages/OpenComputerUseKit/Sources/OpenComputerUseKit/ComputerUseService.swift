@@ -964,6 +964,14 @@ public final class ComputerUseService {
         try RequestCancellation.check(delivery: .notSent)
     }
 
+    /// Local OCR does not require a model helper. Only a real, unambiguous miss can enter this route;
+    /// strict or pinned requests retain their existing accessibility-only/direct delivery contract.
+    static func allowsLocalPerceptionFallback(error: ComputerUseError, strict: Bool, windowBound: Bool,
+                                              clickCount: Int, mouseButton: String) -> Bool {
+        !strict && !windowBound && SmartSteps.isNotFound(error) && !SmartSteps.isAmbiguous(error)
+            && clickCount == 1 && mouseButton.lowercased() == "left"
+    }
+
     /// Ground a label in the same observed window, then verify it immediately before delivery.
     func visionClick(app query: String, label: String, method: ClickMethod) throws -> ToolCallResult? {
         guard method == .auto || method == .skyClick, !VisionFallback.risky(label),
@@ -981,6 +989,9 @@ public final class ComputerUseService {
             return context
         }
 
+        // Do not capture or run OCR on a window already known to contain secure fields.
+        var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
+        guard !secure else { return nil }
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(VisionFallback.timeout, BrowserCallBudget.activeRemaining ?? .infinity)
         guard let context = liveWindow(), let original = SnapshotBuilder.localWindowImage(context),
@@ -989,19 +1000,17 @@ public final class ComputerUseService {
         var located: VisionFallback.Candidate?
         var verified = false
         // Password and secure fields keep their row but never their crop image.
-        var secure = LearningScrubber.marksSecureField([label, snapshot.renderedText])
-        guard !secure else { return nil }
         defer {
             VisionFallback.recordLocate(query: label, crop: crop, candidate: located, verified: verified,
                                         secure: secure, log: LearningLog.shared)
         }
         let candidate = VisionFallback.candidate(scan: { accurate in
-            guard clock.systemUptime < deadline else { return .missing }
+            guard !RequestCancellation.requested, clock.systemUptime < deadline else { return .missing }
             // Preserve small toolbar labels and dense canvas text on the accurate pass.
             let image = accurate ? (LocalWindowImage.downscaled(original, maxSide: VisionFallback.accurateOCRMaxSide) ?? crop) : crop
             return LocalOCR.scan(image, label: label, level: accurate ? .accurate : .fast)
         }, locate: {
-            guard clock.systemUptime < deadline,
+            guard VisionFallback.isEnabled, !RequestCancellation.requested, clock.systemUptime < deadline,
                   let overview = LocalWindowImage.downscaled(crop, maxSide: VisionFallback.overviewMaxSide),
                   let jpeg = LocalWindowImage.jpeg(overview) else { return nil }
             return VisionFallback.locate(imageBase64: jpeg.base64EncodedString(), query: label,
@@ -1059,8 +1068,18 @@ public final class ComputerUseService {
 
         let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
         try RequestCancellation.check()  // L6: a cancelled request sends nothing
-        try InputSimulation.clickWithSkyLight(at: screenPoint, windowPoint: point, windowBounds: bounds,
-                                               windowID: id, clickCount: 1, pid: live.app.pid)
+        let cursorTarget = makeVisualCursorTarget(at: screenPoint, targetWindowID: id,
+            targetWindowLayer: snapshot.targetWindowLayer,
+            anchor: makeCursorWindowAnchor(snapshot: snapshot, windowLocalPoint: point))
+        moveVisualCursor(to: cursorTarget)
+        do {
+            try InputSimulation.clickWithSkyLight(at: screenPoint, windowPoint: point, windowBounds: bounds,
+                                                   windowID: id, clickCount: 1, pid: finalWindow.app.pid)
+        } catch {
+            settleVisualCursor(at: cursorTarget)
+            throw error
+        }
+        pulseVisualCursor(at: cursorTarget, clickCount: 1, mouseButton: .left)
         // Read back the same window. Delivery has already happened if this read fails.
         let state = try? getAppState(app: query,
             observation: SnapshotObservationOptions(includeAX: true, includeScreenshot: false), windowID: id)

@@ -25,6 +25,7 @@ final class FocusBorrowTests: XCTestCase {
         func isAlive(pid: pid_t) -> Bool { alive.contains(pid) }
 
         var typing = false
+        var onPauseCheck: (() -> Void)?
 
         func activate(pid: pid_t) -> Bool {
             activations.append(pid)
@@ -33,7 +34,10 @@ final class FocusBorrowTests: XCTestCase {
             return true
         }
 
-        func waitForTypingPause() -> Bool { !typing }
+        func waitForTypingPause() -> Bool {
+            onPauseCheck?()
+            return !typing
+        }
     }
 
     private let user: pid_t = 100
@@ -72,6 +76,23 @@ final class FocusBorrowTests: XCTestCase {
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "typo"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": "0"]))
         XCTAssertFalse(FocusBorrow.isEnabled(environment: ["OPEN_COMPUTER_USE_FOCUS_BORROW": " off "]))
+    }
+
+    func testIdleThresholdIsFiniteAndUsesTheCurrentRequest() {
+        let key = "OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S"
+        XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [:]), 4)
+        XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [key: " 8 "]), 8)
+        for value in ["-1", "nan", "inf", "invalid"] {
+            XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [key: value]), 4)
+        }
+        // Zero remains an explicit option for unattended benchmarks.
+        XCTAssertEqual(FocusBorrowController.idleThreshold(environment: [key: "0"]), 0)
+        RequestConfiguration.withEnvironment([key: "7"]) {
+            XCTAssertEqual(FocusBorrowController.userIdleNeeded, 7)
+        }
+        RequestConfiguration.withEnvironment([key: "12"]) {
+            XCTAssertEqual(FocusBorrowController.userIdleNeeded, 12)
+        }
     }
 
     // MARK: - Bookkeeping
@@ -128,6 +149,47 @@ final class FocusBorrowTests: XCTestCase {
 
         XCTAssertEqual(activator.front, appB)
         XCTAssertEqual(activator.activations, [appA], "no restore once the user has moved focus")
+    }
+
+    func testUserSwitchDuringAdmissionDoesNotBorrowFromTheNewApp() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        activator.onPauseCheck = { activator.front = self.appB }
+
+        let lease = controller.acquire(pid: appA)
+
+        XCTAssertFalse(lease.activated)
+        XCTAssertEqual(activator.front, appB)
+        XCTAssertEqual(activator.activations, [])
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testUserSwitchDuringRestorePauseIsNotOverridden() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        let lease = controller.acquire(pid: appA)
+        activator.onPauseCheck = { activator.front = self.appB }
+
+        controller.release(lease)
+
+        XCTAssertEqual(activator.front, appB)
+        XCTAssertEqual(activator.activations, [appA])
+        XCTAssertEqual(controller.openCount, 0)
+    }
+
+    func testNestedReleaseDoesNotHandOverWhileTheUserIsTyping() {
+        let activator = FakeActivator(front: user, alive: [user, appA, appB])
+        let controller = FocusBorrowController(activator: activator)
+        let first = controller.acquire(pid: appA)
+        let second = controller.acquire(pid: appB)
+        activator.typing = true
+
+        controller.release(second)
+        controller.release(first)
+
+        XCTAssertEqual(activator.front, appB)
+        XCTAssertEqual(activator.activations, [appA, appB])
+        XCTAssertEqual(controller.openCount, 0)
     }
 
     func testNothingToRestoreWhenTargetWasAlreadyFrontmost() {
@@ -266,6 +328,15 @@ final class FocusBorrowTests: XCTestCase {
         ledger.recordUserHide(pid: appA)
         XCTAssertFalse(ledger.takeRehideNeeded(pid: appA), "the user hid it, so the release must not re-hide or override it")
         XCTAssertFalse(ledger.takeRehideNeeded(pid: appA))
+    }
+
+    func testRehideDoesNotTakeAwayAnAppTheUserIsWorkingIn() {
+        var ledger = UnhiddenAppLedger()
+        ledger.recordUnhide(pid: appA)
+        XCTAssertFalse(ledger.takeRehideNeeded(pid: appA, frontmostPID: appA))
+        XCTAssertFalse(ledger.takeRehideNeeded(pid: appA), "skipping the hide also ends the old ownership record")
+        ledger.recordUnhide(pid: appB)
+        XCTAssertTrue(ledger.takeRehideNeeded(pid: appB, frontmostPID: appA))
     }
 
     func testUserHidingAnAppThisProcessDidNotUnhideChangesNothing() {

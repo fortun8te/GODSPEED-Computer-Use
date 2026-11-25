@@ -49,4 +49,14 @@ final class DocsDriftTests: XCTestCase {
             XCTAssertEqual(number, value, accuracy: 1e-9, "docs/GODSPEED.md default for \(variable) drifted from code")
         }
     }
+
+    func testCursorAndHelperDefaultsMatchDocs() throws {
+        let cursor = VisualCursorSettings(environment: [:])
+        XCTAssertEqual(try documentedDefault("OPEN_COMPUTER_USE_CURSOR_COLOR"), cursor.automaticTint ? "auto" : "default")
+        XCTAssertEqual(Double(try documentedDefault("OPEN_COMPUTER_USE_CURSOR_IDLE_HIDE_SECONDS")), Double(cursor.idleHideDelay))
+        XCTAssertEqual(try documentedDefault("OPEN_COMPUTER_USE_CURSOR_FEEDBACK"), cursor.feedbackEnabled ? "on" : "off")
+        XCTAssertEqual(try documentedDefault("OPEN_COMPUTER_USE_CURSOR_LABEL"), cursor.labelEnabled ? "on" : "off")
+        XCTAssertEqual(try documentedDefault("OPEN_COMPUTER_USE_MODEL_HELPERS"), ModelHelperPolicy.isEnabled(environment: [:]) ? "on" : "off")
+        XCTAssertEqual(try documentedDefault("OPEN_COMPUTER_USE_LEARNING_LOG_IMAGES"), LearningLog.imagesEnabled(environment: [:]) ? "on" : "off")
+    }
 }

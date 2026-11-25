@@ -73,6 +73,40 @@ final class AppAgentProxyTests: XCTestCase {
         ))
     }
 
+    func testInferredCursorNameDoesNotShadowSavedOrExplicitNickname() {
+        let line = #"{"method":"initialize","params":{"clientInfo":{"name":"claude-code"}}}"#
+        let inferred = MacOSAppAgentProxy.addingCursorClientName(to: [:], initializeLine: line)
+        XCTAssertNil(inferred["OPEN_COMPUTER_USE_CURSOR_NAME"])
+        XCTAssertEqual(inferred["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME"], "Claude Code")
+        XCTAssertEqual(VisualCursorSettings(environment: GodspeedSettings.merged(inferred, settings: [:])).agentName,
+                       "Claude Code")
+        XCTAssertEqual(VisualCursorSettings(environment: GodspeedSettings.merged(inferred, settings: ["cursor_name": "Studio"])).agentName,
+                       "Studio")
+        let explicit = MacOSAppAgentProxy.addingCursorClientName(to: ["OPEN_COMPUTER_USE_CURSOR_NAME": "Editor"], initializeLine: line)
+        XCTAssertEqual(VisualCursorSettings(environment: GodspeedSettings.merged(explicit, settings: ["cursor_name": "Studio"])).agentName,
+                       "Editor")
+        // Returning the preference to automatic reuses the connection's inferred identity.
+        XCTAssertEqual(VisualCursorSettings(environment: GodspeedSettings.merged(inferred, settings: [:])).agentName,
+                       "Claude Code")
+    }
+
+    func testCursorIdentityRejectsInvalidNamesAndDoesNotLeakFromHostToAnotherClient() {
+        let invalid = ["OPEN_COMPUTER_USE_CURSOR_NAME": "\u{001B}[31mprivate",
+                       "OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME": "Codex"]
+        XCTAssertEqual(VisualCursorSettings(environment: invalid).agentName, "Codex")
+        XCTAssertNil(VisualCursorSettings(environment: ["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME": "Project\nSecret"]).agentName)
+        let host = ["OPEN_COMPUTER_USE_CURSOR_NAME": "Host", "OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME": "Codex"]
+        let clean = AppAgentEnvironment.effectiveEnvironment([:], launchEnvironment: host)
+        XCTAssertNil(clean["OPEN_COMPUTER_USE_CURSOR_NAME"])
+        XCTAssertNil(clean["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME"])
+        let client = AppAgentEnvironment.effectiveEnvironment(["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME": "Claude"],
+                                                              launchEnvironment: host)
+        XCTAssertEqual(VisualCursorSettings(environment: client).agentName, "Claude")
+        let unknown = MacOSAppAgentProxy.addingCursorClientName(to: [:], initializeLine:
+            #"{"method":"initialize","params":{"clientInfo":{"name":"private-project-owner"}}}"#)
+        XCTAssertNil(unknown["OPEN_COMPUTER_USE_CURSOR_CLIENT_NAME"])
+    }
+
     func testSharedAdmissionIsOnlyForCanonicalBrowserReads() {
         func accepts(_ name: String = "browser", _ arguments: [String: Any]) -> Bool {
             AppAgentBrowserRead.accepts([

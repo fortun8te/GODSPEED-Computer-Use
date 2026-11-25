@@ -75,6 +75,23 @@ final class VisualSearchTests: XCTestCase {
         XCTAssertEqual(calls, 1)
     }
 
+    func testSnapshotActionsRejectMalformedCoordinatesBeforeRecapture() throws {
+        let token = VisualSearch.observationToken(windowID: 42, bytes: Data([1, 2]))
+        let valid: [String: Any] = ["window_id": 42, "x": 12, "y": 34, "visual_snapshot": token]
+        let invalidCoordinates: [Any] = [Double.nan, Double.infinity, -1, true, "twelve"]
+        for invalid in invalidCoordinates {
+            var args = valid
+            args["x"] = invalid
+            XCTAssertThrowsError(try VisualSearch.actionToken(tool: "click", arguments: args))
+        }
+        var wrongWindow = valid
+        wrongWindow["window_id"] = false
+        XCTAssertThrowsError(try VisualSearch.actionToken(tool: "click", arguments: wrongWindow))
+        let drag: [String: Any] = ["window_id": 42, "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                                  "files": ["/tmp/document"], "visual_snapshot": token]
+        XCTAssertThrowsError(try VisualSearch.actionToken(tool: "drag", arguments: drag))
+    }
+
     func testNoScreenshotDoesNotInvokeHelper() throws {
         let state = ToolCallResult.text("Window ID: 42")
         let result = try VisualSearch.annotate(state, queries: ["icon"], region: nil, windowID: 42)

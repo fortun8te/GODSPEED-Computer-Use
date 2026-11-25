@@ -16,6 +16,9 @@ enum GroundingCascade {
     }
 
     static let maxCandidates = 12
+    /// Fuzzy matching is quadratic in label length. Long document contents are not control names;
+    /// keep them out of approximate ranking without changing exact-name resolution.
+    static let maxFuzzyCharacters = 240
 
     /// Dev-calibrated cutoffs for act-on-rank (step 3): the top option needs this probability ...
     static let minProbability = 0.70
@@ -58,10 +61,12 @@ enum GroundingCascade {
     /// Step 2. Rule-based similarity between `label` and each control name, best first, at most `limit`.
     /// A control with no rule-based link to the label is dropped. The result is never a guess; step 3 ranks it.
     static func prefilter(label: String, options: [Option], limit: Int = maxCandidates) -> [Option] {
+        guard limit > 0, label.count <= maxFuzzyCharacters else { return [] }
         let wanted = normalized(label)
         let alternatives = spellings(of: label)
         guard !wanted.isEmpty || !alternatives.isEmpty else { return [] }
         let scored: [(option: Option, score: Double, position: Int)] = options.enumerated().compactMap { position, option in
+            guard option.text.count <= maxFuzzyCharacters else { return nil }
             let name = normalized(option.text)
             guard !name.isEmpty else { return nil }
             let score: Double
@@ -81,7 +86,7 @@ enum GroundingCascade {
         }
         return scored
             .sorted { $0.score != $1.score ? $0.score > $1.score : $0.position < $1.position }
-            .prefix(limit)
+            .prefix(min(limit, maxCandidates))
             .map(\.option)
     }
 
@@ -147,10 +152,17 @@ enum GroundingCascade {
         // Step 2.
         let candidates = prefilter(label: label, options: options)
         guard candidates.count >= 2 else { return .abstain("no close control") }
+        guard Set(candidates.map(\.id)).count == candidates.count,
+              candidates.allSatisfy({ !$0.id.isEmpty && $0.id != "none" }) else {
+            return .abstain("control identifiers are ambiguous")
+        }
         // Step 3.
         guard let probabilities = choose(candidates) else { return .abstain("the local helper gave no ranking") }
         guard probabilities.values.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
             return .abstain("the local helper gave invalid probabilities")
+        }
+        guard Set(probabilities.keys) == Set(candidates.map(\.id)).union(["none"]) else {
+            return .abstain("the local helper gave an incomplete ranking")
         }
         let ranked = candidates.sorted { (probabilities[$0.id] ?? 0) > (probabilities[$1.id] ?? 0) }
         guard let top = ranked.first, let topProbability = probabilities[top.id] else {
@@ -177,6 +189,7 @@ enum GroundingCascade {
     /// Step 5. One locate on the zoomed crop around `point`; its answer maps back to window fractions. The
     /// point is accepted only when `verify` (the hit-test name check) confirms it. Nil otherwise: no retry.
     static func secondLook(at point: CGPoint, locate: (CGRect) -> CGPoint?, verify: (CGPoint) -> Bool) -> CGPoint? {
+        guard (0..<1).contains(point.x), (0..<1).contains(point.y) else { return nil }
         let rect = zoomRect(around: point)
         guard let inside = locate(rect), (0...1).contains(inside.x), (0...1).contains(inside.y) else { return nil }
         let mapped = CGPoint(x: rect.minX + inside.x * rect.width, y: rect.minY + inside.y * rect.height)

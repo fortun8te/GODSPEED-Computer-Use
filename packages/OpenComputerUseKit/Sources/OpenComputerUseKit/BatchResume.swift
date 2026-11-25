@@ -14,7 +14,7 @@ enum BatchResume {
     }
 
     /// Argument keys whose value may be typed text or a secret. Each becomes a slot the caller supplies again.
-    static let slotKeys: [String] = ["text", "value"]
+    static let slotKeys: [String] = ["text", "value", "expected_value"]
 
     struct Stored: Codable, Sendable {
         let number: Int
@@ -36,13 +36,20 @@ enum BatchResume {
         var durationMs: Double? = nil
     }
 
+    /// Completion operators survive a restart; their values do not. Every
+    /// caller-supplied string is supplied again, including paths and labels.
+    struct Completion: Codable, Sendable {
+        let fixed: [String: String]
+        let slots: [String: String]
+    }
+
     struct Record: Codable, Sendable {
         let id: String
         let createdAt: Date
         let expiresAt: Date
         let app: String?
         let goal: String
-        /// JSON of the done_when argument, if the batch had one.
+        /// Legacy completion data. New records use `completion` without payloads.
         let doneWhen: Data?
         let windowID: UInt32?
         let processID: Int32?
@@ -56,8 +63,11 @@ enum BatchResume {
         var requiresFreshSteps: Bool? = nil
         var strictBackground: Bool? = nil
         var backgroundOnly: Bool? = nil
+        var completion: [Completion]? = nil
 
-        var slotNames: [String] { pending.flatMap { $0.slots.values }.sorted() }
+        var slotNames: [String] {
+            (pending.flatMap { $0.slots.values } + (completion ?? []).flatMap { $0.slots.values }).sorted()
+        }
     }
 
     /// Builds a checkpoint using the original target and step numbers.
@@ -65,12 +75,15 @@ enum BatchResume {
                        app: String?, windowID: UInt32?, processID: Int32?, now: Date = Date(),
                        originalWindowID: UInt32? = nil, browserTabs: [Int: Int] = [:],
                        requiresFreshSteps: Bool = false, continuing prior: Record? = nil) -> Record? {
-        guard prior == nil || prior?.pending.count == steps.count else { return nil }
+        guard prior == nil || prior?.pending.count == steps.count,
+              prior?.doneWhen == nil,
+              let completion = try? completionTemplate(doneWhen) else { return nil }
         var pending: [Stored] = []
         var sent = prior?.sent ?? []
         for (index, step) in steps.enumerated() {
             let number = prior?.pending[index].number ?? index + 1
-            if index < receipt.steps.count, receipt.steps[index].deliveryState != .notSent {
+            if index < receipt.steps.count,
+               receipt.steps[index].deliveryState != .notSent || receipt.steps[index].observation == .outcomeUnknown {
                 let result = receipt.steps[index]
                 let state: DeliveryState = result.observation == .outcomeUnknown ? .outcomeUnknown : result.deliveryState
                 let tab = step.tool == "browser"
@@ -86,29 +99,99 @@ enum BatchResume {
             pending.append(stored)
         }
         guard !pending.isEmpty || (receipt.stop != nil && !sent.isEmpty) else { return nil }
-        let doneData = doneWhen.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]) }
+        let privateValues = steps.flatMap { step -> [String] in
+            let normalized = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
+            return (slotKeys + ["values", "expected_values", "done_when"]).flatMap { strings(in: normalized[$0]) }
+        } + strings(in: doneWhen)
+        var savedGoal = prior?.goal ?? goal
+        for value in Set(privateValues).filter({ !$0.isEmpty }).sorted(by: { $0.count > $1.count }) {
+            savedGoal = savedGoal.replacingOccurrences(of: value, with: "[value omitted]")
+        }
         return Record(id: UUID().uuidString, createdAt: now, expiresAt: now.addingTimeInterval(lifetime),
-                      app: prior == nil ? app : prior?.app, goal: prior?.goal ?? goal, doneWhen: prior?.doneWhen ?? doneData,
+                      app: prior == nil ? app : prior?.app, goal: savedGoal, doneWhen: nil,
                       windowID: prior == nil ? windowID : prior?.windowID,
                       processID: prior == nil ? processID : prior?.processID,
                       total: prior?.total ?? steps.count, pending: pending, sent: sent.sorted { $0.number < $1.number },
                       originalWindowID: prior == nil ? originalWindowID : prior?.originalWindowID,
                       requiresFreshSteps: prior?.requiresFreshSteps ?? requiresFreshSteps,
-                      strictBackground: StrictBackground.enabled(), backgroundOnly: backgroundOnlyMode())
+                      strictBackground: StrictBackground.enabled(), backgroundOnly: backgroundOnlyMode(),
+                      completion: prior?.completion ?? completion)
+    }
+
+    private static func strings(in value: Any?) -> [String] {
+        if let string = value as? String { return [string] }
+        if let object = value as? [String: Any] { return object.values.flatMap { strings(in: $0) } }
+        if let array = value as? [Any] { return array.flatMap { strings(in: $0) } }
+        return []
+    }
+
+    private static func completionTemplate(_ raw: Any?) throws -> [Completion] {
+        // Validate the whole list first, including its entry limit. Canonicalize
+        // within each entry so multiple predicates remain grouped on resume.
+        _ = try DoneCheck.parse(raw)
+        guard let raw, !(raw is NSNull) else { return [] }
+        let entries = (raw as? [Any]) ?? [raw]
+        return try entries.enumerated().map { index, entry in
+            var arguments: [String: String] = [:]
+            for condition in try DoneCheck.parse(entry) {
+                arguments.merge(condition.arguments) { _, new in new }
+            }
+            let fixed = arguments.filter { $0.key == "since_start" }
+            let slots = Dictionary(uniqueKeysWithValues: arguments.keys.filter { $0 != "since_start" }.map {
+                ($0, "batch-done-\(index + 1)-\($0)")
+            })
+            return Completion(fixed: fixed, slots: slots)
+        }
+    }
+
+    /// Reconstruct the original predicate structure before preflight or claim.
+    /// An old payload-bearing checkpoint needs fresh instructions, never a
+    /// silently discarded completion check.
+    static func completionArguments(of record: Record, values: [String: Any]) throws -> [[String: String]]? {
+        guard record.doneWhen == nil else {
+            throw ComputerUseError.notSent("This checkpoint contains legacy completion values. Send the remaining steps with a fresh done_when check.")
+        }
+        guard let templates = record.completion, !templates.isEmpty else { return nil }
+        var missing: [String] = []
+        let arguments = templates.map { template in
+            var entry = template.fixed
+            for (key, slot) in template.slots {
+                guard let value = values[slot] as? String, key == "equals" || !value.isEmpty else {
+                    missing.append(slot)
+                    continue
+                }
+                entry[key] = value
+            }
+            return entry
+        }
+        guard missing.isEmpty else {
+            throw ComputerUseError.invalidArguments("Provide these completion values again to resume: \(missing.sorted().joined(separator: ", ")).")
+        }
+        _ = try DoneCheck.parse(arguments)
+        return arguments
     }
 
     static func stored(_ step: BatchTool.Step, number: Int, batchWindowID: UInt32?) -> Stored? {
         // Browser continuations require a fresh driver/tab inspection. Keep only
         // the operation number and explicit tab, never URLs or browser payloads.
+        // Batch parsing preserves several accepted argument aliases until dispatch.
+        // Normalize before removing private values, otherwise e.g. `content` or
+        // `newValue` survives on disk and bypasses the fresh-value slot on resume.
+        let normalized = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: nil)
         var arguments = step.tool == "browser"
-            ? step.arguments.filter { $0.key == "tab_id" } : step.arguments
+            ? normalized.filter { $0.key == "tab_id" } : normalized
         if step.tool != HandoffTool.name, let batchWindowID,
            (try? validatedQueryWindowID(arguments["window_id"])) == batchWindowID {
             arguments.removeValue(forKey: "window_id")
         }
         var slots: [String: String] = [:]
-        let privateKeys = step.tool == HandoffTool.name
-            ? slotKeys + ["values", "expected_values", "done_when"] : slotKeys
+        var privateKeys = slotKeys + ["values", "expected_values", "done_when"]
+        if step.tool == HandoffTool.name, let goal = arguments["goal"] as? String,
+           privateKeys.flatMap({ strings(in: arguments[$0]) }).contains(where: { !$0.isEmpty && goal.contains($0) }) {
+            // A handoff goal can repeat a value from its form payload. Supply
+            // that goal again rather than changing its action semantics.
+            privateKeys.append("goal")
+        }
         for key in privateKeys where arguments[key] != nil {
             arguments.removeValue(forKey: key)
             slots[key] = "step-\(number)-\(key)"
@@ -150,8 +233,22 @@ enum BatchResume {
                 || BatchTool.usesPositionalTargets([.init(tool: stored.tool, arguments: normalized)]) {
                 throw ComputerUseError.notSent("Resume step \(stored.number) uses a target tied to an old snapshot. Read the target and send the remaining steps with fresh targets.")
             }
-            var arguments = object
+            // Older checkpoints could retain a typed alias without a slot. Do
+            // not silently reuse that value after reconnecting or restarting.
+            if slotKeys.contains(where: { normalized[$0] != nil && stored.slots[$0] == nil }) {
+                throw ComputerUseError.notSent("Resume step \(stored.number) contains a saved value without a fresh-value slot. Send the remaining steps explicitly with current values.")
+            }
+            var arguments = normalized
             for (key, slot) in stored.slots { arguments[key] = values[slot] }
+            // Handoff resolves its own initial observation. Give it the original
+            // window explicitly, just like the native steps bound at dispatch.
+            // A front-window switch between preflight and dispatch must not move it.
+            if stored.tool == HandoffTool.name, let window = record.windowID ?? record.originalWindowID {
+                if let explicit = try validatedQueryWindowID(arguments["window_id"]), explicit != window {
+                    throw ComputerUseError.windowChanged(window)
+                }
+                arguments["window_id"] = window
+            }
             return BatchTool.Step(tool: stored.tool, arguments: arguments)
         }
     }
@@ -201,8 +298,17 @@ enum BatchResume {
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(id.uppercased() + ".json"))
     }
 
+    /// Cancellation or an expired request leaves the checkpoint available for a fresh request.
+    static func checkRequest(deadline: TimeInterval?) throws {
+        try RequestCancellation.check(delivery: .notSent)
+        if let deadline, !(ProcessInfo.processInfo.systemUptime < deadline) {
+            throw ComputerUseError.notSent("The resume request deadline elapsed. No remaining step was sent; the checkpoint is still available.")
+        }
+    }
+
     /// Claim after preflight. Moving the token keeps its receipts while preventing another run.
-    static func claim(_ id: String) throws {
+    static func claim(_ id: String, deadline: TimeInterval? = nil) throws {
+        try checkRequest(deadline: deadline)
         guard let uuid = UUID(uuidString: id) else {
             throw ComputerUseError.invalidArguments("RESUME_NOT_FOUND. The resume token is invalid.")
         }

@@ -119,6 +119,174 @@ final class BatchResumeTests: XCTestCase {
         XCTAssertEqual(resumed.last?.arguments["text"] as? String, "hunter2-secret")
     }
 
+    func testTypedAliasesAndCompareValuesRequireFreshSlots() throws {
+        let steps = [
+            BatchTool.Step(tool: "type_text", arguments: ["app": "Notes", "content": "private-body",
+                                                        "message": "unused-private-alias"]),
+            BatchTool.Step(tool: "set_value", arguments: ["app": "Notes", "label": "Name",
+                                                        "newValue": "private-new", "expected_value": "private-old"]),
+        ]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([], stop: .timeBudget, total: 2),
+            goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7))
+        let encoded = String(decoding: try JSONEncoder().encode(record), as: UTF8.self)
+        // Stored arguments are themselves Data in the record; inspect both layers.
+        XCTAssertFalse(encoded.contains("private-"))
+        XCTAssertTrue(record.pending.allSatisfy { !String(decoding: $0.arguments, as: UTF8.self).contains("private-") })
+        XCTAssertEqual(record.slotNames, ["step-1-text", "step-2-expected_value", "step-2-value"])
+        XCTAssertThrowsError(try BatchResume.steps(of: record, values: [:]))
+        let work = try BatchResume.steps(of: record, values: [
+            "step-1-text": "fresh body", "step-2-value": "fresh name", "step-2-expected_value": "fresh old name",
+        ])
+        XCTAssertEqual(work[0].arguments["text"] as? String, "fresh body")
+        XCTAssertNil(work[0].arguments["content"])
+        XCTAssertNil(work[0].arguments["message"])
+        XCTAssertEqual(work[1].arguments["value"] as? String, "fresh name")
+        XCTAssertEqual(work[1].arguments["expected_value"] as? String, "fresh old name")
+        XCTAssertNil(work[1].arguments["newValue"])
+        let legacy = BatchResume.Record(id: UUID().uuidString, createdAt: Date(), expiresAt: Date().addingTimeInterval(60),
+            app: "Notes", goal: "", doneWhen: nil, windowID: 42, processID: 7, total: 1,
+            pending: [.init(number: 1, tool: "type_text", arguments: Data(#"{"app":"Notes","content":"old-private-value"}"#.utf8), slots: [:])],
+            sent: [])
+        XCTAssertThrowsError(try BatchResume.steps(of: legacy, values: [:])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("fresh-value slot"))
+        }
+    }
+
+    func testBrowserTabAliasSurvivesWithoutItsPayload() throws {
+        let stored = try XCTUnwrap(BatchResume.stored(.init(tool: "browser", arguments: [
+            "action": "type", "tab": 42, "content": "private text", "url": "https://example.com/private",
+        ]), number: 1, batchWindowID: nil))
+        let arguments = try XCTUnwrap(JSONSerialization.jsonObject(with: stored.arguments) as? [String: Any])
+        XCTAssertEqual(arguments.count, 1)
+        XCTAssertEqual(arguments["tab_id"] as? Int, 42)
+    }
+
+    func testCompletionPayloadsAreSlottedWithoutLosingVerification() throws {
+        let secret = "private-completion-body"
+        let completion: [String: Any] = ["field": "Body", "equals": secret, "text": "Saved",
+                                          "unused": ["text": "private-ignored-metadata"]]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: [.init(tool: "set_value", arguments: ["app": "Notes", "label": "Body", "value": secret])],
+            receipt: receipt([], stop: .timeBudget, total: 1),
+            goal: "Fill Body with \(secret)", doneWhen: completion, app: "Notes", windowID: 42, processID: 7))
+        XCTAssertNil(record.doneWhen)
+        let json = String(decoding: try JSONEncoder().encode(record), as: UTF8.self)
+        XCTAssertFalse(json.contains(secret))
+        XCTAssertFalse(json.contains("private-ignored-metadata"))
+        XCTAssertFalse(record.goal.contains(secret))
+        XCTAssertEqual(record.slotNames, ["batch-done-1-equals", "batch-done-1-field", "batch-done-1-text", "step-1-value"])
+        let reply = BatchResume.replyLines(for: record).joined(separator: "\n")
+        XCTAssertTrue(reply.contains("batch-done-1-equals"))
+        XCTAssertThrowsError(try BatchResume.completionArguments(of: record, values: [:]))
+        XCTAssertThrowsError(try BatchResume.completionArguments(of: record, values: [
+            "batch-done-1-field": "Body", "batch-done-1-equals": secret,
+        ]), "A caller cannot omit one of the original completion predicates")
+        let restored = try BatchResume.completionArguments(of: record, values: [
+            "batch-done-1-field": "Body", "batch-done-1-equals": secret, "batch-done-1-text": "Saved",
+        ])
+        XCTAssertEqual(try DoneCheck.parse(restored), try DoneCheck.parse(completion))
+    }
+
+    func testCompletionTemplatesSurviveRepeatedResumeAndKeepTransitionOperator() throws {
+        let first = try XCTUnwrap(BatchResume.record(
+            steps: clicks(3), receipt: receipt([.acknowledged], stop: .timeBudget, total: 3),
+            goal: "Update note", doneWhen: ["field": "Body", "value": "changed text", "since_start": "changed"],
+            app: "Notes", windowID: 42, processID: 7))
+        let supplied = ["batch-done-1-field": "Body", "batch-done-1-equals": "changed text"]
+        let work = try BatchResume.steps(of: first, values: [:])
+        let restored = try BatchResume.completionArguments(of: first, values: supplied)
+        XCTAssertEqual(try DoneCheck.parse(restored), [.fieldChanged(label: "Body", equals: "changed text")])
+        let next = try XCTUnwrap(BatchResume.record(
+            steps: work, receipt: receipt([.acknowledged], stop: .timeBudget, total: 2),
+            goal: first.goal, doneWhen: restored, app: "Notes", windowID: 42, processID: 7, continuing: first))
+        XCTAssertNil(next.doneWhen)
+        XCTAssertEqual(next.slotNames, first.slotNames)
+        XCTAssertEqual(try DoneCheck.parse(BatchResume.completionArguments(of: next, values: supplied)),
+                       [.fieldChanged(label: "Body", equals: "changed text")])
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(next), as: UTF8.self).contains("changed text"))
+    }
+
+    func testLegacyCompletionRefusesBeforeClaimAndNestedHandoffValuesStayPrivate() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            let legacy = BatchResume.Record(id: UUID().uuidString, createdAt: Date(), expiresAt: Date().addingTimeInterval(60),
+                app: "NoSuchResumeApp", goal: "", doneWhen: Data(#"{"field":"Body","equals":"old-private-value"}"#.utf8),
+                windowID: 42, processID: 7, total: 1,
+                pending: [.init(number: 1, tool: "click", arguments: Data(#"{"label":"Next"}"#.utf8), slots: [:])], sent: [])
+            try BatchResume.save(legacy)
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": legacy.id])) { error in
+                XCTAssertTrue(error.localizedDescription.contains("legacy completion values"))
+            }
+            XCTAssertNoThrow(try BatchResume.load(legacy.id))
+        }
+        let stored = try XCTUnwrap(BatchResume.stored(.init(tool: HandoffTool.name, arguments: [
+            "app": "Notes", "goal": "Fill Body with private-body", "values": ["Body": "private-body"],
+            "expected_values": ["Body": "private-before"], "done_when": ["field": "Body", "equals": "private-body"],
+        ]), number: 1, batchWindowID: nil))
+        XCTAssertFalse(String(decoding: stored.arguments, as: UTF8.self).contains("private-"))
+        XCTAssertEqual(Set(stored.slots.keys), ["goal", "values", "expected_values", "done_when"])
+    }
+
+    func testUncertainObservationCannotBeDowngradedToPending() throws {
+        var stopped = receipt([.notSent], stop: .stepFailure, total: 2)
+        stopped.steps[0].observation = .outcomeUnknown
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: clicks(2), receipt: stopped, goal: "", doneWhen: nil,
+            app: "Notes", windowID: 42, processID: 7))
+        XCTAssertEqual(record.pending.map(\.number), [2])
+        XCTAssertEqual(record.sent.map(\.state), [.outcomeUnknown])
+        XCTAssertTrue(BatchResume.replyLines(for: record).contains("Inspect the uncertain step before sending any remaining actions."))
+    }
+
+    func testPendingHandoffKeepsOriginalWindowAfterUnpinnedBatch() throws {
+        func checkpoint(window: UInt32?) throws -> BatchResume.Record {
+            var arguments: [String: Any] = ["app": "Notes", "goal": "Click Next"]
+            if let window { arguments["window_id"] = window }
+            return try XCTUnwrap(BatchResume.record(
+                steps: [.init(tool: HandoffTool.name, arguments: arguments)],
+                receipt: receipt([], stop: .timeBudget, total: 1),
+                goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42))
+        }
+        let work = try BatchResume.steps(of: checkpoint(window: nil), values: [:])
+        XCTAssertEqual(try validatedQueryWindowID(work[0].arguments["window_id"]), 42)
+        XCTAssertThrowsError(try BatchResume.steps(of: checkpoint(window: 43), values: [:])) { error in
+            guard case ComputerUseError.windowChanged(42, _) = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testCancelledOrExpiredResumeKeepsTokenUnclaimed() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: clicks(2), receipt: receipt([.acknowledged], stop: .timeBudget, total: 2),
+                goal: "", doneWhen: nil, app: "NoSuchResumeApp", windowID: 42, processID: 7))
+            try BatchResume.save(record)
+            let cancellation = RequestCancellation()
+            cancellation.cancel()
+            RequestCancellation.$current.withValue(cancellation) {
+                XCTAssertThrowsError(try BatchResume.claim(record.id)) { error in
+                    XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+                }
+                XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": record.id])) { error in
+                    XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .notSent)
+                }
+            }
+            let deadline = ProcessInfo.processInfo.systemUptime - 1
+            XCTAssertThrowsError(try BatchResume.claim(record.id, deadline: deadline)) { error in
+                XCTAssertTrue(error.localizedDescription.contains("deadline elapsed"))
+            }
+            XCTAssertThrowsError(try dispatcher().runBatch(arguments: ["resume": record.id], inheritedDeadline: deadline)) { error in
+                XCTAssertTrue(error.localizedDescription.contains("deadline elapsed"))
+            }
+            XCTAssertEqual(try BatchResume.load(record.id).id, record.id)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent(record.id + ".claimed.json").path))
+            XCTAssertNoThrow(try BatchResume.claim(record.id))
+        }
+    }
+
     func testPerStepWindowSurvivesAnUnpinnedBatchResume() throws {
         let steps = [BatchTool.Step(tool: "click", arguments: ["app": "Notes", "window_id": 42, "label": "Save"])]
         let record = try XCTUnwrap(BatchResume.record(

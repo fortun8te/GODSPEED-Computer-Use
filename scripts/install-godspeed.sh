@@ -61,6 +61,11 @@ ditto -x -k "$download_dir/$archive" "$staging"
 app="$staging/GODSPEED.app"
 binary="$app/Contents/MacOS/OpenComputerUse"
 [[ -x "$binary" && -x "$staging/godspeed-mcp" ]] || fail "The package is missing the app or MCP launcher."
+# Old archives have no settings launcher. A new but incomplete one must fail before replacing
+# the installed app, instead of silently losing the terminal menu during the update.
+if [[ -e "$staging/godspeed" ]]; then
+  [[ -f "$staging/godspeed" && -x "$staging/godspeed" ]] || fail "The settings launcher is not an executable file."
+fi
 [[ "$(lipo -archs "$binary")" == arm64 ]] || fail "The package is not an arm64 build."
 codesign --verify --strict --deep "$app"
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" == "$verify_version" ]]   || fail "The package version does not match the release."
@@ -95,7 +100,12 @@ if [[ -x "$staging/godspeed" ]]; then
     cp -p "$settings_launcher" "$previous"
   fi
   install -m 755 "$staging/godspeed" "$settings_launcher"
-  printf 'Settings launcher %s\\n' "$settings_launcher"
+  printf 'Settings launcher %s\n' "$settings_launcher"
+  if [[ "$app_dir" == "$HOME/Applications" || "$app_dir" == /Applications ]]; then
+    printf 'Configure preferences: %q settings\n' "$settings_launcher"
+  else
+    printf 'Configure preferences: GODSPEED_APP=%q %q settings\n' "$target" "$settings_launcher"
+  fi
 fi
 printf 'Installed %s\nMCP launcher %s\n' "$target" "$launcher"
 if [[ -n "$backup" ]]; then printf 'Previous app saved under %s\n' "$backup"; fi

@@ -38,7 +38,9 @@ public final class StdioMCPServer {
         self.service = dispatcher.service
         self.dispatcher = dispatcher
         self.backgroundStateReset = backgroundStateReset
-        self.trajectory = TrajectoryLog(environment: trajectoryEnvironment ?? GodspeedSettings.environment)
+        // App-agent callers supply a raw per-connection environment. Fill saved preferences
+        // underneath it too, so the terminal's telemetry switch applies to proxied sessions.
+        self.trajectory = TrajectoryLog(environment: GodspeedSettings.merged(trajectoryEnvironment ?? RequestConfiguration.environment))
     }
 
     public func run() throws {

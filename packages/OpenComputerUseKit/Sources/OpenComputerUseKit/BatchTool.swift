@@ -597,6 +597,7 @@ extension ComputerUseToolDispatcher {
         guard arguments["steps"] == nil, arguments["app"] == nil, arguments["window_id"] == nil else {
             throw ComputerUseError.invalidArguments("A resume takes its steps, app and window from the stopped batch. Send only resume, plus values if the batch needs them.")
         }
+        try BatchResume.checkRequest(deadline: inheritedDeadline)
         let record = try BatchResume.load(token)
         if record.sent.contains(where: { $0.state == .outcomeUnknown }) {
             throw ComputerUseError.notSent("Inspect the saved step with uncertain delivery in the app, then send the remaining steps explicitly.")
@@ -606,13 +607,15 @@ extension ComputerUseToolDispatcher {
               !record.sent.contains(where: { $0.tool == "browser" }) else {
             throw ComputerUseError.notSent("Read the target again and send the remaining steps explicitly; this token has no native window binding.")
         }
+        let resumedValues = arguments["values"] as? [String: Any] ?? [:]
+        let resumedCompletion = try BatchResume.completionArguments(of: record, values: resumedValues)
         let strict = StrictBackground.enabled() || record.strictBackground == true
         let background = backgroundOnlyMode() || record.backgroundOnly == true
         return try BackgroundContinuation.$required.withValue(background) {
             try StrictBackground.$requested.withValue(strict) {
                 let live = BatchResume.liveState(app: record.app, windowID: record.windowID)
                 try BatchResume.check(record, now: Date(), liveProcessID: live.processID, liveWindowID: live.windowID)
-                let steps = try BatchResume.steps(of: record, values: arguments["values"] as? [String: Any] ?? [:])
+                let steps = try BatchResume.steps(of: record, values: resumedValues)
                 for step in steps {
                     let normalized = ArgumentNormalizer.normalize(tool: step.tool, arguments: step.arguments, lastApp: app)
                     if let window = try validatedQueryWindowID(normalized["window_id"]), window != live.windowID {
@@ -636,11 +639,11 @@ extension ComputerUseToolDispatcher {
                 }
                 let afterRead = BatchResume.liveState(app: app, windowID: record.windowID)
                 try BatchResume.check(record, now: Date(), liveProcessID: afterRead.processID, liveWindowID: afterRead.windowID)
-                try BatchResume.claim(token)
+                try BatchResume.claim(token, deadline: inheritedDeadline)
                 var planArguments: [String: Any] = ["goal": record.goal, "remember": false]
                 if let app = record.app { planArguments["app"] = app }
                 if let windowID = record.windowID { planArguments["window_id"] = NSNumber(value: windowID) }
-                if let doneWhen = record.doneWhen { planArguments["done_when"] = try? JSONSerialization.jsonObject(with: doneWhen, options: [.fragmentsAllowed]) }
+                if let resumedCompletion { planArguments["done_when"] = resumedCompletion }
                 for key in ["screenshot", "compact", "effects", "return_state"] { planArguments[key] = arguments[key] }
                 return try OperationJournal.withBatchGoal(record.goal) {
                     try runBatchPlan(arguments: planArguments, inheritedDeadline: inheritedDeadline,
@@ -1249,7 +1252,7 @@ extension ComputerUseToolDispatcher {
                 && (isLastStep || ((step.arguments["action"] as? String) == "click" && nextReadsBrowser))
             var stepArguments = step.arguments
             if let originalWindow = resumed?.record.originalWindowID,
-               ArgumentNormalizer.windowBoundTools.contains(step.tool) {
+               ArgumentNormalizer.windowBoundTools.contains(step.tool) || step.tool == HandoffTool.name {
                 stepArguments["window_id"] = originalWindow
             }
             if isLastStep, step.tool == "get_app_state", wantsScreenshot {
@@ -1267,6 +1270,10 @@ extension ComputerUseToolDispatcher {
             // Observe the app before a mutating step, so its notifications are not missed.
             let actionPid = isMutating ? stepApp.flatMap(BatchTool.runningPid) : nil
             if let actionPid { AXChangeMonitor.shared.track(actionPid) }
+            // Preparing a private baseline or resolving an app can consume the
+            // remaining budget. Recheck immediately before native dispatch too;
+            // BrowserCallBudget is not enforced by every native action route.
+            if stopIfCancelled() || stopIfOutOfTime(before: number) { break }
             let result = BrowserCallBudget.withDeadline(actionDeadline) {
                 Self.$defersBrowserNavigationObservation.withValue(defersNavigationRead) {
                     Self.$clipsBrowserStepObservation.withValue(step.tool == "browser" && !isLastStep) {

@@ -55,7 +55,6 @@ final class RequestCancellationTests: XCTestCase {
                 guard let id = options.first?.id else { return nil }
                 return ["none": 0, id: 1]
             },
-            looksStuck: { _, _, _ in false },
             check: { _ in .missing(unmet: ["Finished"]) },
             replay: { _ in nil },
             now: { ProcessInfo.processInfo.systemUptime }

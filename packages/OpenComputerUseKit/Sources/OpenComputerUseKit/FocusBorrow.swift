@@ -198,19 +198,24 @@ final class FocusBorrowController: @unchecked Sendable {
     /// Opens a borrow of `pid`: the first borrow records the app in front, then `pid` is brought forward.
     func acquire(pid: pid_t) -> Lease {
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        let initialFront = activator.frontmostPID()
         let needsActivation: Bool = lock.withLock {
             if activePIDs.isEmpty {
-                let front = activator.frontmostPID()
+                let front = initialFront
                 restorePID = (front == nil || front == pid || front == ownPID) ? nil : front
             }
             activePIDs.append(pid)
-            return activator.frontmostPID() != pid
+            return initialFront != pid
         }
         // Not in the middle of a word: wait for a short pause in the user's typing before taking focus. If the
         // user is still typing when the wait ends, focus is not taken at all; the steps then run in the background.
         var activated = true
         if needsActivation {
-            activated = activator.waitForTypingPause() && activator.activate(pid: pid)
+            // The pause check may yield. A user switching apps in that interval owns the new
+            // foreground; do not activate over it using the stale admission observation.
+            activated = activator.waitForTypingPause()
+                && activator.frontmostPID() == initialFront
+                && activator.activate(pid: pid)
         }
         let lease = Lease(pid: pid, activated: activated)
         if !activated { release(lease) }
@@ -241,11 +246,13 @@ final class FocusBorrowController: @unchecked Sendable {
         case .none:
             break
         case .handOver(let pid):
-            if activator.isAlive(pid: pid) { _ = activator.activate(pid: pid) }
+            if activator.isAlive(pid: pid), activator.waitForTypingPause(),
+               activator.frontmostPID() == lease.pid { _ = activator.activate(pid: pid) }
         case .restore(let previous):
             // Restore only if this app is still the one in front (otherwise the user moved on by themselves), and
             // only once the user has paused: taking focus mid-sentence would send their keys to the other app.
-            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid, awaitTypingPause() {
+            if activator.isAlive(pid: previous), activator.frontmostPID() == lease.pid, awaitTypingPause(),
+               activator.frontmostPID() == lease.pid {
                 _ = activator.activate(pid: previous)
             }
         }
@@ -314,12 +321,15 @@ struct UnhiddenAppLedger {
     }
 
     /// Ends the record for `pid`. True when the app should be hidden again: this process unhid it and the user did not hide it since.
-    mutating func takeRehideNeeded(pid: pid_t) -> Bool {
+    mutating func takeRehideNeeded(pid: pid_t, frontmostPID: pid_t? = nil) -> Bool {
         guard unhidden.remove(pid) != nil else {
             hiddenByUser.remove(pid)
             return false
         }
-        return hiddenByUser.remove(pid) == nil
+        let wasHiddenByUser = hiddenByUser.remove(pid) != nil
+        // If restoration was skipped because the user is working in this app, re-hiding it
+        // would take away that same foreground indirectly. End the ledger entry either way.
+        return !wasHiddenByUser && frontmostPID != pid
     }
 }
 
@@ -358,6 +368,10 @@ final class WorkspaceFocusActivator: FocusActivating {
 
     private var hideObserver: NSObjectProtocol?
 
+    deinit {
+        if let hideObserver { NSWorkspace.shared.notificationCenter.removeObserver(hideObserver) }
+    }
+
     func frontmostPID() -> pid_t? {
         NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
@@ -377,9 +391,11 @@ final class WorkspaceFocusActivator: FocusActivating {
     }
 
     func restoreVisibility(pid: pid_t) {
-        guard unhiddenLock.withLock({ unhiddenLedger.takeRehideNeeded(pid: pid) }),
+        guard unhiddenLock.withLock({ unhiddenLedger.takeRehideNeeded(pid: pid, frontmostPID: frontmostPID()) }),
               let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
-        Self.onMain { app.hide() }
+        Self.onMain {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { app.hide() }
+        }
     }
 
     func activate(pid: pid_t) -> Bool {
@@ -445,9 +461,14 @@ extension FocusBorrowController {
     /// How long the user must have been hands-off (no key, click, scroll or mouse move) before focus may be
     /// taken. Taking focus while the user worked put their keys into the borrowed app and raised windows in
     /// front of them. `OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S` overrides it (a benchmark on an unattended Mac).
-    static let userIdleNeeded: TimeInterval = {
-        GodspeedSettings.environment["OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S"].flatMap(Double.init) ?? 4
-    }()
+    static var userIdleNeeded: TimeInterval { idleThreshold(environment: GodspeedSettings.environment) }
+
+    static func idleThreshold(environment: [String: String]) -> TimeInterval {
+        guard let raw = environment["OPEN_COMPUTER_USE_IDLE_BEFORE_FOREGROUND_S"],
+              let seconds = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              seconds.isFinite, seconds >= 0 else { return 4 }
+        return seconds
+    }
 
     /// Seconds since the user's last real input (`hidSystemState`; events this process posts do not count).
     /// Set by tests so they do not depend on whether someone is using the Mac while they run.
