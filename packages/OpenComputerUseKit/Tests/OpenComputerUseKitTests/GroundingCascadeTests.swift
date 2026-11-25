@@ -198,6 +198,26 @@ final class GroundingCascadeTests: XCTestCase {
                                                  width: 101, height: 99))
     }
 
+    func testDuplicateExactNamesAreOfferedWithoutRanking() {
+        let candidates = options(["Open", "Open", "Other"])
+        let decision = GroundingCascade.resolve(label: "Open", options: candidates) { _ in
+            XCTFail("ambiguous exact targets must not be ranked into an action")
+            return nil
+        }
+        XCTAssertEqual(decision, .offer(ids: ["1", "2"]))
+    }
+
+    func testInvalidRankingAndStrongNonePreventAction() {
+        let invalid = GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in
+            ["1": 1.2, "2": 0.1, "none": 0.0]
+        }
+        XCTAssertEqual(invalid, .abstain("the local helper gave invalid probabilities"))
+        let uncertain = GroundingCascade.resolve(label: "Sav", options: threeNames) { _ in
+            ["1": 0.71, "2": 0.02, "none": 0.69]
+        }
+        XCTAssertEqual(uncertain, .abstain("the top choice does not lead by 0.35"))
+    }
+
     func testZoomProvenanceIsNamedInTheLearningLog() {
         XCTAssertEqual(VisionFallback.evidenceName(.ocr), "ocr")
         XCTAssertEqual(VisionFallback.evidenceName(.model), "model")
