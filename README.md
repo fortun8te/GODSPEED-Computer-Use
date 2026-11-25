@@ -1,5 +1,7 @@
 <p align="center"><img src="assets/app-icons/godspeed-1024.png" width="88" alt="Godspeed's red glass cursor icon"></p>
-# Godspeed · Background computer use for macOS
+# Godspeed — Computer Use
+
+**Fast, background-native computer use for AI agents on macOS.**
 
 Godspeed is an open-source Model Context Protocol (MCP) server for Mac app and Chrome automation. Codex, Claude Code, and other local MCP clients can read controls, run actions in the background, and verify the result. Godspeed draws its own cursor so your physical pointer stays free on supported background routes.
 
