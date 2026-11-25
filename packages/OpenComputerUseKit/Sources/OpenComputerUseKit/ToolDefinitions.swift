@@ -297,6 +297,7 @@ public enum ToolDefinitions {
                     "label": labelProperty(),
                     "element_index": stringProperty(description: "Element number"),
                     "ref": nativeElementRefProperty(),
+                    "visual_snapshot": stringProperty(description: "Optional token from visual search. Requires window_id and x/y; rejects changed screenshots."),
                     "x": numberProperty(description: "X pixel from a screenshot"),
                     "y": numberProperty(description: "Y pixel from a screenshot"),
                     "click_count": integerProperty(description: "1 to 32, default 1. sky_click allows 1 or 2."),
@@ -573,6 +574,7 @@ public enum ToolDefinitions {
             inputSchema: objectSchema(
                 properties: [
                     "window_id": observedWindowIDProperty(),
+                    "visual_snapshot": stringProperty(description: "Optional token from visual search. Requires window_id and explicit pixel endpoints; rejects changed screenshots."),
                     "app": stringProperty(description: "App name or bundle identifier"),
                     "from_label": stringProperty(description: "Source control label."),
                     "from_index": integerProperty(description: "Source control reference."),
