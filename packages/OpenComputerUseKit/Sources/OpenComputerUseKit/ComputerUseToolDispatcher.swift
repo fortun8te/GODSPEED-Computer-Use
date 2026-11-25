@@ -118,6 +118,7 @@ public final class ComputerUseToolDispatcher {
         name: String, arguments: [String: Any], ref: String?, log: SmartLog, notesInResult: Bool,
         beforeNativeDispatch: (() -> Void)?
     ) throws -> ToolCallResult {
+        let visualToken = try VisualSearch.actionToken(tool: name, arguments: arguments)
         let hasWindowPin = arguments["window_id"] != nil && name != "query" && name != "get_app_state"
             && name != BatchTool.name && name != HandoffTool.name
         if ref != nil || hasWindowPin {
@@ -140,6 +141,9 @@ public final class ComputerUseToolDispatcher {
             let result = try autoreleasepool {
                 try ComputerUseService.$requiredWindowID.withValue(windowID) {
                     try authorizeNativeAction(name: name, arguments: boundArguments)
+                    if let visualToken {
+                        try service.validateVisualSnapshot(app: app, token: visualToken, windowID: windowID)
+                    }
                     return try ComputerUseService.$requiredRefGeneration.withValue(target?.generation) {
                         try dispatchTool(name: name, arguments: boundArguments, log: log)
                     }
