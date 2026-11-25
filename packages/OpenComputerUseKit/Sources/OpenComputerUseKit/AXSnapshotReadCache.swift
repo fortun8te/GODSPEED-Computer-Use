@@ -55,8 +55,15 @@ final class AXSnapshotReadCache: NSObject {
     func value(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
         let key = ElementKey(element: element)
         if prefetched.insert(key).inserted { attributes[key] = batch(element) }
-        if (name == "AXValue" || name == "AXSelectedText"),
-           isSecureTextField(subrole: value(element, "AXSubrole") as? String) { return nil }
+        if name == "AXValue" || name == "AXSelectedText" {
+            _ = value(element, "AXSubrole")
+            // A transient classification failure is not evidence of an ordinary
+            // field. Leave it retryable, but do not fetch text until it resolves.
+            guard let classification = attributes[key]?["AXSubrole"] else { return nil }
+            if case .value(let raw) = classification {
+                guard let subrole = raw as? String, !isSecureTextField(subrole: subrole) else { return nil }
+            }
+        }
         if let cached = attributes[key]?[name] { return cached.value }
         let (error, value) = single(element, name)
         if error == .success, let value { attributes[key, default: [:]][name] = .value(value); return value }

@@ -3,6 +3,47 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
+/// Tracks one synchronous input sequence. Check immediately before each new
+/// event, after any window/focus validation that may have used the request's
+/// remaining time. Matching releases are cleanup and deliberately bypass this.
+final class NativeInputDelivery {
+    private(set) var state: DeliveryState = .notSent
+    private let remaining: () -> TimeInterval?
+
+    init(remaining: @escaping () -> TimeInterval? = { BrowserCallBudget.activeRemaining }) {
+        self.remaining = remaining
+    }
+
+    func check() throws {
+        try RequestCancellation.check(delivery: state)
+        if let remaining = remaining(), !(remaining > 0) {
+            let detail = state == .notSent
+                ? "Nothing was sent."
+                : "Some input was sent. Inspect the app before repeating the action."
+            throw ComputerUseError.timedOut("The input time budget ended. \(detail)", delivery: state)
+        }
+    }
+
+    func didPost() { state = .outcomeUnknown }
+
+    /// A later validation can know its own step was not sent without proving
+    /// that the earlier part of this gesture was not sent. Keep that evidence.
+    func failure(_ error: Error) -> Error {
+        if error is RequestCancellation.Cancelled {
+            return RequestCancellation.Cancelled(deliveryState: state)
+        }
+        if case ComputerUseError.timedOut(let message, _) = error {
+            return ComputerUseError.timedOut(message, delivery: state)
+        }
+        if state != .notSent, ToolCallResult.delivery(of: error) == .notSent {
+            return ComputerUseError.stateUnavailable(
+                "Input was sent before a later step stopped. Inspect the app before repeating. Later step: \(error.localizedDescription)"
+            )
+        }
+        return error
+    }
+}
+
 enum MouseButtonKind: String {
     case left
     case right
@@ -56,29 +97,33 @@ enum InputSimulation {
     }
 
     static func clickGlobally(at point: CGPoint, button: MouseButtonKind, clickCount: Int) throws {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw ComputerUseError.message("Failed to create HID event source.")
         }
 
         for _ in 0..<max(clickCount, 1) {
-            try postMouseEvent(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount)
+            try postMouseEvent(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, delivery: delivery)
             let release = try mouseRelease(source: source, point: point, button: button, clickState: clickCount)
             try withPressedMouseButton(press: {
-                try postMouseEvent(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount)
+                try postMouseEvent(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, delivery: delivery)
             }, release: { postPreparedRelease(release) }) {}
         }
     }
 
     static func clickTargeted(at point: CGPoint, button: MouseButtonKind, clickCount: Int, pid: pid_t) throws {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             throw ComputerUseError.message("Failed to create app-post event source.")
         }
 
         for _ in 0..<max(clickCount, 1) {
-            try postMouseEventToPid(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
+            try postMouseEventToPid(type: .mouseMoved, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid, delivery: delivery)
             let release = try mouseRelease(source: source, point: point, button: button, clickState: clickCount)
             try withPressedMouseButton(press: {
-                try postMouseEventToPid(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid)
+                try postMouseEventToPid(type: button.downEvent, source: source, point: point, button: button.cgButton, clickState: clickCount, pid: pid, delivery: delivery)
             }, release: { postPreparedRelease(release, pid: pid) }) {}
         }
     }
@@ -120,18 +165,23 @@ enum InputSimulation {
     }
 
     static func scrollTargeted(at point: CGPoint, direction: String, pages: Double, pid: pid_t) throws {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         try requireUsableComputerUseSession()
         guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: wheel1(direction: direction, pages: pages), wheel2: wheel2(direction: direction, pages: pages), wheel3: 0) else {
             throw ComputerUseError.message("Failed to create scroll event.")
         }
 
         event.location = point
+        try delivery.check()
         event.postToPid(pid)
         // Delivery gap only; the read-back waits for the window to settle (pauseBeforeReadBack).
         Thread.sleep(forTimeInterval: 0.02)
     }
 
     static func scrollGlobally(at point: CGPoint, direction: String, pages: Double) throws {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         try requireUsableComputerUseSession()
         guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: wheel1(direction: direction, pages: pages), wheel2: wheel2(direction: direction, pages: pages), wheel3: 0) else {
             throw ComputerUseError.message("Failed to create scroll event.")
@@ -139,6 +189,7 @@ enum InputSimulation {
 
         event.location = point
         try requireUserHandsOff()
+        try delivery.check()
         event.post(tap: .cghidEventTap)
         Thread.sleep(forTimeInterval: 0.02)
     }
@@ -174,12 +225,14 @@ enum InputSimulation {
     }
 
     static func dragGlobally(from start: CGPoint, to end: CGPoint, flags: CGEventFlags = []) throws {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         let gesture = dragGestureEventNumber()
         let release = try mouseRelease(source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture)
         release.flags = flags
-        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1, flags: flags)
+        try postMouseEvent(type: .mouseMoved, source: nil, point: start, button: .left, clickState: 1, flags: flags, delivery: delivery)
         try withPressedMouseButton(press: {
-            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, flags: flags)
+            try postMouseEvent(type: .leftMouseDown, source: nil, point: start, button: .left, clickState: 1, eventNumber: gesture, flags: flags, delivery: delivery)
         }, release: { postPreparedRelease(release) }) {
             Thread.sleep(forTimeInterval: 0.05)
             var previous = start
@@ -188,7 +241,7 @@ enum InputSimulation {
                 let progress = CGFloat(step) / CGFloat(steps)
                 let point = CGPoint(x: start.x + ((end.x - start.x) * progress), y: start.y + ((end.y - start.y) * progress))
                 let delta = CGSize(width: point.x - previous.x, height: point.y - previous.y)
-                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture, flags: flags)
+                try postMouseEvent(type: .leftMouseDragged, source: nil, point: point, button: .left, clickState: 1, delta: delta, eventNumber: gesture, flags: flags, delivery: delivery)
                 previous = point
                 release.location = point
             }
@@ -197,17 +250,28 @@ enum InputSimulation {
 
     /// Posts one keyboard event. `authenticated` attaches the SkyLight authentication
     /// envelope (Chromium/Electron on macOS 14+); command chords never carry it.
-    private static func postKeyEvent(_ event: CGEvent, pid: pid_t, authenticated: Bool) throws {
+    private static func postKeyEvent(_ event: CGEvent, pid: pid_t, authenticated: Bool, delivery: NativeInputDelivery) throws {
         if keyEventUsesAuthentication(flags: event.flags, authenticated: authenticated) {
-            try SkyLightSPI.shared.postKeyToPid(event, pid: pid, authenticated: true)
+            try SkyLightSPI.shared.postKeyToPid(event, pid: pid, authenticated: true, delivery: delivery)
+        } else {
+            try delivery.check()
+            event.postToPid(pid)
+        }
+    }
+
+    private static func releaseKeyEvent(_ event: CGEvent, pid: pid_t, authenticated: Bool) {
+        event.timestamp = DispatchTime.now().uptimeNanoseconds
+        if keyEventUsesAuthentication(flags: event.flags, authenticated: authenticated) {
+            SkyLightSPI.shared.releaseKeyToPid(event, pid: pid, authenticated: true)
         } else {
             event.postToPid(pid)
         }
     }
 
-    static func typeText(_ text: String, pid: pid_t, authenticated: Bool = false) throws {
+    static func typeText(_ text: String, pid: pid_t, authenticated: Bool = false,
+                         delivery: NativeInputDelivery = NativeInputDelivery()) throws {
         for chunk in keyboardUnicodeChunks(for: text) {
-            try RequestCancellation.check()
+            try delivery.check()
             try requireUsableComputerUseSession()
             var mutableChunk = chunk
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
@@ -227,8 +291,13 @@ enum InputSimulation {
             // drop the authentication envelope).
             down.flags = []
             up.flags = []
-            try postKeyEvent(down, pid: pid, authenticated: authenticated)
-            try postKeyEvent(up, pid: pid, authenticated: authenticated)
+            try delivery.check()
+            down.timestamp = DispatchTime.now().uptimeNanoseconds
+            try postKeyEvent(down, pid: pid, authenticated: authenticated, delivery: delivery)
+            delivery.didPost()
+            // A session transition after key-down cannot suppress its key-up.
+            releaseKeyEvent(up, pid: pid, authenticated: authenticated)
+            try delivery.check()
             if InputTiming.typeChunkDelay > 0 {
                 Thread.sleep(forTimeInterval: InputTiming.typeChunkDelay)
             }
@@ -260,8 +329,10 @@ enum InputSimulation {
 
     /// Build every release before sending any input. On failure only release keys that went down.
     static func deliverHeldKey(_ parsed: ParsedKeyPress, hold: TimeInterval,
-                               validate: () throws -> Void, post: (CGEvent) -> Void, release: (CGEvent) -> Void,
+                               validate: () throws -> Void, post: (CGEvent) throws -> Void, release: (CGEvent) -> Void,
+                               delivery: NativeInputDelivery = NativeInputDelivery(),
                                pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws {
+        try delivery.check()
         var flags: CGEventFlags = []
         let modifiers = try parsed.modifiers.map { modifier -> (CGEvent, CGEvent) in
             flags.insert(modifier.flag)
@@ -280,15 +351,24 @@ enum InputSimulation {
         }
         do {
             for (down, up) in pairs {
+                try delivery.check()
                 try validate()
+                try delivery.check()
                 down.timestamp = DispatchTime.now().uptimeNanoseconds
-                post(down)
+                try post(down)
+                delivery.didPost()
                 pressed.append(up)
             }
+            try delivery.check()
             if hold > 0 { pause(hold) }
             try validate()
+            try delivery.check()
+        } catch is RequestCancellation.Cancelled {
+            throw RequestCancellation.Cancelled(deliveryState: delivery.state)
+        } catch ComputerUseError.timedOut(let message, _) {
+            throw ComputerUseError.timedOut(message, delivery: delivery.state)
         } catch {
-            if !pressed.isEmpty {
+            if delivery.state != .notSent {
                 throw ComputerUseError.stateUnavailable("Focus changed during the held key. Inspect the app before repeating.")
             }
             throw error
@@ -305,63 +385,15 @@ enum InputSimulation {
         return (down, up)
     }
 
-    static func pressKey(_ specification: String, pid: pid_t, authenticated: Bool = false) throws {
-        try requireUsableComputerUseSession()
+    static func pressKey(_ specification: String, pid: pid_t, authenticated: Bool = false,
+                         delivery: NativeInputDelivery = NativeInputDelivery()) throws {
         let parsed = try KeyPressParser.parse(specification)
-        var activeFlags: CGEventFlags = []
-        var pressed: [ParsedKeyPress.Modifier] = []
-        // A failure after a modifier went down must not leave it held in the target app.
-        func releasePressed() {
-            for modifier in pressed.reversed() {
-                guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: false) else { continue }
-                event.flags = activeFlags
-                if keyEventUsesAuthentication(flags: event.flags, authenticated: authenticated) {
-                    _ = try? SkyLightSPI.shared.postKeyToPid(event, pid: pid, authenticated: true)
-                } else {
-                    event.postToPid(pid)
-                }
-                activeFlags.remove(modifier.flag)
-            }
-            pressed.removeAll()
-        }
-
-        do {
-            for modifier in parsed.modifiers {
-                guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: true) else {
-                    throw ComputerUseError.message("Failed to create modifier key down event.")
-                }
-
-                activeFlags.insert(modifier.flag)
-                event.flags = activeFlags
-                pressed.append(modifier)
-                try postKeyEvent(event, pid: pid, authenticated: authenticated)
-            }
-
-            guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true),
-                  let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: false) else {
-                throw ComputerUseError.message("Failed to create key event.")
-            }
-
-            keyDown.flags = activeFlags
-            keyUp.flags = activeFlags
-            try postKeyEvent(keyDown, pid: pid, authenticated: authenticated)
-            try postKeyEvent(keyUp, pid: pid, authenticated: authenticated)
-        } catch {
-            releasePressed()
-            throw error
-        }
-
-        for modifier in parsed.modifiers.reversed() {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: modifier.keyCode, keyDown: false) else {
-                releasePressed()
-                throw ComputerUseError.message("Failed to create modifier key up event.")
-            }
-
-            event.flags = activeFlags
-            try postKeyEvent(event, pid: pid, authenticated: authenticated)
-            activeFlags.remove(modifier.flag)
-            pressed.removeAll { $0.keyCode == modifier.keyCode }
-        }
+        let chordAuthentication = keyChordUsesAuthentication(parsed, authenticated: authenticated)
+        try deliverHeldKey(parsed, hold: 0,
+                           validate: { try requireUsableComputerUseSession() },
+                           post: { try postKeyEvent($0, pid: pid, authenticated: chordAuthentication, delivery: delivery) },
+                           release: { releaseKeyEvent($0, pid: pid, authenticated: chordAuthentication) },
+                           delivery: delivery)
 
         if InputTiming.pressKeySettle > 0 {
             Thread.sleep(forTimeInterval: InputTiming.pressKeySettle)
@@ -374,7 +406,9 @@ enum InputSimulation {
             || type == .leftMouseDragged
     }
 
-    private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, flags: CGEventFlags? = nil) throws {
+    private static func postMouseEvent(type: CGEventType, source: CGEventSource?, point: CGPoint, button: CGMouseButton, clickState: Int, delta: CGSize? = nil, eventNumber: Int64? = nil, flags: CGEventFlags? = nil,
+                                       delivery: NativeInputDelivery) throws {
+        try delivery.check()
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
             throw ComputerUseError.message("Failed to create mouse event \(type.rawValue).")
@@ -388,7 +422,9 @@ enum InputSimulation {
         if needsHandsOff(type) {
             try requireUserHandsOff()
         }
+        try delivery.check()
         event.post(tap: .cghidEventTap)
+        delivery.didPost()
         Thread.sleep(forTimeInterval: 0.03)
     }
 
@@ -434,14 +470,18 @@ enum InputSimulation {
         return min(max(Int((distance / 4).rounded(.up)), 10), 60)
     }
 
-    private static func postMouseEventToPid(type: CGEventType, source: CGEventSource, point: CGPoint, button: CGMouseButton, clickState: Int, pid: pid_t) throws {
+    private static func postMouseEventToPid(type: CGEventType, source: CGEventSource, point: CGPoint, button: CGMouseButton, clickState: Int, pid: pid_t,
+                                            delivery: NativeInputDelivery) throws {
+        try delivery.check()
         try requireUsableComputerUseSession()
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
             throw ComputerUseError.message("Failed to create mouse event \(type.rawValue).")
         }
 
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+        try delivery.check()
         event.postToPid(pid)
+        delivery.didPost()
         Thread.sleep(forTimeInterval: 0.03)
     }
 

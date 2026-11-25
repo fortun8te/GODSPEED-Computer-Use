@@ -14,24 +14,32 @@ final class AXChangeMonitorTests: XCTestCase {
         }
 
         private let lock = NSLock()
-        private var handlers: [pid_t: (String) -> Void] = [:]
+        private var handlers: [pid_t: [(String) -> Void]] = [:]
         private var subs: [pid_t: [Sub]] = [:]
         private(set) var subscribeCount = 0
         var refuses = false
+        var afterSubscribe: (() -> Void)?
 
         func subscribe(pid: pid_t, names: [String], handler: @escaping (String) -> Void) -> AXChangeMonitor.Subscription? {
-            lock.withLock {
+            let subscription: AXChangeMonitor.Subscription? = lock.withLock {
                 subscribeCount += 1
                 guard !refuses else { return nil }
-                handlers[pid] = handler
+                handlers[pid, default: []].append(handler)
                 let sub = Sub()
                 subs[pid, default: []].append(sub)
                 return sub
             }
+            let hook = afterSubscribe
+            afterSubscribe = nil
+            hook?()
+            return subscription
         }
 
-        func emit(_ pid: pid_t, _ name: String = kAXValueChangedNotification) {
-            let handler = lock.withLock { handlers[pid] }
+        func emit(_ pid: pid_t, _ name: String = kAXValueChangedNotification, subscription: Int? = nil) {
+            let handler = lock.withLock { () -> ((String) -> Void)? in
+                guard let registered = handlers[pid] else { return nil }
+                return subscription.map { registered[$0] } ?? registered.last
+            }
             handler?(name)
         }
 
@@ -61,6 +69,69 @@ final class AXChangeMonitorTests: XCTestCase {
         XCTAssertLessThan(elapsed, 1.0, "A notification should wake the wait well before its 2 s cap")
     }
 
+    func testUntrackedAppNeverReportsAChangeOrWaitsForTheCap() {
+        let (monitor, _, _) = makeMonitor()
+        let start = ProcessInfo.processInfo.systemUptime
+        XCTAssertFalse(monitor.awaitChange(pid: 42, since: 0, upTo: 1))
+        XCTAssertFalse(monitor.awaitChange(pid: 42, since: 12, upTo: 1))
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.25)
+    }
+
+    func testCancellationInterruptsANotificationWaitWithoutReplacingItsCallback() {
+        let (monitor, _, _) = makeMonitor()
+        let token = monitor.track(42)
+        let cancellation = RequestCancellation()
+        let callback = expectation(description: "existing cancellation callback")
+        cancellation.onCancel { _ in callback.fulfill() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { cancellation.cancel() }
+        let start = ProcessInfo.processInfo.systemUptime
+        let changed = RequestCancellation.$current.withValue(cancellation) {
+            monitor.awaitChange(pid: 42, since: token, upTo: 2)
+        }
+        XCTAssertFalse(changed)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.6)
+        wait(for: [callback], timeout: 0.5)
+    }
+
+    func testLateObserverRegistrationAndCallbacksCannotReplaceARetrackedPID() {
+        let (monitor, source, clock) = makeMonitor()
+        source.afterSubscribe = {
+            clock.time = 61
+            monitor.sweepIdle()
+            monitor.track(9)
+        }
+        let oldToken = monitor.track(9)
+        let replacementToken = monitor.generation(9)
+        XCTAssertNotEqual(oldToken, replacementToken)
+        XCTAssertEqual(source.subscribeCount, 2)
+        XCTAssertEqual(source.cancelledCount(9), 1, "The late old registration must be cancelled")
+
+        source.emit(9, subscription: 0)
+        XCTAssertEqual(monitor.generation(9), replacementToken)
+        XCTAssertEqual(monitor.snapshot(9)?.notifications, 0)
+        source.emit(9)
+        XCTAssertEqual(monitor.snapshot(9)?.notifications, 1)
+
+        clock.time = 122
+        monitor.sweepIdle()
+        XCTAssertEqual(source.cancelledCount(9), 2, "The replacement subscription must remain owned until its own sweep")
+    }
+
+    func testReadFromExpiredObserverCannotCleanAReplacementObserver() {
+        let (monitor, source, clock) = makeMonitor()
+        monitor.track(9)
+        source.emit(9)
+        let oldRead = monitor.generation(9)
+        clock.time = 61
+        monitor.track(9)
+        source.emit(9)
+        let newGeneration = monitor.generation(9)
+        XCTAssertNotEqual(oldRead, newGeneration)
+        monitor.finishRead(pid: 9, startedAt: oldRead, complete: true)
+        XCTAssertEqual(monitor.snapshot(9)?.dirtySince, newGeneration)
+        XCTAssertFalse(monitor.mayReuseQuietRead(pid: 9, purpose: .effectCheck))
+    }
+
     func testReadinessPollWakesOnNotificationInsteadOfItsInterval() {
         let (monitor, source, _) = makeMonitor()
         monitor.track(77)
@@ -73,6 +144,32 @@ final class AXChangeMonitorTests: XCTestCase {
         }
         XCTAssertEqual(value, "ready")
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.6, "A 1 s poll interval should end at the notification")
+    }
+
+    func testCancellationDuringObserverSetupSkipsReadinessAndSettleReads() {
+        let (monitor, source, _) = makeMonitor()
+        let cancellation = RequestCancellation()
+        source.afterSubscribe = { cancellation.cancel() }
+        var reads = 0
+        let value: String? = RequestCancellation.$current.withValue(cancellation) {
+            ReadinessPoll.first(timeout: 1, pid: 77, monitor: monitor) {
+                reads += 1
+                return "ready"
+            }
+        }
+        XCTAssertNil(value)
+        XCTAssertEqual(reads, 0)
+
+        let settleCancellation = RequestCancellation()
+        source.afterSubscribe = { settleCancellation.cancel() }
+        let settled = RequestCancellation.$current.withValue(settleCancellation) {
+            WindowSettle.wait(timeout: 1, pid: 78, monitor: monitor) {
+                reads += 1
+                return false
+            }
+        }
+        XCTAssertFalse(settled)
+        XCTAssertEqual(reads, 0)
     }
 
     func testSilentAppFallsBackToPollingWithTheSameCap() {
@@ -96,6 +193,39 @@ final class AXChangeMonitorTests: XCTestCase {
         clock.time = 0.5
         source.emit(8)
         clock.time = 5
+        XCTAssertEqual(monitor.support(8), .notifying)
+    }
+
+    func testDispatchNotificationPreservesSupportButRequiresAReadAfterDelivery() {
+        let (monitor, source, clock) = makeMonitor()
+        let beforeAction = monitor.track(8)
+        // Dispatch includes preparation: this event and tracked read can precede
+        // the actual input, so neither establishes its later visible effects.
+        source.emit(8)
+        let observedAfter = monitor.generation(8)
+        monitor.finishRead(pid: 8, startedAt: observedAfter, complete: true)
+        monitor.noteAction(8, startedAt: beforeAction, deliveryState: .acknowledged)
+        XCTAssertFalse(monitor.mayReuseQuietRead(pid: 8, purpose: .effectCheck),
+                       "A delivered action invalidates a clean read made before noteAction")
+        monitor.finishRead(pid: 8, startedAt: observedAfter, complete: true)
+        XCTAssertTrue(monitor.mayReuseQuietRead(pid: 8, purpose: .effectCheck),
+                      "A fresh read after delivery may be reused without another notification")
+        clock.time = 3
+        XCTAssertEqual(monitor.support(8), .notifying,
+                       "A synchronous event must not be forgotten when dispatch returns")
+    }
+
+    func testUnsentOrUncertainActionDoesNotStartANotificationGraceWait() {
+        let (monitor, source, clock) = makeMonitor()
+        monitor.track(8)
+        source.emit(8)
+        let token = monitor.generation(8)
+        monitor.finishRead(pid: 8, startedAt: token, complete: true)
+        for delivery in [DeliveryState.notSent, .outcomeUnknown] {
+            monitor.noteAction(8, startedAt: token, deliveryState: delivery)
+            XCTAssertTrue(monitor.mayReuseQuietRead(pid: 8, purpose: .effectCheck))
+        }
+        clock.time = 3
         XCTAssertEqual(monitor.support(8), .notifying)
     }
 

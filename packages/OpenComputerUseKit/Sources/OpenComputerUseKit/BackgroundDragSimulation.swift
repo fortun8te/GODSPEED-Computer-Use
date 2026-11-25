@@ -109,8 +109,10 @@ enum BackgroundDragDispatcher {
     static func hover(
         target: BackgroundDragTarget,
         io: BackgroundDragIO = .system(),
+        delivery: NativeInputDelivery = NativeInputDelivery(),
         validateSession: () throws -> Void = { try requireUsableComputerUseSession() }
     ) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
@@ -118,6 +120,7 @@ enum BackgroundDragDispatcher {
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
+        try delivery.check()
         try io.validateWindow(target)
 
         guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
@@ -131,14 +134,18 @@ enum BackgroundDragDispatcher {
         try io.setWindowLocation(event, local)
         try validateSession()
         try io.validateWindow(target)
+        try delivery.check()
         event.timestamp = DispatchTime.now().uptimeNanoseconds
         io.post(event, target.pid)
+        delivery.didPost()
     }
 
     static func click(target: BackgroundDragTarget, button: MouseButtonKind, count: Int, flags: CGEventFlags,
                       io: BackgroundDragIO = .system(),
+                      delivery: NativeInputDelivery = NativeInputDelivery(),
                       validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
                       validateHit: () throws -> Void) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard (1...3).contains(count), button == .left || count == 1 else {
@@ -149,6 +156,7 @@ enum BackgroundDragDispatcher {
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
+        try delivery.check()
         try io.validateWindow(target)
         func prepare(_ type: CGEventType, beat: Int, group: Int64?) throws -> CGEvent {
             guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: target.start, mouseButton: button.cgButton) else {
@@ -169,29 +177,39 @@ enum BackgroundDragDispatcher {
         var sent = 0
         do {
             for (press, release) in pairs {
+                try delivery.check()
                 try validateSession()
                 try io.validateWindow(target)
                 try validateHit()
                 try validateSession()
                 try io.validateWindow(target)
+                try delivery.check()
                 press.timestamp = DispatchTime.now().uptimeNanoseconds
                 io.post(press, target.pid)
+                delivery.didPost()
                 release.timestamp = DispatchTime.now().uptimeNanoseconds
                 io.release(release, target)
                 sent += 1
+                try delivery.check()
                 if sent < count { io.pause(0.05) }
             }
+        } catch let error as RequestCancellation.Cancelled {
+            throw delivery.failure(error)
+        } catch ComputerUseError.timedOut(let message, _) {
+            throw ComputerUseError.timedOut(message, delivery: delivery.state)
         } catch {
             if sent > 0 {
                 throw ComputerUseError.stateUnavailable("Sent \(sent) of \(count) clicks. Inspect the window before repeating.")
             }
-            throw error
+            throw delivery.failure(error)
         }
     }
 
     static func scroll(target: BackgroundDragTarget, direction: String, unit: ScrollChunks.Unit, size: Int,
                        io: BackgroundDragIO = .system(),
+                       delivery: NativeInputDelivery = NativeInputDelivery(),
                        validateSession: () throws -> Void = { try requireUsableComputerUseSession() }) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard io.windowLocationCapability.isAvailable else {
@@ -204,8 +222,10 @@ enum BackgroundDragDispatcher {
                                                 y: target.start.y - target.windowBounds.minY))
         try validateSession()
         try io.validateWindow(target)
+        try delivery.check()
         event.timestamp = DispatchTime.now().uptimeNanoseconds
         io.post(event, target.pid)
+        delivery.didPost()
     }
 
     static func scrollEvent(direction: String, unit: ScrollChunks.Unit, size: Int) throws -> CGEvent {
@@ -229,9 +249,11 @@ enum BackgroundDragDispatcher {
         steps stepCount: Int = 10,
         hold: TimeInterval = 0,
         io: BackgroundDragIO = .system(),
+        delivery: NativeInputDelivery = NativeInputDelivery(),
         validateSession: () throws -> Void = { try requireUsableComputerUseSession() },
         validateEndpoints: () throws -> Void = {}
     ) throws {
+        try delivery.check()
         try validateSession()
         try target.validateGeometry()
         guard (2...30).contains(stepCount), (0...1).contains(hold) else {
@@ -242,6 +264,7 @@ enum BackgroundDragDispatcher {
         }
         dispatchLock.lock()
         defer { dispatchLock.unlock() }
+        try delivery.check()
         try io.validateWindow(target)
 
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
@@ -276,13 +299,15 @@ enum BackgroundDragDispatcher {
         }
         func send(_ event: CGEvent) throws {
             // The deferred release still runs if cancellation interrupts a press.
-            try RequestCancellation.check()
+            try delivery.check()
             try validateSession()
             try io.validateWindow(target)
+            try delivery.check()
             // Events were prepared earlier; AppKit must see delivery time, not
             // allocation time. The entire sequence remains process-addressed.
             event.timestamp = DispatchTime.now().uptimeNanoseconds
             io.post(event, target.pid)
+            delivery.didPost()
         }
 
         // If the user genuinely activates the target during a gesture, it now
@@ -292,18 +317,23 @@ enum BackgroundDragDispatcher {
         }
         var focus: SkyLightSyntheticFocusContext?
         do {
+            try delivery.check()
             if try io.needsFocus(target.pid) {
                 try validateSession()
                 guard io.focusCapability.isAvailable else {
                     throw ComputerUseError.backgroundUnsupported("background drag is unavailable: \(io.focusCapability.unavailableReason)")
                 }
+                try delivery.check()
                 let context = try io.beginFocus(target)
                 focus = context
                 try validateSession()
+                try delivery.check()
                 try io.makeKey(context)
+                try delivery.check()
                 io.pause(0.01)
             }
             try send(move)
+            try delivery.check()
             io.pause(eventDelay)
             try validateEndpoints()
             try InputSimulation.withPressedMouseButton(press: {
@@ -313,13 +343,16 @@ enum BackgroundDragDispatcher {
                 io.release(release, target)
                 io.pause(eventDelay)
             }) {
+                try delivery.check()
                 io.pause(max(eventDelay, hold))
                 for step in steps {
                     try send(step.drag)
                     release = step.up
+                    try delivery.check()
                     io.pause(eventDelay)
                 }
             }
+            try delivery.check()
         } catch {
             if let focus {
                 do { try endFocus(focus) }
@@ -327,7 +360,7 @@ enum BackgroundDragDispatcher {
                     throw ComputerUseError.message("\(error); background drag focus cleanup also failed: \(cleanupError)")
                 }
             }
-            throw error
+            throw delivery.failure(error)
         }
         if let focus { try endFocus(focus) }
     }

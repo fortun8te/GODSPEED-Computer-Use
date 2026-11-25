@@ -19,6 +19,51 @@ final class AXSnapshotReadCacheTests: XCTestCase {
         XCTAssertTrue(reads.isEmpty)
     }
 
+    func testUnknownPasswordClassificationCannotTriggerATextRead() {
+        let element = AXUIElementCreateApplication(120999)
+        var reads: [String] = []
+        let cache = AXSnapshotReadCache(batch: { _ in [:] }, single: { _, name in
+            reads.append(name)
+            if name == "AXSubrole" {
+                return reads.count == 1 ? (.cannotComplete, nil) : (.success, "AXSecureTextField" as CFString)
+            }
+            return (.success, "secret" as CFString)
+        })
+        XCTAssertNil(cache.value(element, "AXValue"))
+        XCTAssertNil(cache.value(element, "AXSelectedText"))
+        XCTAssertEqual(reads, ["AXSubrole", "AXSubrole"])
+    }
+
+    func testOrdinaryFieldTextCanRetryAfterTransientClassificationFailure() {
+        let element = AXUIElementCreateApplication(120999)
+        var classifications = 0
+        var textReads = 0
+        let cache = AXSnapshotReadCache(batch: { _ in [:] }, single: { _, name in
+            if name == "AXSubrole" {
+                classifications += 1
+                return classifications == 1 ? (.cannotComplete, nil) : (.attributeUnsupported, nil)
+            }
+            textReads += 1
+            return (.success, "ordinary text" as CFString)
+        })
+        XCTAssertNil(cache.value(element, "AXValue"))
+        XCTAssertEqual(textReads, 0)
+        XCTAssertEqual(cache.value(element, "AXValue") as? String, "ordinary text")
+        XCTAssertEqual(cache.value(element, "AXValue") as? String, "ordinary text")
+        XCTAssertEqual(classifications, 2)
+        XCTAssertEqual(textReads, 1)
+    }
+
+    func testMalformedSubroleCannotAuthorizeTextReads() {
+        var textReads = 0
+        let cache = AXSnapshotReadCache(batch: { _ in ["AXSubrole": .value(NSNumber(value: 7))] }, single: { _, _ in
+            textReads += 1
+            return (.success, "secret" as CFString)
+        })
+        XCTAssertNil(cache.value(AXUIElementCreateApplication(120999), "AXValue"))
+        XCTAssertEqual(textReads, 0)
+    }
+
     func testEqualAXReferencesShareTheBatchAndAbsentValuesDoNotRefetch() {
         var batches = 0, singles = 0
         let cache = AXSnapshotReadCache(batch: { _ in

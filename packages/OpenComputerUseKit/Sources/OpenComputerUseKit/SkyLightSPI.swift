@@ -79,6 +79,12 @@ func keyEventUsesAuthentication(flags: CGEventFlags, authenticated: Bool) -> Boo
     authenticated && !flags.contains(.maskCommand)
 }
 
+/// Decide once for a chord, including modifiers before Command is pressed and
+/// the final Command release whose flags correctly no longer contain Command.
+func keyChordUsesAuthentication(_ parsed: ParsedKeyPress, authenticated: Bool) -> Bool {
+    authenticated && !parsed.modifiers.contains { $0.flag.contains(.maskCommand) }
+}
+
 /// Probes the CGEvent's embedded SLSEventRecord pointer at the offsets Cua uses
 /// (24, 32, 16; `{CFRuntimeBase, uint32, SLSEventRecord *}`). `read` returns the
 /// pointer at a byte offset. First non-nil wins.
@@ -325,13 +331,21 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
         return previous != 0
     }
 
-    func postToPid(_ event: CGEvent, pid: pid_t) throws {
+    func postToPid(_ event: CGEvent, pid: pid_t, delivery: NativeInputDelivery) throws {
         try requireUsableComputerUseSession()
         guard let postToPidFunction else {
             throw unavailableError()
         }
 
+        try delivery.check()
         postToPidFunction(pid, opaquePointer(for: event))
+    }
+
+    /// Release only a button already pressed through this transport. A revoked
+    /// lease stops new input, not the matching cleanup event.
+    func releaseMouseToPid(_ event: CGEvent, pid: pid_t) {
+        guard [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(event.type) else { return }
+        postToPidFunction?(pid, opaquePointer(for: event))
     }
 
     /// Posts a keyboard event with `SLEventPostToPid`. With `authenticated`, attaches an
@@ -340,8 +354,20 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
     /// `postToPid` when the SkyLight post symbol is missing. Returns true when an
     /// authentication message was attached. Needs a live check on Chromium/Electron.
     @discardableResult
-    func postKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) throws -> Bool {
+    func postKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool, delivery: NativeInputDelivery) throws -> Bool {
         try requireUsableComputerUseSession()
+        try delivery.check()
+        return postPreparedKeyToPid(event, pid: pid, authenticated: authenticated)
+    }
+
+    /// Balance a key-down already sent by this action, even if its lease ended.
+    /// Keep the same authentication/transport; only prepared key-up is allowed.
+    func releaseKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) {
+        guard event.type == .keyUp else { return }
+        _ = postPreparedKeyToPid(event, pid: pid, authenticated: authenticated)
+    }
+
+    private func postPreparedKeyToPid(_ event: CGEvent, pid: pid_t, authenticated: Bool) -> Bool {
         guard let postToPidFunction else {
             event.postToPid(pid)
             return false
