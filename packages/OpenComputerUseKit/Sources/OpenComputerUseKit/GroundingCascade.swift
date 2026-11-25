@@ -85,6 +85,44 @@ enum GroundingCascade {
             .map(\.option)
     }
 
+    /// Read-only recovery suggestions for unfamiliar interfaces. Never use this ranking to deliver input.
+    /// Keep actual control names and indices, including duplicates, so the caller can inspect the current state.
+    static func discoverySuggestions(label: String, options: [Option], limit: Int = 8) -> [Option] {
+        guard limit > 0 else { return [] }
+        func words(_ text: String) -> Set<String> {
+            let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            return Set(folded.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
+        }
+        let aliases: [[String]] = [
+            ["settings", "preferences", "options", "configuration"],
+            ["search", "find", "lookup"], ["new", "create", "add", "insert"],
+            ["save", "store"], ["open", "browse", "choose", "select"],
+            ["close", "dismiss", "cancel"], ["edit", "modify", "change"],
+            ["export", "download"], ["import", "upload"], ["help", "support"],
+            ["refresh", "reload"], ["next", "continue", "forward"],
+            ["previous", "back"], ["remove", "delete", "trash"],
+            ["sidebar", "navigation", "navigator"], ["filter", "refine"],
+        ]
+        let wanted = words(label)
+        guard !wanted.isEmpty else { return [] }
+        var expanded = wanted
+        for group in aliases where !wanted.isDisjoint(with: group) {
+            expanded.formUnion(group)
+        }
+        let lexical = prefilter(label: label, options: options, limit: maxCandidates)
+        let lexicalIDs = Set(lexical.map(\.id))
+        let ranked = options.enumerated().compactMap { position, option -> (Option, Int, Int)? in
+            let tokens = words(option.text)
+            let exactOverlap = wanted.intersection(tokens).count
+            let aliasOverlap = expanded.intersection(tokens).count
+            let score = 10 * exactOverlap + 3 * aliasOverlap + (lexicalIDs.contains(option.id) ? 5 : 0)
+            guard score > 0 else { return nil }
+            return (option, score, position)
+        }
+        return ranked.sorted { $0.1 == $1.1 ? $0.2 < $1.2 : $0.1 > $1.1 }
+            .prefix(min(limit, maxCandidates)).map { $0.0 }
+    }
+
     /// What the cascade decided for one labelled click.
     enum Decision: Equatable {
         /// Click this control. `probability` and `lead` are set only for a model ranking.
