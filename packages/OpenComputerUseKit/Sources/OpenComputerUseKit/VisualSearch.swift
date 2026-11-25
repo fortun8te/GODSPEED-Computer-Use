@@ -1,5 +1,6 @@
 import CoreFoundation
 import CoreGraphics
+import CryptoKit
 import Foundation
 import ImageIO
 
@@ -49,6 +50,28 @@ enum VisualSearch {
                        y: min(CGFloat(height - 1), floor(fraction.y * CGFloat(height))))
     }
 
+    static func observationToken(windowID: CGWindowID, bytes: Data) -> String {
+        var hash = SHA256()
+        hash.update(data: Data("godspeed-visual-v1:\(windowID):".utf8))
+        hash.update(data: bytes)
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// A visual token is only meaningful for explicit pixel input on the pinned window.
+    static func actionToken(tool: String, arguments: [String: Any]) throws -> String? {
+        guard let raw = arguments["visual_snapshot"] else { return nil }
+        let coordinates = tool == "click" ? ["x", "y"] : ["from_x", "from_y", "to_x", "to_y"]
+        let namedTargets = ["ref", "label", "labels", "element_index", "from_label", "to_label", "from_index", "to_index"]
+        guard ["click", "drag"].contains(tool), arguments["window_id"] != nil,
+              let token = raw as? String, token.utf8.count == 64,
+              token.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+              coordinates.allSatisfy({ arguments[$0] != nil }),
+              namedTargets.allSatisfy({ arguments[$0] == nil }) else {
+            throw ComputerUseError.invalidArguments("visual_snapshot requires a window-bound pixel click or drag with the token from visual search.")
+        }
+        return token
+    }
+
     static func annotate(_ state: ToolCallResult, queries: [String], region: CGRect?, windowID: CGWindowID) throws -> ToolCallResult {
         guard !queries.isEmpty else { return state }
         func append(_ lines: [String]) -> ToolCallResult {
@@ -93,7 +116,8 @@ enum VisualSearch {
             }
             lines.append("Query \(index + 1): x=\(Int(point.x)), y=\(Int(point.y)).")
         }
-        lines.append("Inspect the screenshot and confirm each intended target before using existing window-bound pixel click or drag. Read again if the view changes.")
+        lines.append("visual_snapshot: " + observationToken(windowID: windowID, bytes: bytes))
+        lines.append("Inspect the screenshot and confirm each intended target before using a window-bound pixel click or drag with visual_snapshot. Read again if the view changes.")
         return append(lines)
     }
 }
