@@ -102,6 +102,12 @@ Two places, one rule: **an environment variable that is set always wins**. Other
 
 The app agent snapshots its launch environment. Each request overlays the caller's `OPEN_COMPUTER_USE_*` options. Image, virtual display and browser options that the caller omits use their defaults or settings files. Socket selection, admission limits, the idle timer, package discovery and the cursor renderer style and namespace belong to the host process. The proxy keeps the client identity and trajectory settings for the connection.
 
+### Terminal settings
+
+Run `godspeed` or `godspeed settings` after installing a build with the new launcher. The menu groups appearance, intelligence and execution preferences. Choose a number to edit, `s` to save or `q` to discard unsaved changes. Use `godspeed settings --show` for a read-only display. If the launcher is not on PATH, use `~/.local/bin/godspeed`.
+
+The menu writes the existing settings file only on save, preserves unrelated keys and refuses malformed or externally changed files. Environment overrides take precedence; reconnect clients if needed. It does not grant permissions, install models or enable privileged Locked Use.
+
 ### `~/.godspeed/settings.json`
 
 | Key | Sets | Default if absent |
