@@ -356,6 +356,94 @@ final class HandoffToolTests: XCTestCase {
         XCTAssertEqual(app.reads, 3)
     }
 
+    func testExplicitFormWorkflowUsesRulesForInputsAndFinalClick() {
+        let app = FakeApp()
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [("Name", "Ann"), ("Email", "ann@example.test")],
+                                          maxSteps: 5, timeBudget: 10)
+        let outcome = HandoffTool.run(request, app.deps(choose: { _ in
+            XCTFail("a fully specified form must not need a chooser")
+            return nil
+        }))
+        XCTAssertEqual(outcome.kind, .done)
+        XCTAssertEqual(app.acts, ["fill \"Name\"", "fill \"Email\"", "click \"Save\""])
+        XCTAssertEqual(outcome.ruleActions, 3)
+        XCTAssertEqual(outcome.chooserCalls, 0)
+    }
+
+    func testTypedFormDoesNotOverwriteOrSubmitOnMissingField() {
+        for initialName in ["", "Existing"] {
+            let app = FakeApp()
+            app.name = initialName
+            let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                              values: [("Name", "Ann"), ("Missing field", "X")],
+                                              maxSteps: 5, timeBudget: 10)
+            let outcome = HandoffTool.run(request, app.deps(choose: { _ in
+                XCTFail("invalid typed form must not be handed to the ranker")
+                return nil
+            }, replay: true))
+            XCTAssertEqual(outcome.kind, .escalate)
+            XCTAssertTrue(app.acts.isEmpty)
+        }
+    }
+
+    func testTypedFormWillNotContinueAcrossWindowChanges() {
+        let app = FakeApp()
+        let request = HandoffTool.Request(app: "x", goal: "Click Save", doneWhen: [.text("Saved")],
+                                          values: [("Name", "Ann")], maxSteps: 5, timeBudget: 10)
+        var deps = app.deps(choose: { _ in XCTFail("must not rank after window changed"); return nil })
+        var reads = 0
+        deps.readState = {
+            reads += 1
+            return "App=x\nWindow: \"Form\"\nWindow ID: \(reads == 1 ? 12 : 13)\n1 text field Name =\n3 button Save"
+        }
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertNotEqual(outcome.kind, .done)
+        XCTAssertEqual(app.acts, ["fill \"Name\""])
+    }
+
+    func testRankedFieldWritesRequireExactUniqueEmptyDestination() {
+        let input = [("Name", "Ann")]
+        let candidates = build(values: input, state: HandoffTool.parseControls("1 text field Name ="))
+        let safe = candidates.first { $0.kind == .setValue }
+        XCTAssertEqual(safe?.risky, false)
+        XCTAssertEqual(safe?.expectedValue, "")
+        for state in ["1 text field Name = Existing", "1 text field Display Name =", "1 text field Name =\n2 text field Name ="] {
+            let proposals = build(values: input, state: HandoffTool.parseControls(state)).filter { $0.kind == .setValue }
+            XCTAssertFalse(proposals.isEmpty)
+            XCTAssertTrue(proposals.allSatisfy(\.risky))
+        }
+    }
+
+    func testNavigationCycleStopsWithoutAskingStuckModel() {
+        let request = HandoffTool.Request(app: "x", goal: "Navigate", doneWhen: [.text("Finished")],
+                                          values: [], maxSteps: 10, timeBudget: 20)
+        let first = "App=x\nWindow: Form\n1 button Next\n2 scroll area"
+        let second = "App=x\nWindow: Form\n3 button Continue\n4 scroll area"
+        var state = first
+        var acts = 0
+        let deps = HandoffTool.Dependencies(
+            readState: { state },
+            act: { _, _ in
+                acts += 1
+                state = acts % 2 == 0 ? first : second
+                return .init(ok: true, message: "", observedState: state)
+            },
+            choose: { _, _, _, _, options in
+                var result = Dictionary(uniqueKeysWithValues: options.map { ($0.id, 0.01) })
+                result["none"] = 0.01
+                if let option = options.first { result[option.id] = 0.95 }
+                return result
+            },
+            looksStuck: { _, _, _ in XCTFail("cycle detection is deterministic"); return false },
+            check: { HandoffTool.check(request.doneWhen, screen: $0) }, replay: { _ in nil }, now: { 0 }
+        )
+        let outcome = HandoffTool.run(request, deps)
+        XCTAssertEqual(outcome.kind, .stuck)
+        XCTAssertEqual(acts, 3)
+        XCTAssertTrue(outcome.reason.contains("previously observed states"))
+    }
+
     func testGuardedLineEndingIsAddedOnlyWhenMissing() throws {
         for (kind, ending) in [("lf", "\n"), ("crlf", "\r\n")] {
             let request = try HandoffTool.parse([
