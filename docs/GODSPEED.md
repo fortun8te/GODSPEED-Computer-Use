@@ -395,7 +395,7 @@ The public Godspeed package requires a signed-in, unlocked desktop for app contr
 
 Run `OpenComputerUse locked-use status --json` to check the installed build. The public package reports `not-packaged`.
 
-If the physical Mac needs to stay locked during GUI jobs, an Apple Silicon macOS guest is an option to test. Install Godspeed in the guest, grant its normal permissions there, and run the MCP client or its stdio launcher in the guest. Keep the guest desktop unlocked and the host awake for the job. Guest permissions, performance, and operation during host lock need a live check before relying on this setup. [Apple's macOS virtualization guide](https://developer.apple.com/documentation/virtualization/running-macos-in-a-virtual-machine-on-apple-silicon)
+If the physical Mac needs to stay locked during GUI jobs, see the [isolated macOS guest transport and validation guide](locked-host-guest.md). An Apple Silicon macOS guest is an option to test without a Developer ID certificate. Install Godspeed in the guest, grant its normal permissions there, and run the MCP client or its stdio launcher in the guest. Keep the guest desktop unlocked and the host awake for the job. Guest permissions, performance, and operation during host lock need a live check before relying on this setup. [Apple's macOS virtualization guide](https://developer.apple.com/documentation/virtualization/running-macos-in-a-virtual-machine-on-apple-silicon)
 
 
 ### Browser feedback and parallel jobs
