@@ -52,6 +52,29 @@ final class VisualSearchTests: XCTestCase {
         XCTAssertNil(try VisualSearch.actionToken(tool: "click", arguments: [:]))
     }
 
+    func testDeterministicOCRSkipsVisionAndAmbiguityNeverGuesses() {
+        var calls = 0
+        let target = CGPoint(x: 0.25, y: 0.75)
+        let direct = VisualSearch.resolve(scan: { accurate in
+            XCTAssertFalse(accurate)
+            return .point(target)
+        }, locate: { calls += 1; return target })
+        guard case .point(let point, let source) = direct else { return XCTFail("expected OCR point") }
+        XCTAssertEqual(point, target)
+        XCTAssertEqual(source, "ocr_fast")
+        let ambiguous = VisualSearch.resolve(scan: { _ in .ambiguous }, locate: { calls += 1; return target })
+        guard case .ambiguous = ambiguous else { return XCTFail("expected ambiguous") }
+        XCTAssertEqual(calls, 0)
+        let accurate = VisualSearch.resolve(scan: { accurate in accurate ? .point(target) : .missing },
+                                            locate: { calls += 1; return target })
+        guard case .point(_, let accurateSource) = accurate else { return XCTFail("expected accurate OCR") }
+        XCTAssertEqual(accurateSource, "ocr_accurate")
+        let semantic = VisualSearch.resolve(scan: { _ in .missing }, locate: { calls += 1; return target })
+        guard case .point(_, let semanticSource) = semantic else { return XCTFail("expected vision") }
+        XCTAssertEqual(semanticSource, "vision")
+        XCTAssertEqual(calls, 1)
+    }
+
     func testNoScreenshotDoesNotInvokeHelper() throws {
         let state = ToolCallResult.text("Window ID: 42")
         let result = try VisualSearch.annotate(state, queries: ["icon"], region: nil, windowID: 42)
