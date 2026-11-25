@@ -55,6 +55,8 @@ Some apps expose limited controls. Chrome extension overlays and native file pic
 
 The public build requires an awake, unlocked desktop for app controls, Chrome, and screenshots. The MCP server can still answer discovery requests while the Mac is awake and the server is running.
 
+For unattended GUI work while the physical Mac remains locked, see the experimental [isolated macOS guest route](docs/locked-host-guest.md). It uses the normal development build inside a separate logged-in guest and an authenticated MCP connection; no Developer ID certificate or privileged host installer is needed. Live validation is still required.
+
 ## Examples
 
 | Ask your agent | Godspeed uses |
