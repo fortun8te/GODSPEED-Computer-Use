@@ -4,6 +4,7 @@
 from copy import deepcopy
 import importlib.util
 import io
+import errno
 import json
 import os
 from pathlib import Path
@@ -380,12 +381,72 @@ class HillclimbTests(unittest.TestCase):
         self.assertEqual([call.kwargs for call in process.wait.call_args_list],
                          [{"timeout": 0.2}, {"timeout": 1.0}])
 
+    def test_signal_denial_is_unconfirmed_even_when_the_leader_has_reaped(self):
+        for denied in (HC.signal.SIGTERM, HC.signal.SIGKILL):
+            process = Mock(pid=987654321)
+            process.wait.return_value = 0
+            diagnostics = []
+
+            def signal_owned_group(group, value):
+                self.assertEqual(group, process.pid)
+                if value == denied:
+                    raise PermissionError(errno.EPERM, "Operation not permitted")
+
+            with self.subTest(signal=denied), patch.object(HC.os, "killpg", side_effect=signal_owned_group) as kill:
+                self.assertFalse(HC.stop_group(process, diagnostics))
+            expected = [(process.pid, HC.signal.SIGTERM)]
+            if denied == HC.signal.SIGKILL:
+                expected.append((process.pid, HC.signal.SIGKILL))
+            self.assertEqual([call.args for call in kill.call_args_list], expected)
+            self.assertTrue(any("PermissionError" in error for error in diagnostics))
+            self.assertTrue(all(0 < call.kwargs["timeout"] <= 1 for call in process.wait.call_args_list))
+
+    def test_disappeared_group_is_not_signalled_again_after_leader_wait(self):
+        process = Mock(pid=987654321)
+        process.wait.return_value = 0
+        with patch.object(HC.os, "killpg", side_effect=ProcessLookupError(errno.ESRCH, "No such process")) as kill:
+            self.assertTrue(HC.stop_group(process))
+        kill.assert_called_once_with(process.pid, HC.signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=0.2)
+
+    def test_signal_denial_preserves_timeout_and_closes_both_pipes(self):
+        created = []
+        spawn = HC.subprocess.Popen
+
+        def capture_process(*args, **kwargs):
+            process = spawn(*args, **kwargs)
+            created.append(process)
+            return process
+
+        def denied_kill(group, value):
+            self.assertEqual(group, created[0].pid)
+            if value == HC.signal.SIGKILL:
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            # The short-lived child exits naturally during the bounded TERM wait.
+            # No test process remains alive when this mocked signal is not delivered.
+
+        with patch.object(HC.subprocess, "Popen", side_effect=capture_process), \
+                patch.object(HC.os, "killpg", side_effect=denied_kill):
+            row = HC.run_adapter([sys.executable, "-c", "import time; time.sleep(0.15)"], self.root, {}, 0.02)
+        self.assertEqual(row["status"], "timeout")
+        self.assertFalse(row["cleanup_complete"])
+        self.assertTrue(any("SIGKILL: PermissionError" in error for error in row["cleanup_errors"]))
+        self.assertEqual(created[0].returncode, 0)
+        self.assertTrue(created[0].stdout.closed)
+        self.assertTrue(created[0].stderr.closed)
+        with patch.object(HC, "run_adapter", return_value=row) as adapter:
+            report = HC.Search(self.value, self.root, self.root / "denied-cleanup").run()
+        self.assertEqual(adapter.call_count, 1)
+        self.assertEqual(report["status"], "error")
+        self.assertIsNone(report["recommended_profile"])
+        self.assertFalse((self.root / "denied-cleanup/recommended-profile.json").exists())
+
     def test_unconfirmed_cleanup_cannot_return_a_successful_adapter_receipt(self):
         request = {"case": self.value["train"][0]}
         code = "print(" + repr(json.dumps(result(request))) + ")"
         with patch.object(HC, "stop_group", return_value=False):
             row = HC.run_adapter([sys.executable, "-c", code], self.root, request, 5)
-        self.assertEqual(row["status"], "cleanup_timeout")
+        self.assertEqual(row["status"], "cleanup_incomplete")
         self.assertFalse(row["cleanup_complete"])
         with patch.object(HC, "run_adapter", return_value=row) as adapter:
             report = HC.Search(self.value, self.root, self.root / "run").run()
