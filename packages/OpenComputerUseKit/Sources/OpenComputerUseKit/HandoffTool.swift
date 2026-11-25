@@ -276,7 +276,19 @@ enum HandoffTool {
             for field in named.isEmpty ? Array(fallback.prefix(2)) : named {
                 if field.value == value || field.label == value { continue }
                 let score: Double = sameLabel(field.label, key) ? 12 : (named.isEmpty ? 0.25 : 1)
-                add(fill(field, value: value), score: score)
+                var proposal = fill(field, value: value)
+                // The ranker may suggest a field, but it cannot grant permission to overwrite text or
+                // choose between ambiguous/approximate input destinations. Those require the caller.
+                let exact = writableField(named: key, controls: controls)
+                if exact?.index == field.index, field.value == "",
+                   values.filter({ sameLabel($0.key, key) }).count == 1 {
+                    proposal.expectedValue = ""
+                } else {
+                    proposal = Candidate(id: proposal.id, kind: proposal.kind, text: proposal.text,
+                                         tool: proposal.tool, arguments: proposal.arguments, risky: true,
+                                         key: proposal.key, targetLabel: proposal.targetLabel, targetRole: proposal.targetRole)
+                }
+                add(proposal, score: score)
             }
         }
 
@@ -311,7 +323,7 @@ enum HandoffTool {
         return limited.enumerated().map { offset, item in
             Candidate(id: String(Character(UnicodeScalar(UInt8(97 + offset)))), kind: item.kind, text: item.text, tool: item.tool,
                       arguments: item.arguments, risky: item.risky, key: item.key,
-                      targetLabel: item.targetLabel, targetRole: item.targetRole)
+                      targetLabel: item.targetLabel, targetRole: item.targetRole, expectedValue: item.expectedValue)
         }
     }
 
@@ -381,13 +393,28 @@ enum HandoffTool {
 
     static func exactAction(request: Request, controls: [Control], tried: Set<String>) -> Candidate? {
         if let fill = exactFieldFill(request: request, controls: controls, tried: tried) { return fill }
-        // Only the whole "click <label>" instruction permits a deterministic click.
-        guard !request.doneWhen.isEmpty, request.values.isEmpty, let label = explicitClickLabel(request.goal) else { return nil }
+        // A whole "click <label>" instruction plus explicit values is a typed form workflow.
+        // Preflight every field on the same observation, fill only uniquely named empty/guarded
+        // fields, then click only after every value has been read back as requested.
+        guard !request.doneWhen.isEmpty, let label = explicitClickLabel(request.goal) else { return nil }
         let matches = controls.filter { clickRoles.contains($0.role) && sameLabel($0.label, label) }
         guard matches.count == 1, let control = matches.first, !control.disabled,
               !RecipeLocator.looksSecret(control.label) else { return nil }
         let candidate = click(control, unique: true)
-        return !candidate.risky && !tried.contains(candidate.key) ? candidate : nil
+        guard !candidate.risky, !tried.contains(candidate.key) else { return nil }
+        var pending: [Candidate] = []
+        for (key, desired) in request.values {
+            guard !desired.isEmpty, request.values.filter({ sameLabel($0.key, key) }).count == 1,
+                  let field = writableField(named: key, controls: controls), let actual = field.value else { return nil }
+            if actual == desired { continue }
+            let expected = request.expectedValues.filter { sameLabel($0.key, key) }
+            guard expected.count <= 1, actual == (expected.first?.value ?? "") else { return nil }
+            var write = fill(field, value: desired)
+            write.expectedValue = actual
+            guard !tried.contains(write.key) else { return nil }
+            pending.append(write)
+        }
+        return pending.first ?? candidate
     }
 
     /// All checks must hold after the action, and at least one must have become true.
