@@ -128,8 +128,8 @@ enum CursorWindowActivityRenderer {
         guard window.width > 0, window.height > 0 else { return }
         let accent = tint ?? CursorColor(hex: "#A29AAE")!
         let strength: CGFloat = activity == .waiting ? 0.64 : activity == .delivered ? 0.8 : 1
-        let core = NSColor(calibratedRed: accent.red * 0.30, green: accent.green * 0.30,
-                           blue: accent.blue * 0.30, alpha: 0.80 * strength).cgColor
+        let core = NSColor(calibratedRed: accent.red * 0.28, green: accent.green * 0.28,
+                           blue: accent.blue * 0.28, alpha: 0.58 * strength).cgColor
         let edge = CGPath(roundedRect: window, cornerWidth: 12, cornerHeight: 12, transform: nil)
         context.saveGState()
         // Keep window contents untouched. Only the boundary and the broad outer falloff
@@ -139,19 +139,24 @@ enum CursorWindowActivityRenderer {
         outside.addRoundedRect(in: window.insetBy(dx: 1, dy: 1), cornerWidth: 11, cornerHeight: 11)
         context.addPath(outside)
         context.clip(using: .evenOdd)
-        for (blur, alpha) in [(CGFloat(28), CGFloat(0.32)), (CGFloat(12), CGFloat(0.25))] {
-            context.setShadow(offset: .zero, blur: blur,
-                color: NSColor(calibratedRed: accent.red * 0.48, green: accent.green * 0.48,
-                               blue: accent.blue * 0.48, alpha: alpha * strength).cgColor)
-            context.addPath(edge)
-            context.setStrokeColor(core)
-            context.setLineWidth(2)
+        // A narrow stroke's blurred shadow loses almost all of its opacity at a
+        // useful radius. Draw a continuous falloff instead: the color stays dark,
+        // while the 36-point bloom remains legible on both light and dark desktops.
+        // This view redraws only for geometry/status changes, never on a timer.
+        for offset in stride(from: 36, through: 1, by: -1) {
+            let distance = CGFloat(offset)
+            let falloff = exp(-Double(distance * distance) / (2 * 14 * 14))
+            let ring = window.insetBy(dx: -distance, dy: -distance)
+            context.addPath(CGPath(roundedRect: ring, cornerWidth: 12 + distance,
+                                  cornerHeight: 12 + distance, transform: nil))
+            context.setStrokeColor(NSColor(calibratedRed: accent.red * 0.58, green: accent.green * 0.58,
+                blue: accent.blue * 0.58, alpha: CGFloat(falloff) * 0.25 * strength).cgColor)
+            context.setLineWidth(1.5)
             context.strokePath()
         }
-        context.setShadow(offset: .zero, blur: 0, color: nil)
         context.addPath(edge)
         context.setStrokeColor(core)
-        context.setLineWidth(1.25)
+        context.setLineWidth(1)
         context.strokePath()
         context.restoreGState()
 

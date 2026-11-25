@@ -273,27 +273,50 @@ def quality_failures(result, case, manifest):
     return failures
 
 
-def stop_group(process):
-    # Only the session created for this adapter, never a process-name match.
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=0.2)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=1.0)
-        return True
-    except subprocess.TimeoutExpired:
-        # A process stuck in kernel I/O may not reap promptly even after SIGKILL.
-        # The kill has still been sent; do not hang the whole evaluation forever.
-        return False
+def stop_group(process, diagnostics=None):
+    """Bounded cleanup of the session created for this adapter, never a name match.
+
+    A signal denial is not proof that the group has exited, even if its original
+    leader has already reaped. Do not escalate after denial or after ESRCH: a later
+    group with the same number must not become a new termination target.
+    """
+    failed = False
+
+    def failed_operation(operation, error):
+        nonlocal failed
+        failed = True
+        if diagnostics is not None:
+            diagnostics.append(f"{operation}: {type(error).__name__} (errno {error.errno})")
+
+    def signal_group(value):
+        try:
+            os.killpg(process.pid, value)
+            return "sent"
+        except ProcessLookupError:
+            return "gone"
+        except OSError as error:
+            failed_operation(signal.Signals(value).name, error)
+            return "unconfirmed"
+
+    def wait_for_leader(timeout):
+        try:
+            process.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+        except OSError as error:
+            failed_operation("wait", error)
+            return False
+
+    terminated = signal_group(signal.SIGTERM)
+    reaped = wait_for_leader(0.2)
+    if terminated != "sent":
+        return terminated == "gone" and reaped and not failed
+    killed = signal_group(signal.SIGKILL)
+    reaped = wait_for_leader(1.0)
+    if not reaped and diagnostics is not None:
+        diagnostics.append("adapter leader did not reap within the cleanup deadline")
+    return killed != "unconfirmed" and reaped and not failed
 
 
 def run_adapter(command, cwd, request, timeout):
@@ -303,6 +326,7 @@ def run_adapter(command, cwd, request, timeout):
     process = None
     status = "ok"
     cleanup_complete = True
+    cleanup_errors = []
     environment = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TZ", "TMPDIR") if key in os.environ}
     environment["GODSPEED_EVALUATION"] = "1"
     encoded = canonical(request)
@@ -340,14 +364,24 @@ def run_adapter(command, cwd, request, timeout):
         stderr.extend(str(error).encode("utf-8")[:4096])
     finally:
         if process is not None:
-            cleanup_complete = stop_group(process)
+            try:
+                cleanup_complete = stop_group(process, cleanup_errors)
+            finally:
+                # Signal failures and interruptions cannot skip closing either pipe.
+                # Closing one pipe must not prevent the other from being released.
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError as error:
+                            cleanup_complete = False
+                            cleanup_errors.append(f"pipe close: {type(error).__name__} (errno {error.errno})")
             if not cleanup_complete and status == "ok":
-                status = "cleanup_timeout"
-            process.stdout.close()
-            process.stderr.close()
+                status = "cleanup_incomplete"
     row = {"status": status, "runner_wall_ms": round((time.monotonic() - started) * 1000, 3),
            "exit_code": process.returncode if process else None,
            "cleanup_complete": cleanup_complete,
+           "cleanup_errors": cleanup_errors,
            "stderr": stderr.decode("utf-8", errors="replace")}
     if status == "ok":
         try:
@@ -551,7 +585,7 @@ class Search:
                                              quality_failures=row["quality_failures"])
                         rows.append(score_row)
                         if row.get("cleanup_complete") is False:
-                            raise Invalid("Adapter process did not exit after SIGKILL; evaluation stopped without a recommendation")
+                            raise Invalid("Adapter process-group cleanup could not be confirmed; evaluation stopped without a recommendation")
                         remaining_budget(self.deadline)
         evaluation = {"id": trial_id, "phase": phase, "control": control, "candidate": candidate,
                       **evaluate(rows, self.manifest, cases)}

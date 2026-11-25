@@ -40,6 +40,19 @@ Explicitly compact, verified batches can summarize per-step metadata. In an offl
 
 The app agent used to check for idle exit every five seconds. It now arms a single deadline after the last client disconnects. `swift test --filter LifecycleTests` covers deadline changes as clients connect and disconnect. Whole-machine CPU, GPU and power measurements are pending.
 
+### Local accessibility interpretation
+
+The [25 November macOS run at `55d2a49`](https://github.com/fortun8te/GODSPEED-Computer-Use/actions/runs/45689843363) passed the native accessibility fixture below. The complete job later failed a separate Python process-cleanup test; this table records the completed native measurement, not a passing status for that whole job.
+
+| 200-account synthetic control tree | Before | After |
+| --- | ---: | ---: |
+| Rendered UTF-8 bytes | 34,821 | 29,553 |
+| Required facts retained | 802/802 | 802/802 |
+| Lost required facts | 0 | 0 |
+| Host model tokens | Unmeasured | Unmeasured |
+
+Local interpretation removed 200 duplicate label leaves while retaining 600 controls, 200 named groups, the window and status. That reduced the rendered text by **15.13%** in this fixture. It does not measure model tokens, reasoning effort, live app latency or long-task completion. Reproduce with `swift test --filter AXLocalInterpretationTests`; the test emits `AX_LOCAL_OBSERVATION_METRICS` with the byte counts and required-fact coverage. Separate regressions check bounded AX child reads, repeated-label context and ambiguous state changes.
+
 ### Desktop cursor checks
 
 GitHub CI covers client names, cursor geometry and idle deadlines. Run the animation and window-follow checks on an unlocked Mac with Reduce Motion off. Enable Accessibility for the local test host to exercise the real button click. A second connected display lets the window-follow test cover both displays.
