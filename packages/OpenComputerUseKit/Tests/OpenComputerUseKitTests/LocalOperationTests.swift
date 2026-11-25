@@ -20,28 +20,28 @@ final class LocalOperationTests: XCTestCase {
         if let code { XCTAssertEqual(result.failureCode, code, file: file, line: line) }
     }
 
-    func testCancelledWorkspaceRequestNeverDispatches() {
+    func testCancelledWorkspaceRequestNeverDispatches() throws {
         let cancellation = RequestCancellation()
         cancellation.cancel()
-        RequestCancellation.$current.withValue(cancellation) {
+        try RequestCancellation.$current.withValue(cancellation) {
             XCTAssertThrowsError(try SmartSteps.openWorkspace { _ in XCTFail("Must not open after cancellation") }) {
                 self.assertFailure($0, delivery: .notSent)
             }
         }
     }
 
-    func testExpiredWorkspaceRequestNeverDispatches() {
-        BrowserCallBudget.withDeadline(ProcessInfo.processInfo.systemUptime - 1) {
+    func testExpiredWorkspaceRequestNeverDispatches() throws {
+        try BrowserCallBudget.withDeadline(ProcessInfo.processInfo.systemUptime - 1) {
             XCTAssertThrowsError(try SmartSteps.openWorkspace { _ in XCTFail("Must not open after deadline") }) {
                 self.assertFailure($0, delivery: .notSent, code: .timeout)
             }
         }
     }
 
-    func testCancelledSaveStopsBeforeResolvingOrTouchingAnApplication() {
+    func testCancelledSaveStopsBeforeResolvingOrTouchingAnApplication() throws {
         let cancellation = RequestCancellation()
         cancellation.cancel()
-        RequestCancellation.$current.withValue(cancellation) {
+        try RequestCancellation.$current.withValue(cancellation) {
             XCTAssertThrowsError(try SmartSteps.saveAs(app: "no-running-application", path: "/tmp/test.txt",
                                                       service: ComputerUseService())) {
                 XCTAssertTrue($0 is RequestCancellation.Cancelled)
@@ -50,8 +50,8 @@ final class LocalOperationTests: XCTestCase {
         }
     }
 
-    func testExpiredSaveStopsBeforeResolvingOrTouchingAnApplication() {
-        BrowserCallBudget.withDeadline(ProcessInfo.processInfo.systemUptime - 1) {
+    func testExpiredSaveStopsBeforeResolvingOrTouchingAnApplication() throws {
+        try BrowserCallBudget.withDeadline(ProcessInfo.processInfo.systemUptime - 1) {
             XCTAssertThrowsError(try SmartSteps.saveAs(app: "no-running-application", path: "/tmp/test.txt",
                                                       service: ComputerUseService())) {
                 self.assertFailure($0, delivery: .notSent, code: .timeout)
@@ -59,9 +59,9 @@ final class LocalOperationTests: XCTestCase {
         }
     }
 
-    func testWorkspaceCancellationRejectsEvenAnAvailableSuccess() {
+    func testWorkspaceCancellationRejectsEvenAnAvailableSuccess() throws {
         let cancellation = RequestCancellation()
-        RequestCancellation.$current.withValue(cancellation) {
+        try RequestCancellation.$current.withValue(cancellation) {
             XCTAssertThrowsError(try SmartSteps.openWorkspace { done in
                 cancellation.cancel()
                 done(nil)
@@ -86,9 +86,9 @@ final class LocalOperationTests: XCTestCase {
         }
     }
 
-    func testInheritedDeadlineBoundsWorkspaceCallbackWait() {
+    func testInheritedDeadlineBoundsWorkspaceCallbackWait() throws {
         let began = ProcessInfo.processInfo.systemUptime
-        BrowserCallBudget.withDeadline(began + 0.025) {
+        try BrowserCallBudget.withDeadline(began + 0.025) {
             XCTAssertThrowsError(try SmartSteps.openWorkspace(timeout: 5) { _ in }) {
                 self.assertFailure($0, delivery: .outcomeUnknown, code: .timeout)
             }
@@ -108,9 +108,9 @@ final class LocalOperationTests: XCTestCase {
         }
     }
 
-    func testAppleEventPermissionPreparationCannotConsumeBudgetThenDispatch() {
+    func testAppleEventPermissionPreparationCannotConsumeBudgetThenDispatch() throws {
         let cancellation = RequestCancellation()
-        RequestCancellation.$current.withValue(cancellation) {
+        try RequestCancellation.$current.withValue(cancellation) {
             XCTAssertThrowsError(try AppleEventsGate.send("return 1", bundle: "test", permission: { _ in
                 cancellation.cancel()
                 return true
@@ -120,9 +120,9 @@ final class LocalOperationTests: XCTestCase {
         }
     }
 
-    func testDeniedPermissionAfterCancellationCannotTriggerFallback() {
+    func testDeniedPermissionAfterCancellationCannotTriggerFallback() throws {
         let cancellation = RequestCancellation()
-        RequestCancellation.$current.withValue(cancellation) {
+        try RequestCancellation.$current.withValue(cancellation) {
             XCTAssertThrowsError(try AppleEventsGate.send("return 1", bundle: "test", permission: { _ in
                 cancellation.cancel()
                 return false
@@ -166,10 +166,10 @@ final class LocalOperationTests: XCTestCase {
         XCTAssertEqual(reply?.int32Value, 4)
     }
 
-    func testCancelledAppleEventSuccessIsUncertainAndNeverRetried() {
+    func testCancelledAppleEventSuccessIsUncertainAndNeverRetried() throws {
         let cancellation = RequestCancellation()
         let executions = Box(0)
-        RequestCancellation.$current.withValue(cancellation) {
+        try RequestCancellation.$current.withValue(cancellation) {
             XCTAssertThrowsError(try AppleEventsGate.send("return 1", bundle: "test", permission: { _ in true },
                 schedule: { $0() }, execute: { _ in
                     executions.value += 1

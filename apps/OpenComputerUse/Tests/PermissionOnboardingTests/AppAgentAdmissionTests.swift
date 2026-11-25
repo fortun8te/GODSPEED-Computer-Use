@@ -19,9 +19,11 @@ final class AppAgentAdmissionTests: XCTestCase {
         try gate.withAdmission(.exclusive) {
             DispatchQueue.global().async {
                 defer { finished.signal() }
-                XCTAssertThrowsError(try gate.withAdmission(.exclusive, timeout: 1) {
-                    XCTFail("Expired queued work reached dispatch")
-                }) { error in
+                do {
+                    try gate.withAdmission(.exclusive, timeout: 1) {
+                        XCTFail("Expired queued work reached dispatch")
+                    }
+                } catch {
                     XCTAssertTrue(error is AppAgentAdmission.Timeout, "\(error)")
                 }
             }
