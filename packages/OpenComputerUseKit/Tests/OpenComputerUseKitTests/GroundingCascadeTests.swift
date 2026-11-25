@@ -145,6 +145,30 @@ final class GroundingCascadeTests: XCTestCase {
         XCTAssertEqual(verified, 0)
     }
 
+    func testRetinaCropMappingAccountsForOddPixelDimensions() throws {
+        let rect = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        let pixels = try XCTUnwrap(VisionFallback.pixelCrop(rect, width: 2561, height: 1601))
+        XCTAssertEqual(pixels, CGRect(x: 640, y: 400, width: 1281, height: 801))
+        let local = CGPoint(x: 0.2, y: 0.8)
+        let adjusted = try XCTUnwrap(VisionFallback.remapCropPoint(local, pixels: pixels, requested: rect,
+                                                                    width: 2561, height: 1601))
+        let mapped = try XCTUnwrap(GroundingCascade.secondLook(at: CGPoint(x: 0.5, y: 0.5),
+                                                               locate: { _ in adjusted }, verify: { _ in true }))
+        XCTAssertEqual(mapped.x, (640 + 0.2 * 1281) / 2561, accuracy: 0.000001)
+        XCTAssertEqual(mapped.y, (400 + 0.8 * 801) / 1601, accuracy: 0.000001)
+    }
+
+    func testCropRejectsInvalidGeometryAndOutOfBoundsPoints() throws {
+        let rect = CGRect(x: 0.5, y: 0.5, width: 0.5, height: 0.5)
+        let pixels = try XCTUnwrap(VisionFallback.pixelCrop(rect, width: 101, height: 99))
+        XCTAssertEqual(pixels.maxX, 101)
+        XCTAssertEqual(pixels.maxY, 99)
+        XCTAssertNil(VisionFallback.pixelCrop(rect, width: 0, height: 99))
+        XCTAssertNil(VisionFallback.pixelCrop(CGRect(x: -0.1, y: 0, width: 0.5, height: 0.5), width: 101, height: 99))
+        XCTAssertNil(VisionFallback.remapCropPoint(CGPoint(x: 1, y: 0.5), pixels: pixels, requested: rect,
+                                                 width: 101, height: 99))
+    }
+
     func testZoomProvenanceIsNamedInTheLearningLog() {
         XCTAssertEqual(VisionFallback.evidenceName(.ocr), "ocr")
         XCTAssertEqual(VisionFallback.evidenceName(.model), "model")
