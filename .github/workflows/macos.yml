@@ -24,7 +24,7 @@ jobs:
       - name: Verify compact replies, cursor identity and idle exit
         run: swift test --filter 'CompactVerifiedReplyTests|CursorRequestEnvironmentTests|CursorGlideShapeTests|CursorWindowAnchorTests|CursorDeliveryTests/testGestureBoundariesRetainMovesForTheirOwnClient|HandoffToolTests|LifecycleTests|LockedUseDispatchTests|testEveryToolDescriptionSaysWhenToUseItAndBatchShowsAWaitStep'
       - name: Verify safety, delivery, durability and browser policy
-        run: swift test --filter 'ActionHardeningTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|LocalDecisionToolTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests|RelayGrant|BrowserBridgeRelayGrant|GroundingCascadeTests|VisualSearchTests|LocalDecisionCancellationTests|BatchResumeTests|TeachRecorderTests|TeachModeTests|TeachToolTests|TeachSourcesTests|TeachKeystrokePrivacyTests'
+        run: swift test --filter 'ActionHardeningTests|ActionPolicyTests|AgentEventsTests|BrowserActionPolicyTests|DeliveryStateTests|LocalHelperEvalFixturesTests|LocalPerceptionTests|MCPRequestStreamTests|OperationJournalTests|ReadinessPollTests|RefereePictureTests|RefereeViewTests|RequestCancellationTests|LocalDecisionToolTests|RiskLexiconTests|SemanticChangesRepliesTests|StrictBackgroundTests|TimingLogTests|WindowSettleTests|ArgumentNormalizerTests|FocusBorrowTests|RelayGrant|BrowserBridgeRelayGrant|GroundingCascadeTests|VisualSearchTests|GodspeedTerminalSettingsTests|LocalDecisionCancellationTests|BatchResumeTests|TeachRecorderTests|TeachModeTests|TeachToolTests|TeachSourcesTests|TeachKeystrokePrivacyTests'
       - name: Verify the local training tools
         run: python3 -I -m unittest discover -s scripts/flywheel -p 'test_*.py' && python3 -I -m unittest discover -s scripts/flywheel/synth -p 'test_*.py'
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -45,6 +45,7 @@ jobs:
           root="$(mktemp -d)"
           ./scripts/install-godspeed.sh --archive dist/godspeed/Godspeed-macOS-arm64.zip --expected-version "$version" --app-dir "$root/apps" --launcher-dir "$root/bin"
           GODSPEED_APP="$root/apps/GODSPEED.app" python3 scripts/tests/godspeed-mcp-smoke.py --launcher "$root/bin/godspeed-mcp" --direct
+          GODSPEED_APP="$root/apps/GODSPEED.app" "$root/bin/godspeed" settings --show
           OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY=1 ./scripts/godspeed-doctor.sh --app "$root/apps/GODSPEED.app" --launcher "$root/bin/godspeed-mcp"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: github.event_name == 'workflow_dispatch'
