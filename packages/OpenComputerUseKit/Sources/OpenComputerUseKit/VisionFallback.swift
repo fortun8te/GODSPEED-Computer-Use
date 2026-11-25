@@ -96,6 +96,31 @@ enum VisionFallback {
         return CGPoint(x: fraction.x * bounds.width, y: fraction.y * bounds.height)
     }
 
+    /// Convert top-left window fractions to a bounded, integral pixel crop.
+    static func pixelCrop(_ rect: CGRect, width: Int, height: Int) -> CGRect? {
+        guard width > 0, height > 0, !rect.isNull, !rect.isInfinite,
+              rect.width > 0, rect.height > 0,
+              CGRect(x: 0, y: 0, width: 1, height: 1).contains(rect) else { return nil }
+        let w = CGFloat(width), h = CGFloat(height)
+        let pixels = CGRect(x: rect.minX * w, y: rect.minY * h,
+                            width: rect.width * w, height: rect.height * h).integral
+            .intersection(CGRect(x: 0, y: 0, width: w, height: h))
+        return pixels.isEmpty ? nil : pixels
+    }
+
+    /// Correct for the integral crop rounding before GroundingCascade maps back to window fractions.
+    static func remapCropPoint(_ point: CGPoint, pixels: CGRect, requested: CGRect,
+                               width: Int, height: Int) -> CGPoint? {
+        guard width > 0, height > 0, requested.width > 0, requested.height > 0,
+              (0..<1).contains(point.x), (0..<1).contains(point.y) else { return nil }
+        let x = (pixels.minX + point.x * pixels.width) / CGFloat(width)
+        let y = (pixels.minY + point.y * pixels.height) / CGFloat(height)
+        let mapped = CGPoint(x: (x - requested.minX) / requested.width,
+                             y: (y - requested.minY) / requested.height)
+        guard (0..<1).contains(mapped.x), (0..<1).contains(mapped.y) else { return nil }
+        return mapped
+    }
+
     static func sameCapture(_ original: CGImage, _ fresh: CGImage) -> Bool {
         guard original.width == fresh.width, original.height == fresh.height,
               original.bytesPerRow == fresh.bytesPerRow,
