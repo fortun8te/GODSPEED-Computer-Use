@@ -72,6 +72,25 @@ enum VisualSearch {
         return token
     }
 
+    enum Route {
+        case point(CGPoint, source: String)
+        case ambiguous
+        case unavailable
+    }
+
+    /// A positive unique OCR match is enough to propose a point; ambiguous text is not a model tie-break.
+    static func resolve(scan: (Bool) -> LocalOCR.Scan, locate: () -> CGPoint?) -> Route {
+        for accurate in [false, true] {
+            switch scan(accurate) {
+            case .point(let point): return .point(point, source: accurate ? "ocr_accurate" : "ocr_fast")
+            case .ambiguous: return .ambiguous
+            case .missing: continue
+            }
+        }
+        guard let point = locate() else { return .unavailable }
+        return .point(point, source: "vision")
+    }
+
     static func annotate(_ state: ToolCallResult, queries: [String], region: CGRect?, windowID: CGWindowID) throws -> ToolCallResult {
         guard !queries.isEmpty else { return state }
         func append(_ lines: [String]) -> ToolCallResult {
@@ -86,35 +105,54 @@ enum VisualSearch {
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             return append(["Visual search unavailable: no delivered window screenshot."])
         }
-        guard VisionFallback.isEnabled else {
-            return append(["Visual search unavailable: configure the optional local vision helper."])
-        }
         guard !LearningScrubber.marksSecureField([state.textContent]) else {
             return append(["Visual search unavailable: secure-field evidence in the window."])
         }
         let requested = region ?? CGRect(x: 0, y: 0, width: 1, height: 1)
         guard let crop = VisionFallback.pixelCrop(requested, width: image.width, height: image.height),
               let scoped = region == nil ? image : image.cropping(to: crop),
-              let overview = LocalWindowImage.downscaled(scoped),
-              let jpeg = LocalWindowImage.jpeg(overview) else {
-            return append(["Visual search unavailable: image encoding failed."])
+              let overview = LocalWindowImage.downscaled(scoped) else {
+            return append(["Visual search unavailable: image crop failed."])
         }
         let clock = ProcessInfo.processInfo
         let deadline = clock.systemUptime + min(VisionFallback.timeout, BrowserCallBudget.activeRemaining ?? .infinity)
-        let encoded = jpeg.base64EncodedString()
+        var encoded: String? = nil
+        var accurateImage: CGImage? = nil
         var lines = ["Visual search — UNVERIFIED proposals for Window ID \(windowID), screenshot \(image.width)x\(image.height). No input sent."]
         if region != nil { lines.append("Search limited to the requested region; coordinates refer to the entire screenshot.") }
         for (index, query) in queries.enumerated() {
             try RequestCancellation.check(delivery: .notSent)
             let remaining = deadline - clock.systemUptime
             guard remaining > 0 else { lines.append("Query \(index + 1): budget exhausted."); continue }
-            let fraction = VisionFallback.locate(imageBase64: encoded, query: query, remaining: remaining)
+            let route = resolve(scan: { accurate in
+                guard !RequestCancellation.requested, clock.systemUptime < deadline else { return .missing }
+                if accurate, accurateImage == nil {
+                    accurateImage = LocalWindowImage.downscaled(scoped, maxSide: VisionFallback.accurateOCRMaxSide)
+                }
+                let input = accurate ? (accurateImage ?? overview) : overview
+                return LocalOCR.scan(input, label: query, level: accurate ? .accurate : .fast)
+            }, locate: {
+                guard VisionFallback.isEnabled, !RequestCancellation.requested, clock.systemUptime < deadline else { return nil }
+                if encoded == nil { encoded = LocalWindowImage.jpeg(overview)?.base64EncodedString() }
+                guard let encoded else { return nil }
+                return VisionFallback.locate(imageBase64: encoded, query: query, remaining: deadline - clock.systemUptime)
+            })
             try RequestCancellation.check(delivery: .notSent)
-            guard let fraction, let point = cropPixel(fraction, crop: crop, width: image.width, height: image.height) else {
-                lines.append("Query \(index + 1): no usable proposal.")
-                continue
+            guard clock.systemUptime < deadline else { lines.append("Query \(index + 1): budget exhausted."); continue }
+            switch route {
+            case .point(let fraction, let source):
+                guard let point = cropPixel(fraction, crop: crop, width: image.width, height: image.height) else {
+                    lines.append("Query \(index + 1): no usable proposal.")
+                    continue
+                }
+                ToolTelemetry.current?.add("visual_search_" + source)
+                lines.append("Query \(index + 1): x=\(Int(point.x)), y=\(Int(point.y)) (\(source)).")
+            case .ambiguous:
+                ToolTelemetry.current?.add("visual_search_ambiguous")
+                lines.append("Query \(index + 1): multiple text matches; narrow visual_region or inspect the image.")
+            case .unavailable:
+                lines.append("Query \(index + 1): no usable proposal." + (VisionFallback.isEnabled ? "" : " Configure local vision for semantic targets."))
             }
-            lines.append("Query \(index + 1): x=\(Int(point.x)), y=\(Int(point.y)).")
         }
         lines.append("visual_snapshot: " + observationToken(windowID: windowID, bytes: bytes))
         lines.append("Inspect the screenshot and confirm each intended target before using a window-bound pixel click or drag with visual_snapshot. Read again if the view changes.")
