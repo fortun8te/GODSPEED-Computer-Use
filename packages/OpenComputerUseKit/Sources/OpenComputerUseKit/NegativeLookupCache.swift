@@ -2,7 +2,7 @@ import Foundation
 
 /// Remembers element searches that just found nothing, so the same search is not repeated at once.
 ///
-/// A miss is trusted only for the same window, at the same snapshot generation, and for a short
+/// A miss is trusted only for the same window, snapshot and observed-change generation, and for a short
 /// time (`ttl`). A newer generation, another window, or an expired entry means "search again".
 /// The cache never reports a hit. The caller passes in the time, so tests can drive it.
 /// It is thread-safe. Its size is bounded: the oldest recorded entry is dropped first.
@@ -25,6 +25,7 @@ final class NegativeLookupCache {
 
     private struct Entry {
         let generation: Int
+        let changeGeneration: UInt64?
         let recordedAt: TimeInterval
         // Higher means recorded later. Used to find the oldest entry.
         let sequence: UInt64
@@ -42,22 +43,22 @@ final class NegativeLookupCache {
     }
 
     /// Records that the search for `key` found nothing at this generation and time.
-    func recordMiss(key: Key, generation: Int, now: TimeInterval) {
+    func recordMiss(key: Key, generation: Int, changeGeneration: UInt64? = nil, now: TimeInterval) {
         lock.lock()
         defer { lock.unlock() }
         nextSequence += 1
-        entries[key] = Entry(generation: generation, recordedAt: now, sequence: nextSequence)
+        entries[key] = Entry(generation: generation, changeGeneration: changeGeneration, recordedAt: now, sequence: nextSequence)
         evictIfNeeded()
     }
 
     /// True only if the same search missed at this generation and is still younger than `ttl`.
-    func isKnownMiss(key: Key, generation: Int, now: TimeInterval) -> Bool {
+    func isKnownMiss(key: Key, generation: Int, changeGeneration: UInt64? = nil, now: TimeInterval) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard let entry = entries[key] else { return false }
         let age = now - entry.recordedAt
         // A newer generation, an expired entry, or a clock that went backwards means "unknown".
-        return entry.generation == generation && age >= 0 && age < ttl
+        return entry.generation == generation && entry.changeGeneration == changeGeneration && age >= 0 && age < ttl
     }
 
     /// Forgets every miss recorded for `app`.
@@ -76,23 +77,30 @@ final class NegativeLookupCache {
 
     /// A label search in two steps, as `resolveLabel` runs it: `find` on the cached state first, then, unless this
     /// same search already missed on the current generation, one `readFresh` and `find` again. A miss is recorded
-    /// only after a fresh read, so a repeat within the TTL does not extend the trust. Returns the state the last
-    /// search ran on, its hit, and whether a fresh read ran.
+    /// only after a fresh read with no observed change during it, so a repeat within the TTL does not extend
+    /// the trust. Returns the state the last search ran on, its hit, and whether a fresh read ran.
     func searchTwoStep<State, Hit>(
         keyFor: (State) -> Key,
         cached: State?,
         generation: () -> Int,
+        changeGeneration: (State) -> UInt64? = { _ in nil },
         now: () -> TimeInterval,
         find: (State) throws -> Hit?,
         readFresh: () throws -> State
     ) rethrows -> (state: State, hit: Hit?, freshRead: Bool) {
         if let cached {
             if let hit = try find(cached) { return (cached, hit, false) }
-            if isKnownMiss(key: keyFor(cached), generation: generation(), now: now()) { return (cached, nil, false) }
+            if isKnownMiss(key: keyFor(cached), generation: generation(), changeGeneration: changeGeneration(cached), now: now()) {
+                return (cached, nil, false)
+            }
         }
+        let beforeRead = cached.flatMap(changeGeneration)
         let fresh = try readFresh()
         let hit = try find(fresh)
-        if hit == nil { recordMiss(key: keyFor(fresh), generation: generation(), now: now()) }
+        let afterRead = changeGeneration(fresh)
+        if hit == nil, beforeRead == afterRead {
+            recordMiss(key: keyFor(fresh), generation: generation(), changeGeneration: afterRead, now: now())
+        }
         return (fresh, hit, true)
     }
 

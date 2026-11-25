@@ -51,11 +51,12 @@ final class AXChangeMonitor: @unchecked Sendable {
     static let shared = AXChangeMonitor(source: AXObserverSource(), now: TimingLog.now)
 
     private struct App {
+        let identity = UUID()
         var subscription: Subscription?
         var attempted = false
         var lastActivity: TimeInterval
         /// Bumped by every notification. A read started at generation N saw everything before N.
-        var generation: UInt64 = 0
+        var generation: UInt64
         /// Generation of the first notification since the last clean read, if any.
         var dirtySince: UInt64?
         var reason: String?
@@ -70,6 +71,9 @@ final class AXChangeMonitor: @unchecked Sendable {
     /// Guards `apps` and wakes waiters when a generation moves.
     private let lock = NSCondition()
     private var apps: [pid_t: App] = [:]
+    // Tokens are never reused when a PID is swept and tracked again. A late read
+    // from an old observer must not clean the replacement observer's state.
+    private var nextGeneration: UInt64 = 0
     private let source: NotificationSource
     private let now: () -> TimeInterval
 
@@ -83,28 +87,27 @@ final class AXChangeMonitor: @unchecked Sendable {
     /// Starts watching `pid` (its observer is created on first use) and returns its current generation.
     @discardableResult
     func track(_ pid: pid_t) -> UInt64 {
-        var attempt = false
-        let generation = locked { apps -> UInt64 in
-            var app = apps[pid] ?? App(lastActivity: now())
+        let tracked = locked { apps -> (generation: UInt64, identity: UUID, attempt: Bool) in
+            var app = apps[pid] ?? App(lastActivity: now(), generation: takeGenerationLocked())
             app.lastActivity = now()
-            attempt = !app.attempted
+            let attempt = !app.attempted
             app.attempted = true
             apps[pid] = app
-            return app.generation
+            return (app.generation, app.identity, attempt)
         }
-        if attempt {
+        if tracked.attempt {
             // Subscribe outside the lock: a source may call back synchronously.
             let subscription = source.subscribe(pid: pid, names: Self.watchedNotifications) { [weak self] name in
-                self?.receive(pid: pid, name: name)
+                self?.receive(pid: pid, identity: tracked.identity, name: name)
             }
             let dropped = locked { apps -> Bool in
-                guard apps[pid] != nil else { return true }
+                guard apps[pid]?.identity == tracked.identity else { return true }
                 apps[pid]?.subscription = subscription
                 return false
             }
             if dropped { subscription?.cancel() }
         }
-        return generation
+        return tracked.generation
     }
 
     /// Current generation for `pid`; 0 when the app is not tracked.
@@ -124,19 +127,29 @@ final class AXChangeMonitor: @unchecked Sendable {
     /// own cap and its normal read, so a false return is the same as an ordinary sleep.
     @discardableResult
     func awaitChange(pid: pid_t, since token: UInt64, upTo seconds: TimeInterval) -> Bool {
-        guard seconds > 0, !RequestCancellation.requested else { return false }
-        locked { apps in apps[pid]?.lastActivity = now() }
-        let deadline = Date().addingTimeInterval(seconds)
+        guard seconds.isFinite, seconds > 0, !RequestCancellation.requested else { return false }
+        let identity = locked { apps -> UUID? in
+            apps[pid]?.lastActivity = now()
+            return apps[pid]?.identity
+        }
+        guard let identity else { return false }
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
         lock.lock()
         defer { lock.unlock() }
         // Waits use real time. The injected clock only governs activity and grace windows.
-        while generationLocked(pid) == token {
-            guard Date() < deadline, !RequestCancellation.requested else { return false }
-            _ = lock.wait(until: deadline)
+        while true {
+            guard !RequestCancellation.requested, let app = apps[pid], app.identity == identity else { return false }
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { return false }
+            if app.generation != token {
+                apps[pid]?.wakes += 1
+                if let wakes = apps[pid]?.wakes { TimingLog.count("ax.wakes", wakes) }
+                return true
+            }
+            // Cancellation has no notification on this condition. Bound each sleep
+            // without replacing the request token's admission/transport callback.
+            _ = lock.wait(until: Date().addingTimeInterval(min(remaining, 0.05)))
         }
-        apps[pid]?.wakes += 1
-        if let wakes = apps[pid]?.wakes { TimingLog.count("ax.wakes", wakes) }
-        return true
     }
 
     // MARK: Reads
@@ -172,11 +185,21 @@ final class AXChangeMonitor: @unchecked Sendable {
 
     // MARK: Action detection
 
-    /// Call after a mutating step. A notification within the grace window keeps the app `notifying`;
-    /// none marks it `silent`, so it is polled as before.
-    func noteAction(_ pid: pid_t) {
+    /// Call after a delivered mutating step. A notification during the step or
+    /// within the grace window keeps the app `notifying`; none marks it `silent`.
+    func noteAction(_ pid: pid_t, startedAt token: UInt64? = nil, deliveryState: DeliveryState = .acknowledged) {
+        guard deliveryState == .acknowledged || deliveryState == .verified else { return }
         locked { apps in
-            guard apps[pid] != nil, apps[pid]!.pendingActionAt == nil else { return }
+            guard apps[pid] != nil else { return }
+            // The dispatch token also covers preparation. A notification and a
+            // clean tracked read during that preparation do not prove that the
+            // later input is represented. Only a read after this delivery may be
+            // reused, even when another action is already awaiting its event.
+            apps[pid]!.readComplete = false
+            guard apps[pid]!.pendingActionAt == nil else { return }
+            // The action itself can synchronously trigger an event before dispatch
+            // returns. Do not start waiting for a second notification in that case.
+            if let token, apps[pid]!.generation != token { return }
             apps[pid]!.pendingActionAt = now()
         }
     }
@@ -215,10 +238,13 @@ final class AXChangeMonitor: @unchecked Sendable {
     private func sweepLocked() -> [Subscription] {
         let current = now()
         var removed: [Subscription] = []
+        var didRemove = false
         for (pid, app) in apps where current - app.lastActivity > Self.idleSeconds {
             if let subscription = app.subscription { removed.append(subscription) }
             apps[pid] = nil
+            didRemove = true
         }
+        if didRemove { lock.broadcast() }
         return removed
     }
 
@@ -231,15 +257,17 @@ final class AXChangeMonitor: @unchecked Sendable {
     }
 
     /// Caller holds the lock.
-    private func generationLocked(_ pid: pid_t) -> UInt64 {
-        apps[pid]?.generation ?? 0
+    private func takeGenerationLocked() -> UInt64 {
+        let token = nextGeneration
+        nextGeneration &+= 1
+        return token
     }
 
     /// Runs on the observer thread.
-    private func receive(pid: pid_t, name: String) {
+    private func receive(pid: pid_t, identity: UUID, name: String) {
         let count: Int? = locked { apps in
-            guard apps[pid] != nil else { return nil }
-            apps[pid]!.generation += 1
+            guard apps[pid]?.identity == identity else { return nil }
+            apps[pid]!.generation = takeGenerationLocked()
             if apps[pid]!.dirtySince == nil { apps[pid]!.dirtySince = apps[pid]!.generation }
             apps[pid]!.reason = Self.reason(for: name)
             apps[pid]!.notifications += 1

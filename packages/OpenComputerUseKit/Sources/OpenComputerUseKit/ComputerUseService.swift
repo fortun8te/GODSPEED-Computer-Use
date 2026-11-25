@@ -3270,12 +3270,13 @@ public final class ComputerUseService {
             if let hit = try find(in: fresh) { return hit }
         } else {
             // The expensive fresh read is skipped when this same label already missed on the current snapshot
-            // generation (the generation changes on every stored read, so a new read always searches again).
+            // generation, provided AX has reported no change since then. A new read or notification searches again.
             let labelKey = given.joined(separator: "\n")
             let outcome = try negativeLookups.searchTwoStep(
                 keyFor: { NegativeLookupCache.Key(app: query.lowercased(), windowID: Int($0.targetWindowID ?? 0), label: labelKey, role: "") },
                 cached: try? currentSnapshot(for: query, needScreenshot: false),
                 generation: { self.snapshotStoreCount },
+                changeGeneration: { AXChangeMonitor.shared.track($0.app.pid) },
                 now: { TimingLog.now() },
                 find: { try find(in: $0) },
                 readFresh: { try refreshSnapshot(for: query, recoveryPolicy: recoveryPolicy,

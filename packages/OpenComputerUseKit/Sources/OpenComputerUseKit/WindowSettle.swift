@@ -43,8 +43,11 @@ enum WindowSettle {
         var stableSince: TimeInterval?
         while !RequestCancellation.requested, now() < deadline {
             let current = sample()
-            if let current, now() < deadline, !axBusy() {
-                let sampledAt = now()
+            guard !RequestCancellation.requested, now() < deadline else { break }
+            let sawBusy = current == nil || axBusy()
+            let sampledAt = now()
+            guard !RequestCancellation.requested, sampledAt < deadline else { break }
+            if let current, !sawBusy {
                 if current != previous || stableSince == nil { stableSince = sampledAt }
                 if let since = stableSince, sampledAt - since >= quietPeriod { break }
             } else {
@@ -102,7 +105,9 @@ enum WindowSettle {
         var signs: [Signs<Element>?] = []
         var next = 0
         while next < nodes.count {
+            guard !RequestCancellation.requested else { return true }
             if next == signs.count { signs += read(nodes[next...].map(\.element)) }
+            guard !RequestCancellation.requested else { return true }
             let depth = nodes[next].depth
             defer { next += 1 }
             guard next < signs.count, let node = signs[next] else {
@@ -134,9 +139,10 @@ enum WindowSettle {
         while !RequestCancellation.requested, now() < deadline {
             let watch = pid.map { (monitor ?? AXChangeMonitor.shared, $0) }
             let token = watch.map { $0.0.track($0.1) }
+            guard !RequestCancellation.requested, now() < deadline else { return false }
             let sawBusy = try busy()
             let sampledAt = now()
-            guard sampledAt <= deadline else { return false }
+            guard !RequestCancellation.requested, sampledAt < deadline else { return false }
             if sawBusy {
                 quietSince = nil
             } else if let since = quietSince {
@@ -182,8 +188,13 @@ enum WindowSettle {
         signs.initialize(repeating: nil)
         defer { signs.deinitialize(); signs.deallocate() }
         let ranges = scanRanges(count: elements.count)
+        // Dispatch workers do not inherit the request's TaskLocal cancellation token.
+        let cancellation = RequestCancellation.current
         DispatchQueue.concurrentPerform(iterations: ranges.count) { lane in
-            for index in ranges[lane] { signs[index] = read(elements[index]) }
+            for index in ranges[lane] {
+                guard cancellation?.isCancelled != true else { break }
+                signs[index] = read(elements[index])
+            }
         }
         return Array(signs)
     }
@@ -193,8 +204,30 @@ enum WindowSettle {
     private static func read(_ element: AXUIElement) -> Signs<AXUIElement>? {
         var copied: CFArray?
         guard AXUIElementCopyMultipleAttributeValues(element, attributes as CFArray, [], &copied) == .success,
-              let values = copied as? [Any], values.count == 4 else { return nil }
-        return Signs(role: values[0] as? String, children: values[1] as? [AXUIElement] ?? [],
-                     busy: values[2] as? Bool, loaded: values[3] as? Bool)
+              let values = copied as? [AnyObject] else { return nil }
+        return decodeSigns(values)
+    }
+
+    /// AX can report success for the batch while individual attributes failed.
+    /// Unsupported optional attributes are ordinary absence; transient failures
+    /// and malformed values leave this branch unread, so it cannot prove quiet.
+    static func decodeSigns(_ values: [AnyObject]) -> Signs<AXUIElement>? {
+        guard values.count == attributes.count else { return nil }
+        var decoded = AXSnapshotReadCache.decodeBatch(values, names: attributes)
+        // The multiple-attribute API also uses CFNull for unsupported attributes.
+        for (name, value) in zip(attributes, values) where value is NSNull { decoded[name] = .absent }
+        guard decoded.count == attributes.count,
+              let role = decoded[kAXRoleAttribute]?.value as? String else { return nil }
+        var children: [AXUIElement] = []
+        if let value = decoded[kAXChildrenAttribute]?.value {
+            guard let elements = value as? [AXUIElement] else { return nil }
+            children = elements
+        }
+        for name in ["AXElementBusy", "AXLoaded"] {
+            if let value = decoded[name]?.value, value as? Bool == nil { return nil }
+        }
+        return Signs(role: role, children: children,
+                     busy: decoded["AXElementBusy"]?.value as? Bool,
+                     loaded: decoded["AXLoaded"]?.value as? Bool)
     }
 }

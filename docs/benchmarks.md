@@ -66,6 +66,39 @@ Reproduce these byte counts with `GODSPEED_MEASURE_PAYLOADS=1 swift test --filte
 
 Use host usage receipts for input, cache reads, cache writes, output, and reasoning. Fresh input equals total input minus cache reads when both are reported. Reasoning is part of output. Missing counts remain unreported. Compare payload bytes separately because hosts may handle structured metadata differently.
 
+### Queue delays, local routes, and incomplete work
+
+Use a distinct `OPEN_COMPUTER_USE_RUN_ID` for each workload. After the run, summarize its metadata with the driver build recorded in the receipts:
+
+```sh
+python3 scripts/godspeed-trace-summary.py --run-id local-pass --driver-build BUILD_ID
+```
+
+The report counts top-level tool calls. A call can contain several batch actions or handoffs, so calls, helper requests, and independently checked tasks have different denominators.
+
+| Report field | Population and meaning |
+| --- | --- |
+| `calls`, `tool_errors`, `error_flag_samples` | All matching tool calls; the error sample count shows how many explicitly report an error flag. A non-error reply does not establish task completion. |
+| `delivery_states`, `delivery_state_samples` | Delivery evidence for calls. The sample count covers the four recognized states. Newly reported labels remain visible in the distribution. Acknowledged input is distinct from verified delivery. |
+| `duration_samples`, `p50_duration_ms`, `p95_duration_ms` | Calls with valid execution durations, including execution failures. Admission timeouts have no execution and are excluded. |
+| `admission_samples`, `p50_admission_ms`, `p95_admission_ms` | Calls with recorded admission time, including admission timeouts. |
+| `queue_inclusive_samples`, `p50_queue_inclusive_ms`, `p95_queue_inclusive_ms` | Admission plus execution from each call with both samples; an admission timeout contributes admission alone. Missing admission is not assumed to be zero. These timings exclude client transport and later reply handling. |
+| `helper_activity` | Recorded requests for `decide`, `choose`, `locate`, and the three `gsd1` roles. Image requests overlap those routes and are not added again. The per-call denominator is `telemetry_calls`; `calls_without_telemetry` remains separate. |
+| `local_routing` | Handoff rule versus model actions, using only records containing both counters. The rule fraction divides rule actions by rule plus model actions. Visual search separately reports fast OCR, accurate OCR, vision proposals, and ambiguous text matches. |
+| `done_checks`, `done_check_samples`, `batch_not_run_total` | Explicit batch checks and unexecuted steps. Weak evidence, skipped checks, unmet checks, and cancelled batches remain visible alongside verified checks. `batch_not_run_samples` identifies how many calls report the unexecuted-step count. |
+
+Percentiles use nearest rank over their stated sample population. Queue-inclusive percentiles are calculated from paired samples, not by adding two independently calculated percentiles. Step-level delivery and failure distributions remain separate from top-level calls. Receipt labels are retained when a newer driver introduces a code, rather than omitted by an outdated list.
+
+Older logs may omit telemetry even when a call made no helper request. That absence does not establish zero helper use. A report with no telemetry returns `null` for requests per telemetry-bearing call. `telemetry_totals` retains helper wall time, inference time, busy responses, and other recorded counters. Route labels do not identify whether a service ran locally or remotely; these traces also do not measure the host model's reasoning, token use, whole-machine CPU, or power. OCR targets are proposals, not verified completed actions.
+
+The native regression workload has a separate completion measure:
+
+```sh
+python3 scripts/godspeed-regression-bench.py --repeat 20 --output regression.json
+```
+
+`fixture_pass_rate` measures the expected fixture effects. `completed_pass_rate` additionally requires that the whole workload finish without an error, including its final observation. Both divide by all reported runs. A run that produces the expected effects but loses its final observation can pass the fixture check and still fail completion. `aborted_runs` reports that distinction, and p95 wall time includes completed and aborted runs. These scripted fixture checks can expose regressions; a claim that Godspeed outperforms another driver still requires the matched task schedule below.
+
 ## Earlier runs
 
 These recorded runs used GPT-6 Luna at low reasoning. A task checker scored the final result.

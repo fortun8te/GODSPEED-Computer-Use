@@ -101,6 +101,55 @@ final class TrajectoryLogTests: XCTestCase {
         }
     }
 
+    func testMCPTraceAndWireShareCompleteTelemetryForLocalAndRejectedCalls() throws {
+        let log = TrajectoryLog(environment: [:], directory: directory)
+        let recipes = BatchRecipes(fileURL: directory.appendingPathComponent("recipes.json"))
+        let teach = TeachMode(store: recipes, makeSource: { nil }, resolveApp: { _ in nil },
+                              now: { Date() }, scheduleTimer: false)
+        let dispatcher = ComputerUseToolDispatcher(actionPolicyURL: directory.appendingPathComponent("policy.json"),
+                                                    recipeStore: recipes, teach: teach)
+        let server = StdioMCPServer(dispatcher: dispatcher, backgroundStateReset: {}, trajectoryLog: log)
+        let requests = [
+            #"{"id":1,"method":"tools/call","params":{"name":"teach","arguments":{"action":"status"}}}"#,
+            #"{"id":2,"method":"tools/call","params":{"name":"click","arguments":{"strict_background":"invalid"}}}"#,
+        ]
+        var wireMetrics: [[String: Double]] = []
+        for (index, request) in requests.enumerated() {
+            let response = try XCTUnwrap(server.handle(line: request, admissionMs: 12))
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any])
+            let result = try XCTUnwrap(json["result"] as? [String: Any])
+            XCTAssertEqual(result["isError"] as? Bool ?? false, index == 1)
+            let metadata = try XCTUnwrap(result["_meta"] as? [String: Any])
+            wireMetrics.append(try XCTUnwrap(metadata["godspeed/telemetry"] as? [String: Double]))
+        }
+        let lines = try records(log)
+        XCTAssertEqual(lines.count, requests.count)
+        for (index, line) in lines.enumerated() {
+            let metrics = try XCTUnwrap(line["telemetry"] as? [String: Double])
+            XCTAssertEqual(metrics, wireMetrics[index])
+            let wall = try XCTUnwrap(metrics["wall_ms"])
+            XCTAssertGreaterThanOrEqual(wall, 0)
+            XCTAssertEqual(try XCTUnwrap(line["duration_ms"] as? Double), wall, accuracy: 0.051)
+            XCTAssertEqual(line["admission_ms"] as? Double, 12)
+            XCTAssertFalse(metrics.keys.contains { $0.hasSuffix("_requests") })
+            XCTAssertNil(line["arguments"])
+            XCTAssertNil(line["result_text"])
+        }
+    }
+
+    func testTelemetryUsesOneMonotonicDurationWhenFinalizedAgain() throws {
+        var now: TimeInterval = 20
+        let telemetry = ToolTelemetry(clock: { now })
+        telemetry.add("dispatches")
+        now = 20.25
+        _ = telemetry.reply(.text("ok"))
+        XCTAssertEqual(try XCTUnwrap(telemetry.snapshot()["wall_ms"]), 250, accuracy: 0.001)
+        now = 20.5
+        _ = telemetry.reply(.text("ok"))
+        XCTAssertEqual(try XCTUnwrap(telemetry.snapshot()["wall_ms"]), 500, accuracy: 0.001)
+        XCTAssertEqual(telemetry.snapshot()["dispatches"], 1)
+    }
+
     func testDefaultLogOmitsPrivateContentButRecordsFailedBatch() throws {
         let log = TrajectoryLog(environment: [:], directory: directory)
         let receipt = TrajectoryLog.BatchReceipt(

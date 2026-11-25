@@ -85,8 +85,8 @@ final class BackgroundSafetyTests: XCTestCase {
         XCTAssertTrue(text.contains("File > Save was sent"))
         XCTAssertTrue(text.contains("may still run"))
 
-        guard case .message(let other)? = menuPressError(.invalidUIElement, path: "File > Save") else {
-            return XCTFail("an unrecognised AXError is a plain failure")
+        guard case .notSent(let other)? = menuPressError(.invalidUIElement, path: "File > Save") else {
+            return XCTFail("an invalid element must report that its menu press was not sent")
         }
         XCTAssertTrue(other.hasPrefix("Could not press File > Save"))
     }

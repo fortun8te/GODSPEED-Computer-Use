@@ -1269,7 +1269,7 @@ extension ComputerUseToolDispatcher {
             let dispatchStarted = clock.systemUptime
             // Observe the app before a mutating step, so its notifications are not missed.
             let actionPid = isMutating ? stepApp.flatMap(BatchTool.runningPid) : nil
-            if let actionPid { AXChangeMonitor.shared.track(actionPid) }
+            let actionGeneration = actionPid.map { AXChangeMonitor.shared.track($0) }
             // Preparing a private baseline or resolving an app can consume the
             // remaining budget. Recheck immediately before native dispatch too;
             // BrowserCallBudget is not enforced by every native action route.
@@ -1379,8 +1379,11 @@ extension ComputerUseToolDispatcher {
             }
             lines += stepNotes
 
-            // A notification within the grace window confirms the app reports changes; silence marks it polled.
-            if let actionPid { AXChangeMonitor.shared.noteAction(actionPid) }
+            // Include notifications delivered during dispatch, and do not infer an
+            // action from a successful result that explicitly says no input was sent.
+            if let actionPid, let actionGeneration {
+                AXChangeMonitor.shared.noteAction(actionPid, startedAt: actionGeneration, deliveryState: result.deliveryState)
+            }
             // What this step changed. The last step is judged against the final read below.
             if effectsOn, !effectBudget.exhausted, isMutating, let app = stepApp, watchApp == app, let before = watchState {
                 if isLastStep {

@@ -96,6 +96,8 @@ func menuPressError(_ result: AXError, path: String) -> ComputerUseError? {
         return nil
     case .cannotComplete, .failure, .attributeUnsupported, .noValue:
         return .stateUnavailable("\(path) was sent, but the app did not confirm it (AXError \(result.rawValue)); it may still run. Read the app before pressing again: a repeat could run it twice.")
+    case .actionUnsupported, .invalidUIElement, .apiDisabled:
+        return .notSent("Could not press \(path) (AXError \(result.rawValue)).")
     default:
         return .message("Could not press \(path) (AXError \(result.rawValue)).")
     }
@@ -232,19 +234,23 @@ enum SkyKeyboardDispatcher {
         text: String,
         spi: SkyLightSPI = .shared
     ) throws {
-        try deliver(to: target, spi: spi) {
-            try InputSimulation.typeText(text, pid: target.pid, authenticated: true)
+        let delivery = NativeInputDelivery()
+        try deliver(to: target, spi: spi, delivery: delivery) {
+            try InputSimulation.typeText(text, pid: target.pid, authenticated: true, delivery: delivery)
         }
     }
 
     /// A keypad needs separate key events, but can reuse one target focus for a short group.
     static func typeKeypad(target: SkyKeyboardTarget, keys: String) throws {
+        let delivery = NativeInputDelivery()
         try deliverKeypadGroups(keys) { group, precededByKey in
+            try delivery.check()
             if precededByKey { Thread.sleep(forTimeInterval: 0.04) }
-            try deliver(to: target, spi: .shared) {
+            try deliver(to: target, spi: .shared, delivery: delivery) {
                 for (offset, key) in group.enumerated() {
+                    try delivery.check()
                     if offset > 0 { Thread.sleep(forTimeInterval: 0.04) }
-                    try InputSimulation.typeText(String(key), pid: target.pid, authenticated: true)
+                    try InputSimulation.typeText(String(key), pid: target.pid, authenticated: true, delivery: delivery)
                 }
             }
         }
@@ -270,16 +276,17 @@ enum SkyKeyboardDispatcher {
     ) throws -> Bool {
         // Reject bad key specs before touching the target's focus state.
         let parsed = try KeyPressParser.parse(key)
+        let delivery = NativeInputDelivery()
         var reportedDisabled = false
-        try deliver(to: target, spi: spi) {
+        try deliver(to: target, spi: spi, delivery: delivery) {
             if allowMenuEquivalent, let equivalent = skyMenuKeyEquivalent(for: parsed),
                let found = menuItem(matching: equivalent, pid: target.pid) {
                 reportedDisabled = found.reportedDisabled
-                try pressMenuItem(found, key: key)
+                try pressMenuItem(found, key: key, delivery: delivery)
                 return
             }
 
-            try InputSimulation.pressKey(key, pid: target.pid, authenticated: true)
+            try InputSimulation.pressKey(key, pid: target.pid, authenticated: true, delivery: delivery)
         }
         return reportedDisabled
     }
@@ -288,6 +295,8 @@ enum SkyKeyboardDispatcher {
     /// pressed as that item, with no key event and no focus change. A raw key event to a window that
     /// is not key is dropped without any error, so this is the only background-safe route for chords.
     static func pressMenuKeyEquivalent(_ key: String, pid: pid_t) throws -> MenuEquivalentPress {
+        let delivery = NativeInputDelivery()
+        try delivery.check()
         let parsed = try KeyPressParser.parse(key)
         guard let equivalent = skyMenuKeyEquivalent(for: parsed),
               let found = menuItem(matching: equivalent, pid: pid)
@@ -295,7 +304,7 @@ enum SkyKeyboardDispatcher {
             return .notAMenuItem
         }
 
-        try pressMenuItem(found, key: key)
+        try pressMenuItem(found, key: key, delivery: delivery)
         return .pressed(reportedDisabled: found.reportedDisabled)
     }
 
@@ -311,20 +320,44 @@ enum SkyKeyboardDispatcher {
         return copyValue(found.item, kAXTitleAttribute) as? String
     }
 
-    private static func pressMenuItem(_ found: FoundMenuItem, key: String) throws {
+    private static func pressMenuItem(_ found: FoundMenuItem, key: String, delivery: NativeInputDelivery) throws {
         try requireUsableComputerUseSession()
+        try delivery.check()
         let result = AXUIElementPerformAction(found.item, kAXPressAction as CFString)
-        if let error = menuPressError(result, path: key) {
-            throw error
-        }
+        try recordMenuPressResult(result, key: key, delivery: delivery)
         Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    static func recordMenuPressResult(_ result: AXError, key: String, delivery: NativeInputDelivery) throws {
+        if let error = menuPressError(result, path: key) {
+            // Definite AX refusal does not claim that this press reached the
+            // app. Earlier input in the same sequence still remains recorded.
+            if error.deliveryState != .notSent { delivery.didPost() }
+            throw delivery.failure(error)
+        }
+        delivery.didPost()
     }
 
     private static func deliver(
         to target: SkyKeyboardTarget,
         spi: SkyLightSPI,
+        delivery: NativeInputDelivery,
         _ body: () throws -> Void
     ) throws {
+        do {
+            try deliverSequence(to: target, spi: spi, delivery: delivery, body)
+        } catch {
+            throw delivery.failure(error)
+        }
+    }
+
+    private static func deliverSequence(
+        to target: SkyKeyboardTarget,
+        spi: SkyLightSPI,
+        delivery: NativeInputDelivery,
+        _ body: () throws -> Void
+    ) throws {
+        try delivery.check()
         try requireUsableComputerUseSession()
         guard spi.capability.isAvailable else {
             throw ComputerUseError.message(
@@ -337,7 +370,9 @@ enum SkyKeyboardDispatcher {
             dispatchLock.unlock()
         }
 
+        try delivery.check()
         try validate(target: target)
+        try delivery.check()
 
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid {
             try body()
@@ -347,17 +382,20 @@ enum SkyKeyboardDispatcher {
         // The user's own key window, read before any synthetic focus so it can be handed back.
         let userKeyWindow = UserKeyWindow.capture(excludingPID: target.pid, spi: spi)
         let start = TimingLog.now()
+        try delivery.check()
         let focusContext = try spi.beginSyntheticTargetFocus(
             targetPID: target.pid,
             targetWindowID: target.windowID
         )
         do {
+            try delivery.check()
             try spi.makeSyntheticTargetWindowKey(focusContext)
             TimingLog.log("sky_key.activate", since: start)
             let keyStart = TimingLog.now()
             waitForKeyWindow(target, spi: spi)
             TimingLog.log("sky_key.key_window", since: keyStart)
             let deliverStart = TimingLog.now()
+            try delivery.check()
             try body()
             TimingLog.log("sky_key.deliver", since: deliverStart)
             if releaseSettle > 0 {

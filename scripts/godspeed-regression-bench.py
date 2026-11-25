@@ -97,10 +97,20 @@ def grade(before_restart, final):
 
 def summarize(runs):
     durations = sorted(run["wall_seconds"] for run in runs)
+    fixture_passes = sum(run["fixture_pass"] for run in runs)
+    aborted_runs = sum(run.get("error") is not None for run in runs)
+    completed_passes = sum(run["fixture_pass"] and run.get("error") is None for run in runs)
     return {
         "runs": len(runs),
         "p95_wall_seconds": durations[ceil(0.95 * len(durations)) - 1],
-        "fixture_pass_rate": sum(run["fixture_pass"] for run in runs) / len(runs),
+        # Effects can be correct even when the final observation fails. Keep the
+        # fixture metric, but do not count that aborted workload as a complete pass.
+        "fixture_passes": fixture_passes,
+        "fixture_pass_rate": fixture_passes / len(runs),
+        "aborted_runs": aborted_runs,
+        "completed_runs": len(runs) - aborted_runs,
+        "completed_passes": completed_passes,
+        "completed_pass_rate": completed_passes / len(runs),
         "wrong_targets": sum(run["wrong_targets"] for run in runs),
         "duplicate_actions": sum(run["duplicate_actions"] for run in runs),
     }
@@ -185,7 +195,7 @@ def run_once(driver, fixture, app, root):
                 try:
                     run_workload(client, app, restart, steps)
                 except (RuntimeError, OSError) as exc:
-                    error = str(exc)
+                    error = str(exc) or type(exc).__name__
                 duration = monotonic() - started
                 final, _ = native.read_receipt(root, lambda *_: True)
                 return {"mcp": mcp, "wall_seconds": duration, "steps": steps,
@@ -221,6 +231,7 @@ def main():
         "planned_steps": STEP_COUNT,
         "timing_scope": "First snapshot through final snapshot or abort, including recovery and relaunch",
         "p95_method": "Nearest rank across completed and aborted trials",
+        "pass_scope": "Both pass rates use all runs; completed passes require correct fixture state and no workload error",
         "summary": summarize(runs),
         "runs": runs,
     }
@@ -228,9 +239,9 @@ def main():
     if args.output:
         print(json.dumps(report["summary"], indent=2))
         for index, run in enumerate(runs, start=1):
-            if run["error"]:
+            if run["error"] is not None:
                 print(f"Run {index} stopped after {len(run['steps'])} steps. {run['error'].strip()}")
-    return int(any(run["error"] or not run["fixture_pass"] for run in runs))
+    return int(any(run["error"] is not None or not run["fixture_pass"] for run in runs))
 
 
 if __name__ == "__main__":

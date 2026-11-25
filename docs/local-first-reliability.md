@@ -23,11 +23,19 @@ The master switch is `model_helpers: false` in `~/.godspeed/settings.json`, or `
 | A stale element number needs recovery | Re-read the original window, require the same process and an unambiguous observed identity, then keep the retry pinned. |
 | A workflow repeats unchanged states or navigation cycles | Detect the stall locally and return evidence without a separate stuck-model call. |
 | A resume request is canceled or already expired | Leave its checkpoint available; do not consume the token or send pending input. |
-| A saved pending step contains typed text | Require fresh value slots. Normalize aliases before storage and refuse legacy unslotted values. |
+| A saved pending step or completion check contains user values | Require fresh value slots. Normalize aliases before storage, keep completion operators separate from their values and refuse legacy unslotted values. |
 
 Recipe replay remains evidence-based. A previous successful recipe is a reusable plan, not proof that the present task is already done or permission to repeat an uncertain side effect. Existing action policy and delivery receipts continue to apply.
 
 The settling budget is a maximum of 700 ms of deliberate delay plus at most three local reads. It is used after an acknowledged but unchanged action, stops early on progress, and does not repeat the action. It is not a measured latency improvement across applications.
+
+## Native observation and scheduling
+
+Accessibility notifications invalidate cached misses immediately. A fresh search that overlaps a notification does not save its negative result. Observer callbacks and read generations are tied to the observer's lifetime, so an expired observer cannot alter a replacement observer for the same process number.
+
+Notification waits check cancellation at intervals of at most 50 ms without replacing the request's cancellation callback. Readiness and settling check again after native reads, before accepting completion. A transient attribute failure is not evidence that a window is quiet. Parallel scans carry the request cancellation token into their workers and stop before subsequent reads; an AX call already in flight still depends on the operating system to return.
+
+The action monitor records the generation before dispatch, so a notification received during dispatch establishes that the app reports changes. A delivered action still invalidates reusable read evidence: a preflight notification or read cannot prove its later effect. It does not start an action grace period for input reported as unsent or uncertain. Text values are withheld while secure-field classification is unavailable, with a retry once classification resolves.
 
 ## Shared workspace behaviour
 
@@ -37,11 +45,13 @@ For separately configured sessions that allow focus borrowing, Godspeed checks f
 
 Software cursor presentation is asynchronous. Accent, nickname, visibility, labels, action indicators, speed, reduced motion, idle timeout and floating are independent preferences. System mode respects macOS Reduce Motion. Cosmetic motion has a finite duration even for extreme numeric settings. OCR/vision clicks use the same anchored indication, with the click pulse following delivered input.
 
+Native input rechecks cancellation and the active time budget after window, focus and hit validation, immediately before posting. Keyboard and click sequences prepare matching releases before pressing. If a request ends after input starts, cleanup releases the keys or button already pressed while the receipt preserves uncertain delivery; the caller must inspect the result before repeating it.
+
 ## Settings integrity and privacy
 
 The terminal menu stages edits and presets until an explicit save. Resetting or reverting a setting updates the draft's actual difference; an unchanged draft does not rewrite the file. Read-only output omits editing commands. Custom URL credentials and terminal control characters are not displayed.
 
-Saving preserves unrelated keys, detects external changes and atomically replaces a private settings file. The runtime cache tracks file identity, size and modification time so atomic replacements with identical timestamps are observed. Partial manual edits keep the last valid settings until a complete JSON object is available.
+Saving preserves unrelated keys, detects external changes and atomically replaces a private settings file. Large retained values use compact output when indentation would exceed the read limit; an oversized draft is refused without replacing the original. The runtime cache tracks file identity, size and modification time so atomic replacements with identical timestamps are observed. Partial manual edits and temporary permission or I/O errors keep the last valid settings. Only an explicit missing-file result resets preferences to defaults.
 
 Local learning records and image retention have separate controls. Images remain opt-in. Learning preferences apply per request; connection-level trajectory preferences apply when a client reconnects. Neither logging control changes whether input is sent.
 
@@ -59,6 +69,8 @@ The implementation is native Swift and adds no agent-framework dependency. These
 
 ## Validation
 
-The macOS workflow covers menu transactions and interactive flows, settings-to-runtime mapping, helper exclusion, cursor preferences, foreground races, handoff settling, target integrity and batch resume. Portable launcher tests check executable packaging, argument forwarding, missing applications and enforced MCP defaults.
+The macOS workflow covers menu transactions and interactive flows, settings-to-runtime mapping, helper exclusion, cursor preferences, foreground races, handoff settling, target integrity, batch resume, observer replacement and cancelled native input. Portable launcher tests check executable packaging, argument forwarding, missing applications and enforced MCP defaults.
+
+Tool telemetry is finalized before it is logged, using monotonic execution time. Trace summaries report measurement coverage, queue-inclusive latency, helper routes and completion evidence separately. Missing legacy telemetry remains unknown; a fixture with the expected side effects still fails overall completion if its workload aborts. See [benchmark interpretation and commands](benchmarks.md).
 
 Unit tests establish those contracts. Live evaluations are still needed for unfamiliar applications, overlapping user activity, interrupted long workflows, Retina/canvas targets and video editors. Measure success, false actions, abstentions, helper-call counts and latency on matched tasks before claiming an overall performance gain. The public build still requires an awake, unlocked desktop for GUI work.

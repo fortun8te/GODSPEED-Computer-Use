@@ -5,6 +5,13 @@ final class ToolTelemetry: @unchecked Sendable {
     @TaskLocal static var current: ToolTelemetry?
     private let lock = NSLock()
     private var counters: [String: Double] = [:]
+    private let clock: () -> TimeInterval
+    private let startedAt: TimeInterval
+
+    init(clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.clock = clock
+        startedAt = clock()
+    }
 
     func add(_ key: String, _ value: Double = 1) {
         guard value.isFinite, value >= 0 else { return }
@@ -34,11 +41,18 @@ final class ToolTelemetry: @unchecked Sendable {
         return counters
     }
 
-    func reply(_ result: ToolCallResult, startedAt: Date) -> [String: Any] {
-        add("wall_ms", max(0, Date().timeIntervalSince(startedAt) * 1_000))
+    func reply(_ result: ToolCallResult) -> [String: Any] {
+        // Elapsed execution must survive a system-clock adjustment. Finalize before the
+        // trajectory is written so a measured zero-helper call is distinguishable from
+        // legacy rows that did not collect telemetry.
+        let elapsed = (clock() - startedAt) * 1_000
+        lock.lock()
+        if elapsed.isFinite { counters["wall_ms"] = max(0, elapsed) }
+        let measurements = counters
+        lock.unlock()
         var reply = result.asDictionary
         var metadata = reply["_meta"] as? [String: Any] ?? [:]
-        metadata["godspeed/telemetry"] = snapshot()
+        metadata["godspeed/telemetry"] = measurements
         reply["_meta"] = metadata
         return reply
     }
