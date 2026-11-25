@@ -216,6 +216,26 @@ The command creates the Keychain key on first use and prints the public key as u
 
 Grants are off by default, so today's Chrome helper keeps working unchanged. Turn them on only after installing the authenticated Chrome host with the key above: set `"relay_grant": true` in `~/.godspeed/settings.json` (or `OPEN_COMPUTER_USE_RELAY_GRANT=1`). With grants off, Godspeed never reads the Keychain key and sends no grant or renewal.
 
+## Semantic visual search and canvas interactions
+
+For an unlabeled icon or a canvas object, first read the app to obtain its Window ID. Then explicitly request visual search on that window:
+
+```json
+{"app":"Example","window_id":42,"include_ax":true,"include_screenshot":true,"visual_queries":["gear icon in the upper toolbar","blue circle on the canvas"],"visual_region":[0,0,1,1]}
+```
+
+The optional loopback vision helper returns up to two **unverified** point proposals in the delivered screenshot's pixel coordinates. Use a single normalized top-left region [x,y,width,height] to limit search to a panel or canvas. Inspect the returned image before choosing an action; a model point is not evidence that an object exists or is safe to click. A two-point search can propose the start and end of a drag. No input is sent by visual search. It is off unless requested and the helper is configured.
+
+For a confirmed point, pass its screenshot token, the same window ID and pixel coordinates to the existing click or drag tool:
+
+```json
+{"app":"Example","window_id":42,"x":120,"y":84,"visual_snapshot":"<token returned by visual search>"}
+```
+
+The optional token checks both the cached screenshot and a fresh capture before dispatch. Changed pixels, a replaced read, a changed encoding configuration, or an unavailable capture cause a refusal; reread instead of retrying stale coordinates. Animated windows may require a new observation. The token does not authorize an action or prove its result. Normal accessibility actions and unguarded pixel operations are unchanged. Visual search suppresses helper input when secure-field evidence is present, but this is not a guarantee that every sensitive view can be recognized.
+
+Native control lookup misses also include a bounded ranked shortlist of observed names and indices (including common UI synonyms). These are recovery suggestions, not automatic clicks.
+
 ## Private clipboard
 
 Each Godspeed client has an in-memory clipboard shared by its Mac and Chrome actions. In Mac apps, select text and use `press_key` with `cmd+c`, `cmd+x`, or `cmd+v`. In Chrome, use `browser` with `action: "copy"`, `"cut"`, or `"paste"`. To paste into a named field, pass its label. A single batch can alternate these actions between apps.
