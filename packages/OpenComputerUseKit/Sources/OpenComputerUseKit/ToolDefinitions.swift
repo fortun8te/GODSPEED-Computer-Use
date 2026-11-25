@@ -272,6 +272,7 @@ public enum ToolDefinitions {
                     "include_refs": ["type": "boolean", "default": false, "description": "Return opaque refs for exact native element actions. Requires include_ax."],
                     "include_screenshot": ["type": "boolean", "default": LeanDefaults.includeScreenshot, "description": "Also return a screenshot, e.g. for pixel clicks."],
                     "include_menu_bar": ["type": "boolean", "default": false, "description": "Include the app menu bar in the AX list. For a known menu command, use press_menu."],
+                    "visual_queries": ["type": "array", "items": ["type": "string"], "minItems": 1, "maxItems": 2, "description": "Optional semantic descriptions of icons or canvas targets. Requires window_id, include_ax and include_screenshot; returns unverified pixel proposals, never acts."],
                     "text_limit": textLimitProperty(description: "Max text characters per element; \"max\" for all. Default 500."),
                     "max_tree_nodes": positiveIntegerProperty(description: "Default 1200."),
                     "max_tree_depth": positiveIntegerProperty(description: "Default 64."),
