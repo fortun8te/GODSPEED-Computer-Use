@@ -981,7 +981,9 @@ public final class ComputerUseService {
         }
         let candidate = VisionFallback.candidate(scan: { accurate in
             guard clock.systemUptime < deadline else { return .missing }
-            return LocalOCR.scan(crop, label: label, level: accurate ? .accurate : .fast)
+            // Preserve small toolbar labels and dense canvas text on the accurate pass.
+            let image = accurate ? (LocalWindowImage.downscaled(original, maxSide: VisionFallback.accurateOCRMaxSide) ?? crop) : crop
+            return LocalOCR.scan(image, label: label, level: accurate ? .accurate : .fast)
         }, locate: {
             guard clock.systemUptime < deadline,
                   let overview = LocalWindowImage.downscaled(crop, maxSide: VisionFallback.overviewMaxSide),
@@ -1027,7 +1029,11 @@ public final class ComputerUseService {
             return nil
         }
         let point = chosen.point
-        guard clock.systemUptime < deadline, liveWindow() != nil else { return nil }
+        // The helper can take seconds; reject any changed screen before delivering input.
+        guard clock.systemUptime < deadline, let finalWindow = liveWindow(),
+              let finalImage = SnapshotBuilder.localWindowImage(finalWindow),
+              VisionFallback.sameCapture(original, finalImage),
+              confirms(point, chosen.candidate), clock.systemUptime < deadline else { return nil }
         verified = true
 
         let screenPoint = CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y)
