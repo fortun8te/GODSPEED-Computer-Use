@@ -727,7 +727,7 @@ enum HandoffTool {
         var noChange = 0
         var failures = 0
         let doneSummary = request.doneWhen.map(\.summary).joined(separator: "; ")
-        let needsFreshFields = request.doneWhen.contains { condition in
+        let needsFreshFields = typedForm || request.doneWhen.contains { condition in
             if case .field = condition { return true }
             return false
         }
