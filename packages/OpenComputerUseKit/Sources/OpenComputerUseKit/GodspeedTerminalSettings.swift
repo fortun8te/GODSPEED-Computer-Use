@@ -7,7 +7,7 @@ import Glibc
 
 /// User-local preferences only. No permission grants, daemon changes or input actions.
 public enum GodspeedTerminalSettings {
-    struct Item {
+    struct Item: Sendable {
         let key: String
         let name: String
         let group: String
@@ -15,7 +15,7 @@ public enum GodspeedTerminalSettings {
         let environment: String?
         let kind: Kind
 
-        enum Kind { case toggle, choice([String]), color, endpoint(allowEmpty: Bool) }
+        enum Kind: Sendable { case toggle, choice([String]), color, endpoint(allowEmpty: Bool) }
     }
 
     static let items: [Item] = [
@@ -56,7 +56,7 @@ public enum GodspeedTerminalSettings {
             self.url = url
             original = try Self.read(url)
             if let original {
-                guard let decoded = try JSONSerialization.jsonObject(with: original) as? [String: Any] else {
+                guard let decoded = (try? JSONSerialization.jsonObject(with: original)) as? [String: Any] else {
                     throw Failure.invalid("Settings must be a JSON object. Repair the file before editing.")
                 }
                 values = decoded
@@ -157,7 +157,7 @@ public enum GodspeedTerminalSettings {
                 guard let parts = URLComponents(string: string), parts.user == nil, parts.password == nil,
                       parts.query == nil, parts.fragment == nil else { return "(custom URL)" }
             }
-            return String(string.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.prefix(80))
+            return String(String.UnicodeScalarView(string.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.prefix(80)))
         }
         if let number = value as? NSNumber { return number.stringValue }
         return "(custom)"
@@ -206,7 +206,7 @@ public enum GodspeedTerminalSettings {
             print(menu(values: draft.values, environment: environment, dirty: draft.changed))
             if !notice.isEmpty { print("\n" + notice) }
             print("\n> ", terminator: "")
-            fflush(stdout)
+            fflush(nil)
             guard let command = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return }
             notice = ""
             if command == "q" {
@@ -218,7 +218,7 @@ public enum GodspeedTerminalSettings {
                 print("Saved to ~/.godspeed/settings.json.")
                 return
             }
-            guard let number = Int(command), items.indices.contains(number - 1), number > 0 else {
+            guard let number = Int(command), number > 0, items.indices.contains(number - 1) else {
                 notice = "Choose a setting number, s, or q."
                 continue
             }
@@ -235,7 +235,7 @@ public enum GodspeedTerminalSettings {
             case .endpoint(let allowEmpty): hint = allowEmpty ? "loopback URL / off" : "loopback URL"
             }
             print("\(item.name) (\(hint), reset; Enter cancels): ", terminator: "")
-            fflush(stdout)
+            fflush(nil)
             guard let input = readLine() else { return }
             if input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
             do { try draft.apply(item, input: input) }
