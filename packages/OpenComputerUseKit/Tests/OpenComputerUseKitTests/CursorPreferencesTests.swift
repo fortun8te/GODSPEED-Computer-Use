@@ -79,6 +79,33 @@ final class CursorPreferencesTests: XCTestCase {
         XCTAssertTrue(panel.ignoresMouseEvents)
     }
 
+    func testDisablingOneClientImmediatelyClearsItsPreviousCursor() throws {
+        let screen = try XCTUnwrap(NSScreen.main)
+        let target = CGPoint(x: screen.frame.midX, y: screen.frame.midY)
+        let first = UUID().uuidString
+        let second = UUID().uuidString
+        SoftwareCursorOverlay.reset()
+        defer { SoftwareCursorOverlay.reset() }
+        RequestConfiguration.withEnvironment([
+            "OPEN_COMPUTER_USE_VISUAL_CURSOR": "1",
+            "OPEN_COMPUTER_USE_CURSOR_MOTION": "reduced",
+        ]) {
+            for client in [first, second] {
+                ClientScope.with(client) { SoftwareCursorOverlay.moveCursor(to: target, in: nil) }
+                XCTAssertTrue(SoftwareCursorOverlay.stage(for: client).isVisible)
+            }
+        }
+        RequestConfiguration.withEnvironment(["OPEN_COMPUTER_USE_VISUAL_CURSOR": "0"]) {
+            ClientScope.with(first) { SoftwareCursorOverlay.moveCursor(to: target, in: nil) }
+        }
+        let cleared = SoftwareCursorOverlay.stage(for: first)
+        XCTAssertFalse(cleared.isVisible, "Cursor off must dismiss the previous presentation immediately.")
+        XCTAssertFalse(cleared.isBusy)
+        XCTAssertNil(cleared.hideTimer)
+        XCTAssertTrue(SoftwareCursorOverlay.stage(for: second).isVisible,
+                      "A client's visibility preference must leave another client's cursor alone.")
+    }
+
     func testExtremelySlowExternalSettingsCannotLeaveAnInfiniteAnimation() {
         let speed = visualCursorSpeed(environment: ["OPEN_COMPUTER_USE_CURSOR_SPEED": "1e-310"])
         let travel = visualCursorTravelDuration(distance: 4_000, speed: speed)

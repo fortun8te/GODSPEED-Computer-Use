@@ -11,7 +11,28 @@ struct SkyLightActivationCommand: Equatable {
 }
 
 struct SkyLightSyntheticFocusContext {
+    let targetPID: pid_t
     let deactivateTarget: SkyLightActivationCommand
+}
+
+/// NSWorkspace's cached frontmost app can lag in a long-lived CLI process.
+/// Focus cleanup needs the current system owner, including a user switch that
+/// happened while the agent's target was processing its last input event.
+enum ForegroundApplication {
+    static func pid() throws -> pid_t {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.2)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedApplicationAttribute as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            throw ComputerUseError.stateUnavailable("Cannot determine the current foreground application.")
+        }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(value as! AXUIElement, &pid) == .success, pid > 0 else {
+            throw ComputerUseError.stateUnavailable("Cannot determine the current foreground PID.")
+        }
+        return pid
+    }
 }
 
 struct SkyLightSyntheticFocusPlan: Equatable {
@@ -494,6 +515,7 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
         }
 
         return SkyLightSyntheticFocusContext(
+            targetPID: targetPID,
             deactivateTarget: plan.deactivateTarget
         )
     }
@@ -523,9 +545,12 @@ final class SkyLightSPI: WindowOcclusionControlling, @unchecked Sendable {
     }
 
     func endSyntheticTargetFocus(_ context: SkyLightSyntheticFocusContext) throws {
-        try postActivationCommand(context.deactivateTarget)
-        if InputTiming.focusRecordSettle > 0 {
-            Thread.sleep(forTimeInterval: InputTiming.focusRecordSettle)
+        try SyntheticFocusTeardown.endIfStillBackground(targetPID: context.targetPID,
+            foregroundPID: ForegroundApplication.pid) {
+            try postActivationCommand(context.deactivateTarget)
+            if InputTiming.focusRecordSettle > 0 {
+                Thread.sleep(forTimeInterval: InputTiming.focusRecordSettle)
+            }
         }
     }
 

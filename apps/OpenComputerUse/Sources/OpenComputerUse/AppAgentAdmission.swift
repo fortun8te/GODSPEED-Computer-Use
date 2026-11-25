@@ -46,6 +46,7 @@ final class AppAgentAdmission: @unchecked Sendable {
     }
 
     private let condition = NSCondition()
+    private let now: @Sendable () -> TimeInterval
     private let sharedLimit: Int
     let parallelTabWrites: Bool
     private var active: [UUID: Mode] = [:]
@@ -53,7 +54,9 @@ final class AppAgentAdmission: @unchecked Sendable {
     private var writesWhileReaderWaiting = 0
     private var generation: UInt64 = 0
 
-    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+    init(environment: [String: String] = ProcessInfo.processInfo.environment,
+         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.now = now
         let requested = environment["OPEN_COMPUTER_USE_PARALLEL_READS"].flatMap(Int.init) ?? 3
         sharedLimit = min(4, max(1, requested))
         parallelTabWrites = ["1", "true", "yes", "on"].contains(
@@ -89,8 +92,8 @@ final class AppAgentAdmission: @unchecked Sendable {
     }
 
     private func acquire(_ ticket: Ticket, timeout: TimeInterval) throws -> UInt64 {
-        let clock = ProcessInfo.processInfo
-        let deadline = clock.systemUptime + timeout
+        guard timeout.isFinite, timeout >= 0 else { throw Timeout() }
+        let deadline = now() + timeout
         condition.lock()
         defer { condition.unlock() }
         guard queued.count < Self.queueLimit else { throw Timeout() }
@@ -101,11 +104,15 @@ final class AppAgentAdmission: @unchecked Sendable {
         }
         while nextTicket() != ticket.id {
             try RequestCancellation.check(delivery: .notSent)
-            let left = deadline - clock.systemUptime
+            let left = deadline - now()
             guard left > 0 else { throw Timeout() }
             _ = condition.wait(until: Date().addingTimeInterval(min(left, 0.05)))
         }
         try RequestCancellation.check(delivery: .notSent)
+        // Eligibility may have changed while this thread slept. A released
+        // gate does not renew the queued request's deadline. Zero remains a
+        // nonblocking attempt and is allowed only when no wait was needed.
+        guard timeout == 0 || now() < deadline else { throw Timeout() }
         active[ticket.id] = ticket.mode
         generation &+= 1
         if ticket.mode == .exclusive {

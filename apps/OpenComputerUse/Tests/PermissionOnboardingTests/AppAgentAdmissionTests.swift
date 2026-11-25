@@ -5,6 +5,46 @@ import XCTest
 @testable import OpenComputerUse
 
 final class AppAgentAdmissionTests: XCTestCase {
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: TimeInterval = 100
+        func read() -> TimeInterval { lock.withLock { value } }
+        func advance(_ amount: TimeInterval) { lock.withLock { value += amount } }
+    }
+
+    func testExpiredQueuedWorkDoesNotRunWhenAdmissionBecomesAvailable() throws {
+        let clock = Clock()
+        let gate = AppAgentAdmission(environment: [:], now: { clock.read() })
+        let finished = DispatchSemaphore(value: 0)
+        try gate.withAdmission(.exclusive) {
+            DispatchQueue.global().async {
+                defer { finished.signal() }
+                XCTAssertThrowsError(try gate.withAdmission(.exclusive, timeout: 1) {
+                    XCTFail("Expired queued work reached dispatch")
+                }) { error in
+                    XCTAssertTrue(error is AppAgentAdmission.Timeout, "\(error)")
+                }
+            }
+            XCTAssertTrue(waitForQueue(gate, count: 1))
+            clock.advance(2)
+        }
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(gate.waitingCount, 0)
+        // An expired ticket must not retain or poison the released gate.
+        try gate.withAdmission(.exclusive, timeout: 0) {}
+    }
+
+    func testInvalidAdmissionBudgetsNeverRunEvenWhenGateIsFree() {
+        let gate = AppAgentAdmission(environment: [:])
+        for timeout in [TimeInterval.nan, .infinity, -.infinity, -1] {
+            XCTAssertThrowsError(try gate.withAdmission(.exclusive, timeout: timeout) {
+                XCTFail("Invalid admission budget reached dispatch")
+            }) { error in XCTAssertTrue(error is AppAgentAdmission.Timeout) }
+            XCTAssertEqual(gate.waitingCount, 0)
+        }
+        XCTAssertNoThrow(try gate.withAdmission(.exclusive, timeout: 0) {})
+    }
+
     func testAllowsThreeDistinctReadersAndOnlyOnePerClient() throws {
         let gate = AppAgentAdmission()
 

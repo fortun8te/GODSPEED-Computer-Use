@@ -311,14 +311,17 @@ final class BatchResumeTests: XCTestCase {
     }
 
     func testStaleRawIndexIsRefusedEvenWhenWindowMatches() throws {
+        let launch = Date(timeIntervalSince1970: 1_700_000_000)
         let steps = [
             BatchTool.Step(tool: "click", arguments: ["app": "Notes", "element_index": 3]),
             BatchTool.Step(tool: "click", arguments: ["app": "Notes", "elementId": 4]),
         ]
         let record = try XCTUnwrap(BatchResume.record(
             steps: steps, receipt: receipt([], stop: .windowChanged, total: 2),
-            goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42))
-        XCTAssertNoThrow(try BatchResume.check(record, now: Date(), liveProcessID: 7, liveWindowID: 42))
+            goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42,
+            processLaunchDate: launch))
+        XCTAssertNoThrow(try BatchResume.check(record, now: Date(), liveProcessID: 7, liveWindowID: 42,
+                                              liveProcessLaunchDate: launch))
         XCTAssertThrowsError(try BatchResume.check(record, now: Date(), liveProcessID: 7, liveWindowID: 43))
         XCTAssertThrowsError(try BatchResume.steps(of: record, values: [:])) { error in
             XCTAssertTrue(error.localizedDescription.contains("old snapshot"))
@@ -330,6 +333,7 @@ final class BatchResumeTests: XCTestCase {
     }
 
     func testVerifiedMilestoneSurvivesStorageAndReplacementProcess() throws {
+        let launch = Date(timeIntervalSince1970: 1_700_000_000)
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }
         try BatchResume.$directoryOverride.withValue(folder) {
@@ -337,18 +341,20 @@ final class BatchResumeTests: XCTestCase {
             stopped.steps[0].verification = .effectSeen
             let first = try XCTUnwrap(BatchResume.record(
                 steps: clicks(3), receipt: stopped,
-                goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42))
+                goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 7, originalWindowID: 42,
+                processLaunchDate: launch))
             try BatchResume.save(first)
             let loaded = try BatchResume.load(first.id)
             let next = try XCTUnwrap(BatchResume.record(
                 steps: try BatchResume.steps(of: loaded, values: [:]),
                 receipt: receipt([], stop: .windowChanged, total: 2),
                 goal: "", doneWhen: nil, app: "Notes", windowID: nil, processID: 8,
-                originalWindowID: 43, continuing: loaded))
+                originalWindowID: 43, continuing: loaded, processLaunchDate: launch.addingTimeInterval(60)))
             XCTAssertEqual(next.sent.map(\.number), [1])
             XCTAssertEqual(next.sent.map(\.state), [.verified])
             XCTAssertEqual(next.sent.first?.verification, "effect_seen")
             XCTAssertEqual(next.processID, 7)
+            XCTAssertEqual(next.processLaunchDate, launch)
             XCTAssertEqual(next.originalWindowID, 42)
             XCTAssertThrowsError(try BatchResume.check(next, now: Date(), liveProcessID: 8, liveWindowID: 43))
         }
@@ -358,13 +364,88 @@ final class BatchResumeTests: XCTestCase {
         let start = Date()
         let record = try XCTUnwrap(BatchResume.record(
             steps: clicks(3), receipt: receipt([.acknowledged], stop: .windowChanged, total: 3),
-            goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7, now: start))
-        try BatchResume.check(record, now: start, liveProcessID: 7, liveWindowID: 42)
+            goal: "", doneWhen: nil, app: "Notes", windowID: 42, processID: 7, now: start,
+            processLaunchDate: start))
+        try BatchResume.check(record, now: start, liveProcessID: 7, liveWindowID: 42, liveProcessLaunchDate: start)
         XCTAssertThrowsError(try BatchResume.check(record, now: start, liveProcessID: 7, liveWindowID: 43)) { error in
             guard case ComputerUseError.windowChanged(42, _) = error else { return XCTFail("\(error)") }
         }
         XCTAssertThrowsError(try BatchResume.check(record, now: start, liveProcessID: 8, liveWindowID: 42)) { error in
             guard case ComputerUseError.windowChanged(42, _) = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testReusedProcessAndWindowIdentifiersDoNotMatchRestartedApplication() throws {
+        let launch = Date(timeIntervalSince1970: 1_700_000_000.123456)
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: clicks(2), receipt: receipt([.acknowledged], stop: .timeBudget, total: 2),
+            goal: "Finish the original document", doneWhen: nil, app: "Notes", windowID: 42, processID: 7,
+            processLaunchDate: launch))
+        let restored = try JSONDecoder().decode(BatchResume.Record.self, from: JSONEncoder().encode(record))
+        XCTAssertEqual(restored.processLaunchDate, launch)
+        XCTAssertNoThrow(try BatchResume.check(restored, now: Date(), liveProcessID: 7, liveWindowID: 42,
+                                              liveProcessLaunchDate: launch))
+        for currentLaunch in [launch.addingTimeInterval(1), nil] {
+            XCTAssertThrowsError(try BatchResume.check(restored, now: Date(), liveProcessID: 7, liveWindowID: 42,
+                                                      liveProcessLaunchDate: currentLaunch)) { error in
+                XCTAssertEqual(ToolCallResult.delivery(of: error), .notSent)
+                XCTAssertTrue(error.localizedDescription.contains("application lifetime"))
+            }
+        }
+    }
+
+    func testResumedWindowBindingIncludesExplicitReadsAndInput() throws {
+        let steps: [BatchTool.Step] = [
+            .init(tool: "click", arguments: ["app": "Notes", "label": "Save"]),
+            .init(tool: "get_app_state", arguments: ["app": "Notes"]),
+            .init(tool: "query", arguments: ["app": "Notes", "text": "Saved"]),
+            .init(tool: "wait", arguments: ["app": "Notes", "text": "Saved"]),
+        ]
+        let record = try XCTUnwrap(BatchResume.record(
+            steps: steps, receipt: receipt([], stop: .timeBudget, total: steps.count),
+            goal: "Complete the original document", doneWhen: nil, app: "Notes", windowID: nil, processID: 7,
+            originalWindowID: 42, processLaunchDate: Date()))
+        let bound = try BatchTool.binding(BatchResume.steps(of: record, values: [
+            "step-3-text": "Saved", "step-4-text": "Saved",
+        ]), to: record.targetWindowID, app: record.app)
+        for step in bound.prefix(3) {
+            XCTAssertEqual(try validatedQueryWindowID(step.arguments["window_id"]), 42)
+            XCTAssertEqual(step.arguments["app"] as? String, "Notes")
+        }
+        XCTAssertEqual(bound[3].arguments["app"] as? String, "Notes")
+        XCTAssertEqual(bound[3].arguments["text"] as? String, "Saved")
+    }
+
+    func testResumedWindowBindingRefusesWindowSwitchesAndUnboundActions() {
+        let invalid: [BatchTool.Step] = [
+            .init(tool: "press_menu", arguments: ["app": "Notes", "path": ["File", "Open"]]),
+            .init(tool: "wait", arguments: ["app": "Notes", "window": "Another document"]),
+            .init(tool: "click", arguments: ["app": "Notes", "window_id": 43, "label": "Save"]),
+            .init(tool: "get_app_state", arguments: ["app": "Mail"]),
+        ]
+        for step in invalid {
+            XCTAssertThrowsError(try BatchTool.binding([step], to: 42, app: "Notes"))
+        }
+    }
+
+    func testLegacyCheckpointWithoutLaunchIdentityStaysAvailableForInspection() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try BatchResume.$directoryOverride.withValue(folder) {
+            let record = try XCTUnwrap(BatchResume.record(
+                steps: clicks(2), receipt: receipt([.verified], stop: .timeBudget, total: 2),
+                goal: "Finish the original document", doneWhen: nil, app: "Notes", windowID: 42, processID: 7))
+            try BatchResume.save(record)
+            let restored = try BatchResume.load(record.id)
+            XCTAssertNil(restored.processLaunchDate)
+            XCTAssertThrowsError(try BatchResume.check(restored, now: Date(), liveProcessID: 7, liveWindowID: 42,
+                                                      liveProcessLaunchDate: Date())) { error in
+                XCTAssertEqual(ToolCallResult.delivery(of: error), .notSent)
+            }
+            XCTAssertEqual(try BatchResume.load(record.id).sent.map(\.number), [1])
+            let lines = BatchResume.replyLines(for: restored)
+            XCTAssertTrue(lines.contains("Read the target and send the remaining steps explicitly."))
+            XCTAssertFalse(lines.contains { $0.hasPrefix("Send batch with resume") })
         }
     }
 

@@ -50,6 +50,7 @@ public enum VisualCursorSupport {
     private struct AnimationRequest: Sendable {
         let kind: AnimationKind
         let client: String
+        let generation: UInt64
         let body: @MainActor () -> Void
     }
 
@@ -57,6 +58,7 @@ public enum VisualCursorSupport {
         var pending: [AnimationRequest] = []
         var deliveriesRemaining = 0
         var drainScheduled = false
+        var generation: UInt64 = 0
     }
 
     private static let queueLock = NSLock()
@@ -92,12 +94,28 @@ public enum VisualCursorSupport {
             return
         }
         let shouldSchedule = queueLock.withLock {
-            animationQueue.pending.append(AnimationRequest(kind: kind, client: client, body: perform))
+            animationQueue.pending.append(AnimationRequest(
+                kind: kind, client: client, generation: animationQueue.generation, body: perform
+            ))
             guard !animationQueue.drainScheduled else { return false }
             animationQueue.drainScheduled = true
             return true
         }
         if shouldSchedule { DispatchQueue.main.async { drainAnimationSlice() } }
+    }
+
+    /// A reset also revokes deliveries that have not reached a stage yet. In particular, a
+    /// queued move must not reclaim the desktop after another process takes cursor ownership.
+    /// Keep the scheduled drain alive so new work can use it, but invalidate retained slices
+    /// as well as the pending array.
+    @MainActor
+    static func discardQueuedAnimations() {
+        queueLock.withLock {
+            animationQueue.generation &+= 1
+            animationQueue.pending.removeAll()
+            animationQueue.deliveriesRemaining = 0
+        }
+        deferredReset = false
     }
 
     @MainActor
@@ -123,7 +141,7 @@ public enum VisualCursorSupport {
         // A single expensive WindowServer operation can still exceed this budget.
         let deadline = CACurrentMediaTime() + 0.004
         while let next = deliveries.popFirst() {
-            next.body()
+            if queueLock.withLock({ next.generation == animationQueue.generation }) { next.body() }
             if CACurrentMediaTime() >= deadline { break }
         }
         let drained = queueLock.withLock {
@@ -1109,12 +1127,22 @@ final class CursorStage {
 
     // MARK: Public entry points (all return immediately)
 
+    /// A disabled request must also dismiss this client's previous presentation. Merely skipping
+    /// the new animation leaves an older glide, feedback mark or idle cursor visible.
+    private func applyVisibilityPreference() -> Bool {
+        guard VisualCursorSupport.isEnabled else {
+            reset()
+            return false
+        }
+        return true
+    }
+
     func moveCursor(
         to targetPoint: CGPoint,
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay else { return }
+        guard applyVisibilityPreference(), canPresentOverlay else { return }
         deferredReset = false
         // Claim only when another process holds the cursor (or none is shown). Re-claiming on every
         // move reset another OCU process mid-glide each time, so two agents made the cursor flicker.
@@ -1131,7 +1159,7 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
         deferredReset = false
         enqueue(.pulse(
             target: targetPoint, clickCount: max(clickCount, 1), button: mouseButton,
@@ -1144,7 +1172,7 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow?,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
         deferredReset = false
         enqueue(.settle(target: targetPoint, window: targetWindow, anchor: anchor, settings: VisualCursorSupport.settings))
     }
@@ -1155,7 +1183,7 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow? = nil,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), canPresentOverlay, SoftwareCursorOverlay.ownsCursor() else { return }
         guard targetPoint != nil || displayedTipPosition != nil || isBusy else { return }
         deferredReset = false
         enqueue(.beginFeedback(feedback, target: targetPoint, window: targetWindow, anchor: anchor, settings: VisualCursorSupport.settings))
@@ -1167,12 +1195,12 @@ final class CursorStage {
         in targetWindow: CursorTargetWindow? = nil,
         anchor: CursorRestingAnchor? = nil
     ) {
-        guard VisualCursorSupport.isEnabled, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), SoftwareCursorOverlay.ownsCursor() else { return }
         enqueue(.endFeedback(feedback, target: targetPoint, window: targetWindow, anchor: anchor, settings: VisualCursorSupport.settings))
     }
 
     func cancelFeedback(_ feedback: CursorInteractionFeedback) {
-        guard VisualCursorSupport.isEnabled, SoftwareCursorOverlay.ownsCursor() else { return }
+        guard applyVisibilityPreference(), SoftwareCursorOverlay.ownsCursor() else { return }
         enqueue(.cancelFeedback(feedback))
     }
 
@@ -2264,6 +2292,7 @@ enum SoftwareCursorOverlay {
 
     /// Every cursor, now.
     static func reset() {
+        VisualCursorSupport.discardQueuedAnimations()
         for stage in stages.values { stage.reset() }
     }
 

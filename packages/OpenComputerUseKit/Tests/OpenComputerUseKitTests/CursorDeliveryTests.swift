@@ -4,6 +4,49 @@ import XCTest
 
 @MainActor
 final class CursorDeliveryTests: XCTestCase {
+    func testResetDiscardsQueuedActionsWithoutBlockingFreshWork() {
+        SoftwareCursorOverlay.reset()
+        defer { SoftwareCursorOverlay.reset() }
+        var seen: [String] = []
+        RequestConfiguration.withEnvironment(["OPEN_COMPUTER_USE_CURSOR_ASYNC": "1"]) {
+            VisualCursorSupport.performCursorAnimation(kind: .move) { seen.append("stale move") }
+            VisualCursorSupport.performCursorAnimation { seen.append("stale click") }
+            SoftwareCursorOverlay.reset()
+            VisualCursorSupport.performCursorAnimation { seen.append("fresh action") }
+        }
+        drainDeliveries()
+        XCTAssertEqual(seen, ["fresh action"], "A reset must revoke actions queued before ownership changed.")
+    }
+
+    func testResetDuringDeliveryDiscardsRetainedActionsAndAnOldDeferredReset() {
+        SoftwareCursorOverlay.reset()
+        defer { SoftwareCursorOverlay.reset() }
+        var seen: [String] = []
+        RequestConfiguration.withEnvironment(["OPEN_COMPUTER_USE_CURSOR_ASYNC": "1"]) {
+            VisualCursorSupport.performCursorAnimation {
+                seen.append("started")
+                SoftwareCursorOverlay.resetWhenIdle()
+                XCTAssertTrue(VisualCursorSupport.deferredReset)
+                SoftwareCursorOverlay.reset()
+                XCTAssertFalse(VisualCursorSupport.deferredReset)
+                VisualCursorSupport.performCursorAnimation { seen.append("fresh action") }
+            }
+            // This action has already been removed from `pending` when the first callback runs.
+            VisualCursorSupport.performCursorAnimation { seen.append("stale retained click") }
+        }
+        drainDeliveries()
+        XCTAssertEqual(seen, ["started", "fresh action"])
+    }
+
+    private func drainDeliveries() {
+        let deadline = Date().addingTimeInterval(1)
+        while VisualCursorSupport.isDraining, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+        }
+        XCTAssertFalse(VisualCursorSupport.isDraining)
+        XCTAssertEqual(VisualCursorSupport.queuedAnimations, 0)
+    }
+
     func testMovementBurstCoalescesSeparatelyForEachClient() throws {
         guard let screen = NSScreen.main else { throw XCTSkip("A display is required for overlay rendering") }
         let prefix = UUID().uuidString

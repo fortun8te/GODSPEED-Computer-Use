@@ -37,6 +37,7 @@ public final class ComputerUseToolDispatcher {
     let recipeStore: BatchRecipes
     /// The `teach` tool's session (watch-me recording).
     let teach: TeachMode
+    private let workspaceObservation: SharedWorkspace.Observation
 
     func localDecisionImage(app: String, state: String) -> Data? {
         service.localDecisionImage(app: app, state: state)
@@ -47,11 +48,12 @@ public final class ComputerUseToolDispatcher {
     }
 
     init(service: ComputerUseService = ComputerUseService(), actionPolicyURL: URL, recipeStore: BatchRecipes = .shared,
-         teach: TeachMode = .shared) {
+         teach: TeachMode = .shared, workspaceObservation: SharedWorkspace.Observation = .system) {
         self.service = service
         self.actionPolicyURL = actionPolicyURL
         self.recipeStore = recipeStore
         self.teach = teach
+        self.workspaceObservation = workspaceObservation
     }
 
     func currentActionPolicy() throws -> ActionPolicy { try ActionPolicy.load(from: actionPolicyURL) }
@@ -141,6 +143,7 @@ public final class ComputerUseToolDispatcher {
             let result = try autoreleasepool {
                 try ComputerUseService.$requiredWindowID.withValue(windowID) {
                     try authorizeNativeAction(name: name, arguments: boundArguments)
+                    try requireSharedWorkspace(name: name, arguments: boundArguments)
                     if let visualToken {
                         try service.validateVisualSnapshot(app: app, token: visualToken, windowID: windowID)
                     }
@@ -155,6 +158,7 @@ public final class ComputerUseToolDispatcher {
         }
         // Focus and legacy shortcuts run only after authorization.
         try authorizeNativeAction(name: name, arguments: arguments)
+        try requireSharedWorkspace(name: name, arguments: arguments)
         if !backgroundOnlyMode(), name != "browser" { beforeNativeDispatch?() }
         if let app = arguments["app"] as? String, !app.isEmpty {
             RecentAppMemory.shared.remember(app)
@@ -483,6 +487,7 @@ public final class ComputerUseToolDispatcher {
     private func dispatchTool(name: String, arguments: [String: Any], log: SmartLog) throws -> ToolCallResult {
         // Smart fallbacks can reach the native dispatcher without another tool call.
         if name != BatchTool.name, name != HandoffTool.name { try RequestCancellation.check() }
+        try requireSharedWorkspace(name: name, arguments: arguments)
         switch name {
         case BatchTool.name:
             // The goal and step number go into each journaled intent, so a restart notice can name them.
@@ -805,6 +810,12 @@ public final class ComputerUseToolDispatcher {
         default:
             throw ComputerUseError.unsupportedTool(name)
         }
+    }
+
+    private func requireSharedWorkspace(name: String, arguments: [String: Any]) throws {
+        try SharedWorkspace.requireAvailable(tool: name, arguments: arguments,
+            backgroundOnly: backgroundOnlyMode(), pinnedWindowID: ComputerUseService.requiredWindowID,
+            observation: workspaceObservation)
     }
 
     /// The batch can check its result in the ref's window without an app-wide read.

@@ -13,6 +13,7 @@ final class BackgroundDragTests: XCTestCase {
         var locations: [CGPoint] = []
         var lifecycle: [String] = []
         var pauses: [TimeInterval] = []
+        var now: TimeInterval = 0
         var foreground = false
         var validations = 0
         var failValidation: Int?
@@ -33,7 +34,8 @@ final class BackgroundDragTests: XCTestCase {
                 needsFocus: { _ in !self.foreground },
                 beginFocus: { target in
                     self.lifecycle.append("activate")
-                    return SkyLightSyntheticFocusContext(deactivateTarget: SkyLightActivationCommand(psn: [], windowID: target.windowID, focused: false))
+                    return SkyLightSyntheticFocusContext(targetPID: target.pid,
+                        deactivateTarget: SkyLightActivationCommand(psn: [], windowID: target.windowID, focused: false))
                 },
                 makeKey: { _ in
                     self.lifecycle.append("key")
@@ -56,7 +58,8 @@ final class BackgroundDragTests: XCTestCase {
                     self.events.append(event)
                     self.lifecycle.append("release")
                 },
-                pause: { self.pauses.append($0) }
+                pause: { self.pauses.append($0); self.now += $0 },
+                clock: { self.now }
             )
         }
     }
@@ -115,7 +118,8 @@ final class BackgroundDragTests: XCTestCase {
         let probe = Probe()
         try BackgroundDragDispatcher.drag(target: target, steps: 4, hold: 0.4, io: probe.io, validateSession: {})
         XCTAssertEqual(probe.events.filter { $0.type == .leftMouseDragged }.count, 4)
-        XCTAssertTrue(probe.pauses.contains(0.4))
+        XCTAssertTrue(probe.pauses.allSatisfy { $0 <= 0.05 })
+        XCTAssertEqual(probe.pauses.reduce(0, +), 0.01 + 0.03 + 0.4 + 4 * 0.03 + 0.03, accuracy: 0.0001)
         XCTAssertEqual(probe.events.last?.location, target.end)
 
         let stale = Probe()
@@ -123,6 +127,44 @@ final class BackgroundDragTests: XCTestCase {
             throw ComputerUseError.stateUnavailable("Endpoint moved.")
         })
         XCTAssertEqual(stale.events.map(\.type), [.mouseMoved])
+    }
+
+    func testCancellationDuringDragHoldReleasesWithoutWaitingTheFullSecond() {
+        let probe = Probe()
+        let token = RequestCancellation()
+        var io = probe.io
+        io.pause = { duration in
+            probe.pauses.append(duration)
+            probe.now += duration
+            if probe.events.last?.type == .leftMouseDown { token.cancel() }
+        }
+        XCTAssertThrowsError(try RequestCancellation.$current.withValue(token) {
+            try BackgroundDragDispatcher.drag(target: target, hold: 1, io: io, validateSession: {})
+        }) { error in
+            XCTAssertEqual((error as? RequestCancellation.Cancelled)?.deliveryState, .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertLessThan(probe.now, 0.2)
+        XCTAssertEqual(probe.lifecycle.last, "deactivate")
+    }
+
+    func testWindowChangeDuringDragHoldReleasesAtThePressLocation() {
+        let probe = Probe()
+        var io = probe.io
+        var changed = false
+        io.pause = { duration in
+            probe.now += duration
+            if probe.events.last?.type == .leftMouseDown { changed = true }
+        }
+        io.validateWindow = { _ in
+            if changed { throw ComputerUseError.notSent("The user moved the window.") }
+        }
+        XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, hold: 1, io: io, validateSession: {})) { error in
+            XCTAssertEqual(ToolCallResult.delivery(of: error), .outcomeUnknown)
+        }
+        XCTAssertEqual(probe.events.map(\.type), [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(probe.events.last?.location, target.start)
+        XCTAssertLessThan(probe.now, 0.2)
     }
 
     func testModifiedDragKeepsFlagsAndMotionTogetherUntilRelease() throws {
@@ -198,8 +240,8 @@ final class BackgroundDragTests: XCTestCase {
     }
 
     func testWindowFailureAtEverySendReleasesOnlyAfterOurPress() {
-        // validateWindow is called once before setup and before each send.
-        for failingValidation in 1...13 {
+        // Window checks cover setup, every send, and both ends of the hold.
+        for failingValidation in 1...15 {
             let probe = Probe(); probe.failValidation = failingValidation
             XCTAssertThrowsError(try BackgroundDragDispatcher.drag(target: target, io: probe.io, validateSession: {}))
             let pressed = probe.events.contains { $0.type == .leftMouseDown }

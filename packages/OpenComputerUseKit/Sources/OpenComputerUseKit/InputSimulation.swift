@@ -26,6 +26,27 @@ final class NativeInputDelivery {
 
     func didPost() { state = .outcomeUnknown }
 
+    /// A held button/key must be released promptly when the request ends or
+    /// the target stops being valid. Count validation time toward the hold,
+    /// and never sleep past the enclosing request's remaining budget.
+    func wait(_ duration: TimeInterval, validate: () throws -> Void,
+              clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+              pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws {
+        let end = clock() + duration
+        while true {
+            try check()
+            try validate()
+            try check()
+            let left = end - clock()
+            guard left > 0 else { return }
+            let budget = remaining() ?? left
+            guard budget > 0 else {
+                throw ComputerUseError.timedOut("The input time budget ended during a hold. Inspect the app before repeating.", delivery: state)
+            }
+            pause(min(0.05, min(left, budget)))
+        }
+    }
+
     /// A later validation can know its own step was not sent without proving
     /// that the earlier part of this gesture was not sent. Keep that evidence.
     func failure(_ error: Error) -> Error {
@@ -331,8 +352,12 @@ enum InputSimulation {
     static func deliverHeldKey(_ parsed: ParsedKeyPress, hold: TimeInterval,
                                validate: () throws -> Void, post: (CGEvent) throws -> Void, release: (CGEvent) -> Void,
                                delivery: NativeInputDelivery = NativeInputDelivery(),
+                               clock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                                pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws {
         try delivery.check()
+        guard hold.isFinite, hold >= 0 else {
+            throw ComputerUseError.invalidArguments("A key hold must be a finite, nonnegative duration.")
+        }
         var flags: CGEventFlags = []
         let modifiers = try parsed.modifiers.map { modifier -> (CGEvent, CGEvent) in
             flags.insert(modifier.flag)
@@ -359,10 +384,7 @@ enum InputSimulation {
                 delivery.didPost()
                 pressed.append(up)
             }
-            try delivery.check()
-            if hold > 0 { pause(hold) }
-            try validate()
-            try delivery.check()
+            try delivery.wait(hold, validate: validate, clock: clock, pause: pause)
         } catch is RequestCancellation.Cancelled {
             throw RequestCancellation.Cancelled(deliveryState: delivery.state)
         } catch ComputerUseError.timedOut(let message, _) {

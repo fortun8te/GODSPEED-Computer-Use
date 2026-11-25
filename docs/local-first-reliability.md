@@ -2,6 +2,14 @@
 
 Godspeed should carry out a well-specified task with local evidence, keep progress attached to the right window, and return a useful checkpoint when it cannot continue. A model is useful for an unresolved choice; it should not be required to remember which button was already pressed, check a field value, or wait for a slow interface.
 
+## Coworker behaviour
+
+The user owns the foreground and physical input. Background work can continue in its own target while the user works elsewhere; optional focus borrowing yields when the user returns. A delayed request must not reclaim focus or resurrect an old cursor after its ownership has ended.
+
+An unattended task keeps its original application lifetime, window, deadline and delivery evidence. An app restart is a new target even if macOS reuses its process and window numbers. Cancellation releases held input and stops queued work before dispatch; an operation already handed to macOS remains uncertain until its effect can be inspected. The system returns that distinction instead of treating a timeout as permission to repeat an action.
+
+Local actions, accessibility reads, OCR and verification carry routine work. Optional models handle unresolved choices under the same task budget. Progress and recovery should be useful to the host agent without requiring the user to supervise every click.
+
 ## Configuration
 
 Open `godspeed` and choose **Presets → Model-free** to stage compact reads, verified recipes, change-only batch replies, screenshots on request, and disabled optional model helpers. Review the changes and save. The host agent still uses its own configured model; this preset controls inference inside Godspeed.
@@ -25,6 +33,9 @@ Optional helper requests share the enclosing task's deadline. Encoding, admissio
 | A stale element number needs recovery | Re-read the original window, require the same process and an unambiguous observed identity, then keep the retry pinned. |
 | A workflow repeats unchanged states or navigation cycles | Detect the stall locally and return evidence without a separate stuck-model call. |
 | A resume request is canceled or already expired | Leave its checkpoint available; do not consume the token or send pending input. |
+| A native checkpoint belongs to a restarted app, or lacks launch identity | Refuse the old continuation and require fresh explicit steps; matching process/window numbers are insufficient. |
+| A compatible native checkpoint resumes | Carry the original window through actions, waits, baselines and final verification. Validate incompatible steps before claiming the checkpoint. |
+| A save sheet shows only a folder basename | Do not infer the destination from that name. Require the accepted full-path filename or an observed absolute destination before pressing Save. |
 | A saved pending step or completion check contains user values | Require fresh value slots. Normalize aliases before storage, keep completion operators separate from their values and refuse legacy unslotted values. |
 
 Recipe replay remains evidence-based. A previous successful recipe is a reusable plan, not proof that the present task is already done or permission to repeat an uncertain side effect. Existing action policy and delivery receipts continue to apply.
@@ -39,17 +50,29 @@ Notification waits check cancellation at intervals of at most 50 ms without repl
 
 Control-condition waits check cancellation before reading, after reading and between polls. A ready sample received after cancellation cannot become a successful completion. The stdio request queue refuses only the excess request when full, keeps reading cancellation messages and preserves active and previously queued work. The request worker and overflow reader serialize whole reply lines so concurrent responses cannot corrupt the JSON-RPC stream.
 
+Local readiness polls also respect the enclosing workflow deadline. NSWorkspace opens and Apple Events retain cancellation and the same absolute budget through their asynchronous callbacks. A delayed Apple Event worker cannot dispatch after its caller has timed out. Duplicate or late completions do not replace the first result; cancellation after dispatch preserves uncertain delivery. A queued desktop request rechecks its deadline when the admission gate becomes available.
+
+App-agent cancellation covers a blocked request write as well as the response wait. A partially written request is interrupted by shutting down that connection, rather than inserting a cancellation message into its unfinished frame. Closed, malformed and timed-out streams are invalidated immediately; the next non-cancelled request reconnects. Queued requests survive the connection failure, and the interrupted action retains uncertain delivery.
+
 The action monitor records the generation before dispatch, so a notification received during dispatch establishes that the app reports changes. A delivered action still invalidates reusable read evidence: a preflight notification or read cannot prove its later effect. It does not start an action grace period for input reported as unsent or uncertain. Text values are withheld while secure-field classification is unavailable, with a retry once classification resolves.
 
 ## Shared workspace behaviour
 
 The standard MCP launcher enforces background-only operation and disables focus borrowing and physical-pointer fallbacks. Some applications still cannot perform particular actions in the background; these return a refusal with the current evidence.
 
+At native mutating dispatch boundaries, background-only sessions yield when recent physical user activity overlaps the target foreground app or window. Work in another app, or a demonstrably different explicitly pinned window, can continue. Read-only operations and the private clipboard remain available. This check does not establish an exclusive lease against user input arriving after dispatch.
+
 For separately configured sessions that allow focus borrowing, Godspeed checks foreground ownership again after waiting for user inactivity, before both acquisition and restoration. Nested borrowing respects user activity. A previously hidden application is not hidden again while the user is actively using it.
+
+Acquisition rechecks live foreground ownership, user inactivity and the originating request on the main queue, including after unhiding. It does not schedule a forced asynchronous activation retry that could arrive after the user returns. Retained leases are checked against the current foreground owner when a workflow moves between apps. Synthetic input cleanup does not deactivate a target the user has brought forward.
 
 Software cursor presentation is asynchronous. Accent, nickname, visibility, labels, action indicators, speed, reduced motion, idle timeout and floating are independent preferences. System mode respects macOS Reduce Motion. Cosmetic motion has a finite duration even for extreme numeric settings. OCR/vision clicks use the same anchored indication, with the click pulse following delivered input.
 
+Cursor ownership resets discard queued animation generations, including a retained main-thread slice. Fresh work can still drain normally. A cursor-disabled request dismisses its own existing presentation without clearing another client's cursor.
+
 Native input rechecks cancellation and the active time budget after window, focus and hit validation, immediately before posting. Keyboard and click sequences prepare matching releases before pressing. If a request ends after input starts, cleanup releases the keys or button already pressed while the receipt preserves uncertain delivery; the caller must inspect the result before repeating it.
+
+Held keys and drag holds use sleep intervals of at most 50 ms and recheck target validity, cancellation and the remaining budget between intervals. Validation time counts toward the requested hold. A synchronous accessibility call already in flight can take longer than the sleep interval.
 
 ## Settings integrity and privacy
 
