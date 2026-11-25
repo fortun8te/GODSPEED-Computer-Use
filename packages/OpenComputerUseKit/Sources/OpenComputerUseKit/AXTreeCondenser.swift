@@ -330,7 +330,7 @@ enum AXTreeCondenser {
     )
 
     private static func roleName(of rest: String) -> String {
-        let firstWord = String(rest.prefix(while: { $0 != " " }))
+        let firstWord = String(rest.prefix(while: { $0 != " " && $0 != "\t" }))
         if let candidates = multiWordRolePrefixes[firstWord] {
             for entry in candidates where rest == entry.role || rest.hasPrefix(entry.prefix) { return entry.role }
         }
