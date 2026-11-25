@@ -949,6 +949,21 @@ public final class ComputerUseService {
         return LocalWindowImage.jpeg(crop)
     }
 
+    /// Guard explicit semantic-search coordinates against both a replaced cached read and a changed live window.
+    /// Opt-in only: ordinary AX and pixel actions keep their existing latency.
+    func validateVisualSnapshot(app query: String, token: String, windowID: CGWindowID) throws {
+        let snapshot = try currentSnapshot(for: query, recoveryPolicy: .readOnly)
+        guard snapshot.observedWindowID == windowID, let bytes = snapshot.screenshotData,
+              VisualSearch.observationToken(windowID: windowID, bytes: bytes) == token,
+              let capture = WindowCapture.resolve(for: snapshot.app.pid, exactWindowID: windowID),
+              capture.bounds == snapshot.windowBounds,
+              let fresh = capture.screenshotResult().data,
+              VisualSearch.observationToken(windowID: windowID, bytes: fresh) == token else {
+            throw ComputerUseError.notSent("Visual snapshot changed or could not be verified. Read the window and inspect the target again.")
+        }
+        try RequestCancellation.check(delivery: .notSent)
+    }
+
     /// Ground a label in the same observed window, then verify it immediately before delivery.
     func visionClick(app query: String, label: String, method: ClickMethod) throws -> ToolCallResult? {
         guard method == .auto || method == .skyClick, !VisionFallback.risky(label),
